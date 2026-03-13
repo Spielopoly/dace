@@ -111,37 +111,37 @@ class ExpandTileAddCuTile(ExpandTransformation):
 
             # Keep the operation generic via an operator policy lambda.
             code = f"""
-constexpr int __ndim = {ndim};
-const long long __shape[__ndim] = {{{shape_expr}}};
-const long long __a_strides[__ndim] = {{{a_strides_expr}}};
-const long long __b_strides[__ndim] = {{{b_strides_expr}}};
-const long long __c_strides[__ndim] = {{{c_strides_expr}}};
+constexpr int ndim = {ndim};
+const std::size_t shape[ndim] = {{{shape_expr}}};
+const std::size_t a_strides[ndim] = {{{a_strides_expr}}};
+const std::size_t b_strides[ndim] = {{{b_strides_expr}}};
+const std::size_t c_strides[ndim] = {{{c_strides_expr}}};
 
-std::size_t __n = 1;
-for (int __d = 0; __d < __ndim; ++__d) {{
-    __n *= static_cast<std::size_t>(__shape[__d]);
+std::size_t n = 1;
+for (int d = 0; d < ndim; ++d) {{
+    n *= shape[d];
 }}
 
-auto __apply_binary = [&](auto __op) {{
-    for (std::size_t __linear = 0; __linear < __n; ++__linear) {{
-        std::size_t __rem = __linear;
-        long long __ia = 0;
-        long long __ib = 0;
-        long long __ic = 0;
-        for (int __d = __ndim - 1; __d >= 0; --__d) {{
-            const auto __extent = static_cast<std::size_t>(__shape[__d]);
-            const long long __coord = static_cast<long long>(__rem % __extent);
-            __rem /= __extent;
-            __ia += __coord * __a_strides[__d];
-            __ib += __coord * __b_strides[__d];
-            __ic += __coord * __c_strides[__d];
+auto apply_binary = [&](auto op) {{
+    for (std::size_t linear = 0; linear < n; ++linear) {{
+        std::size_t rem = linear;
+        long long ia = 0;
+        long long ib = 0;
+        long long ic = 0;
+        for (int d = ndim - 1; d >= 0; --d) {{
+            const auto extent = static_cast<std::size_t>(shape[ d]);
+            const long long coord = static_cast<long long>(rem % extent);
+            rem /= extent;
+            ia += coord * a_strides[ d];
+            ib += coord * b_strides[ d];
+            ic += coord * c_strides[ d];
         }}
-        _c[__ic] = __op(_a[__ia], _b[__ib]);
+        _c[ic] = op(_a[ia], _b[ib]);
     }}
 }};
 
-__apply_binary([](const auto& __lhs, const auto& __rhs) {{
-    return __lhs + __rhs;
+apply_binary([](const auto& lhs, const auto& rhs) {{
+    return lhs + rhs;
 }});
 """
         tasklet = nodes.Tasklet(
