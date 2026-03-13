@@ -7,6 +7,7 @@ with scalar tasklets by cuTile library nodes.
 from __future__ import annotations
 
 import dace
+import numpy as np
 from dace import dtypes, Memlet
 from dace.sdfg import SDFG, nodes
 from dace.libraries.cutile.transformations.pipeline import apply_cutile_pipeline
@@ -249,6 +250,56 @@ def test_structure_matches_expected():
     assert sdfg.arrays[out_edges[0].dst.data].transient
 
 
+def test_tileadd_expands_to_cpp_tasklet():
+    """TileAdd expansion should generate a C++ tasklet implementation."""
+    sdfg = build_tiled_scalar_add_sdfg()
+    apply_cutile_pipeline(sdfg, validate=True)
+
+    sdfg.expand_library_nodes()
+    sdfg.validate()
+
+    state = sdfg.states()[0]
+    tasklets = [n for n in state.nodes() if isinstance(n, nodes.Tasklet)]
+    assert len(tasklets) == 1
+    assert tasklets[0].language == dtypes.Language.CPP
+    assert "__apply_binary" in tasklets[0].code.as_string
+
+
+def test_tileadd_runtime_numeric_correctness():
+    """Execute TileAdd with concrete data and compare against NumPy addition."""
+    sdfg = SDFG("tile_add_runtime")
+    sdfg.add_array("A", shape=[3, 4], dtype=dace.float64)
+    sdfg.add_array("B", shape=[3, 4], dtype=dace.float64)
+    sdfg.add_array("C", shape=[3, 4], dtype=dace.float64)
+
+    state = sdfg.add_state("main")
+    a_read = state.add_read("A")
+    b_read = state.add_read("B")
+    c_write = state.add_write("C")
+    add_node = TileAdd("tile_add_runtime_node")
+    state.add_node(add_node)
+
+    state.add_edge(a_read, None, add_node, "_a", Memlet("A[0:3, 0:4]"))
+    state.add_edge(b_read, None, add_node, "_b", Memlet("B[0:3, 0:4]"))
+    state.add_edge(add_node, "_c", c_write, None, Memlet("C[0:3, 0:4]"))
+
+    sdfg.validate()
+    sdfg.expand_library_nodes()
+    sdfg.validate()
+
+    a = np.array([[1.5, -2.0, 3.25, 0.0],
+                  [4.0, 5.5, -6.75, 8.0],
+                  [9.0, -10.25, 11.0, 12.5]], dtype=np.float64)
+    b = np.array([[0.5, 2.0, -1.25, 3.0],
+                  [-4.0, 1.5, 6.75, -2.0],
+                  [1.0, 10.25, -3.0, 7.5]], dtype=np.float64)
+    c = np.zeros((3, 4), dtype=np.float64)
+
+    sdfg(A=a, B=b, C=c)
+
+    np.testing.assert_allclose(c, a + b, rtol=0.0, atol=1e-12)
+
+
 if __name__ == "__main__":
     test_scalar_to_tile_add()
     print("[PASS] test_scalar_to_tile_add")
@@ -264,5 +315,11 @@ if __name__ == "__main__":
 
     test_structure_matches_expected()
     print("[PASS] test_structure_matches_expected")
+
+    test_tileadd_expands_to_cpp_tasklet()
+    print("[PASS] test_tileadd_expands_to_cpp_tasklet")
+
+    test_tileadd_runtime_numeric_correctness()
+    print("[PASS] test_tileadd_runtime_numeric_correctness")
 
     print("\nAll tests passed!")

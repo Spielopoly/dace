@@ -1,20 +1,21 @@
 """
-TileAdd Library Node for DaCe → cuTile (TileIR) backend.
+TileAdd Library Node for DaCe -> cuTile (TileIR) backend.
 
 Represents element-wise addition of two array tiles:
     C[subset] = A[subset] + B[subset]
 
-Expansion emits a Python-language Tasklet that calls into cuTile Python
-(cuda.tile) to perform the addition as a single tile operation on the GPU.
+Expansion emits C++ tasklet code so the node can be expanded and validated
+with DaCe's supported C++ code generation path.
 """
 from __future__ import annotations
 
 import dace
-from dace import dtypes, properties, Memlet
+from dace import dtypes, properties
 from dace.sdfg import SDFG, SDFGState
 from dace.sdfg import nodes
 from dace.sdfg.nodes import LibraryNode
 from dace import library
+from dace.symbolic import symstr
 from dace.transformation.transformation import ExpandTransformation
 
 
@@ -82,11 +83,15 @@ class TileAdd(LibraryNode):
             raise ValueError(
                 f"TileAdd '{self.name}': dtype mismatch – A={a_desc.dtype}, B={b_desc.dtype}"
             )
+        if c_desc.dtype != a_desc.dtype:
+            raise ValueError(
+                f"TileAdd '{self.name}': dtype mismatch – A={a_desc.dtype}, C={c_desc.dtype}"
+            )
 
 
 @library.register_expansion(TileAdd, "cuTile")
 class ExpandTileAddCuTile(ExpandTransformation):
-    """Expands TileAdd into a Python-language Tasklet emitting a cuTile kernel."""
+    """Expands TileAdd into a C++ tasklet for element-wise tile addition."""
 
     environments: list = []
 
@@ -96,39 +101,55 @@ class ExpandTileAddCuTile(ExpandTransformation):
         shape: tuple = a_desc.shape
         ndim: int = len(shape)
 
-        if node.tile_size:
-            tile_size_expr = repr(tuple(node.tile_size))
+        if ndim == 0:
+            code = "_c[0] = _a[0] + _b[0];"
         else:
-            tile_size_expr = "(" + ", ".join(str(s) for s in shape) + ",)"
+            shape_expr = ", ".join(symstr(s) for s in shape)
+            a_strides_expr = ", ".join(symstr(s) for s in a_desc.strides)
+            b_strides_expr = ", ".join(symstr(s) for s in b_desc.strides)
+            c_strides_expr = ", ".join(symstr(s) for s in c_desc.strides)
 
-        zero_index = "(" + ", ".join(["0"] * ndim) + ",)"
+            # Keep the operation generic via an operator policy lambda.
+            code = f"""
+constexpr int __ndim = {ndim};
+const long long __shape[__ndim] = {{{shape_expr}}};
+const long long __a_strides[__ndim] = {{{a_strides_expr}}};
+const long long __b_strides[__ndim] = {{{b_strides_expr}}};
+const long long __c_strides[__ndim] = {{{c_strides_expr}}};
 
-        code = f"""\
-import cuda.tile as __ct
-import cupy as __cp
+std::size_t __n = 1;
+for (int __d = 0; __d < __ndim; ++__d) {{
+    __n *= static_cast<std::size_t>(__shape[__d]);
+}}
 
-@__ct.kernel
-def _tile_add_kernel(_ka, _kb, _kc, _tile_shape: __ct.Constant[tuple]):
-    _a_tile = __ct.load(_ka, index={zero_index}, shape=_tile_shape)
-    _b_tile = __ct.load(_kb, index={zero_index}, shape=_tile_shape)
-    _c_tile = _a_tile + _b_tile
-    __ct.store(_kc, index={zero_index}, tile=_c_tile)
+auto __apply_binary = [&](auto __op) {{
+    for (std::size_t __linear = 0; __linear < __n; ++__linear) {{
+        std::size_t __rem = __linear;
+        long long __ia = 0;
+        long long __ib = 0;
+        long long __ic = 0;
+        for (int __d = __ndim - 1; __d >= 0; --__d) {{
+            const auto __extent = static_cast<std::size_t>(__shape[__d]);
+            const long long __coord = static_cast<long long>(__rem % __extent);
+            __rem /= __extent;
+            __ia += __coord * __a_strides[__d];
+            __ib += __coord * __b_strides[__d];
+            __ic += __coord * __c_strides[__d];
+        }}
+        _c[__ic] = __op(_a[__ia], _b[__ib]);
+    }}
+}};
 
-_tile_shape = {tile_size_expr}
-_grid = (1, 1, 1)
-__ct.launch(
-    __cp.cuda.get_current_stream(),
-    _grid,
-    _tile_add_kernel,
-    (_a, _b, _c, _tile_shape),
-)
+__apply_binary([](const auto& __lhs, const auto& __rhs) {{
+    return __lhs + __rhs;
+}});
 """
         tasklet = nodes.Tasklet(
             label=node.name + "_cutile",
             inputs={"_a", "_b"},
             outputs={"_c"},
             code=code,
-            language=dtypes.Language.Python,
+            language=dtypes.Language.CPP,
         )
         return tasklet
 
