@@ -98,6 +98,14 @@ def _parse_simple_binop(
 def match_add(tasklet: Tasklet) -> Optional[TileOpMatch]:
     """Match ``c = a + b``."""
     def get_class():
-        from dace.libraries.cutile.nodes.add import TileAdd
-        return TileAdd
+        from dace.libraries.cutile.nodes import TileAddLibraryNode
+        return TileAddLibraryNode
     return _parse_simple_binop(tasklet, ast.Add, "add", get_class)
+
+@register_matcher
+def match_subtract(tasklet: Tasklet) -> Optional[TileOpMatch]:
+    """Match ``c = a - b``."""
+    def get_class():
+        from dace.libraries.cutile.nodes import TileSubtractLibraryNode
+        return TileSubtractLibraryNode
+    return _parse_simple_binop(tasklet, ast.Sub, "subtract", get_class)
