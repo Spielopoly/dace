@@ -92,6 +92,7 @@ class TileBinaryOPLibraryNode(LibraryNode):
                 state_id=state.parent_graph.node_id(state),
                 node_id=state.node_id(self),
             )
+        # TODO: cuTile actually has some flexibility here, which we could implement in the future.
         if a_desc.dtype != b_desc.dtype:
             raise InvalidSDFGNodeError(
                 f"TileBinaryOP '{self.name}': dtype mismatch – A={a_desc.dtype}, B={b_desc.dtype}",
@@ -107,7 +108,7 @@ class TileBinaryOPLibraryNode(LibraryNode):
                 node_id=state.node_id(self),
             )
 
-
+# This does not need to get registered as it is only used as a base class for the actual expansions (TileAdd, TileSubtract, etc.) which are registered.
 class ExpandTileElementWiseBinaryOPPure(ExpandTransformation):
     """Expands TileBinaryOPLibraryNode into a C++ tasklet for element-wise binary operations."""
 
@@ -171,9 +172,9 @@ class ExpandTileElementWiseBinaryOPPure(ExpandTransformation):
             code = f"""
 constexpr int ndim = {ndim};
 const std::size_t shape[ndim] = {{{shape_expr}}};
-const std::size_t a_strides[ndim] = {{{a_strides_expr}}};
-const std::size_t b_strides[ndim] = {{{b_strides_expr}}};
-const std::size_t c_strides[ndim] = {{{c_strides_expr}}};
+const std::ptrdiff_t a_strides[ndim] = {{{a_strides_expr}}};
+const std::ptrdiff_t b_strides[ndim] = {{{b_strides_expr}}};
+const std::ptrdiff_t c_strides[ndim] = {{{c_strides_expr}}};
 
 // Calculate total number of elements in the tile
 std::size_t n = 1;
@@ -186,12 +187,12 @@ for (std::size_t i = 0; i < n; ++i) {{
     std::size_t ib = 0;
     std::size_t ic = 0;
     for (int d = ndim - 1; d >= 0; --d) {{
-        const auto extent = shape[ d];
+        const auto extent = shape[d];
         const std::size_t coord = rem % extent;
         rem /= extent;
-        ia += coord * a_strides[ d];
-        ib += coord * b_strides[ d];
-        ic += coord * c_strides[ d];
+        ia += coord * a_strides[d];
+        ib += coord * b_strides[d];
+        ic += coord * c_strides[d];
     }}
     _c[ic] = {binary_op_string_generator('_a[ia]', '_b[ib]')};
 }}
