@@ -16,6 +16,7 @@ from dace.sdfg import SDFG, SDFGState
 from dace.sdfg import nodes
 from dace.sdfg.nodes import LibraryNode
 from dace import library
+from dace import symbolic
 from dace.symbolic import symstr
 from dace.transformation.transformation import ExpandTransformation
 from dace.sdfg.validation import (InvalidSDFGError, InvalidSDFGNodeError, InvalidSDFGEdgeError,
@@ -49,10 +50,37 @@ class TileBinaryOPLibraryNode(LibraryNode):
         ),
         allow_none=True,
     )
+
+    write_mask = properties.Property(
+        dtype=str,
+        default="1",
+        desc=(
+            "Symbolic write-mask expression for per-element output writes. "
+            "When false, the output element is not overwritten. "
+            "Expression may use flattened index '__i_flat' and per-dimension "
+            "indices '__i0', '__i1', ... in expansion code."
+        ),
+    )
+
+    mask_indices = properties.ListProperty(
+        element_type=str,
+        default=None,
+        allow_none=True,
+        desc=(
+            "Optional symbolic index names mapped to generated per-dimension "
+            "indices in write_mask. For example ['ii', 'jj'] maps to '__i0', '__i1'."
+        ),
+    )
     
     
 
-    def __init__(self, name: str = "TileBinaryOP", binary_op = None, tile_shape: list[int] | None = None, **kwargs):
+    def __init__(self,
+                 name: str = "TileBinaryOP",
+                 binary_op=None,
+                 tile_shape: list[int] | None = None,
+                 write_mask: str = "1",
+                 mask_indices: list[str] | None = None,
+                 **kwargs):
         super().__init__(
             name,
             inputs={"_a", "_b"},
@@ -60,6 +88,8 @@ class TileBinaryOPLibraryNode(LibraryNode):
             **kwargs,
         )
         self.tile_shape = tile_shape
+        self.write_mask = write_mask
+        self.mask_indices = mask_indices
 
     def validate(self, sdfg: SDFG, state: SDFGState):
         a_node = b_node = c_node = None
@@ -148,6 +178,7 @@ class ExpandTileElementWiseBinaryOPPure(ExpandTransformation):
         a_desc, b_desc, c_desc = _get_tile_descriptors(node, parent_state, parent_sdfg)
         shape: tuple[int] = tuple(node.tile_shape) if node.tile_shape is not None else a_desc.shape
         ndim: int = len(shape)
+        write_mask_cpp_expr = _to_mask_cpp_expr(node, ndim)
 
         # Determine whether DaCe will collapse the tile connector to a scalar.
         # This happens when the tile is 0-D (ndim == 0) OR when every dimension
@@ -162,12 +193,20 @@ class ExpandTileElementWiseBinaryOPPure(ExpandTransformation):
             use_scalar_form = (ndim == 0)
 
         if use_scalar_form:
-            code = f"_c = {binary_op_string_generator('_a', '_b')};"
+            index_alias_lines = "\n".join(f"const std::size_t __i{d} = 0;" for d in range(ndim))
+            code = f"""
+const std::size_t __i_flat = 0;
+{index_alias_lines}
+if ({write_mask_cpp_expr}) {{
+    _c = {binary_op_string_generator('_a', '_b')};
+}}
+"""
         else:
             shape_expr = ", ".join(symstr(s) for s in shape)
             a_strides_expr = ", ".join(symstr(s) for s in a_desc.strides)
             b_strides_expr = ", ".join(symstr(s) for s in b_desc.strides)
             c_strides_expr = ", ".join(symstr(s) for s in c_desc.strides)
+            index_alias_lines = "\n".join(f"    const std::size_t __i{d} = coords[{d}];" for d in range(ndim))
 
             code = f"""
 constexpr int ndim = {ndim};
@@ -186,15 +225,21 @@ for (std::size_t i = 0; i < n; ++i) {{
     std::size_t ia = 0;
     std::size_t ib = 0;
     std::size_t ic = 0;
+    std::size_t coords[ndim];
     for (int d = ndim - 1; d >= 0; --d) {{
         const auto extent = shape[d];
         const std::size_t coord = rem % extent;
         rem /= extent;
+        coords[d] = coord;
         ia += coord * a_strides[d];
         ib += coord * b_strides[d];
         ic += coord * c_strides[d];
     }}
-    _c[ic] = {binary_op_string_generator('_a[ia]', '_b[ib]')};
+    const std::size_t __i_flat = i;
+{index_alias_lines}
+    if ({write_mask_cpp_expr}) {{
+        _c[ic] = {binary_op_string_generator('_a[ia]', '_b[ib]')};
+    }}
 }}
 """
         tasklet = nodes.Tasklet(
@@ -205,6 +250,21 @@ for (std::size_t i = 0; i < n; ++i) {{
             language=dtypes.Language.CPP,
         )
         return tasklet
+
+
+def _to_mask_cpp_expr(node: TileBinaryOPLibraryNode, ndim: int) -> str:
+    """Convert node write_mask to a C++ expression and remap symbolic indices to __i* aliases."""
+    mask_expr = symbolic.pystr_to_symbolic(node.write_mask)
+
+    if node.mask_indices is not None:
+        substitutions = {
+            symbolic.pystr_to_symbolic(param): symbolic.symbol(f"__i{idx}")
+            for idx, param in enumerate(node.mask_indices[:ndim])
+        }
+        if substitutions:
+            mask_expr = mask_expr.subs(substitutions)
+
+    return symstr(mask_expr, cpp_mode=True)
 
 
 def _get_tile_descriptors(node: TileBinaryOPLibraryNode, state: SDFGState, sdfg: SDFG) -> tuple[dace.data.Data, dace.data.Data, dace.data.Data]:

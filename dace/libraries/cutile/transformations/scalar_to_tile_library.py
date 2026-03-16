@@ -20,6 +20,7 @@ from typing import Optional
 
 import dace
 from dace import Memlet, dtypes, subsets
+from dace import symbolic
 from dace.sdfg import SDFG, SDFGState, nodes, utils as sdutil
 from dace.transformation import transformation as xf
 
@@ -104,6 +105,18 @@ class ScalarToTileLibrary(xf.SingleStateTransformation):
 
         # Create the library node
         lib_node = op_match.library_node_class(name=op_match.op_name)
+        lib_node.tile_shape = list(tile_shape)
+        lib_node.mask_indices = list(inner_entry.map.params)
+        # Initial mask is the inner-map bounds in symbolic form; this keeps
+        # masking encoded at node level for later passes.
+        mask_terms = []
+        for param, map_range in zip(inner_entry.map.params, inner_entry.map.range):
+            start, end, _ = map_range
+            start_expr = symbolic.symstr(start)
+            end_expr = symbolic.symstr(end)
+            mask_terms.append(f"(({param}) >= ({start_expr}))")
+            mask_terms.append(f"(({param}) <= ({end_expr}))")
+        lib_node.write_mask = " and ".join(mask_terms) if mask_terms else "1"
         graph.add_node(lib_node)
 
         # --- Process inputs ---
