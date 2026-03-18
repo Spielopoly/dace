@@ -39,18 +39,24 @@ class ScalarToTileLibrary(xf.SingleStateTransformation):
     outer_map_entry = xf.PatternNode(nodes.MapEntry)
     inner_map_entry = xf.PatternNode(nodes.MapEntry)
     tasklet = xf.PatternNode(nodes.Tasklet)
+    inner_map_exit = xf.PatternNode(nodes.MapExit)
+    outer_map_exit = xf.PatternNode(nodes.MapExit)
 
     @classmethod
     def expressions(cls):
         return [sdutil.node_path_graph(cls.outer_map_entry,
                                        cls.inner_map_entry,
-                                       cls.tasklet)]
+                                       cls.tasklet,
+                                       cls.inner_map_exit,
+                                       cls.outer_map_exit)]
 
     def can_be_applied(self, graph: SDFGState, expr_index: int,
                        sdfg: SDFG, permissive: bool = False) -> bool:
         outer_entry = self.outer_map_entry
         inner_entry = self.inner_map_entry
         tasklet = self.tasklet
+        inner_exit = self.inner_map_exit
+        outer_exit = self.outer_map_exit
 
         # 1. Inner map scope must contain only the tasklet
         inner_scope = graph.scope_subgraph(inner_entry,
@@ -65,7 +71,6 @@ class ScalarToTileLibrary(xf.SingleStateTransformation):
         outer_scope = graph.scope_subgraph(outer_entry,
                                            include_entry=False,
                                            include_exit=False)
-        inner_exit = graph.exit_node(inner_entry)
         if set(outer_scope.nodes()) != {inner_entry, inner_exit, tasklet}:
             return False
 
