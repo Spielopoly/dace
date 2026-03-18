@@ -1437,95 +1437,10 @@ def test_tilemaskedadd_validate_rejects_non_integer_mask_dtype():
 
 
 if __name__ == "__main__":
-    # --- original add tests ---
-    test_scalar_to_tile_add()
-    print("[PASS] test_scalar_to_tile_add")
-
-    test_can_be_applied_rejects_non_scalar()
-    print("[PASS] test_can_be_applied_rejects_non_scalar")
-
-    test_can_be_applied_rejects_unknown_op()
-    print("[PASS] test_can_be_applied_rejects_unknown_op")
-
-    test_pipeline_idempotent()
-    print("[PASS] test_pipeline_idempotent")
-
-    test_structure_matches_expected()
-    print("[PASS] test_structure_matches_expected")
-
-    test_tileadd_runtime_numeric_correctness()
-    print("[PASS] test_tileadd_runtime_numeric_correctness")
-
-    test_pipeline_runtime_numeric_correctness_float64()
-    print("[PASS] test_pipeline_runtime_numeric_correctness_float64")
-
-    test_pipeline_runtime_numeric_correctness_float32()
-    print("[PASS] test_pipeline_runtime_numeric_correctness_float32")
-
-    # --- subtraction transformation tests ---
-    test_scalar_to_tile_subtract()
-    print("[PASS] test_scalar_to_tile_subtract")
-
-    test_subtract_pipeline_idempotent()
-    print("[PASS] test_subtract_pipeline_idempotent")
-
-    test_subtract_structure_matches_expected()
-    print("[PASS] test_subtract_structure_matches_expected")
-
-    # --- subtraction runtime/pipeline tests ---
-    test_tilesubtract_runtime_numeric_correctness()
-    print("[PASS] test_tilesubtract_runtime_numeric_correctness")
-
-    test_pipeline_runtime_subtraction_float64()
-    print("[PASS] test_pipeline_runtime_subtraction_float64")
-
-    test_pipeline_runtime_subtraction_float32()
-    print("[PASS] test_pipeline_runtime_subtraction_float32")
-
-    # --- N-D dimension tests: TileAdd ---
-    for _d in range(7):
-        _fn = globals()[f"test_tileadd_ndim_{_d}"]
-        _fn()
-        print(f"[PASS] test_tileadd_ndim_{_d}")
-
-    # --- N-D dimension tests: TileSubtract ---
-    for _d in range(7):
-        _fn = globals()[f"test_tilesubtract_ndim_{_d}"]
-        _fn()
-        print(f"[PASS] test_tilesubtract_ndim_{_d}")
-
-    # --- Edge case tests ---
-    test_subtract_self_gives_zero()
-    print("[PASS] test_subtract_self_gives_zero")
-
-    test_add_subtract_roundtrip()
-    print("[PASS] test_add_subtract_roundtrip")
-
-    test_add_zero_identity()
-    print("[PASS] test_add_zero_identity")
-
-    test_subtract_zero_identity()
-    print("[PASS] test_subtract_zero_identity")
-
-    test_tilesubtract_negative_result()
-    print("[PASS] test_tilesubtract_negative_result")
-
-    test_large_tile_subtract()
-    print("[PASS] test_large_tile_subtract")
-
-    test_large_tile_add()
-    print("[PASS] test_large_tile_add")
-
-    test_tileadd_int32_dtype()
-    print("[PASS] test_tileadd_int32_dtype")
-
-    test_tilesubtract_int32_dtype()
-    print("[PASS] test_tilesubtract_int32_dtype")
-
-    test_subtract_pipeline_various_tile_sizes()
-    print("[PASS] test_subtract_pipeline_various_tile_sizes")
-
-    test_add_pipeline_various_tile_sizes()
-    print("[PASS] test_add_pipeline_various_tile_sizes")
+    # run all functions with names starting with "test_"
+    for name, fn in sorted(globals().items()):
+        if name.startswith("test_") and callable(fn):
+            print(f"Running {name}...")
+            fn()
 
     print("\nAll tests passed!")

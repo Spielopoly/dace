@@ -96,8 +96,8 @@ class ScalarToTileLibrary(xf.SingleStateTransformation):
     def apply(self, graph: SDFGState, sdfg: SDFG) -> None:
         outer_entry = self.outer_map_entry
         inner_entry = self.inner_map_entry
-        inner_exit = graph.exit_node(inner_entry)
-        outer_exit = graph.exit_node(outer_entry)
+        inner_exit = self.inner_map_exit
+        outer_exit = self.outer_map_exit
         tasklet = self.tasklet
 
         op_match = match_tasklet(tasklet)
