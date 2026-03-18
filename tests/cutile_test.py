@@ -1460,10 +1460,10 @@ def test_noncanonical_subtract_runtime_numeric_correctness_negative_step():
         dtype=dace.float64,
     )
     
-    sdfg.save("cutile_test_noncanonical_subtract_before_pipeline.sdfg")
+    # sdfg.save("cutile_test_noncanonical_subtract_before_pipeline.sdfg")
     count = apply_cutile_pipeline(sdfg, validate=True)
     assert count == 1
-    sdfg.save("cutile_test_noncanonical_subtract_after_pipeline.sdfg")
+    # sdfg.save("cutile_test_noncanonical_subtract_after_pipeline.sdfg")
 
     state = sdfg.states()[0]
     lib_nodes = [n for n in state.nodes() if isinstance(n, nodes.LibraryNode)]

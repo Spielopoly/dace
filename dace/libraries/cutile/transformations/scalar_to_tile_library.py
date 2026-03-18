@@ -101,8 +101,11 @@ class ScalarToTileLibrary(xf.SingleStateTransformation):
             return False
 
         # 6. Non-canonical maps require a masked counterpart
-        if not self._is_canonical_inner_map(inner_entry.map):
-            if self._masked_library_node_class(op_match) is None:
+        if self._is_canonical_inner_map(inner_entry.map):
+            if op_match[0] is None:
+                return False
+        else:
+            if op_match[1] is None:
                 return False
 
         return True
@@ -118,11 +121,13 @@ class ScalarToTileLibrary(xf.SingleStateTransformation):
         assert op_match is not None
 
         if self._is_canonical_inner_map(inner_entry.map):
+            assert op_match[0] is not None
             self._apply_canonical(graph, sdfg, outer_entry, inner_entry,
-                                  tasklet, inner_exit, outer_exit, op_match)
+                                  tasklet, inner_exit, outer_exit, op_match[0])
         else:
+            assert op_match[1] is not None
             self._apply_noncanonical(graph, sdfg, outer_entry, inner_entry,
-                                     tasklet, inner_exit, outer_exit, op_match)
+                                     tasklet, inner_exit, outer_exit, op_match[1])
 
     def _apply_canonical(self, graph: SDFGState, sdfg: SDFG,
                          outer_entry: nodes.MapEntry, inner_entry: nodes.MapEntry,
@@ -229,7 +234,7 @@ class ScalarToTileLibrary(xf.SingleStateTransformation):
                             outer_entry: nodes.MapEntry, inner_entry: nodes.MapEntry,
                             tasklet: nodes.Tasklet, inner_exit: nodes.MapExit,
                             outer_exit: nodes.MapExit, op_match: TileOpMatch) -> None:
-        masked_cls = self._masked_library_node_class(op_match)
+        masked_cls = op_match.library_node_class
         assert masked_cls is not None
 
         tile_shape = self._bounding_tile_shape(inner_entry.map)
@@ -494,18 +499,6 @@ class ScalarToTileLibrary(xf.SingleStateTransformation):
             if start != 0 or step != 1:
                 return False
         return True
-
-    @staticmethod
-    def _masked_library_node_class(op_match: TileOpMatch):
-        from dace.libraries.cutile.nodes.binary_op_map import (
-            TileMaskedAddLibraryNode,
-            TileMaskedSubtractLibraryNode,
-        )
-        mapping = {
-            "add": TileMaskedAddLibraryNode,
-            "subtract": TileMaskedSubtractLibraryNode,
-        }
-        return mapping.get(op_match.op_name)
 
     # ------------------------------------------------------------------
     @staticmethod
