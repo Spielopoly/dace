@@ -328,7 +328,7 @@ def test_tileadd_runtime_numeric_correctness():
     c = np.zeros((3, 4), dtype=np.float64)
 
     sdfg(A=a, B=b, C=c)
-    sdfg.save("cutile_test_tileadd_runtime.sdfg")
+    # sdfg.save("cutile_test_tileadd_runtime.sdfg")
 
     np.testing.assert_allclose(c, a + b, rtol=0.0, atol=1e-12)
 
@@ -341,13 +341,13 @@ def test_pipeline_runtime_numeric_correctness_float64():
         dtype=dace.float64,
     )
     
-    sdfg.save("cutile_test_before_pipeline_float64.sdfg")
+    # sdfg.save("cutile_test_before_pipeline_float64.sdfg")
 
     count = apply_cutile_pipeline(sdfg, validate=True)
-    sdfg.save("cutile_test_after_pipeline_float64.sdfg")
+    # sdfg.save("cutile_test_after_pipeline_float64.sdfg")
     assert count == 1
     sdfg.expand_library_nodes()
-    sdfg.save("cutile_test_after_expansion_float64.sdfg")
+    # sdfg.save("cutile_test_after_expansion_float64.sdfg")
     sdfg.validate()
 
     shape = (2, 3, 2, 2)
@@ -369,13 +369,13 @@ def test_pipeline_runtime_numeric_correctness_float32():
         dtype=dace.float32,
     )
     
-    sdfg.save("cutile_test_before_pipeline_float32.sdfg")
+    # sdfg.save("cutile_test_before_pipeline_float32.sdfg")
 
     count = apply_cutile_pipeline(sdfg, validate=True)
-    sdfg.save("cutile_test_after_pipeline_float32.sdfg")
+    # sdfg.save("cutile_test_after_pipeline_float32.sdfg")
     assert count == 1
     sdfg.expand_library_nodes()
-    sdfg.save("cutile_test_after_expansion_float32.sdfg")
+    # sdfg.save("cutile_test_after_expansion_float32.sdfg")
     sdfg.validate()
 
     shape = (3, 2, 1, 4)
@@ -1292,6 +1292,226 @@ def test_add_pipeline_various_tile_sizes():
         sdfg(A=a, B=b, C=c)
         np.testing.assert_allclose(c, a + b, rtol=0.0, atol=1e-12,
                                    err_msg=f"Failed for {outer_shape=} {tile_shape=}")
+
+
+# ---------------------------------------------------------------------------
+# Non-canonical inner-map transformation tests
+# ---------------------------------------------------------------------------
+
+def build_runtime_tiled_scalar_noncanonical_binary_sdfg(
+    ii_range: str,
+    jj_range: str,
+    op: str,
+    name: str,
+    outer_shape=(2, 2),
+    inner_shape=(6, 5),
+    dtype=dace.float64,
+    step_symbol: str | None = None,
+) -> SDFG:
+    """Build a runtime SDFG with shifted/strided inner-map ranges."""
+    mt, nt = outer_shape
+    t0, t1 = inner_shape
+
+    sdfg = SDFG(name)
+    if step_symbol is not None:
+        sdfg.add_symbol(step_symbol, dace.int32)
+
+    sdfg.add_array("A", shape=[mt, nt, t0, t1], dtype=dtype)
+    sdfg.add_array("B", shape=[mt, nt, t0, t1], dtype=dtype)
+    sdfg.add_array("C", shape=[mt, nt, t0, t1], dtype=dtype)
+
+    state = sdfg.add_state("main")
+    a_acc = state.add_read("A")
+    b_acc = state.add_read("B")
+    c_acc = state.add_write("C")
+
+    outer_entry, outer_exit = state.add_map(
+        "tile_map",
+        {"i": f"0:{mt}", "j": f"0:{nt}"},
+        schedule=dtypes.ScheduleType.Sequential,
+    )
+    inner_entry, inner_exit = state.add_map(
+        "elem_map",
+        {"ii": ii_range, "jj": jj_range},
+        schedule=dtypes.ScheduleType.Sequential,
+    )
+
+    if op == "+":
+        tasklet_code = "c = a + b"
+        tasklet_name = "add_noncanonical"
+    elif op == "-":
+        tasklet_code = "c = a - b"
+        tasklet_name = "sub_noncanonical"
+    else:
+        raise ValueError(f"Unsupported op '{op}'.")
+
+    tasklet = state.add_tasklet(tasklet_name, {"a", "b"}, {"c"}, tasklet_code)
+
+    state.add_memlet_path(
+        a_acc,
+        outer_entry,
+        inner_entry,
+        tasklet,
+        dst_conn="a",
+        memlet=Memlet("A[i, j, ii, jj]"),
+    )
+    state.add_memlet_path(
+        b_acc,
+        outer_entry,
+        inner_entry,
+        tasklet,
+        dst_conn="b",
+        memlet=Memlet("B[i, j, ii, jj]"),
+    )
+    state.add_memlet_path(
+        tasklet,
+        inner_exit,
+        outer_exit,
+        c_acc,
+        src_conn="c",
+        memlet=Memlet("C[i, j, ii, jj]"),
+    )
+
+    sdfg.validate()
+    return sdfg
+
+
+def _expected_noncanonical_binary(a, b, c_init, ii_values, jj_values, np_op):
+    expected = c_init.copy()
+    for ii in ii_values:
+        for jj in jj_values:
+            expected[:, :, ii, jj] = np_op(a[:, :, ii, jj], b[:, :, ii, jj])
+    return expected
+
+
+def _assert_no_strided_outer_memlets(state: dace.SDFGState):
+    for edge in state.edges():
+        if edge.data.data not in {"A", "B", "C"}:
+            continue
+        if not isinstance(edge.data.subset, dace.subsets.Range):
+            continue
+        if not (
+            isinstance(edge.src, (nodes.MapEntry, nodes.MapExit))
+            or isinstance(edge.dst, (nodes.MapEntry, nodes.MapExit))
+        ):
+            continue
+        for _, _, step in edge.data.subset:
+            assert step == 1, f"Found strided outer memlet: {edge.data}"
+
+
+def test_noncanonical_add_transforms_to_masked_node_and_contiguous_memlets():
+    """Non-canonical add should rewrite to masked node and avoid strided outer memlets."""
+    sdfg = build_runtime_tiled_scalar_noncanonical_binary_sdfg(
+        ii_range="1:6:2",
+        jj_range="1:5",
+        op="+",
+        name="tile_add_before_runtime_noncanonical",
+        dtype=dace.float64,
+    )
+    sdfg.save("cutile_test_noncanonical_add_before_pipeline.sdfg")
+
+    count = apply_cutile_pipeline(sdfg, validate=True)
+    assert count == 1
+    sdfg.save("cutile_test_noncanonical_add_runtime_after_pipeline.sdfg")
+
+    state = sdfg.states()[0]
+    lib_nodes = [n for n in state.nodes() if isinstance(n, nodes.LibraryNode)]
+    assert len(lib_nodes) == 1
+    assert isinstance(lib_nodes[0], TileMaskedAddLibraryNode)
+
+    transient_names = {name for name, desc in sdfg.arrays.items() if desc.transient}
+    assert any(name.startswith("map_mask_tile") for name in transient_names)
+    _assert_no_strided_outer_memlets(state)
+
+
+def test_noncanonical_add_runtime_numeric_correctness():
+    """Non-canonical add should update only the mapped points and keep others unchanged."""
+    sdfg = build_runtime_tiled_scalar_noncanonical_binary_sdfg(
+        ii_range="1:6:2",
+        jj_range="1:5",
+        op="+",
+        name="tile_add_runtime_noncanonical_add",
+        dtype=dace.float64,
+    )
+
+    count = apply_cutile_pipeline(sdfg, validate=True)
+    assert count == 1
+    sdfg.expand_library_nodes()
+    sdfg.validate()
+
+    shape = (2, 2, 6, 5)
+    rng = np.random.default_rng(4242)
+    a = rng.uniform(-10.0, 10.0, size=shape).astype(np.float64)
+    b = rng.uniform(-10.0, 10.0, size=shape).astype(np.float64)
+    c = rng.uniform(-5.0, 5.0, size=shape).astype(np.float64)
+    c_expected = _expected_noncanonical_binary(a, b, c, range(1, 6, 2), range(1, 5, 1), np.add)
+
+    sdfg(A=a, B=b, C=c)
+    np.testing.assert_allclose(c, c_expected, rtol=0.0, atol=1e-12)
+
+
+def test_noncanonical_subtract_runtime_numeric_correctness_negative_step():
+    """Non-canonical subtract with reverse traversal should use masked subtract semantics."""
+    sdfg = build_runtime_tiled_scalar_noncanonical_binary_sdfg(
+        ii_range="5:0:-2",
+        jj_range="1:5",
+        op="-",
+        name="tile_subtract_runtime_noncanonical_negative",
+        dtype=dace.float64,
+    )
+    
+    sdfg.save("cutile_test_noncanonical_subtract_before_pipeline.sdfg")
+    count = apply_cutile_pipeline(sdfg, validate=True)
+    assert count == 1
+    sdfg.save("cutile_test_noncanonical_subtract_after_pipeline.sdfg")
+
+    state = sdfg.states()[0]
+    lib_nodes = [n for n in state.nodes() if isinstance(n, nodes.LibraryNode)]
+    assert len(lib_nodes) == 1
+    assert isinstance(lib_nodes[0], TileMaskedSubtractLibraryNode)
+
+    sdfg.expand_library_nodes()
+    sdfg.validate()
+
+    shape = (2, 2, 6, 5)
+    rng = np.random.default_rng(5252)
+    a = rng.uniform(-10.0, 10.0, size=shape).astype(np.float64)
+    b = rng.uniform(-10.0, 10.0, size=shape).astype(np.float64)
+    c = rng.uniform(-5.0, 5.0, size=shape).astype(np.float64)
+    c_expected = _expected_noncanonical_binary(a, b, c, range(5, 0, -2), range(1, 5, 1), np.subtract)
+
+    sdfg(A=a, B=b, C=c)
+    np.testing.assert_allclose(c, c_expected, rtol=0.0, atol=1e-12)
+
+
+def test_noncanonical_symbolic_unknown_sign_step_runtime():
+    """Unknown-sign symbolic step should work for both positive and negative runtime values."""
+    sdfg = build_runtime_tiled_scalar_noncanonical_binary_sdfg(
+        ii_range="1:6:S",
+        jj_range="1:5",
+        op="+",
+        name="tile_add_runtime_noncanonical_symbolic_step",
+        dtype=dace.float64,
+        step_symbol="S",
+    )
+
+    count = apply_cutile_pipeline(sdfg, validate=True)
+    assert count == 1
+    sdfg.expand_library_nodes()
+    sdfg.validate()
+
+    shape = (2, 2, 6, 5)
+    rng = np.random.default_rng(6262)
+    a = rng.uniform(-10.0, 10.0, size=shape).astype(np.float64)
+    b = rng.uniform(-10.0, 10.0, size=shape).astype(np.float64)
+
+    for step_value in (2, -2):
+        c = rng.uniform(-5.0, 5.0, size=shape).astype(np.float64)
+        c_expected = _expected_noncanonical_binary(
+            a, b, c, range(1, 6, step_value), range(1, 5, 1), np.add
+        )
+        sdfg(A=a, B=b, C=c, S=np.int32(step_value))
+        np.testing.assert_allclose(c, c_expected, rtol=0.0, atol=1e-12)
 
 
 # ---------------------------------------------------------------------------

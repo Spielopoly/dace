@@ -1,2 +1,2 @@
 from .binary_op import TileAddLibraryNode, TileSubtractLibraryNode
-from .binary_op_map import TileMaskedAddLibraryNode
+from .binary_op_map import TileMaskedAddLibraryNode, TileMaskedSubtractLibraryNode
