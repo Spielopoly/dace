@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import dace
 import numpy as np
+import pytest
 from dace import dtypes, Memlet
 from dace.sdfg import SDFG, nodes
 from dace.libraries.cutile.transformations.pipeline import apply_cutile_pipeline
@@ -480,6 +481,213 @@ def build_runtime_tiled_scalar_subtract_sdfg(
 
     sdfg.validate()
     return sdfg
+
+
+def build_tiled_scalar_masked_add_sdfg(mask_dtype=dace.bool) -> SDFG:
+    """Build an SDFG with tiled scalar masked add (the 'before' state)."""
+    sdfg = SDFG("tile_masked_add_before")
+    for sym in ("M", "N", "T0", "T1"):
+        sdfg.add_symbol(sym, dace.int32)
+
+    _add_blocked_arrays(sdfg, names=("A", "B", "MASK", "C"))
+    sdfg.arrays["MASK"].dtype = mask_dtype
+
+    state = sdfg.add_state("main")
+    a_acc = state.add_read("A")
+    b_acc = state.add_read("B")
+    m_acc = state.add_read("MASK")
+    c_acc = state.add_write("C")
+
+    outer_entry, outer_exit = state.add_map(
+        "tile_map",
+        {"i": "0:M//T0", "j": "0:N//T1"},
+        schedule=dtypes.ScheduleType.Sequential,
+    )
+    inner_entry, inner_exit = state.add_map(
+        "elem_map",
+        {"ii": "0:T0", "jj": "0:T1"},
+        schedule=dtypes.ScheduleType.GPU_ThreadBlock,
+    )
+    tasklet = state.add_tasklet("masked_add", {"a", "b", "m"}, {"c"}, "if m:\n    c = a + b")
+
+    state.add_memlet_path(
+        a_acc,
+        outer_entry,
+        inner_entry,
+        tasklet,
+        dst_conn="a",
+        memlet=Memlet("A[i, j, ii, jj]"),
+    )
+    state.add_memlet_path(
+        b_acc,
+        outer_entry,
+        inner_entry,
+        tasklet,
+        dst_conn="b",
+        memlet=Memlet("B[i, j, ii, jj]"),
+    )
+    state.add_memlet_path(
+        m_acc,
+        outer_entry,
+        inner_entry,
+        tasklet,
+        dst_conn="m",
+        memlet=Memlet("MASK[i, j, ii, jj]"),
+    )
+    state.add_memlet_path(
+        tasklet,
+        inner_exit,
+        outer_exit,
+        c_acc,
+        src_conn="c",
+        memlet=Memlet("C[i, j, ii, jj]"),
+    )
+
+    sdfg.validate()
+    return sdfg
+
+
+def build_runtime_tiled_scalar_masked_add_sdfg(
+    outer_shape=(2, 3),
+    tile_shape=(2, 2),
+    dtype=dace.float64,
+    mask_dtype=dace.bool,
+) -> SDFG:
+    """Build a CPU-friendly 'before pipeline' tiled scalar masked add SDFG."""
+    mt, nt = outer_shape
+    t0, t1 = tile_shape
+
+    sdfg = SDFG("tile_masked_add_before_runtime")
+    sdfg.add_array("A", shape=[mt, nt, t0, t1], dtype=dtype)
+    sdfg.add_array("B", shape=[mt, nt, t0, t1], dtype=dtype)
+    sdfg.add_array("MASK", shape=[mt, nt, t0, t1], dtype=mask_dtype)
+    sdfg.add_array("C", shape=[mt, nt, t0, t1], dtype=dtype)
+
+    state = sdfg.add_state("main")
+    a_acc = state.add_read("A")
+    b_acc = state.add_read("B")
+    m_acc = state.add_read("MASK")
+    c_acc = state.add_write("C")
+
+    outer_entry, outer_exit = state.add_map(
+        "tile_map",
+        {"i": f"0:{mt}", "j": f"0:{nt}"},
+        schedule=dtypes.ScheduleType.Sequential,
+    )
+    inner_entry, inner_exit = state.add_map(
+        "elem_map",
+        {"ii": f"0:{t0}", "jj": f"0:{t1}"},
+        schedule=dtypes.ScheduleType.Sequential,
+    )
+    tasklet = state.add_tasklet("masked_add", {"a", "b", "m"}, {"c"}, "if m:\n    c = a + b")
+
+    state.add_memlet_path(
+        a_acc,
+        outer_entry,
+        inner_entry,
+        tasklet,
+        dst_conn="a",
+        memlet=Memlet("A[i, j, ii, jj]"),
+    )
+    state.add_memlet_path(
+        b_acc,
+        outer_entry,
+        inner_entry,
+        tasklet,
+        dst_conn="b",
+        memlet=Memlet("B[i, j, ii, jj]"),
+    )
+    state.add_memlet_path(
+        m_acc,
+        outer_entry,
+        inner_entry,
+        tasklet,
+        dst_conn="m",
+        memlet=Memlet("MASK[i, j, ii, jj]"),
+    )
+    state.add_memlet_path(
+        tasklet,
+        inner_exit,
+        outer_exit,
+        c_acc,
+        src_conn="c",
+        memlet=Memlet("C[i, j, ii, jj]"),
+    )
+
+    sdfg.validate()
+    return sdfg
+
+
+def _make_direct_masked_add_sdfg(shape, name, dtype=dace.float64, mask_dtype=dace.bool, tile_shape_override=None):
+    """Build a single-state SDFG with one masked-add library node."""
+    if not shape:
+        actual_shape = [1]
+        node_tile_shape = [] if tile_shape_override is None else tile_shape_override
+    else:
+        actual_shape = list(shape)
+        node_tile_shape = tile_shape_override
+
+    sdfg = SDFG(name)
+    sdfg.add_array("A", shape=actual_shape, dtype=dtype)
+    sdfg.add_array("B", shape=actual_shape, dtype=dtype)
+    sdfg.add_array("MASK", shape=actual_shape, dtype=mask_dtype)
+    sdfg.add_array("C", shape=actual_shape, dtype=dtype)
+
+    state = sdfg.add_state("main")
+    a_read = state.add_read("A")
+    b_read = state.add_read("B")
+    m_read = state.add_read("MASK")
+    c_write = state.add_write("C")
+
+    op_node = TileMaskedAddLibraryNode(name + "_node", tile_shape=node_tile_shape)
+    state.add_node(op_node)
+
+    subset = ", ".join(f"0:{s}" for s in actual_shape)
+    state.add_edge(a_read, None, op_node, "_a", Memlet(f"A[{subset}]"))
+    state.add_edge(b_read, None, op_node, "_b", Memlet(f"B[{subset}]"))
+    state.add_edge(m_read, None, op_node, "_m", Memlet(f"MASK[{subset}]"))
+    state.add_edge(op_node, "_c", c_write, None, Memlet(f"C[{subset}]"))
+
+    sdfg.validate()
+    return sdfg, actual_shape
+
+
+def _run_direct_masked_add_test(shape,
+                                name,
+                                seed=123,
+                                dtype=np.float64,
+                                mask_dtype=dace.bool,
+                                tile_shape_override=None,
+                                c_init=3.5,
+                                atol=1e-12,
+                                rtol=1e-12):
+    """Expand + execute masked add and verify that unmasked values stay untouched."""
+    dace_dtype = dace.float64 if dtype == np.float64 else dace.float32
+    sdfg, actual_shape = _make_direct_masked_add_sdfg(
+        shape,
+        name,
+        dtype=dace_dtype,
+        mask_dtype=mask_dtype,
+        tile_shape_override=tile_shape_override,
+    )
+    sdfg.expand_library_nodes()
+    sdfg.validate()
+
+    rng = np.random.default_rng(seed)
+    a = rng.uniform(-10.0, 10.0, size=actual_shape).astype(dtype)
+    b = rng.uniform(-10.0, 10.0, size=actual_shape).astype(dtype)
+
+    if mask_dtype == dace.bool:
+        mask_np = rng.integers(0, 2, size=actual_shape).astype(np.bool_)
+    else:
+        mask_np = rng.integers(0, 4, size=actual_shape).astype(np.uint8)
+
+    c = np.full(actual_shape, c_init, dtype=dtype)
+    expected = np.full(actual_shape, c_init, dtype=dtype)
+    expected[mask_np.astype(bool)] = (a + b)[mask_np.astype(bool)]
+
+    sdfg(A=a, B=b, MASK=mask_np, C=c)
+    np.testing.assert_allclose(c, expected, rtol=rtol, atol=atol)
 
 
 # Tile shapes for N-D dimension tests (0-D through 6-D).
@@ -1084,6 +1292,148 @@ def test_add_pipeline_various_tile_sizes():
         sdfg(A=a, B=b, C=c)
         np.testing.assert_allclose(c, a + b, rtol=0.0, atol=1e-12,
                                    err_msg=f"Failed for {outer_shape=} {tile_shape=}")
+
+
+# ---------------------------------------------------------------------------
+# Masked add tests
+# ---------------------------------------------------------------------------
+
+def test_tilemaskedadd_runtime_numeric_correctness_bool_mask():
+    """Direct masked add runtime test with bool mask."""
+    _run_direct_masked_add_test(
+        shape=[5, 6],
+        name="tilemaskedadd_bool",
+        seed=111,
+        dtype=np.float64,
+        mask_dtype=dace.bool,
+        c_init=7.0,
+        atol=1e-12,
+        rtol=1e-12,
+    )
+
+
+def test_tilemaskedadd_runtime_numeric_correctness_uint8_mask():
+    """Direct masked add runtime test with uint8 bitmask-like values."""
+    _run_direct_masked_add_test(
+        shape=[5, 6],
+        name="tilemaskedadd_uint8",
+        seed=222,
+        dtype=np.float64,
+        mask_dtype=dace.uint8,
+        c_init=-3.0,
+        atol=1e-12,
+        rtol=1e-12,
+    )
+
+
+def test_tilemaskedadd_ndim_0():
+    """MaskedAdd 0-D expansion path (tile_shape=[]) with active mask."""
+    sdfg, actual_shape = _make_direct_masked_add_sdfg(
+        shape=(),
+        name="tilemaskedadd_ndim0",
+        dtype=dace.float64,
+        mask_dtype=dace.bool,
+        tile_shape_override=[],
+    )
+    sdfg.expand_library_nodes()
+    sdfg.validate()
+
+    rng = np.random.default_rng(333)
+    a = rng.uniform(-10.0, 10.0, size=actual_shape).astype(np.float64)
+    b = rng.uniform(-10.0, 10.0, size=actual_shape).astype(np.float64)
+    mask = np.ones(actual_shape, dtype=np.bool_)
+    c = np.full(actual_shape, 12.0, dtype=np.float64)
+
+    sdfg(A=a, B=b, MASK=mask, C=c)
+    np.testing.assert_allclose(c, a + b, rtol=1e-12, atol=1e-12)
+
+
+def test_tilemaskedadd_ndim_4_float32():
+    """MaskedAdd with a 4-D float32 tile."""
+    _run_direct_masked_add_test(
+        shape=[2, 3, 4, 5],
+        name="tilemaskedadd_ndim4_f32",
+        seed=444,
+        dtype=np.float32,
+        mask_dtype=dace.bool,
+        c_init=2.0,
+        atol=1e-6,
+        rtol=1e-6,
+    )
+
+
+def test_tilemaskedadd_all_false_keeps_output_unchanged():
+    """All-false mask must leave C unchanged."""
+    shape = [4, 7]
+    sdfg, actual_shape = _make_direct_masked_add_sdfg(shape, "tilemaskedadd_all_false")
+    sdfg.expand_library_nodes()
+    sdfg.validate()
+
+    rng = np.random.default_rng(555)
+    a = rng.uniform(-10.0, 10.0, size=actual_shape).astype(np.float64)
+    b = rng.uniform(-10.0, 10.0, size=actual_shape).astype(np.float64)
+    mask = np.zeros(actual_shape, dtype=np.bool_)
+    c = np.full(actual_shape, -9.25, dtype=np.float64)
+
+    sdfg(A=a, B=b, MASK=mask, C=c)
+    np.testing.assert_array_equal(c, np.full(actual_shape, -9.25, dtype=np.float64))
+
+
+def test_tilemaskedadd_all_true_equals_plain_add():
+    """All-true mask must behave like plain add."""
+    shape = [4, 7]
+    sdfg, actual_shape = _make_direct_masked_add_sdfg(shape, "tilemaskedadd_all_true")
+    sdfg.expand_library_nodes()
+    sdfg.validate()
+
+    rng = np.random.default_rng(666)
+    a = rng.uniform(-10.0, 10.0, size=actual_shape).astype(np.float64)
+    b = rng.uniform(-10.0, 10.0, size=actual_shape).astype(np.float64)
+    mask = np.ones(actual_shape, dtype=np.bool_)
+    c = np.full(actual_shape, 1.0, dtype=np.float64)
+
+    sdfg(A=a, B=b, MASK=mask, C=c)
+    np.testing.assert_allclose(c, a + b, rtol=0.0, atol=1e-12)
+
+
+def test_tilemaskedadd_validate_rejects_mask_shape_mismatch():
+    """Validation must reject mask shape mismatch."""
+    sdfg = SDFG("tilemaskedadd_bad_mask_shape")
+    sdfg.add_array("A", shape=[4, 4], dtype=dace.float64)
+    sdfg.add_array("B", shape=[4, 4], dtype=dace.float64)
+    sdfg.add_array("MASK", shape=[4, 3], dtype=dace.bool)
+    sdfg.add_array("C", shape=[4, 4], dtype=dace.float64)
+
+    state = sdfg.add_state("main")
+    node = TileMaskedAddLibraryNode("bad_shape")
+    state.add_node(node)
+    state.add_edge(state.add_read("A"), None, node, "_a", Memlet("A[0:4, 0:4]"))
+    state.add_edge(state.add_read("B"), None, node, "_b", Memlet("B[0:4, 0:4]"))
+    state.add_edge(state.add_read("MASK"), None, node, "_m", Memlet("MASK[0:4, 0:3]"))
+    state.add_edge(node, "_c", state.add_write("C"), None, Memlet("C[0:4, 0:4]"))
+
+    with pytest.raises(Exception):
+        sdfg.validate()
+
+
+def test_tilemaskedadd_validate_rejects_non_integer_mask_dtype():
+    """Validation must reject non-bool/non-integer mask dtype."""
+    sdfg = SDFG("tilemaskedadd_bad_mask_dtype")
+    sdfg.add_array("A", shape=[4, 4], dtype=dace.float64)
+    sdfg.add_array("B", shape=[4, 4], dtype=dace.float64)
+    sdfg.add_array("MASK", shape=[4, 4], dtype=dace.float32)
+    sdfg.add_array("C", shape=[4, 4], dtype=dace.float64)
+
+    state = sdfg.add_state("main")
+    node = TileMaskedAddLibraryNode("bad_dtype")
+    state.add_node(node)
+    state.add_edge(state.add_read("A"), None, node, "_a", Memlet("A[0:4, 0:4]"))
+    state.add_edge(state.add_read("B"), None, node, "_b", Memlet("B[0:4, 0:4]"))
+    state.add_edge(state.add_read("MASK"), None, node, "_m", Memlet("MASK[0:4, 0:4]"))
+    state.add_edge(node, "_c", state.add_write("C"), None, Memlet("C[0:4, 0:4]"))
+
+    with pytest.raises(Exception):
+        sdfg.validate()
 
 
 if __name__ == "__main__":
