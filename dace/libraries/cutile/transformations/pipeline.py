@@ -11,7 +11,7 @@ from typing import Optional, Tuple
 
 from dace.sdfg import SDFG
 from dace.libraries.cutile.transformations.scalar_to_tile_library import ScalarToTileLibrary
-from dace.transformation.dataflow import MapTiling, TrivialAccessNodeElimination, TrivialTaskletElimination
+from dace.transformation.dataflow import TrivialChainElimination, MapTiling
 
 
 
@@ -63,8 +63,7 @@ def apply_cutile_pipeline(sdfg: SDFG, *,
     # Phase 1: Replace scalar tasklets with library nodes
     count += sdfg.apply_transformations(
         [
-            TrivialTaskletElimination,
-            TrivialAccessNodeElimination,
+            TrivialChainElimination,
             ScalarToTileLibrary
         ],
         validate=validate_all,
