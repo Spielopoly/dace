@@ -7,13 +7,19 @@ Usage::
     count = apply_cutile_pipeline(sdfg)
 """
 from __future__ import annotations
+from typing import Optional, Tuple
 
 from dace.sdfg import SDFG
 from dace.libraries.cutile.transformations.scalar_to_tile_library import ScalarToTileLibrary
+from dace.transformation.dataflow import MapTiling
 
 
-def apply_cutile_pipeline(sdfg: SDFG, validate: bool = True,
-                          validate_all: bool = False) -> int:
+
+def apply_cutile_pipeline(sdfg: SDFG, *,
+                          validate: bool = True,
+                          validate_all: bool = True,
+                          apply_map_tiling: bool = True,
+                          tile_shape: Optional[Tuple[int, ...]] = None) -> int:
     """
     Apply the full cuTile transformation pipeline to an SDFG.
 
@@ -30,6 +36,8 @@ def apply_cutile_pipeline(sdfg: SDFG, validate: bool = True,
         Validate the SDFG after the full pipeline.
     validate_all : bool
         Validate after every single transformation application.
+    apply_map_tiling : bool
+        Whether to apply MapTiling first
 
     Returns
     -------
@@ -37,15 +45,28 @@ def apply_cutile_pipeline(sdfg: SDFG, validate: bool = True,
         Total number of transformations applied.
     """
     count = 0
+    
+    # Apply MapTiling to create tiled patterns
+    if apply_map_tiling:
+        options = {
+            "tile_sizes": tile_shape,
+            "skew": True,
+        }
+        count += sdfg.apply_transformations(
+            [MapTiling],
+            validate=validate_all,
+            validate_all=validate_all,
+            options=options,
+        )
 
     # Phase 1: Replace scalar tasklets with library nodes
-    count += sdfg.apply_transformations_repeated(
-        ScalarToTileLibrary,
+    count += sdfg.apply_transformations(
+        [ScalarToTileLibrary],
         validate=validate_all,
         validate_all=validate_all,
     )
 
-    if validate:
+    if validate or validate_all:
         sdfg.validate()
 
     return count
