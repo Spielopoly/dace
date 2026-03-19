@@ -13,7 +13,7 @@ from dace.transformation import transformation
 
 @make_properties
 class TrivialChainElimination(transformation.SingleStateTransformation):
-    """Eliminates a trivial copy-tasklet together with one adjacent trivial access.
+    """Eliminates a trivial copy-tasklet together with one adjacent access node.
 
     This transformation is intentionally conservative and only matches local
     direct-neighbor chains with exactly one access node adjacent to the trivial
