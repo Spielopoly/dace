@@ -2,9 +2,11 @@
 
 import dace
 import numpy as np
+import pytest
 
 from dace.sdfg import nodes
 from dace.libraries.cutile.nodes import TileAddLibraryNode
+from dace.libraries.cutile.nodes.binary_op_map import TileMaskedAddLibraryNode
 from dace.libraries.cutile.transformations.pipeline import apply_cutile_pipeline
 
 
@@ -39,6 +41,28 @@ def frontend_noncanonical_vadd_program(
     C: dace.float64[13, 11],
 ):
     for i, j in dace.map[1:13:2, 2:10]:
+        C[i, j] = A[i, j] + B[i, j]
+
+
+@dace.program
+def frontend_large_prime_stride_vadd_program(
+    A: dace.float64[211, 197],
+    B: dace.float64[211, 197],
+    C: dace.float64[211, 197],
+):
+    for i, j in dace.map[2:209:3, 5:194:7]:
+        C[i, j] = A[i, j] + B[i, j]
+
+
+@dace.program
+def frontend_large_prime_stride_nondivisible_vadd_program(
+    A: dace.float64[223, 199],
+    B: dace.float64[223, 199],
+    C: dace.float64[223, 199],
+):
+    # Both dimensions intentionally use ranges where (end - start) is not
+    # divisible by the stride.
+    for i, j in dace.map[3:221:7, 2:198:5]:
         C[i, j] = A[i, j] + B[i, j]
 
 
@@ -152,11 +176,65 @@ def test_frontend_noncanonical_strided_add_pipeline_structure_and_runtime():
     np.testing.assert_allclose(c, expected, rtol=0.0, atol=1e-12)
 
 
-if __name__ == "__main__":
-    # run all functions with names starting with "test_"
-    for name, fn in sorted(globals().items()):
-        if name.startswith("test_") and callable(fn):
-            print(f"Running {name}...")
-            fn()
+@pytest.mark.parametrize("tile_shape", [(10, 11), (16, 9)])
+def test_frontend_large_prime_strided_add_with_nonmultiple_tile_shape(tile_shape):
+    """Large prime-strided frontend map should remain correct after map tiling."""
+    sdfg = frontend_large_prime_stride_vadd_program.to_sdfg(simplify=True)
+    count = apply_cutile_pipeline(
+        sdfg,
+        validate=True,
+        apply_map_tiling=True,
+        tile_shape=tile_shape,
+    )
+    assert count >= 1
 
-    print("\nAll tests passed!")
+    lib_nodes = _frontend_library_nodes(sdfg)
+    assert any(isinstance(node, TileMaskedAddLibraryNode) for node in lib_nodes)
+
+    sdfg.expand_library_nodes()
+    sdfg.validate()
+
+    rng = np.random.default_rng(7004)
+    a = rng.uniform(-8.0, 8.0, size=(211, 197)).astype(np.float64)
+    b = rng.uniform(-8.0, 8.0, size=(211, 197)).astype(np.float64)
+    c = rng.uniform(-3.0, 3.0, size=(211, 197)).astype(np.float64)
+
+    expected = c.copy()
+    expected[2:209:3, 5:194:7] = a[2:209:3, 5:194:7] + b[2:209:3, 5:194:7]
+
+    sdfg(A=a, B=b, C=c)
+    np.testing.assert_allclose(c, expected, rtol=0.0, atol=1e-12)
+
+
+@pytest.mark.parametrize("tile_shape", [(13, 10), (17, 12)])
+def test_frontend_large_prime_strided_add_with_nondivisible_ranges(tile_shape):
+    """Prime strides with non-divisible ranges should remain correct after tiling."""
+    sdfg = frontend_large_prime_stride_nondivisible_vadd_program.to_sdfg(simplify=True)
+    count = apply_cutile_pipeline(
+        sdfg,
+        validate=True,
+        apply_map_tiling=True,
+        tile_shape=tile_shape,
+    )
+    assert count >= 1
+
+    lib_nodes = _frontend_library_nodes(sdfg)
+    assert any(isinstance(node, TileMaskedAddLibraryNode) for node in lib_nodes)
+
+    sdfg.expand_library_nodes()
+    sdfg.validate()
+
+    rng = np.random.default_rng(7005)
+    a = rng.uniform(-10.0, 10.0, size=(223, 199)).astype(np.float64)
+    b = rng.uniform(-10.0, 10.0, size=(223, 199)).astype(np.float64)
+    c = rng.uniform(-4.0, 4.0, size=(223, 199)).astype(np.float64)
+
+    expected = c.copy()
+    expected[3:221:7, 2:198:5] = a[3:221:7, 2:198:5] + b[3:221:7, 2:198:5]
+
+    sdfg(A=a, B=b, C=c)
+    np.testing.assert_allclose(c, expected, rtol=0.0, atol=1e-12)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-q"]))

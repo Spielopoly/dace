@@ -387,17 +387,11 @@ class ScalarToTileLibrary(xf.SingleStateTransformation):
         )
 
         # Build producer subgraph that computes per-lane validity predicate.
-        # We then route mask through the outer map to match scope semantics.
-        mask_source = self._add_mask_fill_subgraph(graph, mask_name, tile_shape, inner_entry.map)
-        mask_read = graph.add_access(mask_name)
-
-        outer_entry.add_in_connector("IN_mask")
-        outer_entry.add_out_connector("OUT_mask")
-        graph.add_edge(mask_source, None, outer_entry, "IN_mask",
-                       Memlet(data=mask_name, subset=tile_subset))
-        graph.add_edge(outer_entry, "OUT_mask", mask_read, None,
-                       Memlet(data=mask_name, subset=tile_subset))
-        graph.add_edge(mask_read, None, lib_node, "_m",
+        # It must execute inside the outer map, because mask predicates can
+        # reference tiled-loop symbols (e.g., tile_i/tile_j).
+        mask_source, fill_entry = self._add_mask_fill_subgraph(graph, mask_name, tile_shape, inner_entry.map)
+        graph.add_edge(outer_entry, None, fill_entry, None, Memlet())
+        graph.add_edge(mask_source, None, lib_node, "_m",
                        Memlet(data=mask_name, subset=tile_subset))
 
         # === Output lowering (non-canonical) ===
@@ -502,6 +496,8 @@ class ScalarToTileLibrary(xf.SingleStateTransformation):
         """
         shape = []
         for start, end, _ in inner_map.range:
+            start = ScalarToTileLibrary._to_sympy_expr(start)
+            end = ScalarToTileLibrary._to_sympy_expr(end)
             low = sp.Min(start, end)
             high = sp.Max(start, end)
             shape.append(high - low + 1)
@@ -522,13 +518,22 @@ class ScalarToTileLibrary(xf.SingleStateTransformation):
         # Precompute symbolic min/max bounds for each inner-map parameter so we
         # can safely evaluate accesses even for reversed iteration ranges.
         param_bounds = {
-            pname: (sp.Min(start, end), sp.Max(start, end))
+            pname: (
+                sp.Min(
+                    ScalarToTileLibrary._to_sympy_expr(start),
+                    ScalarToTileLibrary._to_sympy_expr(end),
+                ),
+                sp.Max(
+                    ScalarToTileLibrary._to_sympy_expr(start),
+                    ScalarToTileLibrary._to_sympy_expr(end),
+                ),
+            )
             for pname, (start, end, _) in zip(inner_map.params, inner_map.range)
         }
 
         new_ranges = []
         for rng in tasklet_subset:
-            expr = sp.sympify(rng[0])
+            expr = ScalarToTileLibrary._to_sympy_expr(rng[0])
             expr_symbols = {str(s): s for s in expr.free_symbols}
             used_params = [p for p in inner_map.params if p in expr_symbols]
 
@@ -560,7 +565,7 @@ class ScalarToTileLibrary(xf.SingleStateTransformation):
 
     @staticmethod
     def _add_mask_fill_subgraph(graph: SDFGState, mask_name: str,
-                                tile_shape: list, inner_map: nodes.Map) -> nodes.AccessNode:
+                                tile_shape: list, inner_map: nodes.Map) -> tuple[nodes.AccessNode, nodes.MapEntry]:
         """
         Build a sequential map that fills the mask tile with domain validity.
 
@@ -580,6 +585,9 @@ class ScalarToTileLibrary(xf.SingleStateTransformation):
 
         cond_terms = []
         for p, (start, end, step) in zip(params, inner_map.range):
+            start = ScalarToTileLibrary._to_sympy_expr(start)
+            end = ScalarToTileLibrary._to_sympy_expr(end)
+            step = ScalarToTileLibrary._to_sympy_expr(step)
             low_expr = sp.Min(start, end)
             global_idx = f"(({symstr(low_expr)}) + ({p}))"
 
@@ -622,7 +630,14 @@ class ScalarToTileLibrary(xf.SingleStateTransformation):
                        Memlet(data=mask_name, subset=idx_subset))
         graph.add_edge(fill_exit, mask_out_conn, mask_write, None,
                        Memlet(data=mask_name, subset=idx_subset))
-        return mask_write
+        return mask_write, fill_entry
+
+    @staticmethod
+    def _to_sympy_expr(expr):
+        """Convert DaCe symbolic values (including SymExpr) to plain SymPy."""
+        if isinstance(expr, dace.symbolic.SymExpr):
+            return expr.expr
+        return sp.sympify(expr)
 
     @staticmethod
     def _is_canonical_inner_map(inner_map: nodes.Map) -> bool:
