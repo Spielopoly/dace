@@ -1408,11 +1408,11 @@ def test_noncanonical_add_transforms_to_masked_node_and_contiguous_memlets():
         name="tile_add_before_runtime_noncanonical",
         dtype=dace.float64,
     )
-    sdfg.save("cutile_test_noncanonical_add_before_pipeline.sdfg")
+    # sdfg.save("cutile_test_noncanonical_add_before_pipeline.sdfg")
 
     count = apply_cutile_pipeline(sdfg, validate=True, apply_map_tiling=False)
     assert count == 1
-    sdfg.save("cutile_test_noncanonical_add_runtime_after_pipeline.sdfg")
+    # sdfg.save("cutile_test_noncanonical_add_runtime_after_pipeline.sdfg")
 
     state = sdfg.states()[0]
     lib_nodes = [n for n in state.nodes() if isinstance(n, nodes.LibraryNode)]
