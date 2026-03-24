@@ -757,5 +757,5 @@ def test_single_tasklet_split(tasklet_info):
 
 
 if __name__ == "__main__":
-    for config_tuple in tasklet_infos:
-        test_single_tasklet_split(config_tuple)
+    for id, tasklet_info in enumerate(tasklet_infos):
+        test_single_tasklet_split((id, tasklet_info))
