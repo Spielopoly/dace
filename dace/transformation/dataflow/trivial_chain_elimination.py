@@ -1,5 +1,5 @@
 # Copyright 2019-2026 ETH Zurich and the DaCe authors. All rights reserved.
-"""Conservative elimination of a trivial tasklet and one adjacent access node."""
+"""Elimination of a trivial tasklet and one adjacent access node."""
 
 import copy
 
@@ -14,6 +14,9 @@ from dace.transformation import transformation
 @make_properties
 class TrivialChainElimination(transformation.SingleStateTransformation):
     """Eliminates a trivial copy-tasklet together with one adjacent access node.
+    
+    Similar to trivial tasklet elimination but also removes one of the access nodes
+    adjacent to the trivial tasklet.
 
     This transformation is intentionally conservative and only matches local
     direct-neighbor chains with exactly one access node adjacent to the trivial
