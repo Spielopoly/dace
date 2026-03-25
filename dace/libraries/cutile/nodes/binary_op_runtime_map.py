@@ -20,13 +20,18 @@ from dace.sdfg.nodes import LibraryNode
 from dace.sdfg.validation import InvalidSDFGNodeError
 from dace.symbolic import symstr
 from dace.transformation.transformation import ExpandTransformation
+from ..op_registry import TaskletType, MaskType, register_matcher
 
 
 @library.node
-class TileMaskedBinaryOPLibraryNode(LibraryNode):
+class TileRuntimeMaskedBinaryOPLibraryNode(LibraryNode):
     """
     Library node for masked binary operation on 2 tiles:
         if M: C = foo(A, B)
+        else: C unchanged
+    
+    The mask is read at runtime, so this library node can be used for patterns where the mask condition cannot be resolved at compile time.
+    
 
     Connectors
     ----------
@@ -155,8 +160,8 @@ class TileMaskedBinaryOPLibraryNode(LibraryNode):
             )
 
 
-class ExpandTileElementWiseMaskedBinaryOPPure(ExpandTransformation):
-    """Expand TileMaskedBinaryOPLibraryNode into a C++ tasklet."""
+class ExpandTileElementWiseRuntimeMaskedBinaryOPPure(ExpandTransformation):
+    """Expand TileRuntimeMaskedBinaryOPLibraryNode into a C++ tasklet."""
 
     environments: list = []
 
@@ -164,7 +169,7 @@ class ExpandTileElementWiseMaskedBinaryOPPure(ExpandTransformation):
     def expansion_with_op(node: LibraryNode, parent_state: SDFGState,
                           parent_sdfg: SDFG,
                           binary_op_string_generator: Callable[[str, str], str]):
-        masked_node = cast(TileMaskedBinaryOPLibraryNode, node)
+        masked_node = cast(TileRuntimeMaskedBinaryOPLibraryNode, node)
         a_desc, b_desc, m_desc, c_desc, c_in_desc = _get_masked_tile_descriptors(masked_node, parent_state, parent_sdfg)
         has_c_in = c_in_desc is not None
 
@@ -247,7 +252,7 @@ for (std::size_t i = 0; i < n; ++i) {{
         return tasklet
 
 
-def _get_masked_tile_descriptors(node: TileMaskedBinaryOPLibraryNode, state: SDFGState,
+def _get_masked_tile_descriptors(node: TileRuntimeMaskedBinaryOPLibraryNode, state: SDFGState,
                                  sdfg: SDFG) -> tuple[dace.data.Data, dace.data.Data, dace.data.Data, dace.data.Data, Optional[dace.data.Data]]:
     """Return (a_desc, b_desc, m_desc, c_desc, c_in_desc) array descriptors for node."""
     a_desc = b_desc = m_desc = c_desc = c_in_desc = None
@@ -283,8 +288,10 @@ def _get_masked_tile_descriptors(node: TileMaskedBinaryOPLibraryNode, state: SDF
     )
 
 
+@register_matcher(op="+", tasklet_type=TaskletType.ARRAY_ARRAY, mask=MaskType.RUNTIME,
+                  node_name="TileAdd", out="_c", rhs1="_a", rhs2="_b", mask_in="_m", out_in="_c_in")
 @library.node
-class TileMaskedAddLibraryNode(TileMaskedBinaryOPLibraryNode):
+class TileRuntimeMaskedAddLibraryNode(TileRuntimeMaskedBinaryOPLibraryNode):
     """Masked tile addition: if M then C = A + B else keep C unchanged."""
 
     def __init__(self,
@@ -298,13 +305,13 @@ class TileMaskedAddLibraryNode(TileMaskedBinaryOPLibraryNode):
         )
 
 
-@library.register_expansion(TileMaskedAddLibraryNode, "pure")  # type: ignore[arg-type]
-class ExpandTileMaskedAddPure(ExpandTileElementWiseMaskedBinaryOPPure):
-    """Expand TileMaskedAddLibraryNode into a C++ tasklet."""
+@library.register_expansion(TileRuntimeMaskedAddLibraryNode, "pure")  # type: ignore[arg-type]
+class ExpandTileRuntimeMaskedAddPure(ExpandTileElementWiseRuntimeMaskedBinaryOPPure):
+    """Expand TileRuntimeMaskedAddLibraryNode into a C++ tasklet."""
 
     @staticmethod
-    def expansion(node: TileMaskedAddLibraryNode, state: SDFGState, sdfg: SDFG) -> nodes.Tasklet:
-        return ExpandTileElementWiseMaskedBinaryOPPure.expansion_with_op(
+    def expansion(node: TileRuntimeMaskedAddLibraryNode, state: SDFGState, sdfg: SDFG) -> nodes.Tasklet:
+        return ExpandTileElementWiseRuntimeMaskedBinaryOPPure.expansion_with_op(
             node,
             state,
             sdfg,
@@ -312,12 +319,14 @@ class ExpandTileMaskedAddPure(ExpandTileElementWiseMaskedBinaryOPPure):
         )
 
 
+@register_matcher(op="-", tasklet_type=TaskletType.ARRAY_ARRAY, mask=MaskType.RUNTIME,
+                  node_name="TileSubtract", out="_c", rhs1="_a", rhs2="_b", mask_in="_m", out_in="_c_in")
 @library.node
-class TileMaskedSubtractLibraryNode(TileMaskedBinaryOPLibraryNode):
+class TileRuntimeMaskedSubtractLibraryNode(TileRuntimeMaskedBinaryOPLibraryNode):
     """Masked tile subtraction: if M then C = A - B else keep C unchanged."""
 
     def __init__(self,
-                 name: str = "TileMaskedSubtract",
+                 name: str = "TileRuntimeMaskedSubtract",
                  tile_shape: list[int] | None = None,
                  **kwargs):
         super().__init__(
@@ -327,13 +336,13 @@ class TileMaskedSubtractLibraryNode(TileMaskedBinaryOPLibraryNode):
         )
 
 
-@library.register_expansion(TileMaskedSubtractLibraryNode, "pure")  # type: ignore[arg-type]
-class ExpandTileMaskedSubtractPure(ExpandTileElementWiseMaskedBinaryOPPure):
-    """Expand TileMaskedSubtractLibraryNode into a C++ tasklet."""
+@library.register_expansion(TileRuntimeMaskedSubtractLibraryNode, "pure")  # type: ignore[arg-type]
+class ExpandTileRuntimeMaskedSubtractPure(ExpandTileElementWiseRuntimeMaskedBinaryOPPure):
+    """Expand TileRuntimeMaskedSubtractLibraryNode into a C++ tasklet."""
 
     @staticmethod
-    def expansion(node: TileMaskedSubtractLibraryNode, state: SDFGState, sdfg: SDFG) -> nodes.Tasklet:
-        return ExpandTileElementWiseMaskedBinaryOPPure.expansion_with_op(
+    def expansion(node: TileRuntimeMaskedSubtractLibraryNode, state: SDFGState, sdfg: SDFG) -> nodes.Tasklet:
+        return ExpandTileElementWiseRuntimeMaskedBinaryOPPure.expansion_with_op(
             node,
             state,
             sdfg,

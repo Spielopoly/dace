@@ -20,7 +20,7 @@ from dace.symbolic import symstr
 from dace.transformation.transformation import ExpandTransformation
 from dace.sdfg.validation import (InvalidSDFGError, InvalidSDFGNodeError, InvalidSDFGEdgeError,
                                   InvalidSDFGInterstateEdgeError, NodeNotExpandedError)
-
+from ..op_registry import register_matcher, MaskType, TaskletType
 
 @library.node
 class TileBinaryOPLibraryNode(LibraryNode):
@@ -114,62 +114,61 @@ class ExpandTileElementWiseBinaryOPPure(ExpandTransformation):
 
     environments: list = []
 
-    @staticmethod
-    def expansion(node: TileBinaryOPLibraryNode, parent_state: SDFGState, parent_sdfg: SDFG, binary_op_string_generator: Callable[[str, str], str]):
-        """Expand a ``TileBinaryOPLibraryNode`` into a C++ tasklet that performs
-        element-wise binary computation over a tile.
-        This method builds tasklet source code dynamically based on tile dimensionality:
-        for scalar tiles (0D), it emits a single assignment; for N-D tiles, it generates
-        index-linearization logic using shape and stride metadata, then applies the
-        provided binary operation to each element pair from inputs ``_a`` and ``_b``,
-        writing results to ``_c``.
-        
-        Parameters
-        ----------
-        node : TileBinaryOPLibraryNode
-            The library node being expanded. Supplies tile metadata (e.g., ``tile_shape``)
-            and naming information used for the generated tasklet.
-        state : SDFGState
-            The SDFG state that contains ``node``. Used to resolve data descriptors and
-            context needed for expansion.
-        sdfg : SDFG
-            The parent SDFG graph. Used together with ``state``/``node`` to retrieve
-            array descriptors (shape/strides) for input and output tiles.
-        binary_op_string_generator : Callable[[str, str], str]
-            Callback that receives two C++ operand expressions (for elements from ``_a``
-            and ``_b``) and returns a C++ expression string implementing the desired
-            binary operation. Example: lambda a, b: f"{a} + {b}" for addition.
-        Returns
-        -------
-        nodes.Tasklet
-            A C++ tasklet node with inputs ``_a``, ``_b`` and output ``_c`` containing
-            generated code for element-wise tile-wise binary operation.
-        """
-        a_desc, b_desc, c_desc = _get_tile_descriptors(node, parent_state, parent_sdfg)
-        shape: tuple[int] = tuple(node.tile_shape) if node.tile_shape is not None else a_desc.shape
-        ndim: int = len(shape)
+def _tile_binary_op_cpp_expansion(node: TileBinaryOPLibraryNode, parent_state: SDFGState, parent_sdfg: SDFG, binary_op_string_generator: Callable[[str, str], str]):
+    """Expand a ``TileBinaryOPLibraryNode`` into a C++ tasklet that performs
+    element-wise binary computation over a tile.
+    This method builds tasklet source code dynamically based on tile dimensionality:
+    for scalar tiles (0D), it emits a single assignment; for N-D tiles, it generates
+    index-linearization logic using shape and stride metadata, then applies the
+    provided binary operation to each element pair from inputs ``_a`` and ``_b``,
+    writing results to ``_c``.
+    
+    Parameters
+    ----------
+    node : TileBinaryOPLibraryNode
+        The library node being expanded. Supplies tile metadata (e.g., ``tile_shape``)
+        and naming information used for the generated tasklet.
+    state : SDFGState
+        The SDFG state that contains ``node``. Used to resolve data descriptors and
+        context needed for expansion.
+    sdfg : SDFG
+        The parent SDFG graph. Used together with ``state``/``node`` to retrieve
+        array descriptors (shape/strides) for input and output tiles.
+    binary_op_string_generator : Callable[[str, str], str]
+        Callback that receives two C++ operand expressions (for elements from ``_a``
+        and ``_b``) and returns a C++ expression string implementing the desired
+        binary operation. Example: lambda a, b: f"{a} + {b}" for addition.
+    Returns
+    -------
+    nodes.Tasklet
+        A C++ tasklet node with inputs ``_a``, ``_b`` and output ``_c`` containing
+        generated code for element-wise tile-wise binary operation.
+    """
+    a_desc, b_desc, c_desc = _get_tile_descriptors(node, parent_state, parent_sdfg)
+    shape: tuple[int] = tuple(node.tile_shape) if node.tile_shape is not None else a_desc.shape
+    ndim: int = len(shape)
 
-        # Determine whether DaCe will collapse the tile connector to a scalar.
-        # This happens when the tile is 0-D (ndim == 0) OR when every dimension
-        # is concretely 1 (single element). In both cases the C++ connector
-        # variable is `double _a`, not `double *_a`, so we must NOT subscript it.
-        try:
-            n_total = 1
-            for s in shape:
-                n_total *= int(s)
-            use_scalar_form = (ndim == 0) or (n_total == 1)
-        except (TypeError, ValueError):
-            use_scalar_form = (ndim == 0)
+    # Determine whether DaCe will collapse the tile connector to a scalar.
+    # This happens when the tile is 0-D (ndim == 0) OR when every dimension
+    # is concretely 1 (single element). In both cases the C++ connector
+    # variable is `double _a`, not `double *_a`, so we must NOT subscript it.
+    try:
+        n_total = 1
+        for s in shape:
+            n_total *= int(s)
+        use_scalar_form = (ndim == 0) or (n_total == 1)
+    except (TypeError, ValueError):
+        use_scalar_form = (ndim == 0)
 
-        if use_scalar_form:
-            code = f"_c = {binary_op_string_generator('_a', '_b')};"
-        else:
-            shape_expr = ", ".join(symstr(s) for s in shape)
-            a_strides_expr = ", ".join(symstr(s) for s in a_desc.strides)
-            b_strides_expr = ", ".join(symstr(s) for s in b_desc.strides)
-            c_strides_expr = ", ".join(symstr(s) for s in c_desc.strides)
+    if use_scalar_form:
+        code = f"_c = {binary_op_string_generator('_a', '_b')};"
+    else:
+        shape_expr = ", ".join(symstr(s) for s in shape)
+        a_strides_expr = ", ".join(symstr(s) for s in a_desc.strides)
+        b_strides_expr = ", ".join(symstr(s) for s in b_desc.strides)
+        c_strides_expr = ", ".join(symstr(s) for s in c_desc.strides)
 
-            code = f"""
+        code = f"""
 constexpr int ndim = {ndim};
 const std::size_t shape[ndim] = {{{shape_expr}}};
 const std::ptrdiff_t a_strides[ndim] = {{{a_strides_expr}}};
@@ -197,14 +196,14 @@ for (std::size_t i = 0; i < n; ++i) {{
     _c[ic] = {binary_op_string_generator('_a[ia]', '_b[ib]')};
 }}
 """
-        tasklet = nodes.Tasklet(
-            label=node.name + "_cutile",
-            inputs={"_a", "_b"},
-            outputs={"_c"},
-            code=code,
-            language=dtypes.Language.CPP,
-        )
-        return tasklet
+    tasklet = nodes.Tasklet(
+        label=node.name + "_cutile",
+        inputs={"_a", "_b"},
+        outputs={"_c"},
+        code=code,
+        language=dtypes.Language.CPP,
+    )
+    return tasklet
 
 
 def _get_tile_descriptors(node: TileBinaryOPLibraryNode, state: SDFGState, sdfg: SDFG) -> tuple[dace.data.Data, dace.data.Data, dace.data.Data]:
@@ -227,7 +226,8 @@ def _get_tile_descriptors(node: TileBinaryOPLibraryNode, state: SDFGState, sdfg:
         )
     return a_desc, b_desc, c_desc
 
-
+@register_matcher(op="+", tasklet_type=TaskletType.ARRAY_ARRAY, mask=MaskType.UNMASKED,
+                  node_name="TileAdd", out="_c", rhs1="_a", rhs2="_b")
 @library.node
 class TileAddLibraryNode(TileBinaryOPLibraryNode):
     """Tile addition: C = A + B"""
@@ -239,17 +239,19 @@ class TileAddLibraryNode(TileBinaryOPLibraryNode):
             **kwargs,
         )
 
-@library.register_expansion(TileAddLibraryNode, "pure")
+@library.register_expansion(TileAddLibraryNode, "pure") # type: ignore
 class ExpandTileAddPure(ExpandTileElementWiseBinaryOPPure):
     """Expands TileAddLibraryNode into a C++ tasklet that performs element-wise addition over a tile."""
 
     @staticmethod
     def expansion(node: TileAddLibraryNode, state: SDFGState, sdfg: SDFG) -> nodes.Tasklet:
-        return super(ExpandTileAddPure, ExpandTileAddPure).expansion(
+        return _tile_binary_op_cpp_expansion(
             node, state, sdfg,
             binary_op_string_generator=lambda a, b: f"{a} + {b}"
         )
 
+@register_matcher(op="-", tasklet_type=TaskletType.ARRAY_ARRAY, mask=MaskType.UNMASKED,
+                  node_name="TileSubtract", out="_c", rhs1="_a", rhs2="_b")
 @library.node
 class TileSubtractLibraryNode(TileBinaryOPLibraryNode):
     """Tile subtraction: C = A - B"""
@@ -261,15 +263,13 @@ class TileSubtractLibraryNode(TileBinaryOPLibraryNode):
             **kwargs,
         )
 
-@library.register_expansion(TileSubtractLibraryNode, "pure")
+@library.register_expansion(TileSubtractLibraryNode, "pure") # type: ignore
 class ExpandTileSubtractPure(ExpandTileElementWiseBinaryOPPure):
     """Expands TileSubtractLibraryNode into a C++ tasklet that performs element-wise subtraction over a tile."""
 
     @staticmethod
     def expansion(node: TileSubtractLibraryNode, state: SDFGState, sdfg: SDFG) -> nodes.Tasklet:
-        return super(ExpandTileSubtractPure, ExpandTileSubtractPure).expansion(
+        return _tile_binary_op_cpp_expansion(
             node, state, sdfg,
             binary_op_string_generator=lambda a, b: f"{a} - {b}"
         )
-
-

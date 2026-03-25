@@ -1,0 +1,112 @@
+"""
+Operation registry for cuTile transformations.
+
+Maps tasklet code patterns to cuTile library node classes. To add a new
+operation, implement a matcher function and decorate it with @register_matcher.
+"""
+from __future__ import annotations
+from typing import Dict, Optional, Type
+from enum import Enum
+from dataclasses import dataclass
+from dace.sdfg.tasklet_utils import classify_tasklet, TaskletType
+import dace
+from dace.sdfg.nodes import LibraryNode, Tasklet
+
+@dataclass(frozen=True)
+class TaskletClassification:
+    """
+    - type (TaskletType): The classified tasklet type
+    - lhs (str): Output connector name (left-hand side variable)
+    - rhs1 (str or None):  Input connector/operand name left of the operator/first function argument
+    - rhs2 (str or None): Input connector/operand name right of the operator/second function argument
+    - constant1 (str or None): First constant/symbol value left of the operator/first function argument
+    - constant2 (str or None): Second constant/symbol value right of the operator/second function argument
+    - op (str): Operation symbol or function name
+    """
+    type: TaskletType
+    lhs: str
+    rhs1: Optional[str]
+    rhs2: Optional[str]
+    constant1: Optional[str]
+    constant2: Optional[str]
+    op: str
+
+@dataclass(frozen=True)
+class LibraryNodeInfo:
+    type: Type[LibraryNode]
+    node_name: str
+    out: str # output connector name
+    # input connector names, rhs1 from tasklet connects to rhs1 from library node, etc. If None, the library node does not have that input.
+    rhs1: Optional[str] = None
+    rhs2: Optional[str] = None
+    constant1: Optional[str] = None
+    constant2: Optional[str] = None
+    mask_in: Optional[str] = None  # name of the library node connector for the mask, if applicable
+    out_in: Optional[str] = None  # name of the library node connector for the original output (for masked nodes), if applicable
+
+@dataclass(frozen=True)
+class TaskletLibraryNodeMatch:
+    node_info: LibraryNodeInfo
+    tasklet_classification: TaskletClassification
+
+class MaskType(Enum):
+    UNMASKED = "unmasked"
+    RUNTIME = "runtime"
+
+# Mapping from (operation, tasklet type, mask) to (library node class, library node name)
+_OP_TO_LIBRARY_NODE: Dict[tuple[str, TaskletType, MaskType], LibraryNodeInfo] = {}
+
+def register_matcher(op: str, tasklet_type: TaskletType, mask: MaskType, **library_node_kwargs):
+    """
+    Decorator to register a tasklet matcher function for a specific operation, tasklet type, and mask.
+
+    Parameters
+    ----------
+    op : str
+        Operation symbol or function name to match (e.g., "+", "-", "numpy.add").
+    tasklet_type : TaskletType
+        The classified tasklet type to match.
+    mask : MaskType
+        The mask type to match (e.g., UNMASKED, RUNTIME).
+    library_node_kwargs: 
+        keyword arguments for the LibraryNodeInfo, such as node_name and connector names.
+
+    Returns
+    -------
+    Callable
+        Decorator function that registers the matcher.
+    """
+    def decorator(cls):
+        _OP_TO_LIBRARY_NODE[(op, tasklet_type, mask)] = LibraryNodeInfo(type=cls, **library_node_kwargs)
+        return cls
+    return decorator
+    
+
+def match_tasklet_to_tile_library_node(state: dace.SDFGState, tasklet: Tasklet, mask: MaskType) -> Optional[TaskletLibraryNodeMatch]:
+    """
+    Match a tasklet to a tile library node class based on its code.
+
+    Parameters
+    ----------
+    state : dace.SDFGState
+        The state containing the tasklet.
+    tasklet : dace.nodes.Tasklet
+        The tasklet to match.
+    mask : MaskType
+        Select a masked library node variant
+        Currently implemented masks are:
+            - MaskType.UNMASKED (library node takes no mask argument)
+            - MaskType.RUNTIME (library node takes an additional runtime boolean mask argument)
+
+    Returns
+    -------
+        TODO
+    """
+    classification = TaskletClassification(**classify_tasklet(state, tasklet))
+    
+    key = (classification.op, classification.type, mask)
+    if key in _OP_TO_LIBRARY_NODE:
+        info = _OP_TO_LIBRARY_NODE[key]
+        return TaskletLibraryNodeMatch(info, classification)
+    else:
+        return None

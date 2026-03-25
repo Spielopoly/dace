@@ -639,7 +639,7 @@ def _make_direct_masked_add_sdfg(shape, name, dtype=dace.float64, mask_dtype=dac
     m_read = state.add_read("MASK")
     c_write = state.add_write("C")
 
-    op_node = TileMaskedAddLibraryNode(name + "_node", tile_shape=node_tile_shape)
+    op_node = TileRuntimeMaskedAddLibraryNode(name + "_node", tile_shape=node_tile_shape)
     state.add_node(op_node)
 
     subset = ", ".join(f"0:{s}" for s in actual_shape)
@@ -1417,7 +1417,7 @@ def test_noncanonical_add_transforms_to_masked_node_and_contiguous_memlets():
     state = sdfg.states()[0]
     lib_nodes = [n for n in state.nodes() if isinstance(n, nodes.LibraryNode)]
     assert len(lib_nodes) == 1
-    assert isinstance(lib_nodes[0], TileMaskedAddLibraryNode)
+    assert isinstance(lib_nodes[0], TileRuntimeMaskedAddLibraryNode)
 
     transient_names = {name for name, desc in sdfg.arrays.items() if desc.transient}
     assert any(name.startswith("map_mask_tile") for name in transient_names)
@@ -1468,7 +1468,7 @@ def test_noncanonical_subtract_runtime_numeric_correctness_negative_step():
     state = sdfg.states()[0]
     lib_nodes = [n for n in state.nodes() if isinstance(n, nodes.LibraryNode)]
     assert len(lib_nodes) == 1
-    assert isinstance(lib_nodes[0], TileMaskedSubtractLibraryNode)
+    assert isinstance(lib_nodes[0], TileRuntimeMaskedSubtractLibraryNode)
 
     sdfg.expand_library_nodes()
     sdfg.validate()
@@ -1625,7 +1625,7 @@ def test_tilemaskedadd_validate_rejects_mask_shape_mismatch():
     sdfg.add_array("C", shape=[4, 4], dtype=dace.float64)
 
     state = sdfg.add_state("main")
-    node = TileMaskedAddLibraryNode("bad_shape")
+    node = TileRuntimeMaskedAddLibraryNode("bad_shape")
     state.add_node(node)
     state.add_edge(state.add_read("A"), None, node, "_a", Memlet("A[0:4, 0:4]"))
     state.add_edge(state.add_read("B"), None, node, "_b", Memlet("B[0:4, 0:4]"))
@@ -1645,7 +1645,7 @@ def test_tilemaskedadd_validate_rejects_non_integer_mask_dtype():
     sdfg.add_array("C", shape=[4, 4], dtype=dace.float64)
 
     state = sdfg.add_state("main")
-    node = TileMaskedAddLibraryNode("bad_dtype")
+    node = TileRuntimeMaskedAddLibraryNode("bad_dtype")
     state.add_node(node)
     state.add_edge(state.add_read("A"), None, node, "_a", Memlet("A[0:4, 0:4]"))
     state.add_edge(state.add_read("B"), None, node, "_b", Memlet("B[0:4, 0:4]"))

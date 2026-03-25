@@ -38,7 +38,7 @@ from dace.sdfg import SDFG, SDFGState, nodes, utils as sdutil
 from dace.symbolic import symstr
 from dace.transformation import transformation as xf
 
-from dace.libraries.cutile._op_registry import TileOpMatch, match_tasklet
+from dace.libraries.cutile.op_registry import match_tasklet_to_tile_library_node, MaskType, TaskletLibraryNodeMatch
 
 
 class ScalarToTileLibrary(xf.SingleStateTransformation):
@@ -62,7 +62,7 @@ class ScalarToTileLibrary(xf.SingleStateTransformation):
     outer_map_exit = xf.PatternNode(nodes.MapExit)
 
     @classmethod
-    def expressions(cls):
+    def expressions(cls): # type: ignore
         """
         Declare the exact path-shaped pattern this transformation looks for.
 
@@ -118,23 +118,20 @@ class ScalarToTileLibrary(xf.SingleStateTransformation):
                 if start != end:
                     return False
 
-        # 4. Reject invalid map ranges (zero increment)
+        # 4) Reject invalid map ranges (zero increment)
         for start, end, step in inner_entry.map.range:
             if step == 0:
                 return False
 
-        # 5. Tasklet must match a registered operation
-        op_match = match_tasklet(tasklet)
-        if op_match is None:
-            return False
-
-        # 6) Canonical maps use unmasked operators; non-canonical maps
+        # 5) Canonical maps use unmasked operators; non-canonical maps
         # require a masked variant to preserve out-of-domain behavior.
         if self._is_canonical_inner_map(inner_entry.map):
-            if op_match[0] is None:
+            op_match = match_tasklet_to_tile_library_node(graph, tasklet, MaskType.UNMASKED)
+            if op_match is None:
                 return False
         else:
-            if op_match[1] is None:
+            op_match = match_tasklet_to_tile_library_node(graph, tasklet, MaskType.RUNTIME)
+            if op_match is None:
                 return False
 
         return True
@@ -154,26 +151,27 @@ class ScalarToTileLibrary(xf.SingleStateTransformation):
         outer_exit = self.outer_map_exit
         tasklet = self.tasklet
 
-        op_match = match_tasklet(tasklet)
-        assert op_match is not None
-
-        # Canonical inner maps are exactly [0:N:1] per dimension, so every point
-        # in the tile is valid and no mask is needed.
         if self._is_canonical_inner_map(inner_entry.map):
-            assert op_match[0] is not None
+            # Canonical inner maps are exactly [0:N:1] per dimension, so every point
+            # in the tile is valid and no mask is needed.
+            op_match = match_tasklet_to_tile_library_node(graph, tasklet, MaskType.UNMASKED)
+            if op_match is None:
+                raise RuntimeError("Operator became unsupported between can_be_applied and apply.")
             self._apply_canonical(graph, sdfg, outer_entry, inner_entry,
-                                  tasklet, inner_exit, outer_exit, op_match[0])
+                                  tasklet, inner_exit, outer_exit, op_match)
         else:
             # Non-canonical ranges (offsets/negative steps/strides) are lowered
             # via a mask-aware node to preserve exact iteration-domain semantics.
-            assert op_match[1] is not None
+            op_match = match_tasklet_to_tile_library_node(graph, tasklet, MaskType.RUNTIME)
+            if op_match is None:
+                raise RuntimeError("Operator became unsupported between can_be_applied and apply.")
             self._apply_noncanonical(graph, sdfg, outer_entry, inner_entry,
-                                     tasklet, inner_exit, outer_exit, op_match[1])
+                                     tasklet, inner_exit, outer_exit, op_match)
 
     def _apply_canonical(self, graph: SDFGState, sdfg: SDFG,
                          outer_entry: nodes.MapEntry, inner_entry: nodes.MapEntry,
                          tasklet: nodes.Tasklet, inner_exit: nodes.MapExit,
-                         outer_exit: nodes.MapExit, op_match: TileOpMatch) -> None:
+                         outer_exit: nodes.MapExit, op_match: TaskletLibraryNodeMatch) -> None:
         """
         Lower a canonical inner map (0-based, unit-stride) to a tile op.
 
@@ -186,7 +184,7 @@ class ScalarToTileLibrary(xf.SingleStateTransformation):
         tile_subset = self._tile_subset_from_shape(tile_shape)
 
         # Instantiate the target library node selected by the operation matcher.
-        lib_node = op_match.library_node_class(name=op_match.op_name)
+        lib_node = op_match.node_info.type(name=op_match.node_info.node_name)
         graph.add_node(lib_node)
 
         # === Input lowering ===
@@ -194,7 +192,7 @@ class ScalarToTileLibrary(xf.SingleStateTransformation):
         #   outer map slice -> tile transient -> library node input.
         # We preserve original outer indexing by copying memlets and only adding
         # `other_subset` to describe how the outer slice maps into tile space.
-        for edge in list(graph.out_edges(inner_entry)):
+        for edge in graph.out_edges(inner_entry):
             if edge.dst is not tasklet:
                 continue
             tasklet_conn = edge.dst_conn
@@ -242,7 +240,7 @@ class ScalarToTileLibrary(xf.SingleStateTransformation):
         # === Output lowering ===
         # Symmetric to input lowering:
         #   library node output -> tile transient -> original outer destination.
-        for edge in list(graph.in_edges(inner_exit)):
+        for edge in graph.in_edges(inner_exit):
             if edge.src is not tasklet:
                 continue
             tasklet_conn = edge.src_conn
@@ -294,7 +292,7 @@ class ScalarToTileLibrary(xf.SingleStateTransformation):
     def _apply_noncanonical(self, graph: SDFGState, sdfg: SDFG,
                             outer_entry: nodes.MapEntry, inner_entry: nodes.MapEntry,
                             tasklet: nodes.Tasklet, inner_exit: nodes.MapExit,
-                            outer_exit: nodes.MapExit, op_match: TileOpMatch) -> None:
+                            outer_exit: nodes.MapExit, op_match: TaskletLibraryNodeMatch) -> None:
         """
         Lower non-canonical inner maps using a mask-aware tile library node.
 
@@ -302,10 +300,7 @@ class ScalarToTileLibrary(xf.SingleStateTransformation):
         mapped to a bounding tile. A boolean mask marks valid points and is
         provided to the masked library node.
         """
-        # Mask-aware op class is mandatory for non-canonical lowering.
-        masked_cls = op_match.library_node_class
-        assert masked_cls is not None
-
+        
         # The bounding tile is the smallest axis-aligned tile that contains all
         # iteration points from the original inner map, regardless of direction.
         tile_shape = self._bounding_tile_shape(inner_entry.map)
@@ -313,7 +308,7 @@ class ScalarToTileLibrary(xf.SingleStateTransformation):
 
         # `_m` receives domain mask; `_c_in` receives preloaded old output values
         # so masked lanes can preserve original values.
-        lib_node = masked_cls(name=op_match.op_name)
+        lib_node = op_match.node_info.type(name=op_match.node_info.node_name)
         graph.add_node(lib_node)
         lib_node.add_in_connector("_c_in")
 
