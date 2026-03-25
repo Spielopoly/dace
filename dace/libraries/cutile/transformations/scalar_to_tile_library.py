@@ -526,9 +526,6 @@ class _ScalarToTileLibraryBase(xf.SingleStateTransformation):
     def _tile_subset_from_shape(tile_shape) -> subsets.Range:
         """
         Build a dense local tile range [0, extent-1] in every dimension.
-
-        This is the canonical subset used for transient tiles and library-node
-        memlets, independent of where the tile lives in global tensor space.
         """
         return subsets.Range([(0, d - 1, 1) for d in tile_shape])
 

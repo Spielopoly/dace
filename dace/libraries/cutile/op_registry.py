@@ -100,7 +100,8 @@ def match_tasklet_to_tile_library_node(state: dace.SDFGState, tasklet: Tasklet, 
 
     Returns
     -------
-        TODO
+    Optional[TaskletLibraryNodeMatch]
+        A TaskletLibraryNodeMatch containing the matched library node class and tasklet classification if a match is found, otherwise None.
     """
     classification = TaskletClassification(**classify_tasklet(state, tasklet))
     
