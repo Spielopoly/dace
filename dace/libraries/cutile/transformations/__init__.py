@@ -1,2 +1,2 @@
-from .scalar_to_tile_library import ScalarToTileLibrary
+from .scalar_to_tile_library import ScalarToTileLibraryCanonical, ScalarToTileLibraryMasked
 from .pipeline import apply_cutile_pipeline

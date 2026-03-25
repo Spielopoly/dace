@@ -29,7 +29,7 @@ Result (AFTER, non-canonical inner maps)::
 from __future__ import annotations
 
 import copy
-from typing import Optional
+from typing import Dict, Optional
 
 import dace
 import sympy as sp
@@ -41,7 +41,7 @@ from dace.transformation import transformation as xf
 from dace.libraries.cutile.op_registry import match_tasklet_to_tile_library_node, MaskType, TaskletLibraryNodeMatch
 
 
-class ScalarToTileLibrary(xf.SingleStateTransformation):
+class _ScalarToTileLibraryBase(xf.SingleStateTransformation):
     """
     Replace an inner scalar element-wise map nest with a tile library call.
 
@@ -60,6 +60,9 @@ class ScalarToTileLibrary(xf.SingleStateTransformation):
     tasklet = xf.PatternNode(nodes.Tasklet)
     inner_map_exit = xf.PatternNode(nodes.MapExit)
     outer_map_exit = xf.PatternNode(nodes.MapExit)
+
+    _MASK_TYPE: MaskType
+    _REQUIRES_CANONICAL: bool
 
     @classmethod
     def expressions(cls): # type: ignore
@@ -123,25 +126,19 @@ class ScalarToTileLibrary(xf.SingleStateTransformation):
             if step == 0:
                 return False
 
-        # 5) Canonical maps use unmasked operators; non-canonical maps
-        # require a masked variant to preserve out-of-domain behavior.
-        if self._is_canonical_inner_map(inner_entry.map):
-            op_match = match_tasklet_to_tile_library_node(graph, tasklet, MaskType.UNMASKED)
-            if op_match is None:
-                return False
-        else:
-            op_match = match_tasklet_to_tile_library_node(graph, tasklet, MaskType.RUNTIME)
-            if op_match is None:
-                return False
+        is_canonical = self._is_canonical_inner_map(inner_entry.map)
+        if is_canonical != self._REQUIRES_CANONICAL:
+            return False
+
+        op_match = match_tasklet_to_tile_library_node(graph, tasklet, self._MASK_TYPE)
+        if op_match is None:
+            return False
 
         return True
 
-    def apply(self, graph: SDFGState, sdfg: SDFG) -> None:
+    def apply(self, graph: SDFGState, sdfg: SDFG) -> None:  # type: ignore[override]
         """
-        Dispatch to canonical or masked/non-canonical lowering.
-
-        The operation matcher returns both canonical and masked variants of
-        each tile op. We select the variant based on inner-map structure.
+        Apply the selected lowering mode for this specialization.
         """
         # `can_be_applied` already validated pattern shape and operator support;
         # here we perform the actual graph rewrite.
@@ -151,22 +148,56 @@ class ScalarToTileLibrary(xf.SingleStateTransformation):
         outer_exit = self.outer_map_exit
         tasklet = self.tasklet
 
-        if self._is_canonical_inner_map(inner_entry.map):
-            # Canonical inner maps are exactly [0:N:1] per dimension, so every point
-            # in the tile is valid and no mask is needed.
-            op_match = match_tasklet_to_tile_library_node(graph, tasklet, MaskType.UNMASKED)
-            if op_match is None:
-                raise RuntimeError("Operator became unsupported between can_be_applied and apply.")
+        op_match = match_tasklet_to_tile_library_node(graph, tasklet, self._MASK_TYPE)
+        if op_match is None:
+            raise RuntimeError("Operator became unsupported between can_be_applied and apply.")
+
+        if self._REQUIRES_CANONICAL:
             self._apply_canonical(graph, sdfg, outer_entry, inner_entry,
                                   tasklet, inner_exit, outer_exit, op_match)
         else:
-            # Non-canonical ranges (offsets/negative steps/strides) are lowered
-            # via a mask-aware node to preserve exact iteration-domain semantics.
-            op_match = match_tasklet_to_tile_library_node(graph, tasklet, MaskType.RUNTIME)
-            if op_match is None:
-                raise RuntimeError("Operator became unsupported between can_be_applied and apply.")
             self._apply_noncanonical(graph, sdfg, outer_entry, inner_entry,
                                      tasklet, inner_exit, outer_exit, op_match)
+
+    @staticmethod
+    def _build_input_slot_map(op_match: TaskletLibraryNodeMatch) -> dict[str, list[str]]:
+        """
+        Build tasklet-input to library-input slot mapping.
+
+        A single tasklet connector can map to multiple library slots, e.g.,
+        for expressions such as c = a + a where rhs1 == rhs2.
+        """
+        slot_map: dict[str, list[str]] = {}
+        classification = op_match.tasklet_classification
+        node_info = op_match.node_info
+
+        if classification.rhs1 is not None and node_info.rhs1 is not None:
+            slot_map.setdefault(classification.rhs1, []).append(node_info.rhs1)
+        if classification.rhs2 is not None and node_info.rhs2 is not None:
+            slot_map.setdefault(classification.rhs2, []).append(node_info.rhs2)
+
+        return slot_map
+
+    @staticmethod
+    def _output_connector_for_tasklet(op_match: TaskletLibraryNodeMatch,
+                                      tasklet_conn: Optional[str]) -> Optional[str]:
+        if tasklet_conn is None:
+            return None
+        if op_match.tasklet_classification.lhs == tasklet_conn:
+            return op_match.node_info.out
+        return None
+
+    @staticmethod
+    def _tasklet_input_edges_from_inner(graph: SDFGState,
+                                        inner_entry: nodes.MapEntry,
+                                        tasklet: nodes.Tasklet) -> Dict[str, dace.graph.MultiConnectorEdge[Memlet]]:
+        """Map tasklet input connector to the edge inner_entry -> tasklet."""
+        edge_map = {}
+        for edge in graph.out_edges(inner_entry):
+            if edge.dst is not tasklet or edge.dst_conn is None:
+                continue
+            edge_map[edge.dst_conn] = edge
+        return edge_map
 
     def _apply_canonical(self, graph: SDFGState, sdfg: SDFG,
                          outer_entry: nodes.MapEntry, inner_entry: nodes.MapEntry,
@@ -192,18 +223,25 @@ class ScalarToTileLibrary(xf.SingleStateTransformation):
         #   outer map slice -> tile transient -> library node input.
         # We preserve original outer indexing by copying memlets and only adding
         # `other_subset` to describe how the outer slice maps into tile space.
-        for edge in graph.out_edges(inner_entry):
-            if edge.dst is not tasklet:
-                continue
-            tasklet_conn = edge.dst_conn
-            lib_conn = op_match.in_conn_map.get(tasklet_conn)
-            if lib_conn is None:
-                continue
+        input_slots = self._build_input_slot_map(op_match)
+        input_edges = self._tasklet_input_edges_from_inner(graph, inner_entry, tasklet)
 
-            # Translate inner-map outgoing connector to its matching incoming
-            # connector so we can find the producer edge entering the map.
-            inner_out_conn = edge.src_conn          # e.g. "OUT_A"
-            inner_in_conn = inner_out_conn.replace("OUT_", "IN_")
+        # Multiple tasklet inputs can be fed by the same map connector
+        # (frontend c = a + a often yields __in1/__in2 both from OUT_A).
+        # Group by map input connector and lower each producer edge once.
+        input_plan: dict[str, list[str]] = {}
+        plan_edges = {}
+        for tasklet_conn, lib_conns in input_slots.items():
+            edge = input_edges.get(tasklet_conn)
+            if edge is None or edge.src_conn is None:
+                continue
+            inner_in_conn = edge.src_conn.replace("OUT_", "IN_")
+            input_plan.setdefault(inner_in_conn, []).extend(lib_conns)
+            if inner_in_conn not in plan_edges:
+                plan_edges[inner_in_conn] = edge
+
+        for inner_in_conn, lib_conns in input_plan.items():
+            edge = plan_edges[inner_in_conn]
             outer_to_inner = self._find_edge(graph, outer_entry, inner_entry,
                                              dst_conn=inner_in_conn)
             if outer_to_inner is None:
@@ -231,8 +269,9 @@ class ScalarToTileLibrary(xf.SingleStateTransformation):
                            trans_read, None, new_memlet)
 
             # The library node consumes the full tile domain.
-            graph.add_edge(trans_read, None, lib_node, lib_conn,
-                           Memlet(data=trans_name, subset=tile_subset))
+            for lib_conn in lib_conns:
+                graph.add_edge(trans_read, None, lib_node, lib_conn,
+                               Memlet(data=trans_name, subset=tile_subset))
 
             # Remove the original scalar feed from outer map to inner map.
             graph.remove_edge(outer_to_inner)
@@ -244,7 +283,7 @@ class ScalarToTileLibrary(xf.SingleStateTransformation):
             if edge.src is not tasklet:
                 continue
             tasklet_conn = edge.src_conn
-            lib_conn = op_match.out_conn_map.get(tasklet_conn)
+            lib_conn = self._output_connector_for_tasklet(op_match, tasklet_conn)
             if lib_conn is None:
                 continue
 
@@ -310,7 +349,10 @@ class ScalarToTileLibrary(xf.SingleStateTransformation):
         # so masked lanes can preserve original values.
         lib_node = op_match.node_info.type(name=op_match.node_info.node_name)
         graph.add_node(lib_node)
-        lib_node.add_in_connector("_c_in")
+        out_in_conn = op_match.node_info.out_in or "_c_in"
+        mask_in_conn = op_match.node_info.mask_in or "_m"
+        if out_in_conn not in lib_node.in_connectors:
+            lib_node.add_in_connector(out_in_conn)
 
         # Keep mask storage aligned with operand storage when possible to avoid
         # introducing unnecessary storage-space transitions.
@@ -319,16 +361,22 @@ class ScalarToTileLibrary(xf.SingleStateTransformation):
         # === Input lowering (non-canonical) ===
         # Input memlets are expanded from scalar expressions to contiguous outer
         # ranges covering the complete bounding tile footprint.
-        for edge in list(graph.out_edges(inner_entry)):
-            if edge.dst is not tasklet:
-                continue
-            tasklet_conn = edge.dst_conn
-            lib_conn = op_match.in_conn_map.get(tasklet_conn)
-            if lib_conn is None:
-                continue
+        input_slots = self._build_input_slot_map(op_match)
+        input_edges = self._tasklet_input_edges_from_inner(graph, inner_entry, tasklet)
 
-            inner_out_conn = edge.src_conn
-            inner_in_conn = inner_out_conn.replace("OUT_", "IN_")
+        input_plan: dict[str, list[str]] = {}
+        plan_edges = {}
+        for tasklet_conn, lib_conns in input_slots.items():
+            edge = input_edges.get(tasklet_conn)
+            if edge is None or edge.src_conn is None:
+                continue
+            inner_in_conn = edge.src_conn.replace("OUT_", "IN_")
+            input_plan.setdefault(inner_in_conn, []).extend(lib_conns)
+            if inner_in_conn not in plan_edges:
+                plan_edges[inner_in_conn] = edge
+
+        for inner_in_conn, lib_conns in input_plan.items():
+            edge = plan_edges[inner_in_conn]
             outer_to_inner = self._find_edge(graph, outer_entry, inner_entry,
                                              dst_conn=inner_in_conn)
             if outer_to_inner is None:
@@ -361,8 +409,9 @@ class ScalarToTileLibrary(xf.SingleStateTransformation):
                 Memlet(data=data_name, subset=load_subset, other_subset=tile_subset),
             )
 
-            graph.add_edge(trans_read, None, lib_node, lib_conn,
-                           Memlet(data=trans_name, subset=tile_subset))
+            for lib_conn in lib_conns:
+                graph.add_edge(trans_read, None, lib_node, lib_conn,
+                               Memlet(data=trans_name, subset=tile_subset))
 
             # Remove scalar path now represented by tile staging edges.
             graph.remove_edge(outer_to_inner)
@@ -386,7 +435,7 @@ class ScalarToTileLibrary(xf.SingleStateTransformation):
         # reference tiled-loop symbols (e.g., tile_i/tile_j).
         mask_source, fill_entry = self._add_mask_fill_subgraph(graph, mask_name, tile_shape, inner_entry.map)
         graph.add_edge(outer_entry, None, fill_entry, None, Memlet())
-        graph.add_edge(mask_source, None, lib_node, "_m",
+        graph.add_edge(mask_source, None, lib_node, mask_in_conn,
                        Memlet(data=mask_name, subset=tile_subset))
 
         # === Output lowering (non-canonical) ===
@@ -396,7 +445,7 @@ class ScalarToTileLibrary(xf.SingleStateTransformation):
             if edge.src is not tasklet:
                 continue
             tasklet_conn = edge.src_conn
-            lib_conn = op_match.out_conn_map.get(tasklet_conn)
+            lib_conn = self._output_connector_for_tasklet(op_match, tasklet_conn)
             if lib_conn is None:
                 continue
 
@@ -409,6 +458,8 @@ class ScalarToTileLibrary(xf.SingleStateTransformation):
 
             data_name = inner_to_outer.data.data
             data_desc = sdfg.arrays[data_name]
+            if not isinstance(edge.data.subset, subsets.Subset):
+                raise TypeError("Expected subset on inner map output edge.")
             store_subset = self._build_contiguous_outer_subset(edge.data.subset, inner_entry.map)
 
             # Preload current destination tile values into _c_in so masked ops
@@ -437,7 +488,7 @@ class ScalarToTileLibrary(xf.SingleStateTransformation):
                 None,
                 Memlet(data=data_name, subset=store_subset, other_subset=tile_subset),
             )
-            graph.add_edge(preload_tile, None, lib_node, "_c_in",
+            graph.add_edge(preload_tile, None, lib_node, out_in_conn,
                            Memlet(data=preload_name, subset=tile_subset))
 
             # Temporary tile for the new output produced by the library node.
@@ -491,8 +542,8 @@ class ScalarToTileLibrary(xf.SingleStateTransformation):
         """
         shape = []
         for start, end, _ in inner_map.range:
-            start = ScalarToTileLibrary._to_sympy_expr(start)
-            end = ScalarToTileLibrary._to_sympy_expr(end)
+            start = _ScalarToTileLibraryBase._to_sympy_expr(start)
+            end = _ScalarToTileLibraryBase._to_sympy_expr(end)
             low = sp.Min(start, end)
             high = sp.Max(start, end)
             shape.append(high - low + 1)
@@ -513,14 +564,14 @@ class ScalarToTileLibrary(xf.SingleStateTransformation):
         # Precompute symbolic min/max bounds for each inner-map parameter so we
         # can safely evaluate accesses even for reversed iteration ranges.
         param_bounds = {
-            pname: (
+            str(pname): (
                 sp.Min(
-                    ScalarToTileLibrary._to_sympy_expr(start),
-                    ScalarToTileLibrary._to_sympy_expr(end),
+                    _ScalarToTileLibraryBase._to_sympy_expr(start),
+                    _ScalarToTileLibraryBase._to_sympy_expr(end),
                 ),
                 sp.Max(
-                    ScalarToTileLibrary._to_sympy_expr(start),
-                    ScalarToTileLibrary._to_sympy_expr(end),
+                    _ScalarToTileLibraryBase._to_sympy_expr(start),
+                    _ScalarToTileLibraryBase._to_sympy_expr(end),
                 ),
             )
             for pname, (start, end, _) in zip(inner_map.params, inner_map.range)
@@ -528,9 +579,9 @@ class ScalarToTileLibrary(xf.SingleStateTransformation):
 
         new_ranges = []
         for rng in tasklet_subset:
-            expr = ScalarToTileLibrary._to_sympy_expr(rng[0])
+            expr = _ScalarToTileLibraryBase._to_sympy_expr(rng[0])
             expr_symbols = {str(s): s for s in expr.free_symbols}
-            used_params = [p for p in inner_map.params if p in expr_symbols]
+            used_params = [str(p) for p in inner_map.params if str(p) in expr_symbols]
 
             if len(used_params) > 1:
                 # We currently support one inner-map symbol per dimension.
@@ -545,7 +596,7 @@ class ScalarToTileLibrary(xf.SingleStateTransformation):
                 new_ranges.append((expr, expr, 1))
                 continue
 
-            pname = used_params[0]
+            pname = str(used_params[0])
             map_symbol = expr_symbols[pname]
             low, high = param_bounds[pname]
 
@@ -570,8 +621,9 @@ class ScalarToTileLibrary(xf.SingleStateTransformation):
         """
         # Create one index variable per tile dimension (m0, m1, ...).
         params = [f"m{d}" for d in range(len(tile_shape))]
-        map_ranges = {p: f"0:{symstr(extent)}"
-                      for p, extent in zip(params, tile_shape)}
+        map_ranges: Dict[str, str | subsets.Subset] = {
+            p: f"0:{symstr(extent)}" for p, extent in zip(params, tile_shape)
+        }
         fill_entry, fill_exit = graph.add_map(
             "fill_mask_map",
             map_ranges,
@@ -580,9 +632,9 @@ class ScalarToTileLibrary(xf.SingleStateTransformation):
 
         cond_terms = []
         for p, (start, end, step) in zip(params, inner_map.range):
-            start = ScalarToTileLibrary._to_sympy_expr(start)
-            end = ScalarToTileLibrary._to_sympy_expr(end)
-            step = ScalarToTileLibrary._to_sympy_expr(step)
+            start = _ScalarToTileLibraryBase._to_sympy_expr(start)
+            end = _ScalarToTileLibraryBase._to_sympy_expr(end)
+            step = _ScalarToTileLibraryBase._to_sympy_expr(step)
             low_expr = sp.Min(start, end)
             global_idx = f"(({symstr(low_expr)}) + ({p}))"
 
@@ -658,3 +710,17 @@ class ScalarToTileLibrary(xf.SingleStateTransformation):
                 continue
             return e
         return None
+
+
+class ScalarToTileLibraryCanonical(_ScalarToTileLibraryBase):
+    """Lower canonical scalar inner maps to unmasked cuTile library nodes."""
+
+    _MASK_TYPE = MaskType.UNMASKED
+    _REQUIRES_CANONICAL = True
+
+
+class ScalarToTileLibraryMasked(_ScalarToTileLibraryBase):
+    """Lower non-canonical scalar inner maps to masked cuTile library nodes."""
+
+    _MASK_TYPE = MaskType.RUNTIME
+    _REQUIRES_CANONICAL = False

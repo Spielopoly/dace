@@ -10,7 +10,10 @@ from __future__ import annotations
 from typing import Optional, Tuple
 
 from dace.sdfg import SDFG
-from dace.libraries.cutile.transformations.scalar_to_tile_library import ScalarToTileLibrary
+from dace.libraries.cutile.transformations.scalar_to_tile_library import (
+    ScalarToTileLibraryCanonical,
+    ScalarToTileLibraryMasked,
+)
 from dace.transformation.dataflow import TrivialChainElimination, MapTiling
 
 
@@ -25,8 +28,10 @@ def apply_cutile_pipeline(sdfg: SDFG, *,
 
     Currently applies:
 
-    1. **ScalarToTileLibrary** – replace inner maps + scalar tasklets inside
-       tile maps with cuTile library nodes.
+     1. **ScalarToTileLibraryCanonical** – replace canonical inner scalar maps
+         with unmasked cuTile library nodes.
+     2. **ScalarToTileLibraryMasked** – replace non-canonical inner scalar maps
+         with runtime-masked cuTile library nodes.
 
     Parameters
     ----------
@@ -64,7 +69,8 @@ def apply_cutile_pipeline(sdfg: SDFG, *,
     count += sdfg.apply_transformations_once_everywhere(
         [
             TrivialChainElimination,
-            ScalarToTileLibrary
+            ScalarToTileLibraryCanonical,
+            ScalarToTileLibraryMasked,
         ],
         validate=validate_all,
         validate_all=validate_all,

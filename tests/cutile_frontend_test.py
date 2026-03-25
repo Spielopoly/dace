@@ -35,6 +35,17 @@ def frontend_symbolic_vadd_program(
 
 
 @dace.program
+def frontend_vselfadd_program(
+    A: dace.float32[24, 20],
+    C: dace.float32[24, 20],
+):
+    for i, j in dace.map[0:24, 0:20]:
+        C[i, j] = A[i, j] + A[i, j]
+
+
+
+
+@dace.program
 def frontend_noncanonical_vadd_program(
     A: dace.float64[13, 11],
     B: dace.float64[13, 11],
@@ -135,6 +146,31 @@ def test_frontend_symbolic_vadd_pipeline_structure_and_runtime():
 
     sdfg(A=a, B=b, C=c, FN=n_val, FM=m_val)
     np.testing.assert_allclose(c, a + b, rtol=1e-6, atol=1e-6)
+
+
+def test_frontend_vselfadd_pipeline_structure_and_runtime():
+    """Frontend self-add should transform and execute numerically correctly."""
+    sdfg = frontend_vselfadd_program.to_sdfg(simplify=True)
+    count = apply_cutile_pipeline(
+        sdfg,
+        validate=True,
+        apply_map_tiling=True,
+        tile_shape=(6, 5),
+    )
+    assert count >= 1
+
+    lib_nodes = _frontend_library_nodes(sdfg)
+    assert any(isinstance(node, TileAddLibraryNode) for node in lib_nodes)
+
+    sdfg.expand_library_nodes()
+    sdfg.validate()
+
+    rng = np.random.default_rng(7006)
+    a = rng.uniform(-3.0, 3.0, size=(24, 20)).astype(np.float32)
+    c = np.zeros((24, 20), dtype=np.float32)
+
+    sdfg(A=a, C=c)
+    np.testing.assert_allclose(c, a + a, rtol=1e-6, atol=1e-6)
 
 
 def test_frontend_noncanonical_strided_add_pipeline_structure_and_runtime():

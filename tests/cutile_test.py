@@ -1,7 +1,7 @@
 """
 Tests for the cuTile transformation pipeline.
 
-Tests the ScalarToTileLibrary transformation that replaces inner maps
+Tests scalar-to-library transformations that replace inner maps
 with scalar tasklets by cuTile library nodes.
 """
 from __future__ import annotations
@@ -12,7 +12,10 @@ import pytest
 from dace import dtypes, Memlet
 from dace.sdfg import SDFG, nodes
 from dace.libraries.cutile.transformations.pipeline import apply_cutile_pipeline
-from dace.libraries.cutile.transformations.scalar_to_tile_library import ScalarToTileLibrary
+from dace.libraries.cutile.transformations.scalar_to_tile_library import (
+    ScalarToTileLibraryCanonical,
+    ScalarToTileLibraryMasked,
+)
 from dace.libraries.cutile.nodes import *
 
 
@@ -126,6 +129,85 @@ def build_runtime_tiled_scalar_add_sdfg(
     return sdfg
 
 
+def build_runtime_tiled_scalar_add_same_input_sdfg(
+    outer_shape=(2, 3),
+    tile_shape=(2, 2),
+    dtype=dace.float64,
+) -> SDFG:
+    """Build a CPU-friendly 'before pipeline' tiled scalar c=a+a SDFG."""
+    mt, nt = outer_shape
+    t0, t1 = tile_shape
+
+    sdfg = SDFG("tile_add_same_input_before_runtime")
+    sdfg.add_array("A", shape=[mt, nt, t0, t1], dtype=dtype)
+    sdfg.add_array("C", shape=[mt, nt, t0, t1], dtype=dtype)
+
+    state = sdfg.add_state("main")
+    a_acc = state.add_read("A")
+    c_acc = state.add_write("C")
+
+    outer_entry, outer_exit = state.add_map(
+        "tile_map",
+        {"i": f"0:{mt}", "j": f"0:{nt}"},
+        schedule=dtypes.ScheduleType.Sequential,
+    )
+    inner_entry, inner_exit = state.add_map(
+        "elem_map",
+        {"ii": f"0:{t0}", "jj": f"0:{t1}"},
+        schedule=dtypes.ScheduleType.Sequential,
+    )
+    tasklet = state.add_tasklet("add_same", {"a"}, {"c"}, "c = a + a")
+
+    state.add_memlet_path(
+        a_acc, outer_entry, inner_entry, tasklet,
+        dst_conn="a", memlet=Memlet("A[i, j, ii, jj]"),
+    )
+    state.add_memlet_path(
+        tasklet, inner_exit, outer_exit, c_acc,
+        src_conn="c", memlet=Memlet("C[i, j, ii, jj]"),
+    )
+
+    sdfg.validate()
+    return sdfg
+
+
+def build_tiled_scalar_add_same_input_sdfg() -> SDFG:
+    """Build canonical tiled SDFG with duplicated operand use: c = a + a."""
+    sdfg = SDFG("tile_add_same_input_before")
+    for sym in ("M", "N", "T0", "T1"):
+        sdfg.add_symbol(sym, dace.int32)
+
+    _add_blocked_arrays(sdfg, names=("A", "C"))
+    state = sdfg.add_state("main")
+
+    A_acc = state.add_read("A")
+    C_acc = state.add_write("C")
+
+    outer_entry, outer_exit = state.add_map(
+        "tile_map",
+        {"i": "0:M//T0", "j": "0:N//T1"},
+        schedule=dtypes.ScheduleType.Sequential,
+    )
+    inner_entry, inner_exit = state.add_map(
+        "elem_map",
+        {"ii": "0:T0", "jj": "0:T1"},
+        schedule=dtypes.ScheduleType.GPU_ThreadBlock,
+    )
+    tasklet = state.add_tasklet("add_same", {"a"}, {"c"}, "c = a + a")
+
+    state.add_memlet_path(
+        A_acc, outer_entry, inner_entry, tasklet,
+        dst_conn="a", memlet=Memlet("A[i, j, ii, jj]"),
+    )
+    state.add_memlet_path(
+        tasklet, inner_exit, outer_exit, C_acc,
+        src_conn="c", memlet=Memlet("C[i, j, ii, jj]"),
+    )
+
+    sdfg.validate()
+    return sdfg
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -166,6 +248,25 @@ def test_scalar_to_tile_add():
     sdfg.validate()
 
 
+def test_scalar_to_tile_add_same_input_operand():
+    """Regression: c = a + a must wire one input tile to both library inputs."""
+    sdfg = build_tiled_scalar_add_same_input_sdfg()
+
+    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_tiling=False)
+    assert count == 1, f"Expected 1 transformation, got {count}"
+
+    state = sdfg.states()[0]
+    lib_nodes = [n for n in state.nodes() if isinstance(n, nodes.LibraryNode)]
+    assert len(lib_nodes) == 1
+    assert isinstance(lib_nodes[0], TileAddLibraryNode)
+
+    lib_node = lib_nodes[0]
+    in_edges = state.in_edges(lib_node)
+    assert len(in_edges) == 2
+    assert {e.dst_conn for e in in_edges} == {"_a", "_b"}
+    assert len({e.src.data for e in in_edges if isinstance(e.src, nodes.AccessNode)}) == 1
+
+
 def test_can_be_applied_rejects_non_scalar():
     """Transformation must NOT match when tasklet accesses are not scalar."""
     sdfg = SDFG("non_scalar")
@@ -197,7 +298,7 @@ def test_can_be_applied_rejects_non_scalar():
         src_conn="c", memlet=Memlet("C[i, j, ii, jj]"),
     )
 
-    count = sdfg.apply_transformations(ScalarToTileLibrary)
+    count = sdfg.apply_transformations([ScalarToTileLibraryCanonical, ScalarToTileLibraryMasked])
     assert count == 0, "Should not apply to inner map not starting at 0"
 
 
@@ -238,7 +339,7 @@ def test_can_be_applied_rejects_unknown_op():
         src_conn="c", memlet=Memlet("C[i, j, ii, jj]"),
     )
 
-    count = sdfg.apply_transformations(ScalarToTileLibrary)
+    count = sdfg.apply_transformations([ScalarToTileLibraryCanonical, ScalarToTileLibraryMasked])
     assert count == 0, "Should not apply to unknown operation"
 
 
@@ -387,6 +488,52 @@ def test_pipeline_runtime_numeric_correctness_float32():
     sdfg(A=a, B=b, C=c)
 
     np.testing.assert_allclose(c, a + b, rtol=1e-6, atol=1e-6)
+
+
+def test_pipeline_runtime_numeric_correctness_same_input_float64():
+    """End-to-end: c = a + a is transformed and numerically correct."""
+    sdfg = build_runtime_tiled_scalar_add_same_input_sdfg(
+        outer_shape=(2, 3),
+        tile_shape=(2, 2),
+        dtype=dace.float64,
+    )
+
+    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_tiling=False)
+    assert count == 1
+    sdfg.expand_library_nodes()
+    sdfg.validate()
+
+    shape = (2, 3, 2, 2)
+    rng = np.random.default_rng(2027)
+    a = rng.uniform(-50.0, 50.0, size=shape).astype(np.float64)
+    c = np.zeros(shape, dtype=np.float64)
+
+    sdfg(A=a, C=c)
+
+    np.testing.assert_allclose(c, a + a, rtol=0.0, atol=1e-12)
+
+
+def test_pipeline_runtime_numeric_correctness_same_input_float32():
+    """Second shape/type runtime check for c = a + a."""
+    sdfg = build_runtime_tiled_scalar_add_same_input_sdfg(
+        outer_shape=(3, 2),
+        tile_shape=(1, 4),
+        dtype=dace.float32,
+    )
+
+    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_tiling=False)
+    assert count == 1
+    sdfg.expand_library_nodes()
+    sdfg.validate()
+
+    shape = (3, 2, 1, 4)
+    rng = np.random.default_rng(2028)
+    a = rng.uniform(-10.0, 10.0, size=shape).astype(np.float32)
+    c = np.zeros(shape, dtype=np.float32)
+
+    sdfg(A=a, C=c)
+
+    np.testing.assert_allclose(c, a + a, rtol=1e-6, atol=1e-6)
 
 
 # ---------------------------------------------------------------------------
