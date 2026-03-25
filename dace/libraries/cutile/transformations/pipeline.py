@@ -61,7 +61,7 @@ def apply_cutile_pipeline(sdfg: SDFG, *,
 
 
     # Phase 1: Replace scalar tasklets with library nodes
-    count += sdfg.apply_transformations(
+    count += sdfg.apply_transformations_once_everywhere(
         [
             TrivialChainElimination,
             ScalarToTileLibrary
