@@ -153,8 +153,8 @@ class _ScalarToTileLibraryBase(xf.SingleStateTransformation):
             raise RuntimeError("Operator became unsupported between can_be_applied and apply.")
 
         if self._REQUIRES_CANONICAL:
-            self._apply_canonical(graph, sdfg, outer_entry, inner_entry,
-                                  tasklet, inner_exit, outer_exit, op_match)
+                self._apply_canonical(graph, sdfg, outer_entry, inner_entry,
+                                      tasklet, inner_exit, outer_exit, op_match)
         else:
             self._apply_noncanonical(graph, sdfg, outer_entry, inner_entry,
                                      tasklet, inner_exit, outer_exit, op_match)
@@ -187,17 +187,6 @@ class _ScalarToTileLibraryBase(xf.SingleStateTransformation):
             return op_match.node_info.out
         return None
 
-    @staticmethod
-    def _tasklet_input_edges_from_inner(graph: SDFGState,
-                                        inner_entry: nodes.MapEntry,
-                                        tasklet: nodes.Tasklet) -> Dict[str, dace.graph.MultiConnectorEdge[Memlet]]:
-        """Map tasklet input connector to the edge inner_entry -> tasklet."""
-        edge_map = {}
-        for edge in graph.out_edges(inner_entry):
-            if edge.dst is not tasklet or edge.dst_conn is None:
-                continue
-            edge_map[edge.dst_conn] = edge
-        return edge_map
 
     def _apply_canonical(self, graph: SDFGState, sdfg: SDFG,
                          outer_entry: nodes.MapEntry, inner_entry: nodes.MapEntry,
@@ -224,24 +213,20 @@ class _ScalarToTileLibraryBase(xf.SingleStateTransformation):
         # We preserve original outer indexing by copying memlets and only adding
         # `other_subset` to describe how the outer slice maps into tile space.
         input_slots = self._build_input_slot_map(op_match)
-        input_edges = self._tasklet_input_edges_from_inner(graph, inner_entry, tasklet)
 
         # Multiple tasklet inputs can be fed by the same map connector
         # (frontend c = a + a often yields __in1/__in2 both from OUT_A).
         # Group by map input connector and lower each producer edge once.
         input_plan: dict[str, list[str]] = {}
-        plan_edges = {}
         for tasklet_conn, lib_conns in input_slots.items():
-            edge = input_edges.get(tasklet_conn)
-            if edge is None or edge.src_conn is None:
+            # Get edges from inner_entry to tasklet on this connector
+            edges = list(graph.in_edges_by_connector(tasklet, tasklet_conn))
+            if not edges or edges[0].src_conn is None:
                 continue
-            inner_in_conn = edge.src_conn.replace("OUT_", "IN_")
+            inner_in_conn = edges[0].src_conn.replace("OUT_", "IN_")
             input_plan.setdefault(inner_in_conn, []).extend(lib_conns)
-            if inner_in_conn not in plan_edges:
-                plan_edges[inner_in_conn] = edge
 
         for inner_in_conn, lib_conns in input_plan.items():
-            edge = plan_edges[inner_in_conn]
             outer_to_inner = self._find_edge(graph, outer_entry, inner_entry,
                                              dst_conn=inner_in_conn)
             if outer_to_inner is None:
@@ -362,21 +347,22 @@ class _ScalarToTileLibraryBase(xf.SingleStateTransformation):
         # Input memlets are expanded from scalar expressions to contiguous outer
         # ranges covering the complete bounding tile footprint.
         input_slots = self._build_input_slot_map(op_match)
-        input_edges = self._tasklet_input_edges_from_inner(graph, inner_entry, tasklet)
 
-        input_plan: dict[str, list[str]] = {}
-        plan_edges = {}
+        # Group by map input connector, tracking inner tasklet edges for subset info
+        input_plan: dict[str, tuple[list[str], dace.graph.MultiConnectorEdge[Memlet]]] = {}
         for tasklet_conn, lib_conns in input_slots.items():
-            edge = input_edges.get(tasklet_conn)
-            if edge is None or edge.src_conn is None:
+            # Get edges from inner_entry to tasklet on this connector
+            edges = list(graph.in_edges_by_connector(tasklet, tasklet_conn))
+            if not edges or edges[0].src_conn is None:
                 continue
+            edge = edges[0]
             inner_in_conn = edge.src_conn.replace("OUT_", "IN_")
-            input_plan.setdefault(inner_in_conn, []).extend(lib_conns)
-            if inner_in_conn not in plan_edges:
-                plan_edges[inner_in_conn] = edge
+            # Store both lib_conns and the edge for subset info
+            if inner_in_conn not in input_plan:
+                input_plan[inner_in_conn] = ([], edge)
+            input_plan[inner_in_conn][0].extend(lib_conns)
 
-        for inner_in_conn, lib_conns in input_plan.items():
-            edge = plan_edges[inner_in_conn]
+        for inner_in_conn, (lib_conns, edge) in input_plan.items():
             outer_to_inner = self._find_edge(graph, outer_entry, inner_entry,
                                              dst_conn=inner_in_conn)
             if outer_to_inner is None:
@@ -607,27 +593,18 @@ class _ScalarToTileLibraryBase(xf.SingleStateTransformation):
         return subsets.Range(new_ranges)
 
     @staticmethod
-    def _add_mask_fill_subgraph(graph: SDFGState, mask_name: str,
-                                tile_shape: list, inner_map: nodes.Map) -> tuple[nodes.AccessNode, nodes.MapEntry]:
+    def _build_mask_condition(tile_shape: list, inner_map: nodes.Map) -> str:
         """
-        Build a sequential map that fills the mask tile with domain validity.
+        Build a predicate string that checks if a tile point is within the map domain.
 
-        Each mask element corresponds to a point in the bounding tile and is
-        True iff that point is part of the original (possibly strided/reversed)
-        inner-map iteration domain.
+        For each dimension, generates direction-aware conditions for both positive
+        and negative steps, including stride/offset checks.
+
+        Returns a conjunction of per-dimension predicates.
         """
-        # Create one index variable per tile dimension (m0, m1, ...).
         params = [f"m{d}" for d in range(len(tile_shape))]
-        map_ranges: Dict[str, str | subsets.Subset] = {
-            p: f"0:{symstr(extent)}" for p, extent in zip(params, tile_shape)
-        }
-        fill_entry, fill_exit = graph.add_map(
-            "fill_mask_map",
-            map_ranges,
-            schedule=dtypes.ScheduleType.Sequential,
-        )
-
         cond_terms = []
+        
         for p, (start, end, step) in zip(params, inner_map.range):
             start = _ScalarToTileLibraryBase._to_sympy_expr(start)
             end = _ScalarToTileLibraryBase._to_sympy_expr(end)
@@ -655,7 +632,30 @@ class _ScalarToTileLibraryBase(xf.SingleStateTransformation):
             )
             cond_terms.append(f"(({cond_pos}) or ({cond_neg}))")
 
-        condition = " and ".join(cond_terms) if cond_terms else "True"
+        return " and ".join(cond_terms) if cond_terms else "True"
+
+    @staticmethod
+    def _add_mask_fill_subgraph(graph: SDFGState, mask_name: str,
+                                tile_shape: list, inner_map: nodes.Map) -> tuple[nodes.AccessNode, nodes.MapEntry]:
+        """
+        Build a sequential map that fills the mask tile with domain validity.
+
+        Each mask element corresponds to a point in the bounding tile and is
+        True iff that point is part of the original (possibly strided/reversed)
+        inner-map iteration domain.
+        """
+        # Create one index variable per tile dimension (m0, m1, ...).
+        params = [f"m{d}" for d in range(len(tile_shape))]
+        map_ranges: Dict[str, str | subsets.Subset] = {
+            p: f"0:{symstr(extent)}" for p, extent in zip(params, tile_shape)
+        }
+        fill_entry, fill_exit = graph.add_map(
+            "fill_mask_map",
+            map_ranges,
+            schedule=dtypes.ScheduleType.Sequential,
+        )
+
+        condition = _ScalarToTileLibraryBase._build_mask_condition(tile_shape, inner_map)
         # Materialize predicate directly in a tasklet to avoid extra branches.
         fill_tasklet = graph.add_tasklet("fill_mask", {}, {"out"},
                                          f"out = {condition}")
