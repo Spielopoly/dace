@@ -369,6 +369,13 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
         if self._tasklet_classification.lhs == tasklet_conn:
             return self._node_info.out
         return None
+    
+    def _remove_original_nodes(self):
+        # After all dataflow edges are rewired through the library node, the
+        # scalar tasklet and inner-map nodes are dead and can be removed.
+        self._graph.remove_node(self.tasklet)
+        self._graph.remove_node(self.inner_map_entry)
+        self._graph.remove_node(self.inner_map_exit)
 
     def apply(self, graph: SDFGState, sdfg: SDFG): # type: ignore
         """
@@ -432,20 +439,16 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
                 continue
 
             # Follow the same memlet path and pick the inner-exit -> outer-exit
-            inner_to_outer = self._find_path_edge(edge, self.inner_map_exit, self.outer_map_exit)
-            if inner_to_outer is None:
+            inner_map_to_outer_map_edge = self._find_path_edge(edge, self.inner_map_exit, self.outer_map_exit)
+            if inner_map_to_outer_map_edge is None:
                 continue
 
-            self._add_output_transient_and_connect_edges(inner_to_outer, lib_conn)
+            self._add_output_transient_and_connect_edges(inner_map_to_outer_map_edge, lib_conn)
 
             # Remove the original scalar store path.
-            graph.remove_edge(inner_to_outer)
+            self._graph.remove_edge(inner_map_to_outer_map_edge)
 
-        # After all dataflow edges are rewired through the library node, the
-        # scalar tasklet and inner-map nodes are dead and can be removed.
-        graph.remove_node(self.tasklet)
-        graph.remove_node(self.inner_map_entry)
-        graph.remove_node(self.inner_map_exit)
+        self._remove_original_nodes()
 
 
 class ScalarToTileCanonical(_ScalarToTileBase):
