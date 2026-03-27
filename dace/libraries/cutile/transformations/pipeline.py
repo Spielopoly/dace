@@ -22,7 +22,7 @@ def apply_cutile_pipeline(sdfg: SDFG, *,
                           validate: bool = True,
                           validate_all: bool = True,
                           apply_map_tiling: bool = True,
-                          tile_shape: Optional[Tuple[int, ...]] = None) -> int:
+                          tile_shape: Tuple[int, ...] = (16, 16, 16)) -> int:
     """
     Apply the full cuTile transformation pipeline to an SDFG.
 
