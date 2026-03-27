@@ -324,6 +324,45 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
         
         return trans_name, trans_read
     
+    def _add_output_transient_and_connect_edges(self, inner_to_outer_edge: sdutil.gr.MultiConnectorEdge[Memlet], lib_conn: str):
+        """
+        For a given edge connecting the inner map exit to the outer map exit, create a transient tile array and connect it to the library node.
+        
+        This involves:
+        1. Creating a transient array for the tile data.
+        2. Connecting the library node to the transient with a memlet that has the tile subset as its subset.
+        3. Connecting the transient to the outer map exit with a memlet that has the same subset as the original edge but with `other_subset` set to the tile subset.
+        
+        Parameters
+        ----------
+        inner_to_outer_edge : MultiConnectorEdge[Memlet]
+            The edge connecting the inner map exit to the outer map exit.
+        lib_conn : str
+            The name of the library node connector that should produce this output.
+        
+        Returns
+        -------
+        trans_name : str
+            The name of the created transient array.
+        trans_write : AccessNode
+            The graph node corresponding to the transient array.
+        """
+        
+        data_name = cast(str, inner_to_outer_edge.data.data)
+        trans_name, trans_write = self._create_and_add_tile_transient(data_name, self._tile_shape)
+        # Library writes full tile result into transient.
+        self._graph.add_edge(self._library_node, lib_conn, trans_write, None,
+                        Memlet(data=trans_name, subset=self._tile_subset))
+
+        # transient → outer_exit (tile-slice memlet with other_subset)
+        new_memlet = copy.deepcopy(inner_to_outer_edge.data)
+        new_memlet.other_subset = self._tile_subset
+        self._graph.add_edge(trans_write, None, self.outer_map_exit,
+                        inner_to_outer_edge.dst_conn, new_memlet)
+        
+
+        return trans_name, trans_write
+
     def _output_connector_for_tasklet(self, tasklet_conn: Optional[str]) -> Optional[str]:
         if tasklet_conn is None:
             return None
@@ -381,9 +420,10 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
         # === Output lowering ===
         # Symmetric to input lowering:
         #   library node output -> tile transient -> original outer destination.
-        # Fortunately there is only one output, so no need to worry about multiple
-        # tasklet connectors mapping to the same library node connector and such.
-        for edge in graph.in_edges(self.inner_map_exit):
+        # Fortunately there is only one output to the library node and tasklet,
+        # so no need to worry about multiple tasklet connectors mapping to the 
+        # same library node connector and such.
+        for edge in self._graph.in_edges(self.inner_map_exit):
             if edge.src is not self.tasklet:
                 continue
             tasklet_conn = edge.src_conn
@@ -396,18 +436,7 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
             if inner_to_outer is None:
                 continue
 
-            data_name = cast(str, inner_to_outer.data.data)
-            trans_name, trans_write = self._create_and_add_tile_transient(data_name, self._tile_shape)
-
-            # Library writes full tile result into transient.
-            graph.add_edge(self._library_node, lib_conn, trans_write, None,
-                           Memlet(data=trans_name, subset=self._tile_subset))
-
-            # transient → outer_exit (tile-slice memlet with other_subset)
-            new_memlet = copy.deepcopy(inner_to_outer.data)
-            new_memlet.other_subset = self._tile_subset
-            graph.add_edge(trans_write, None, self.outer_map_exit,
-                           inner_to_outer.dst_conn, new_memlet)
+            self._add_output_transient_and_connect_edges(inner_to_outer, lib_conn)
 
             # Remove the original scalar store path.
             graph.remove_edge(inner_to_outer)
