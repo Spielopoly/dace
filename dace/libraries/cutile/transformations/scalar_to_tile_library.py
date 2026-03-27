@@ -214,25 +214,26 @@ class _ScalarToTileLibraryBase(xf.SingleStateTransformation):
         # `other_subset` to describe how the outer slice maps into tile space.
         input_slots = self._build_input_slot_map(op_match)
 
-        # Multiple tasklet inputs can be fed by the same map connector
-        # (frontend c = a + a often yields __in1/__in2 both from OUT_A).
-        # Group by map input connector and lower each producer edge once.
-        input_plan: dict[str, list[str]] = {}
+        # Multiple tasklet inputs can be fed by the same map path
+        # (frontend c = a + a often yields two tasklet connectors from one map
+        # connector). Group by the actual outer->inner edge on the memlet path
+        # instead of relying on connector name rewrites.
+        input_plan: dict[tuple[Optional[str], Optional[str]], tuple[dace.graph.MultiConnectorEdge[Memlet], list[str]]] = {}
         for tasklet_conn, lib_conns in input_slots.items():
-            # Get edges from inner_entry to tasklet on this connector
-            edges = list(graph.in_edges_by_connector(tasklet, tasklet_conn))
-            if not edges or edges[0].src_conn is None:
+            tasklet_edges = list(graph.in_edges_by_connector(tasklet, tasklet_conn))
+            if not tasklet_edges:
                 continue
-            inner_in_conn = edges[0].src_conn.replace("OUT_", "IN_")
-            input_plan.setdefault(inner_in_conn, []).extend(lib_conns)
-
-        for inner_in_conn, lib_conns in input_plan.items():
-            outer_to_inner = self._find_edge(graph, outer_entry, inner_entry,
-                                             dst_conn=inner_in_conn)
-            if outer_to_inner is None:
+            outer_map_to_inner_map_edge = self._find_path_edge(tasklet_edges[0], outer_entry, inner_entry, graph)
+            if outer_map_to_inner_map_edge is None:
                 continue
+            edge_key = (outer_map_to_inner_map_edge.src_conn, outer_map_to_inner_map_edge.dst_conn)
+            if edge_key not in input_plan:
+                input_plan[edge_key] = (outer_map_to_inner_map_edge, [])
+            input_plan[edge_key][1].extend(lib_conns)
 
-            data_name = outer_to_inner.data.data
+        for outer_map_to_inner_map_edge, lib_conns in input_plan.values():
+
+            data_name = outer_map_to_inner_map_edge.data.data
             data_desc = sdfg.arrays[data_name]
 
             # Create a scope-lifetime transient tile to stage this operand.
@@ -248,9 +249,9 @@ class _ScalarToTileLibraryBase(xf.SingleStateTransformation):
             trans_read = graph.add_access(trans_name)
 
             # outer_entry → transient (tile-slice memlet with other_subset)
-            new_memlet = copy.deepcopy(outer_to_inner.data)
+            new_memlet = copy.deepcopy(outer_map_to_inner_map_edge.data)
             new_memlet.other_subset = tile_subset
-            graph.add_edge(outer_entry, outer_to_inner.src_conn,
+            graph.add_edge(outer_entry, outer_map_to_inner_map_edge.src_conn,
                            trans_read, None, new_memlet)
 
             # The library node consumes the full tile domain.
@@ -259,7 +260,7 @@ class _ScalarToTileLibraryBase(xf.SingleStateTransformation):
                                Memlet(data=trans_name, subset=tile_subset))
 
             # Remove the original scalar feed from outer map to inner map.
-            graph.remove_edge(outer_to_inner)
+            graph.remove_edge(outer_map_to_inner_map_edge)
 
         # === Output lowering ===
         # Symmetric to input lowering:
@@ -272,11 +273,9 @@ class _ScalarToTileLibraryBase(xf.SingleStateTransformation):
             if lib_conn is None:
                 continue
 
-            # Same connector translation in reverse for inner-exit -> outer-exit.
-            inner_in_conn = edge.dst_conn           # e.g. "IN_C"
-            inner_out_conn = inner_in_conn.replace("IN_", "OUT_")
-            inner_to_outer = self._find_edge(graph, inner_exit, outer_exit,
-                                             src_conn=inner_out_conn)
+            # Follow the same memlet path and pick the inner-exit -> outer-exit
+            # segment directly instead of inferring connector names.
+            inner_to_outer = self._find_path_edge(edge, inner_exit, outer_exit, graph)
             if inner_to_outer is None:
                 continue
 
@@ -348,25 +347,24 @@ class _ScalarToTileLibraryBase(xf.SingleStateTransformation):
         # ranges covering the complete bounding tile footprint.
         input_slots = self._build_input_slot_map(op_match)
 
-        # Group by map input connector, tracking inner tasklet edges for subset info
-        input_plan: dict[str, tuple[list[str], dace.graph.MultiConnectorEdge[Memlet]]] = {}
+        # Group by actual outer->inner edges, tracking a representative tasklet
+        # edge for subset lifting. This avoids assumptions about IN_/OUT_
+        # connector naming conventions.
+        input_plan: dict[tuple[Optional[str], Optional[str]], tuple[dace.graph.MultiConnectorEdge[Memlet], list[str], dace.graph.MultiConnectorEdge[Memlet]]] = {}
         for tasklet_conn, lib_conns in input_slots.items():
-            # Get edges from inner_entry to tasklet on this connector
-            edges = list(graph.in_edges_by_connector(tasklet, tasklet_conn))
-            if not edges or edges[0].src_conn is None:
+            tasklet_edges = list(graph.in_edges_by_connector(tasklet, tasklet_conn))
+            if not tasklet_edges:
                 continue
-            edge = edges[0]
-            inner_in_conn = edge.src_conn.replace("OUT_", "IN_")
-            # Store both lib_conns and the edge for subset info
-            if inner_in_conn not in input_plan:
-                input_plan[inner_in_conn] = ([], edge)
-            input_plan[inner_in_conn][0].extend(lib_conns)
-
-        for inner_in_conn, (lib_conns, edge) in input_plan.items():
-            outer_to_inner = self._find_edge(graph, outer_entry, inner_entry,
-                                             dst_conn=inner_in_conn)
+            tasklet_edge = tasklet_edges[0]
+            outer_to_inner = self._find_path_edge(tasklet_edge, outer_entry, inner_entry, graph)
             if outer_to_inner is None:
                 continue
+            edge_key = (outer_to_inner.src_conn, outer_to_inner.dst_conn)
+            if edge_key not in input_plan:
+                input_plan[edge_key] = (outer_to_inner, [], tasklet_edge)
+            input_plan[edge_key][1].extend(lib_conns)
+
+        for outer_to_inner, lib_conns, edge in input_plan.values():
 
             data_name = outer_to_inner.data.data
             data_desc = sdfg.arrays[data_name]
@@ -435,10 +433,7 @@ class _ScalarToTileLibraryBase(xf.SingleStateTransformation):
             if lib_conn is None:
                 continue
 
-            inner_in_conn = edge.dst_conn
-            inner_out_conn = inner_in_conn.replace("IN_", "OUT_")
-            inner_to_outer = self._find_edge(graph, inner_exit, outer_exit,
-                                             src_conn=inner_out_conn)
+            inner_to_outer = self._find_path_edge(edge, inner_exit, outer_exit, graph)
             if inner_to_outer is None:
                 continue
 
@@ -697,6 +692,16 @@ class _ScalarToTileLibraryBase(xf.SingleStateTransformation):
         return True
 
     # ------------------------------------------------------------------
+    @staticmethod
+    def _find_path_edge(anchor_edge, src, dst, graph):
+        """
+        Find the path segment from `src` to `dst` on an anchor edge memlet path.
+        """
+        for e in graph.memlet_path(anchor_edge):
+            if e.src is src and e.dst is dst:
+                return e
+        return None
+
     @staticmethod
     def _find_edge(graph, src, dst, src_conn=None, dst_conn=None):
         """Find one edge between `src` and `dst` matching optional connectors."""

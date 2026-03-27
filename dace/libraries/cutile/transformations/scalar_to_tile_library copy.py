@@ -171,7 +171,7 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
         
         return True
     
-    def _calculate_tile_shape(self):
+    def _calculate_tile_shape(self) -> tuple:
         """
         Calculate the shape of the tile being processed by the inner map.
 
@@ -179,7 +179,7 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
         and the transients used to connect it to the rest of the graph.
         """
         assert isinstance(self.inner_map_entry.map.range, subsets.Range)
-        return self.inner_map_entry.map.range.size()
+        return tuple(self.inner_map_entry.map.range.size())
 
     def _tile_subset_from_shape(self, tile_shape) -> subsets.Range:
         """
@@ -212,31 +212,124 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
                                  f"tasklet connector {tasklet_conn}, library connector {library_conn}")
         return slot_map
 
-    def _get_map_from_tasklet_input_to_edge(self) -> Dict[str, sdutil.gr.MultiConnectorEdge[Memlet]]:
-        """Map tasklet input connector to the edge inner_entry -> tasklet."""
-        edge_map = {}
-        for edge in self._graph.edges_between(self.inner_map_entry, self.tasklet):
-            if edge.dst_conn is None:
-                continue
-            edge_map[edge.dst_conn] = edge
-        return edge_map
-    
-    def _create_input_plan_and_edges(self, input_slots: dict[str, list[str]], input_edges: dict[str, sdutil.gr.MultiConnectorEdge[Memlet]]):
+    def _find_path_edge(self, anchor_edge: sdutil.gr.MultiConnectorEdge[Memlet], src: nodes.Node, dst: nodes.Node) -> Optional[sdutil.gr.MultiConnectorEdge[Memlet]]:
         """
-        Returns:
-        - input_plan: dict mapping 
+        Find the path segment from `src` to `dst` on an anchor edge memlet path.
         """
-        input_plan: dict[str, list[str]] = {}
-        plan_edges = {}
+        for e in self._graph.memlet_path(anchor_edge):
+            if e.src is src and e.dst is dst:
+                return e
+        return None
+
+    def _create_input_plan(self, input_slots: dict[str, list[str]]):
+        """
+        The input plan represents a mapping from edges, that connect the outer map to the inner map, to a list of corresponding library node connectors.
+        
+        
+        Parameters
+        ----------
+        input_slots : dict[str, list[str]]
+            A dictionary mapping tasklet input connector names to lists of library node input connector names.
+
+        Returns
+        -------
+        input_plan : dict[tuple[Optional[str], Optional[str]], tuple[sdutil.gr.MultiConnectorEdge[Memlet], list[str]]]
+            A dictionary mapping edge keys to tuples of the corresponding edge and library node connectors.
+
+        """
+        input_plan: dict[tuple[Optional[str], Optional[str]], tuple[sdutil.gr.MultiConnectorEdge[Memlet], list[str]]] = {}
         for tasklet_conn, lib_conns in input_slots.items():
-            edge = input_edges.get(tasklet_conn)
-            if edge is None or edge.src_conn is None:
+            tasklet_edges = list(self._graph.in_edges_by_connector(self.tasklet, tasklet_conn))
+            if not tasklet_edges:
                 continue
-            inner_in_conn = edge.src_conn.replace("OUT_", "IN_")
-            input_plan.setdefault(inner_in_conn, []).extend(lib_conns)
-            if inner_in_conn not in plan_edges:
-                plan_edges[inner_in_conn] = edge
-        return input_plan, plan_edges
+            outer_map_to_inner_map_edge = self._find_path_edge(tasklet_edges[0], self.outer_map_entry, self.inner_map_entry)
+            if outer_map_to_inner_map_edge is None:
+                continue
+            edge_key = (outer_map_to_inner_map_edge.src_conn, outer_map_to_inner_map_edge.dst_conn)
+            if edge_key not in input_plan:
+                input_plan[edge_key] = (outer_map_to_inner_map_edge, [])
+            input_plan[edge_key][1].extend(lib_conns)
+        return input_plan
+    
+    def _create_and_add_tile_transient(self, data_name: str, tile_shape: tuple):
+        """
+        Create a transient array for tile data.
+
+        The transient has scope lifetime and tile shape, and is used to
+        connect the original scalar memlets to the library node's tile memlets.
+        
+        Parameters
+        ----------
+        data_name : str
+            The base name of the data for the transient array (a unique name will be generated).
+        tile_shape : tuple
+            The shape of the tile being processed, used to set the transient shape.
+
+        Returns
+        -------
+        trans_name : str
+            The name of the created transient array.
+        trans_node : AccessNode
+            The graph node corresponding to the transient array.
+        """
+        data_desc = self._sdfg.arrays[data_name]
+        trans_name = self._sdfg._find_new_name(data_name + "_tile")
+        self._sdfg.add_transient(
+            trans_name,
+            shape=tile_shape,
+            dtype=data_desc.dtype,
+            storage=data_desc.storage,
+            lifetime=dtypes.AllocationLifetime.Scope,
+        )
+        trans_node = self._graph.add_access(trans_name)
+        
+        return trans_name, trans_node
+
+    def _add_input_transient_and_connect_edges(self, outer_map_to_inner_map_edge: sdutil.gr.MultiConnectorEdge[Memlet], lib_conns: list[str]):
+        """
+        For a given edge connecting the outer map to the inner map, create a transient tile array and connect it to the library node.
+        
+        This involves:
+        1. Creating a transient array for the tile data.
+        2. Connecting the outer map entry to the transient with a memlet that has the same subset as the original edge but with `other_subset` set to the tile subset.
+        3. Connecting the transient to the library node with memlets that have the tile subset as their subset.
+        
+        Parameters
+        ----------
+        outer_map_to_inner_map_edge : MultiConnectorEdge[Memlet]
+            The edge connecting the outer map to the inner map.
+        lib_conns : list[str]
+            The list of library node connector names that should be fed by this edge.
+        
+        Returns
+        -------
+        trans_name : str
+            The name of the created transient array.
+        trans_read : AccessNode
+            The graph node corresponding to the transient array.
+        """
+        
+        data_name = cast(str, outer_map_to_inner_map_edge.data.data)
+        trans_name, trans_read = self._create_and_add_tile_transient(data_name, self._tile_shape)
+
+        # outer_entry → transient (tile-slice memlet with other_subset)
+        new_memlet = copy.deepcopy(outer_map_to_inner_map_edge.data)
+        new_memlet.other_subset = self._tile_subset
+        self._graph.add_edge(self.outer_map_entry, outer_map_to_inner_map_edge.src_conn, trans_read, None, new_memlet)
+
+        # Add transient → library node edges
+        for lib_conn in lib_conns:
+            self._graph.add_edge(trans_read, None, self._library_node, lib_conn,
+                                 Memlet(data=trans_name, subset=self._tile_subset))
+        
+        return trans_name, trans_read
+    
+    def _output_connector_for_tasklet(self, tasklet_conn: Optional[str]) -> Optional[str]:
+        if tasklet_conn is None:
+            return None
+        if self._tasklet_classification.lhs == tasklet_conn:
+            return self._node_info.out
+        return None
 
     def apply(self, graph: SDFGState, sdfg: SDFG): # type: ignore
         """
@@ -265,13 +358,65 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
         self._library_node = self._node_info.type(self._node_info.node_name)
         graph.add_node(self._library_node)
         
-        # Multiple tasklet inputs can be fed by the same map connector
-        # (frontend c = a + a often yields __in1/__in2 both from OUT_A).
-        # Group by map input connector and lower each producer edge once.
+        # === Input lowering ===
+        # For each tasklet input connector:
+        #   outer map slice -> tile transient -> library node input.
+        # We preserve original outer indexing by copying memlets and only adding
+        # `other_subset` to describe how the outer slice maps into tile space
+
+        # Multiple tasklet inputs can be fed by the same map path
+        # (frontend c = a + a often yields two tasklet connectors from one map
+        # connector)
         self._input_slots = self._get_map_from_tasklet_input_to_libnode_inputs()
-        self._input_edges = self._get_map_from_tasklet_input_to_edge()
+        # The input plan represents a mapping from edges, that connect the outer map to the inner map, to a list of corresponding library node connectors.
+        self._input_plan = self._create_input_plan(self._input_slots)
         
+        # Create input transient accesses (tiles) and edges
+        for outer_map_to_inner_map_edge, lib_conns in self._input_plan.values():
+            self._add_input_transient_and_connect_edges(outer_map_to_inner_map_edge, lib_conns)
+
+            # Remove the original scalar feed from outer map to inner map.
+            self._graph.remove_edge(outer_map_to_inner_map_edge)
         
+        # === Output lowering ===
+        # Symmetric to input lowering:
+        #   library node output -> tile transient -> original outer destination.
+        # Fortunately there is only one output, so no need to worry about multiple
+        # tasklet connectors mapping to the same library node connector and such.
+        for edge in graph.in_edges(self.inner_map_exit):
+            if edge.src is not self.tasklet:
+                continue
+            tasklet_conn = edge.src_conn
+            lib_conn = self._output_connector_for_tasklet(tasklet_conn)
+            if lib_conn is None:
+                continue
+
+            # Follow the same memlet path and pick the inner-exit -> outer-exit
+            inner_to_outer = self._find_path_edge(edge, self.inner_map_exit, self.outer_map_exit)
+            if inner_to_outer is None:
+                continue
+
+            data_name = cast(str, inner_to_outer.data.data)
+            trans_name, trans_write = self._create_and_add_tile_transient(data_name, self._tile_shape)
+
+            # Library writes full tile result into transient.
+            graph.add_edge(self._library_node, lib_conn, trans_write, None,
+                           Memlet(data=trans_name, subset=self._tile_subset))
+
+            # transient → outer_exit (tile-slice memlet with other_subset)
+            new_memlet = copy.deepcopy(inner_to_outer.data)
+            new_memlet.other_subset = self._tile_subset
+            graph.add_edge(trans_write, None, self.outer_map_exit,
+                           inner_to_outer.dst_conn, new_memlet)
+
+            # Remove the original scalar store path.
+            graph.remove_edge(inner_to_outer)
+
+        # After all dataflow edges are rewired through the library node, the
+        # scalar tasklet and inner-map nodes are dead and can be removed.
+        graph.remove_node(self.tasklet)
+        graph.remove_node(self.inner_map_entry)
+        graph.remove_node(self.inner_map_exit)
 
 
 class ScalarToTileCanonical(_ScalarToTileBase):
