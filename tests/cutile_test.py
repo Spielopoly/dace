@@ -225,7 +225,8 @@ def test_scalar_to_tile_add():
     # Exactly one library node
     lib_nodes = [n for n in state.nodes() if isinstance(n, nodes.LibraryNode)]
     assert len(lib_nodes) == 1
-    assert isinstance(lib_nodes[0], TileAddLibraryNode)
+    assert isinstance(lib_nodes[0], TileBinaryOpLibraryNode)
+    assert lib_nodes[0].op == "+"
 
     # Only the outer map remains (no inner map)
     map_entries = [n for n in state.nodes() if isinstance(n, nodes.MapEntry)]
@@ -258,7 +259,8 @@ def test_scalar_to_tile_add_same_input_operand():
     state = sdfg.states()[0]
     lib_nodes = [n for n in state.nodes() if isinstance(n, nodes.LibraryNode)]
     assert len(lib_nodes) == 1
-    assert isinstance(lib_nodes[0], TileAddLibraryNode)
+    assert isinstance(lib_nodes[0], TileBinaryOpLibraryNode)
+    assert lib_nodes[0].op == "+"
 
     lib_node = lib_nodes[0]
     in_edges = state.in_edges(lib_node)
@@ -412,7 +414,7 @@ def test_tileadd_runtime_numeric_correctness():
     a_read = state.add_read("A")
     b_read = state.add_read("B")
     c_write = state.add_write("C")
-    add_node = TileAddLibraryNode("tile_add_runtime_node")
+    add_node = TileBinaryOpLibraryNode("tile_add_runtime_node", op="+")
     state.add_node(add_node)
 
     state.add_edge(a_read, None, add_node, "_a", Memlet("A[0:3, 0:4]"))
@@ -786,7 +788,7 @@ def _make_direct_masked_add_sdfg(shape, name, dtype=dace.float64, mask_dtype=dac
     m_read = state.add_read("MASK")
     c_write = state.add_write("C")
 
-    op_node = TileRuntimeMaskedAddLibraryNode(name + "_node", tile_shape=node_tile_shape)
+    op_node = TileRuntimeMaskedBinaryOpLibraryNode(name + "_node", op="+", tile_shape=node_tile_shape)
     state.add_node(op_node)
 
     subset = ", ".join(f"0:{s}" for s in actual_shape)
@@ -850,7 +852,7 @@ _NDIM_SHAPES = {
 }
 
 
-def _make_direct_binary_sdfg(shape, node_class, name, tile_shape_override=None):
+def _make_direct_binary_sdfg(shape, name, op="+", tile_shape_override=None):
     """Build a single-state SDFG with one binary library node for a given tile shape.
 
     For shape=() (0-D), a 1-element 1-D backing array is used and tile_shape=[]
@@ -873,7 +875,7 @@ def _make_direct_binary_sdfg(shape, node_class, name, tile_shape_override=None):
     b_read = state.add_read("B")
     c_write = state.add_write("C")
 
-    op_node = node_class(name + "_node", tile_shape=node_tile_shape)
+    op_node = TileBinaryOpLibraryNode(name + "_node", op=op, tile_shape=node_tile_shape)
     state.add_node(op_node)
 
     subset = ", ".join(f"0:{s}" for s in actual_shape)
@@ -885,11 +887,11 @@ def _make_direct_binary_sdfg(shape, node_class, name, tile_shape_override=None):
     return sdfg, actual_shape
 
 
-def _run_direct_binary_op_test(shape, node_class, np_op, name,
+def _run_direct_binary_op_test(shape, np_op, name, op="+",
                                 tile_shape_override=None, seed=42,
                                 dtype=np.float64, atol=1e-12, rtol=1e-12):
     """Expand + execute a direct binary library node and verify against NumPy."""
-    sdfg, actual_shape = _make_direct_binary_sdfg(shape, node_class, name, tile_shape_override)
+    sdfg, actual_shape = _make_direct_binary_sdfg(shape, name, op=op, tile_shape_override=tile_shape_override)
     sdfg.expand_library_nodes()
     sdfg.validate()
 
@@ -918,7 +920,8 @@ def test_scalar_to_tile_subtract():
 
     lib_nodes = [n for n in state.nodes() if isinstance(n, nodes.LibraryNode)]
     assert len(lib_nodes) == 1
-    assert isinstance(lib_nodes[0], TileSubtractLibraryNode)
+    assert isinstance(lib_nodes[0], TileBinaryOpLibraryNode)
+    assert lib_nodes[0].op == "-"
 
     map_entries = [n for n in state.nodes() if isinstance(n, nodes.MapEntry)]
     assert len(map_entries) == 1, f"Expected 1 map entry, got {len(map_entries)}"
@@ -964,7 +967,8 @@ def test_subtract_structure_matches_expected():
             lib_node = n
 
     assert outer_entry is not None and outer_exit is not None and lib_node is not None
-    assert isinstance(lib_node, TileSubtractLibraryNode)
+    assert isinstance(lib_node, TileBinaryOpLibraryNode)
+    assert lib_node.op == "-"
 
     scope = state.scope_dict()
     assert scope[lib_node] == outer_entry
@@ -1002,7 +1006,7 @@ def test_tilesubtract_runtime_numeric_correctness():
     a_read = state.add_read("A")
     b_read = state.add_read("B")
     c_write = state.add_write("C")
-    sub_node = TileSubtractLibraryNode("tile_subtract_runtime_node")
+    sub_node = TileBinaryOpLibraryNode("tile_subtract_runtime_node", op="-")
     state.add_node(sub_node)
 
     state.add_edge(a_read, None, sub_node, "_a", Memlet("A[0:3, 0:4]"))
@@ -1078,56 +1082,56 @@ def test_pipeline_runtime_subtraction_float32():
 def test_tileadd_ndim_0():
     """TileAdd: 0-D expansion path (tile_shape=[]) on a 1-element array."""
     _run_direct_binary_op_test(
-        shape=_NDIM_SHAPES[0], node_class=TileAddLibraryNode, np_op=np.add,
-        name="tileadd_ndim0",
+        shape=_NDIM_SHAPES[0], np_op=np.add,
+        name="tileadd_ndim0", op="+",
     )
 
 
 def test_tileadd_ndim_1():
     """TileAdd with a 1-D tile of shape (16,)."""
     _run_direct_binary_op_test(
-        shape=_NDIM_SHAPES[1], node_class=TileAddLibraryNode, np_op=np.add,
-        name="tileadd_ndim1",
+        shape=_NDIM_SHAPES[1], np_op=np.add,
+        name="tileadd_ndim1", op="+",
     )
 
 
 def test_tileadd_ndim_2():
     """TileAdd with a 2-D tile of shape (4, 8)."""
     _run_direct_binary_op_test(
-        shape=_NDIM_SHAPES[2], node_class=TileAddLibraryNode, np_op=np.add,
-        name="tileadd_ndim2",
+        shape=_NDIM_SHAPES[2], np_op=np.add,
+        name="tileadd_ndim2", op="+",
     )
 
 
 def test_tileadd_ndim_3():
     """TileAdd with a 3-D tile of shape (3, 4, 5)."""
     _run_direct_binary_op_test(
-        shape=_NDIM_SHAPES[3], node_class=TileAddLibraryNode, np_op=np.add,
-        name="tileadd_ndim3",
+        shape=_NDIM_SHAPES[3], np_op=np.add,
+        name="tileadd_ndim3", op="+",
     )
 
 
 def test_tileadd_ndim_4():
     """TileAdd with a 4-D tile of shape (2, 3, 4, 5)."""
     _run_direct_binary_op_test(
-        shape=_NDIM_SHAPES[4], node_class=TileAddLibraryNode, np_op=np.add,
-        name="tileadd_ndim4",
+        shape=_NDIM_SHAPES[4], np_op=np.add,
+        name="tileadd_ndim4", op="+",
     )
 
 
 def test_tileadd_ndim_5():
     """TileAdd with a 5-D tile of shape (2, 2, 3, 4, 5)."""
     _run_direct_binary_op_test(
-        shape=_NDIM_SHAPES[5], node_class=TileAddLibraryNode, np_op=np.add,
-        name="tileadd_ndim5",
+        shape=_NDIM_SHAPES[5], np_op=np.add,
+        name="tileadd_ndim5", op="+",
     )
 
 
 def test_tileadd_ndim_6():
     """TileAdd with a 6-D tile of shape (2, 2, 2, 3, 4, 5)."""
     _run_direct_binary_op_test(
-        shape=_NDIM_SHAPES[6], node_class=TileAddLibraryNode, np_op=np.add,
-        name="tileadd_ndim6",
+        shape=_NDIM_SHAPES[6], np_op=np.add,
+        name="tileadd_ndim6", op="+",
     )
 
 
@@ -1138,56 +1142,56 @@ def test_tileadd_ndim_6():
 def test_tilesubtract_ndim_0():
     """TileSubtract: 0-D expansion path (tile_shape=[]) on a 1-element array."""
     _run_direct_binary_op_test(
-        shape=_NDIM_SHAPES[0], node_class=TileSubtractLibraryNode, np_op=np.subtract,
-        name="tilesubtract_ndim0",
+        shape=_NDIM_SHAPES[0], np_op=np.subtract,
+        name="tilesubtract_ndim0", op="-",
     )
 
 
 def test_tilesubtract_ndim_1():
     """TileSubtract with a 1-D tile of shape (16,)."""
     _run_direct_binary_op_test(
-        shape=_NDIM_SHAPES[1], node_class=TileSubtractLibraryNode, np_op=np.subtract,
-        name="tilesubtract_ndim1",
+        shape=_NDIM_SHAPES[1], np_op=np.subtract,
+        name="tilesubtract_ndim1", op="-",
     )
 
 
 def test_tilesubtract_ndim_2():
     """TileSubtract with a 2-D tile of shape (4, 8)."""
     _run_direct_binary_op_test(
-        shape=_NDIM_SHAPES[2], node_class=TileSubtractLibraryNode, np_op=np.subtract,
-        name="tilesubtract_ndim2",
+        shape=_NDIM_SHAPES[2], np_op=np.subtract,
+        name="tilesubtract_ndim2", op="-",
     )
 
 
 def test_tilesubtract_ndim_3():
     """TileSubtract with a 3-D tile of shape (3, 4, 5)."""
     _run_direct_binary_op_test(
-        shape=_NDIM_SHAPES[3], node_class=TileSubtractLibraryNode, np_op=np.subtract,
-        name="tilesubtract_ndim3",
+        shape=_NDIM_SHAPES[3], np_op=np.subtract,
+        name="tilesubtract_ndim3", op="-",
     )
 
 
 def test_tilesubtract_ndim_4():
     """TileSubtract with a 4-D tile of shape (2, 3, 4, 5)."""
     _run_direct_binary_op_test(
-        shape=_NDIM_SHAPES[4], node_class=TileSubtractLibraryNode, np_op=np.subtract,
-        name="tilesubtract_ndim4",
+        shape=_NDIM_SHAPES[4], np_op=np.subtract,
+        name="tilesubtract_ndim4", op="-",
     )
 
 
 def test_tilesubtract_ndim_5():
     """TileSubtract with a 5-D tile of shape (2, 2, 3, 4, 5)."""
     _run_direct_binary_op_test(
-        shape=_NDIM_SHAPES[5], node_class=TileSubtractLibraryNode, np_op=np.subtract,
-        name="tilesubtract_ndim5",
+        shape=_NDIM_SHAPES[5], np_op=np.subtract,
+        name="tilesubtract_ndim5", op="-",
     )
 
 
 def test_tilesubtract_ndim_6():
     """TileSubtract with a 6-D tile of shape (2, 2, 2, 3, 4, 5)."""
     _run_direct_binary_op_test(
-        shape=_NDIM_SHAPES[6], node_class=TileSubtractLibraryNode, np_op=np.subtract,
-        name="tilesubtract_ndim6",
+        shape=_NDIM_SHAPES[6], np_op=np.subtract,
+        name="tilesubtract_ndim6", op="-",
     )
 
 
@@ -1207,7 +1211,7 @@ def test_subtract_self_gives_zero():
     a_read_2 = state.add_read("A")
     c_write = state.add_write("C")
 
-    sub_node = TileSubtractLibraryNode("sub_self")
+    sub_node = TileBinaryOpLibraryNode("sub_self", op="-")
     state.add_node(sub_node)
     state.add_edge(a_read_1, None, sub_node, "_a", Memlet("A[0:5, 0:6]"))
     state.add_edge(a_read_2, None, sub_node, "_b", Memlet("A[0:5, 0:6]"))
@@ -1238,7 +1242,7 @@ def test_add_subtract_roundtrip():
     sdfg_add.add_array("B", shape=shape, dtype=dace.float64)
     sdfg_add.add_array("T", shape=shape, dtype=dace.float64)
     st = sdfg_add.add_state()
-    add_node = TileAddLibraryNode("add_rt_node")
+    add_node = TileBinaryOpLibraryNode("add_rt_node", op="+")
     st.add_node(add_node)
     st.add_edge(st.add_read("A"), None, add_node, "_a", Memlet("A[0:6, 0:7]"))
     st.add_edge(st.add_read("B"), None, add_node, "_b", Memlet("B[0:6, 0:7]"))
@@ -1253,7 +1257,7 @@ def test_add_subtract_roundtrip():
     sdfg_sub.add_array("B", shape=shape, dtype=dace.float64)
     sdfg_sub.add_array("O", shape=shape, dtype=dace.float64)
     st2 = sdfg_sub.add_state()
-    sub_node = TileSubtractLibraryNode("sub_rt_node")
+    sub_node = TileBinaryOpLibraryNode("sub_rt_node", op="-")
     st2.add_node(sub_node)
     st2.add_edge(st2.add_read("T"), None, sub_node, "_a", Memlet("T[0:6, 0:7]"))
     st2.add_edge(st2.add_read("B"), None, sub_node, "_b", Memlet("B[0:6, 0:7]"))
@@ -1268,7 +1272,7 @@ def test_add_subtract_roundtrip():
 def test_add_zero_identity():
     """A + zeros must equal A exactly."""
     shape = [8, 8]
-    sdfg, actual_shape = _make_direct_binary_sdfg(shape, TileAddLibraryNode, "add_zero_identity")
+    sdfg, actual_shape = _make_direct_binary_sdfg(shape, "add_zero_identity", op="+")
     sdfg.expand_library_nodes()
 
     rng = np.random.default_rng(33)
@@ -1283,7 +1287,7 @@ def test_add_zero_identity():
 def test_subtract_zero_identity():
     """A - zeros must equal A exactly."""
     shape = [8, 8]
-    sdfg, actual_shape = _make_direct_binary_sdfg(shape, TileSubtractLibraryNode, "sub_zero_identity")
+    sdfg, actual_shape = _make_direct_binary_sdfg(shape, "sub_zero_identity", op="-")
     sdfg.expand_library_nodes()
 
     rng = np.random.default_rng(44)
@@ -1298,7 +1302,7 @@ def test_subtract_zero_identity():
 def test_tilesubtract_negative_result():
     """TileSubtract produces correct negative values when a < 0 and b > 0."""
     shape = [4, 5]
-    sdfg, actual_shape = _make_direct_binary_sdfg(shape, TileSubtractLibraryNode, "sub_negative")
+    sdfg, actual_shape = _make_direct_binary_sdfg(shape, "sub_negative", op="-")
     sdfg.expand_library_nodes()
 
     rng = np.random.default_rng(55)
@@ -1314,16 +1318,16 @@ def test_tilesubtract_negative_result():
 def test_large_tile_subtract():
     """TileSubtract on a large 2-D tile (64 × 128)."""
     _run_direct_binary_op_test(
-        shape=[64, 128], node_class=TileSubtractLibraryNode, np_op=np.subtract,
-        name="sub_large_tile", seed=66,
+        shape=[64, 128], np_op=np.subtract,
+        name="sub_large_tile", op="-", seed=66,
     )
 
 
 def test_large_tile_add():
     """TileAdd on a large 2-D tile (64 × 128)."""
     _run_direct_binary_op_test(
-        shape=[64, 128], node_class=TileAddLibraryNode, np_op=np.add,
-        name="add_large_tile", seed=77,
+        shape=[64, 128], np_op=np.add,
+        name="add_large_tile", op="+", seed=77,
     )
 
 
@@ -1336,7 +1340,7 @@ def test_tileadd_int32_dtype():
     sdfg.add_array("C", shape=shape, dtype=dace.int32)
 
     state = sdfg.add_state("main")
-    add_node = TileAddLibraryNode("add_int32")
+    add_node = TileBinaryOpLibraryNode("add_int32", op="+")
     state.add_node(add_node)
     state.add_edge(state.add_read("A"), None, add_node, "_a", Memlet("A[0:5, 0:6]"))
     state.add_edge(state.add_read("B"), None, add_node, "_b", Memlet("B[0:5, 0:6]"))
@@ -1364,7 +1368,7 @@ def test_tilesubtract_int32_dtype():
     sdfg.add_array("C", shape=shape, dtype=dace.int32)
 
     state = sdfg.add_state("main")
-    sub_node = TileSubtractLibraryNode("sub_int32")
+    sub_node = TileBinaryOpLibraryNode("sub_int32", op="-")
     state.add_node(sub_node)
     state.add_edge(state.add_read("A"), None, sub_node, "_a", Memlet("A[0:5, 0:6]"))
     state.add_edge(state.add_read("B"), None, sub_node, "_b", Memlet("B[0:5, 0:6]"))
@@ -1564,7 +1568,8 @@ def test_noncanonical_add_transforms_to_masked_node_and_contiguous_memlets():
     state = sdfg.states()[0]
     lib_nodes = [n for n in state.nodes() if isinstance(n, nodes.LibraryNode)]
     assert len(lib_nodes) == 1
-    assert isinstance(lib_nodes[0], TileRuntimeMaskedAddLibraryNode)
+    assert isinstance(lib_nodes[0], TileRuntimeMaskedBinaryOpLibraryNode)
+    assert lib_nodes[0].op == "+"
 
     transient_names = {name for name, desc in sdfg.arrays.items() if desc.transient}
     assert any(name.startswith("map_mask_tile") for name in transient_names)
@@ -1615,7 +1620,8 @@ def test_noncanonical_subtract_runtime_numeric_correctness_negative_step():
     state = sdfg.states()[0]
     lib_nodes = [n for n in state.nodes() if isinstance(n, nodes.LibraryNode)]
     assert len(lib_nodes) == 1
-    assert isinstance(lib_nodes[0], TileRuntimeMaskedSubtractLibraryNode)
+    assert isinstance(lib_nodes[0], TileRuntimeMaskedBinaryOpLibraryNode)
+    assert lib_nodes[0].op == "-"
 
     sdfg.expand_library_nodes()
     sdfg.validate()
@@ -1772,7 +1778,7 @@ def test_tilemaskedadd_validate_rejects_mask_shape_mismatch():
     sdfg.add_array("C", shape=[4, 4], dtype=dace.float64)
 
     state = sdfg.add_state("main")
-    node = TileRuntimeMaskedAddLibraryNode("bad_shape")
+    node = TileRuntimeMaskedBinaryOpLibraryNode("bad_shape", op="+")
     state.add_node(node)
     state.add_edge(state.add_read("A"), None, node, "_a", Memlet("A[0:4, 0:4]"))
     state.add_edge(state.add_read("B"), None, node, "_b", Memlet("B[0:4, 0:4]"))
@@ -1792,7 +1798,7 @@ def test_tilemaskedadd_validate_rejects_non_integer_mask_dtype():
     sdfg.add_array("C", shape=[4, 4], dtype=dace.float64)
 
     state = sdfg.add_state("main")
-    node = TileRuntimeMaskedAddLibraryNode("bad_dtype")
+    node = TileRuntimeMaskedBinaryOpLibraryNode("bad_dtype", op="+")
     state.add_node(node)
     state.add_edge(state.add_read("A"), None, node, "_a", Memlet("A[0:4, 0:4]"))
     state.add_edge(state.add_read("B"), None, node, "_b", Memlet("B[0:4, 0:4]"))
@@ -1801,6 +1807,808 @@ def test_tilemaskedadd_validate_rejects_non_integer_mask_dtype():
 
     with pytest.raises(Exception):
         sdfg.validate()
+
+
+# ---------------------------------------------------------------------------
+# Multiply and Divide tests (new binary ops)
+# ---------------------------------------------------------------------------
+
+def test_tilemultiply_runtime_numeric_correctness():
+    """Execute TileMultiply directly and compare against NumPy multiplication."""
+    sdfg = SDFG("tile_multiply_runtime")
+    sdfg.add_array("A", shape=[3, 4], dtype=dace.float64)
+    sdfg.add_array("B", shape=[3, 4], dtype=dace.float64)
+    sdfg.add_array("C", shape=[3, 4], dtype=dace.float64)
+
+    state = sdfg.add_state("main")
+    a_read = state.add_read("A")
+    b_read = state.add_read("B")
+    c_write = state.add_write("C")
+    mul_node = TileBinaryOpLibraryNode("tile_multiply_runtime_node", op="*")
+    state.add_node(mul_node)
+
+    state.add_edge(a_read, None, mul_node, "_a", Memlet("A[0:3, 0:4]"))
+    state.add_edge(b_read, None, mul_node, "_b", Memlet("B[0:3, 0:4]"))
+    state.add_edge(mul_node, "_c", c_write, None, Memlet("C[0:3, 0:4]"))
+
+    sdfg.validate()
+    sdfg.expand_library_nodes()
+    sdfg.validate()
+
+    rng = np.random.default_rng(3001)
+    a = rng.standard_normal((3, 4), dtype=np.float64)
+    b = rng.standard_normal((3, 4), dtype=np.float64)
+    c = np.zeros((3, 4), dtype=np.float64)
+
+    sdfg(A=a, B=b, C=c)
+    np.testing.assert_allclose(c, a * b, rtol=0.0, atol=1e-12)
+
+
+def test_tiledivide_runtime_numeric_correctness():
+    """Execute TileDivide directly and compare against NumPy division."""
+    sdfg = SDFG("tile_divide_runtime")
+    sdfg.add_array("A", shape=[3, 4], dtype=dace.float64)
+    sdfg.add_array("B", shape=[3, 4], dtype=dace.float64)
+    sdfg.add_array("C", shape=[3, 4], dtype=dace.float64)
+
+    state = sdfg.add_state("main")
+    a_read = state.add_read("A")
+    b_read = state.add_read("B")
+    c_write = state.add_write("C")
+    div_node = TileBinaryOpLibraryNode("tile_divide_runtime_node", op="/")
+    state.add_node(div_node)
+
+    state.add_edge(a_read, None, div_node, "_a", Memlet("A[0:3, 0:4]"))
+    state.add_edge(b_read, None, div_node, "_b", Memlet("B[0:3, 0:4]"))
+    state.add_edge(div_node, "_c", c_write, None, Memlet("C[0:3, 0:4]"))
+
+    sdfg.validate()
+    sdfg.expand_library_nodes()
+    sdfg.validate()
+
+    rng = np.random.default_rng(3002)
+    a = rng.standard_normal((3, 4), dtype=np.float64)
+    # Avoid near-zero denominators
+    b = rng.uniform(1.0, 10.0, size=(3, 4)).astype(np.float64)
+    c = np.zeros((3, 4), dtype=np.float64)
+
+    sdfg(A=a, B=b, C=c)
+    np.testing.assert_allclose(c, a / b, rtol=1e-12, atol=1e-12)
+
+
+def test_tilemultiply_ndim_2():
+    """TileMultiply with a 2-D tile of shape (4, 8)."""
+    _run_direct_binary_op_test(
+        shape=_NDIM_SHAPES[2], np_op=np.multiply,
+        name="tilemultiply_ndim2", op="*",
+    )
+
+
+def test_tiledivide_ndim_2():
+    """TileDivide with a 2-D tile (avoid near-zero denominator)."""
+    shape = [4, 8]
+    sdfg, actual_shape = _make_direct_binary_sdfg(shape, "tiledivide_ndim2", op="/")
+    sdfg.expand_library_nodes()
+    sdfg.validate()
+
+    rng = np.random.default_rng(3003)
+    a = rng.uniform(-10.0, 10.0, size=actual_shape).astype(np.float64)
+    b = rng.uniform(0.5, 5.0, size=actual_shape).astype(np.float64)
+    c = np.zeros(actual_shape, dtype=np.float64)
+
+    sdfg(A=a, B=b, C=c)
+    np.testing.assert_allclose(c, a / b, rtol=1e-12, atol=1e-12)
+
+
+def test_pipeline_multiply_transforms_correctly():
+    """Pipeline multiply SDFG → TileBinaryOpLibraryNode with op='*'."""
+    mt, nt, t0, t1 = 2, 3, 2, 2
+    sdfg = SDFG("tile_multiply_pipeline")
+    sdfg.add_array("A", shape=[mt, nt, t0, t1], dtype=dace.float64)
+    sdfg.add_array("B", shape=[mt, nt, t0, t1], dtype=dace.float64)
+    sdfg.add_array("C", shape=[mt, nt, t0, t1], dtype=dace.float64)
+
+    state = sdfg.add_state("main")
+    a_acc = state.add_read("A")
+    b_acc = state.add_read("B")
+    c_acc = state.add_write("C")
+
+    outer_entry, outer_exit = state.add_map(
+        "tile_map", {"i": f"0:{mt}", "j": f"0:{nt}"},
+        schedule=dtypes.ScheduleType.Sequential,
+    )
+    inner_entry, inner_exit = state.add_map(
+        "elem_map", {"ii": f"0:{t0}", "jj": f"0:{t1}"},
+        schedule=dtypes.ScheduleType.Sequential,
+    )
+    tasklet = state.add_tasklet("multiply", {"a", "b"}, {"c"}, "c = a * b")
+
+    state.add_memlet_path(a_acc, outer_entry, inner_entry, tasklet,
+                          dst_conn="a", memlet=Memlet("A[i, j, ii, jj]"))
+    state.add_memlet_path(b_acc, outer_entry, inner_entry, tasklet,
+                          dst_conn="b", memlet=Memlet("B[i, j, ii, jj]"))
+    state.add_memlet_path(tasklet, inner_exit, outer_exit, c_acc,
+                          src_conn="c", memlet=Memlet("C[i, j, ii, jj]"))
+    sdfg.validate()
+
+    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_tiling=False)
+    assert count == 1
+
+    state = sdfg.states()[0]
+    lib_nodes = [n for n in state.nodes() if isinstance(n, nodes.LibraryNode)]
+    assert len(lib_nodes) == 1
+    assert isinstance(lib_nodes[0], TileBinaryOpLibraryNode)
+    assert lib_nodes[0].op == "*"
+
+    sdfg.expand_library_nodes()
+    sdfg.validate()
+
+    shape = (mt, nt, t0, t1)
+    rng = np.random.default_rng(3004)
+    a = rng.uniform(-5.0, 5.0, size=shape).astype(np.float64)
+    b = rng.uniform(-5.0, 5.0, size=shape).astype(np.float64)
+    c = np.zeros(shape, dtype=np.float64)
+
+    sdfg(A=a, B=b, C=c)
+    np.testing.assert_allclose(c, a * b, rtol=0.0, atol=1e-12)
+
+
+# ---------------------------------------------------------------------------
+# Unary operation tests (new)
+# ---------------------------------------------------------------------------
+
+def _make_direct_unary_sdfg(shape, name, op="-", tile_shape_override=None):
+    """Build a single-state SDFG with one unary library node."""
+    if not shape:
+        actual_shape = [1]
+        node_tile_shape = [] if tile_shape_override is None else tile_shape_override
+    else:
+        actual_shape = list(shape)
+        node_tile_shape = tile_shape_override
+
+    sdfg = SDFG(name)
+    sdfg.add_array("A", shape=actual_shape, dtype=dace.float64)
+    sdfg.add_array("C", shape=actual_shape, dtype=dace.float64)
+
+    state = sdfg.add_state("main")
+    a_read = state.add_read("A")
+    c_write = state.add_write("C")
+
+    op_node = TileUnaryOpLibraryNode(name + "_node", op=op, tile_shape=node_tile_shape)
+    state.add_node(op_node)
+
+    subset = ", ".join(f"0:{s}" for s in actual_shape)
+    state.add_edge(a_read, None, op_node, "_a", Memlet(f"A[{subset}]"))
+    state.add_edge(op_node, "_c", c_write, None, Memlet(f"C[{subset}]"))
+
+    sdfg.validate()
+    return sdfg, actual_shape
+
+
+def test_unary_negate_runtime_numeric_correctness():
+    """Execute TileUnaryOp (negate) directly and compare against NumPy."""
+    sdfg, actual_shape = _make_direct_unary_sdfg([5, 6], "tile_negate_runtime")
+    sdfg.expand_library_nodes()
+    sdfg.validate()
+
+    rng = np.random.default_rng(4001)
+    a = rng.uniform(-10.0, 10.0, size=actual_shape).astype(np.float64)
+    c = np.zeros(actual_shape, dtype=np.float64)
+
+    sdfg(A=a, C=c)
+    np.testing.assert_allclose(c, -a, rtol=0.0, atol=1e-12)
+
+
+def test_unary_negate_0d():
+    """TileUnaryOp negate: 0-D expansion path."""
+    sdfg, actual_shape = _make_direct_unary_sdfg((), "tile_negate_0d")
+    sdfg.expand_library_nodes()
+    sdfg.validate()
+
+    rng = np.random.default_rng(4002)
+    a = rng.uniform(-10.0, 10.0, size=actual_shape).astype(np.float64)
+    c = np.zeros(actual_shape, dtype=np.float64)
+
+    sdfg(A=a, C=c)
+    np.testing.assert_allclose(c, -a, rtol=0.0, atol=1e-12)
+
+
+def test_unary_negate_4d():
+    """TileUnaryOp negate with a 4-D tile."""
+    sdfg, actual_shape = _make_direct_unary_sdfg([2, 3, 4, 5], "tile_negate_4d")
+    sdfg.expand_library_nodes()
+    sdfg.validate()
+
+    rng = np.random.default_rng(4003)
+    a = rng.uniform(-10.0, 10.0, size=actual_shape).astype(np.float64)
+    c = np.zeros(actual_shape, dtype=np.float64)
+
+    sdfg(A=a, C=c)
+    np.testing.assert_allclose(c, -a, rtol=0.0, atol=1e-12)
+
+
+def test_pipeline_unary_negate_transforms_correctly():
+    """Pipeline unary negate: c = -a → TileUnaryOpLibraryNode with op='-'."""
+    mt, nt, t0, t1 = 2, 3, 2, 2
+    sdfg = SDFG("tile_negate_pipeline")
+    sdfg.add_array("A", shape=[mt, nt, t0, t1], dtype=dace.float64)
+    sdfg.add_array("C", shape=[mt, nt, t0, t1], dtype=dace.float64)
+
+    state = sdfg.add_state("main")
+    a_acc = state.add_read("A")
+    c_acc = state.add_write("C")
+
+    outer_entry, outer_exit = state.add_map(
+        "tile_map", {"i": f"0:{mt}", "j": f"0:{nt}"},
+        schedule=dtypes.ScheduleType.Sequential,
+    )
+    inner_entry, inner_exit = state.add_map(
+        "elem_map", {"ii": f"0:{t0}", "jj": f"0:{t1}"},
+        schedule=dtypes.ScheduleType.Sequential,
+    )
+    tasklet = state.add_tasklet("negate", {"a"}, {"c"}, "c = -a")
+
+    state.add_memlet_path(a_acc, outer_entry, inner_entry, tasklet,
+                          dst_conn="a", memlet=Memlet("A[i, j, ii, jj]"))
+    state.add_memlet_path(tasklet, inner_exit, outer_exit, c_acc,
+                          src_conn="c", memlet=Memlet("C[i, j, ii, jj]"))
+    sdfg.validate()
+
+    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_tiling=False)
+    assert count == 1
+
+    state = sdfg.states()[0]
+    lib_nodes = [n for n in state.nodes() if isinstance(n, nodes.LibraryNode)]
+    assert len(lib_nodes) == 1
+    assert isinstance(lib_nodes[0], TileUnaryOpLibraryNode)
+    assert lib_nodes[0].op == "-"
+
+    sdfg.expand_library_nodes()
+    sdfg.validate()
+
+    shape = (mt, nt, t0, t1)
+    rng = np.random.default_rng(4004)
+    a = rng.uniform(-5.0, 5.0, size=shape).astype(np.float64)
+    c = np.zeros(shape, dtype=np.float64)
+
+    sdfg(A=a, C=c)
+    np.testing.assert_allclose(c, -a, rtol=0.0, atol=1e-12)
+
+
+# ---------------------------------------------------------------------------
+# Constant binary operation tests (new)
+# ---------------------------------------------------------------------------
+
+def _make_direct_const_binary_sdfg(shape, name, op="+", constant="2",
+                                    constant_position="right",
+                                    tile_shape_override=None,
+                                    dtype=dace.float64):
+    """Build SDFG with one const-binary library node."""
+    if not shape:
+        actual_shape = [1]
+        node_tile_shape = [] if tile_shape_override is None else tile_shape_override
+    else:
+        actual_shape = list(shape)
+        node_tile_shape = tile_shape_override
+
+    sdfg = SDFG(name)
+    sdfg.add_array("A", shape=actual_shape, dtype=dtype)
+    sdfg.add_array("C", shape=actual_shape, dtype=dtype)
+
+    state = sdfg.add_state("main")
+    a_read = state.add_read("A")
+    c_write = state.add_write("C")
+
+    op_node = TileBinaryOpLibraryNode(
+        name + "_node", op=op, constant=constant,
+        constant_position=constant_position, tile_shape=node_tile_shape)
+    state.add_node(op_node)
+
+    subset = ", ".join(f"0:{s}" for s in actual_shape)
+    state.add_edge(a_read, None, op_node, "_a", Memlet(f"A[{subset}]"))
+    state.add_edge(op_node, "_c", c_write, None, Memlet(f"C[{subset}]"))
+
+    sdfg.validate()
+    return sdfg, actual_shape
+
+
+def test_const_add_right_runtime():
+    """c = a + 2 → TileConstBinaryOp with constant on right."""
+    sdfg, actual_shape = _make_direct_const_binary_sdfg(
+        [4, 5], "const_add_right", op="+", constant="2", constant_position="right")
+    sdfg.expand_library_nodes()
+    sdfg.validate()
+
+    rng = np.random.default_rng(5001)
+    a = rng.uniform(-10.0, 10.0, size=actual_shape).astype(np.float64)
+    c = np.zeros(actual_shape, dtype=np.float64)
+
+    sdfg(A=a, C=c)
+    np.testing.assert_allclose(c, a + 2, rtol=0.0, atol=1e-12)
+
+
+def test_const_add_left_runtime():
+    """c = 3 + a → TileConstBinaryOp with constant on left."""
+    sdfg, actual_shape = _make_direct_const_binary_sdfg(
+        [4, 5], "const_add_left", op="+", constant="3", constant_position="left")
+    sdfg.expand_library_nodes()
+    sdfg.validate()
+
+    rng = np.random.default_rng(5002)
+    a = rng.uniform(-10.0, 10.0, size=actual_shape).astype(np.float64)
+    c = np.zeros(actual_shape, dtype=np.float64)
+
+    sdfg(A=a, C=c)
+    np.testing.assert_allclose(c, 3 + a, rtol=0.0, atol=1e-12)
+
+
+def test_const_subtract_right_runtime():
+    """c = a - 5 → TileConstBinaryOp(op='-', constant='5', position='right')."""
+    sdfg, actual_shape = _make_direct_const_binary_sdfg(
+        [3, 7], "const_sub_right", op="-", constant="5", constant_position="right")
+    sdfg.expand_library_nodes()
+    sdfg.validate()
+
+    rng = np.random.default_rng(5003)
+    a = rng.uniform(-10.0, 10.0, size=actual_shape).astype(np.float64)
+    c = np.zeros(actual_shape, dtype=np.float64)
+
+    sdfg(A=a, C=c)
+    np.testing.assert_allclose(c, a - 5, rtol=0.0, atol=1e-12)
+
+
+def test_const_subtract_left_runtime():
+    """c = 10 - a → TileConstBinaryOp(op='-', constant='10', position='left')."""
+    sdfg, actual_shape = _make_direct_const_binary_sdfg(
+        [3, 7], "const_sub_left", op="-", constant="10", constant_position="left")
+    sdfg.expand_library_nodes()
+    sdfg.validate()
+
+    rng = np.random.default_rng(5004)
+    a = rng.uniform(-10.0, 10.0, size=actual_shape).astype(np.float64)
+    c = np.zeros(actual_shape, dtype=np.float64)
+
+    sdfg(A=a, C=c)
+    np.testing.assert_allclose(c, 10 - a, rtol=0.0, atol=1e-12)
+
+
+def test_const_multiply_right_runtime():
+    """c = a * 3 → TileConstBinaryOp(op='*', constant='3', position='right')."""
+    sdfg, actual_shape = _make_direct_const_binary_sdfg(
+        [4, 6], "const_mul_right", op="*", constant="3", constant_position="right")
+    sdfg.expand_library_nodes()
+    sdfg.validate()
+
+    rng = np.random.default_rng(5005)
+    a = rng.uniform(-10.0, 10.0, size=actual_shape).astype(np.float64)
+    c = np.zeros(actual_shape, dtype=np.float64)
+
+    sdfg(A=a, C=c)
+    np.testing.assert_allclose(c, a * 3, rtol=0.0, atol=1e-12)
+
+
+def test_const_divide_right_runtime():
+    """c = a / 4 → TileConstBinaryOp(op='/', constant='4', position='right')."""
+    sdfg, actual_shape = _make_direct_const_binary_sdfg(
+        [4, 6], "const_div_right", op="/", constant="4", constant_position="right")
+    sdfg.expand_library_nodes()
+    sdfg.validate()
+
+    rng = np.random.default_rng(5006)
+    a = rng.uniform(-10.0, 10.0, size=actual_shape).astype(np.float64)
+    c = np.zeros(actual_shape, dtype=np.float64)
+
+    sdfg(A=a, C=c)
+    np.testing.assert_allclose(c, a / 4, rtol=1e-12, atol=1e-12)
+
+
+def test_const_binary_0d():
+    """TileConstBinaryOp: 0-D tile path on single-element array."""
+    sdfg, actual_shape = _make_direct_const_binary_sdfg(
+        (), "const_add_0d", op="+", constant="7", constant_position="right")
+    sdfg.expand_library_nodes()
+    sdfg.validate()
+
+    a = np.array([3.0], dtype=np.float64)
+    c = np.zeros([1], dtype=np.float64)
+
+    sdfg(A=a, C=c)
+    np.testing.assert_allclose(c, a + 7, rtol=0.0, atol=1e-12)
+
+
+def test_pipeline_const_add_right_transforms_correctly():
+    """Pipeline c = a + 2 → TileConstBinaryOpLibraryNode."""
+    mt, nt, t0, t1 = 2, 3, 2, 2
+    sdfg = SDFG("tile_const_add_pipeline")
+    sdfg.add_array("A", shape=[mt, nt, t0, t1], dtype=dace.float64)
+    sdfg.add_array("C", shape=[mt, nt, t0, t1], dtype=dace.float64)
+
+    state = sdfg.add_state("main")
+    a_acc = state.add_read("A")
+    c_acc = state.add_write("C")
+
+    outer_entry, outer_exit = state.add_map(
+        "tile_map", {"i": f"0:{mt}", "j": f"0:{nt}"},
+        schedule=dtypes.ScheduleType.Sequential,
+    )
+    inner_entry, inner_exit = state.add_map(
+        "elem_map", {"ii": f"0:{t0}", "jj": f"0:{t1}"},
+        schedule=dtypes.ScheduleType.Sequential,
+    )
+    tasklet = state.add_tasklet("const_add", {"a"}, {"c"}, "c = a + 2")
+
+    state.add_memlet_path(a_acc, outer_entry, inner_entry, tasklet,
+                          dst_conn="a", memlet=Memlet("A[i, j, ii, jj]"))
+    state.add_memlet_path(tasklet, inner_exit, outer_exit, c_acc,
+                          src_conn="c", memlet=Memlet("C[i, j, ii, jj]"))
+    sdfg.validate()
+
+    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_tiling=False)
+    assert count == 1
+
+    state = sdfg.states()[0]
+    lib_nodes = [n for n in state.nodes() if isinstance(n, nodes.LibraryNode)]
+    assert len(lib_nodes) == 1
+    assert isinstance(lib_nodes[0], TileBinaryOpLibraryNode)
+    assert lib_nodes[0].op == "+"
+    assert lib_nodes[0].constant == "2"
+    assert lib_nodes[0].constant_position == "right"
+
+    sdfg.expand_library_nodes()
+    sdfg.validate()
+
+    shape = (mt, nt, t0, t1)
+    rng = np.random.default_rng(5007)
+    a = rng.uniform(-5.0, 5.0, size=shape).astype(np.float64)
+    c = np.zeros(shape, dtype=np.float64)
+
+    sdfg(A=a, C=c)
+    np.testing.assert_allclose(c, a + 2, rtol=0.0, atol=1e-12)
+
+
+def test_pipeline_const_left_multiply_transforms_correctly():
+    """Pipeline c = 3 * a → TileConstBinaryOpLibraryNode with constant on left."""
+    mt, nt, t0, t1 = 2, 3, 2, 2
+    sdfg = SDFG("tile_const_lmul_pipeline")
+    sdfg.add_array("A", shape=[mt, nt, t0, t1], dtype=dace.float64)
+    sdfg.add_array("C", shape=[mt, nt, t0, t1], dtype=dace.float64)
+
+    state = sdfg.add_state("main")
+    a_acc = state.add_read("A")
+    c_acc = state.add_write("C")
+
+    outer_entry, outer_exit = state.add_map(
+        "tile_map", {"i": f"0:{mt}", "j": f"0:{nt}"},
+        schedule=dtypes.ScheduleType.Sequential,
+    )
+    inner_entry, inner_exit = state.add_map(
+        "elem_map", {"ii": f"0:{t0}", "jj": f"0:{t1}"},
+        schedule=dtypes.ScheduleType.Sequential,
+    )
+    tasklet = state.add_tasklet("const_lmul", {"a"}, {"c"}, "c = 3 * a")
+
+    state.add_memlet_path(a_acc, outer_entry, inner_entry, tasklet,
+                          dst_conn="a", memlet=Memlet("A[i, j, ii, jj]"))
+    state.add_memlet_path(tasklet, inner_exit, outer_exit, c_acc,
+                          src_conn="c", memlet=Memlet("C[i, j, ii, jj]"))
+    sdfg.validate()
+
+    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_tiling=False)
+    assert count == 1
+
+    state = sdfg.states()[0]
+    lib_nodes = [n for n in state.nodes() if isinstance(n, nodes.LibraryNode)]
+    assert len(lib_nodes) == 1
+    assert isinstance(lib_nodes[0], TileBinaryOpLibraryNode)
+    assert lib_nodes[0].op == "*"
+    assert lib_nodes[0].constant == "3"
+    assert lib_nodes[0].constant_position == "left"
+
+    sdfg.expand_library_nodes()
+    sdfg.validate()
+
+    shape = (mt, nt, t0, t1)
+    rng = np.random.default_rng(5008)
+    a = rng.uniform(-5.0, 5.0, size=shape).astype(np.float64)
+    c = np.zeros(shape, dtype=np.float64)
+
+    sdfg(A=a, C=c)
+    np.testing.assert_allclose(c, 3 * a, rtol=0.0, atol=1e-12)
+
+
+# ---------------------------------------------------------------------------
+# Masked unary and masked const tests (new)
+# ---------------------------------------------------------------------------
+
+def _make_direct_masked_unary_sdfg(shape, name, op="-", mask_dtype=dace.bool,
+                                    tile_shape_override=None):
+    """Build SDFG with one masked unary library node."""
+    if not shape:
+        actual_shape = [1]
+        node_tile_shape = [] if tile_shape_override is None else tile_shape_override
+    else:
+        actual_shape = list(shape)
+        node_tile_shape = tile_shape_override
+
+    sdfg = SDFG(name)
+    sdfg.add_array("A", shape=actual_shape, dtype=dace.float64)
+    sdfg.add_array("MASK", shape=actual_shape, dtype=mask_dtype)
+    sdfg.add_array("C", shape=actual_shape, dtype=dace.float64)
+
+    state = sdfg.add_state("main")
+    a_read = state.add_read("A")
+    m_read = state.add_read("MASK")
+    c_write = state.add_write("C")
+
+    op_node = TileRuntimeMaskedUnaryOpLibraryNode(
+        name + "_node", op=op, tile_shape=node_tile_shape)
+    state.add_node(op_node)
+
+    subset = ", ".join(f"0:{s}" for s in actual_shape)
+    state.add_edge(a_read, None, op_node, "_a", Memlet(f"A[{subset}]"))
+    state.add_edge(m_read, None, op_node, "_m", Memlet(f"MASK[{subset}]"))
+    state.add_edge(op_node, "_c", c_write, None, Memlet(f"C[{subset}]"))
+
+    sdfg.validate()
+    return sdfg, actual_shape
+
+
+def test_masked_unary_negate_runtime():
+    """Masked negate: only negates where mask is True."""
+    sdfg, actual_shape = _make_direct_masked_unary_sdfg([4, 5], "masked_negate")
+    sdfg.expand_library_nodes()
+    sdfg.validate()
+
+    rng = np.random.default_rng(6001)
+    a = rng.uniform(-10.0, 10.0, size=actual_shape).astype(np.float64)
+    mask = rng.integers(0, 2, size=actual_shape).astype(np.bool_)
+    c = np.full(actual_shape, 99.0, dtype=np.float64)
+
+    expected = c.copy()
+    expected[mask] = (-a)[mask]
+
+    sdfg(A=a, MASK=mask, C=c)
+    np.testing.assert_allclose(c, expected, rtol=0.0, atol=1e-12)
+
+
+def test_masked_const_add_right_runtime():
+    """Masked c = a + 2: only applies where mask is True."""
+    shape = [4, 5]
+    sdfg = SDFG("masked_const_add_right")
+    sdfg.add_array("A", shape=shape, dtype=dace.float64)
+    sdfg.add_array("MASK", shape=shape, dtype=dace.bool)
+    sdfg.add_array("C", shape=shape, dtype=dace.float64)
+
+    state = sdfg.add_state("main")
+    a_read = state.add_read("A")
+    m_read = state.add_read("MASK")
+    c_write = state.add_write("C")
+
+    op_node = TileRuntimeMaskedBinaryOpLibraryNode(
+        "masked_const_add_node", op="+", constant="2", constant_position="right")
+    state.add_node(op_node)
+
+    state.add_edge(a_read, None, op_node, "_a", Memlet("A[0:4, 0:5]"))
+    state.add_edge(m_read, None, op_node, "_m", Memlet("MASK[0:4, 0:5]"))
+    state.add_edge(op_node, "_c", c_write, None, Memlet("C[0:4, 0:5]"))
+
+    sdfg.validate()
+    sdfg.expand_library_nodes()
+    sdfg.validate()
+
+    rng = np.random.default_rng(6002)
+    a = rng.uniform(-10.0, 10.0, size=shape).astype(np.float64)
+    mask = rng.integers(0, 2, size=shape).astype(np.bool_)
+    c = np.full(shape, -7.0, dtype=np.float64)
+
+    expected = c.copy()
+    expected[mask] = (a + 2)[mask]
+
+    sdfg(A=a, MASK=mask, C=c)
+    np.testing.assert_allclose(c, expected, rtol=0.0, atol=1e-12)
+
+
+# ---------------------------------------------------------------------------
+# Function-style unary ops (sin, abs, exp, sqrt, log)
+# ---------------------------------------------------------------------------
+
+def _make_direct_unary_func_sdfg(shape, name, op="sin", tile_shape_override=None,
+                                  dtype=dace.float64):
+    """Build SDFG with one function-style unary library node."""
+    if not shape:
+        actual_shape = [1]
+        node_tile_shape = [] if tile_shape_override is None else tile_shape_override
+    else:
+        actual_shape = list(shape)
+        node_tile_shape = tile_shape_override
+
+    sdfg = SDFG(name)
+    sdfg.add_array("A", shape=actual_shape, dtype=dtype)
+    sdfg.add_array("C", shape=actual_shape, dtype=dtype)
+
+    state = sdfg.add_state("main")
+    a_read = state.add_read("A")
+    c_write = state.add_write("C")
+
+    op_node = TileUnaryOpLibraryNode(
+        name + "_node", op=op, tile_shape=node_tile_shape)
+    state.add_node(op_node)
+
+    subset = ", ".join(f"0:{s}" for s in actual_shape)
+    state.add_edge(a_read, None, op_node, "_a", Memlet(f"A[{subset}]"))
+    state.add_edge(op_node, "_c", c_write, None, Memlet(f"C[{subset}]"))
+
+    sdfg.validate()
+    return sdfg, actual_shape
+
+
+def test_unary_sin_runtime():
+    """c = sin(a)."""
+    sdfg, actual_shape = _make_direct_unary_func_sdfg([4, 5], "unary_sin", op="sin")
+    sdfg.expand_library_nodes()
+    sdfg.validate()
+
+    rng = np.random.default_rng(7001)
+    a = rng.uniform(-3.14, 3.14, size=actual_shape).astype(np.float64)
+    c = np.zeros(actual_shape, dtype=np.float64)
+
+    sdfg(A=a, C=c)
+    np.testing.assert_allclose(c, np.sin(a), rtol=1e-12, atol=1e-12)
+
+
+def test_unary_abs_runtime():
+    """c = abs(a)."""
+    sdfg, actual_shape = _make_direct_unary_func_sdfg([3, 7], "unary_abs", op="abs")
+    sdfg.expand_library_nodes()
+    sdfg.validate()
+
+    rng = np.random.default_rng(7002)
+    a = rng.uniform(-10.0, 10.0, size=actual_shape).astype(np.float64)
+    c = np.zeros(actual_shape, dtype=np.float64)
+
+    sdfg(A=a, C=c)
+    np.testing.assert_allclose(c, np.abs(a), rtol=0.0, atol=1e-12)
+
+
+def test_unary_exp_runtime():
+    """c = exp(a)."""
+    sdfg, actual_shape = _make_direct_unary_func_sdfg([4, 5], "unary_exp", op="exp")
+    sdfg.expand_library_nodes()
+    sdfg.validate()
+
+    rng = np.random.default_rng(7003)
+    a = rng.uniform(-2.0, 2.0, size=actual_shape).astype(np.float64)
+    c = np.zeros(actual_shape, dtype=np.float64)
+
+    sdfg(A=a, C=c)
+    np.testing.assert_allclose(c, np.exp(a), rtol=1e-12, atol=1e-12)
+
+
+def test_unary_sqrt_runtime():
+    """c = sqrt(a)."""
+    sdfg, actual_shape = _make_direct_unary_func_sdfg([5, 6], "unary_sqrt", op="sqrt")
+    sdfg.expand_library_nodes()
+    sdfg.validate()
+
+    rng = np.random.default_rng(7004)
+    a = rng.uniform(0.1, 10.0, size=actual_shape).astype(np.float64)
+    c = np.zeros(actual_shape, dtype=np.float64)
+
+    sdfg(A=a, C=c)
+    np.testing.assert_allclose(c, np.sqrt(a), rtol=1e-12, atol=1e-12)
+
+
+def test_unary_log_runtime():
+    """c = log(a)."""
+    sdfg, actual_shape = _make_direct_unary_func_sdfg([3, 4], "unary_log", op="log")
+    sdfg.expand_library_nodes()
+    sdfg.validate()
+
+    rng = np.random.default_rng(7005)
+    a = rng.uniform(0.1, 10.0, size=actual_shape).astype(np.float64)
+    c = np.zeros(actual_shape, dtype=np.float64)
+
+    sdfg(A=a, C=c)
+    np.testing.assert_allclose(c, np.log(a), rtol=1e-12, atol=1e-12)
+
+
+def test_unary_cos_runtime():
+    """c = cos(a)."""
+    sdfg, actual_shape = _make_direct_unary_func_sdfg([4, 5], "unary_cos", op="cos")
+    sdfg.expand_library_nodes()
+    sdfg.validate()
+
+    rng = np.random.default_rng(7006)
+    a = rng.uniform(-3.14, 3.14, size=actual_shape).astype(np.float64)
+    c = np.zeros(actual_shape, dtype=np.float64)
+
+    sdfg(A=a, C=c)
+    np.testing.assert_allclose(c, np.cos(a), rtol=1e-12, atol=1e-12)
+
+
+# ---------------------------------------------------------------------------
+# Const-only binary ops (c = CONST op CONST, no array inputs)
+# ---------------------------------------------------------------------------
+
+def test_const_only_multiply():
+    """c = 2 * 3 → entire tile filled with 6."""
+    shape = [4, 5]
+    sdfg = SDFG("const_only_mul")
+    sdfg.add_array("C", shape=shape, dtype=dace.float64)
+
+    state = sdfg.add_state("main")
+    c_write = state.add_write("C")
+
+    op_node = TileBinaryOpLibraryNode(
+        "const_only_mul_node", op="*", constant="2",
+        constant_position="left", constant2="3")
+    state.add_node(op_node)
+
+    subset = ", ".join(f"0:{s}" for s in shape)
+    state.add_edge(op_node, "_c", c_write, None, Memlet(f"C[{subset}]"))
+
+    sdfg.validate()
+    sdfg.expand_library_nodes()
+    sdfg.validate()
+
+    c = np.zeros(shape, dtype=np.float64)
+    sdfg(C=c)
+    np.testing.assert_allclose(c, np.full(shape, 6.0), rtol=0.0, atol=1e-12)
+
+
+def test_const_only_add():
+    """c = 10 + 5 → entire tile filled with 15."""
+    shape = [3, 4]
+    sdfg = SDFG("const_only_add")
+    sdfg.add_array("C", shape=shape, dtype=dace.float64)
+
+    state = sdfg.add_state("main")
+    c_write = state.add_write("C")
+
+    op_node = TileBinaryOpLibraryNode(
+        "const_only_add_node", op="+", constant="10",
+        constant_position="left", constant2="5")
+    state.add_node(op_node)
+
+    subset = ", ".join(f"0:{s}" for s in shape)
+    state.add_edge(op_node, "_c", c_write, None, Memlet(f"C[{subset}]"))
+
+    sdfg.validate()
+    sdfg.expand_library_nodes()
+    sdfg.validate()
+
+    c = np.zeros(shape, dtype=np.float64)
+    sdfg(C=c)
+    np.testing.assert_allclose(c, np.full(shape, 15.0), rtol=0.0, atol=1e-12)
+
+
+# ---------------------------------------------------------------------------
+# Unary constant (c = sin(CONST)) — fill tile with constant result
+# ---------------------------------------------------------------------------
+
+def test_unary_const_sin():
+    """c = sin(0) → entire tile filled with 0."""
+    shape = [4, 5]
+    sdfg = SDFG("unary_const_sin")
+    sdfg.add_array("C", shape=shape, dtype=dace.float64)
+
+    state = sdfg.add_state("main")
+    c_write = state.add_write("C")
+
+    op_node = TileUnaryOpLibraryNode(
+        "unary_const_sin_node", op="sin", constant="0.0")
+    state.add_node(op_node)
+
+    subset = ", ".join(f"0:{s}" for s in shape)
+    state.add_edge(op_node, "_c", c_write, None, Memlet(f"C[{subset}]"))
+
+    sdfg.validate()
+    sdfg.expand_library_nodes()
+    sdfg.validate()
+
+    c = np.full(shape, 99.0, dtype=np.float64)
+    sdfg(C=c)
+    np.testing.assert_allclose(c, np.full(shape, np.sin(0.0)), rtol=0.0, atol=1e-12)
 
 
 if __name__ == "__main__":

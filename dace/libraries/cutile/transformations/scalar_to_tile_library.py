@@ -224,7 +224,7 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
 
     # ---- tile shape / subset helpers ----------------------------------------
 
-    def _calculate_tile_shape(self) -> tuple:
+    def _calculate_tile_shape(self) -> tuple[sp.Basic | int, ...]:
         """
         Tile shape from the inner map range.
 
@@ -248,21 +248,33 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
         A single tasklet connector can map to multiple library slots, e.g.,
         for expressions such as ``c = a + a`` where ``rhs1 == rhs2``.  In that
         case, one tasklet connector name fans out to two library input slots.
+
+        Only array/connector operands (``rhs1``/``rhs2``) are mapped here.
+        Constants (``constant1``/``constant2``) are handled separately via
+        properties on the library node — they have no connector counterpart.
+
+        When one operand is a constant, the positions of the array operand in
+        the classification and in the library node registration may differ
+        (e.g. ``3 - a`` has the array at rhs2 in the classification but the
+        library node registers a single array slot at rhs1).  We therefore
+        match non-None entries by order rather than by strict position index.
         """
         slot_map: dict[str, list[str]] = {}
         classification = self._tasklet_classification
         node_info = self._node_info
 
-        for tasklet_conn, library_conn in zip(
-            [classification.rhs1, classification.rhs2, classification.constant1, classification.constant2],
-            [node_info.rhs1, node_info.rhs2, node_info.constant1, node_info.constant2]
-        ):
-            if tasklet_conn is not None and library_conn is not None:
-                slot_map.setdefault(tasklet_conn, []).append(library_conn)
-            elif tasklet_conn is not None and library_conn is None:
+        tasklet_conns = [c for c in [classification.rhs1, classification.rhs2] if c is not None]
+        library_conns = [c for c in [node_info.rhs1, node_info.rhs2] if c is not None]
+
+        for tc, lc in zip(tasklet_conns, library_conns):
+            slot_map.setdefault(tc, []).append(lc)
+
+        if len(tasklet_conns) > len(library_conns):
+            unmapped = [tc for tc in tasklet_conns if tc not in slot_map]
+            if unmapped:
                 raise ValueError(
-                    f"Invalid mapping: tasklet connector {tasklet_conn}, "
-                    f"library connector {library_conn}"
+                    f"Invalid mapping: tasklet connectors {unmapped} have no "
+                    f"corresponding library connectors"
                 )
         return slot_map
 
@@ -440,12 +452,48 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
 
     def _configure_library_node(self):
         """
-        Hook to configure extra connectors on the library node.
+        Configure the library node's properties from the tasklet classification.
 
-        No-op in the canonical case.  The masked child relies on
-        ``_post_input_lowering`` to wire the mask connector instead.
+        Sets ``op`` on all node types.  For nodes with constants, also sets
+        ``constant`` / ``constant_position`` / ``constant2`` so the expansion
+        can emit the right literal value.
+
+        Because the node was constructed with default parameters (no constants),
+        connectors that are replaced by constants are removed here.
         """
-        pass
+        c = self._tasklet_classification
+        node = self._library_node
+        if hasattr(node, 'op'):
+            node.op = c.op
+        if hasattr(node, 'constant'):
+            if c.constant1 is not None and c.constant2 is not None:
+                # Both operands are constants (SYMBOL_SYMBOL)
+                node.constant = c.constant1
+                node.constant_position = "left"
+                if hasattr(node, 'constant2'):
+                    node.constant2 = c.constant2
+                # Remove all array input connectors
+                for conn in ("_a", "_b"):
+                    if conn in node.in_connectors:
+                        node.remove_in_connector(conn)
+            elif c.constant1 is not None:
+                node.constant = c.constant1
+                if hasattr(node, 'constant_position'):
+                    node.constant_position = "left"
+                # Binary node: single constant replaces one operand,
+                # remaining array uses _a; remove _b.
+                # Unary node: constant replaces the single operand _a; remove _a.
+                if "_b" in node.in_connectors:
+                    node.remove_in_connector("_b")
+                else:
+                    if "_a" in node.in_connectors:
+                        node.remove_in_connector("_a")
+            elif c.constant2 is not None:
+                node.constant = c.constant2
+                node.constant_position = "right"
+                # Right constant replaces _b in binary nodes
+                if "_b" in node.in_connectors:
+                    node.remove_in_connector("_b")
 
     def _post_input_lowering(self):
         """

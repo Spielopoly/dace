@@ -293,6 +293,8 @@ _SUPPORTED = {
     'pow',
     'min',
     'max',
+    'sin',
+    'cos',
     'and',
     'or',
     'not',
@@ -347,6 +349,7 @@ def _extract_single_op(src: str, default_to_assignment: bool = False) -> str:
 
         if op not in _SUPPORTED:
             print(f"Found unsupported op {op} in {src}")
+            continue
 
         if found is not None:
             raise ValueError(

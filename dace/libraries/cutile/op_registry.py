@@ -2,7 +2,8 @@
 Operation registry for cuTile transformations.
 
 Maps tasklet code patterns to cuTile library node classes. To add a new
-operation, implement a matcher function and decorate it with @register_matcher.
+operation, call ``register_op`` with the operation string, tasklet type,
+mask type, library node class, and connector mapping.
 """
 from __future__ import annotations
 from typing import Dict, Optional, Type
@@ -36,11 +37,10 @@ class LibraryNodeInfo:
     type: Type[LibraryNode]
     node_name: str
     out: str # output connector name
-    # input connector names, rhs1 from tasklet connects to rhs1 from library node, etc. If None, the library node does not have that input.
+    # input connector names, rhs1 from tasklet connects to rhs1 from library node, etc.
+    # If None, the library node does not have that input.
     rhs1: Optional[str] = None
     rhs2: Optional[str] = None
-    constant1: Optional[str] = None
-    constant2: Optional[str] = None
     mask_in: Optional[str] = None  # name of the library node connector for the mask, if applicable
     out_in: Optional[str] = None  # name of the library node connector for the original output (for masked nodes), if applicable
 
@@ -56,31 +56,47 @@ class MaskType(Enum):
 # Mapping from (operation, tasklet type, mask) to (library node class, library node name)
 _OP_TO_LIBRARY_NODE: Dict[tuple[str, TaskletType, MaskType], LibraryNodeInfo] = {}
 
-def register_matcher(op: str, tasklet_type: TaskletType, mask: MaskType, **library_node_kwargs):
+
+def register_op(op: str, tasklet_type: TaskletType, mask: MaskType, node_type: Type[LibraryNode], **library_node_kwargs):
     """
-    Decorator to register a tasklet matcher function for a specific operation, tasklet type, and mask.
+    Register a cuTile library node for a specific operation pattern.
 
     Parameters
     ----------
     op : str
-        Operation symbol or function name to match (e.g., "+", "-", "numpy.add").
+        Operation symbol or function name to match (e.g., "+", "-", "*", "/").
     tasklet_type : TaskletType
-        The classified tasklet type to match.
+        The classified tasklet type to match (e.g., ARRAY_ARRAY, UNARY_ARRAY, ARRAY_SYMBOL).
     mask : MaskType
         The mask type to match (e.g., UNMASKED, RUNTIME).
-    library_node_kwargs: 
-        keyword arguments for the LibraryNodeInfo, such as node_name and connector names.
+    node_type : Type[LibraryNode]
+        The library node class to instantiate.
+    library_node_kwargs :
+        Keyword arguments used to construct a :class:`LibraryNodeInfo` instance. The following
+        keys are expected:
 
-    Returns
-    -------
-    Callable
-        Decorator function that registers the matcher.
+        - ``node_name`` (str, required):
+            Name of the library node to create (used as the node's label/name in the SDFG).
+        - ``out`` (str, required):
+            Name of the output connector of the library node that corresponds to the tasklet
+            left-hand side (``lhs``).
+        - ``rhs1`` (str, optional):
+            Name of the first input connector of the library node. When present, the tasklet's
+            ``rhs1`` connector is connected to this connector.
+        - ``rhs2`` (str, optional):
+            Name of the second input connector of the library node. When present, the tasklet's
+            ``rhs2`` connector is connected to this connector.
+        - ``mask_in`` (str, optional):
+            Name of the input connector that receives a runtime boolean mask, for masked
+            operations (e.g., when ``mask`` is :class:`MaskType.RUNTIME`). If not provided,
+            the library node is assumed not to take a mask input.
+        - ``out_in`` (str, optional):
+            Name of an additional input connector that can receive the original output value
+            for masked nodes (e.g., to implement "update where masked" semantics). If not
+            provided, the library node is assumed not to take such an input.
     """
-    def decorator(cls):
-        _OP_TO_LIBRARY_NODE[(op, tasklet_type, mask)] = LibraryNodeInfo(type=cls, **library_node_kwargs)
-        return cls
-    return decorator
-    
+    _OP_TO_LIBRARY_NODE[(op, tasklet_type, mask)] = LibraryNodeInfo(type=node_type, **library_node_kwargs)
+
 
 def match_tasklet_to_tile_library_node(state: dace.SDFGState, tasklet: Tasklet, mask: MaskType) -> Optional[TaskletLibraryNodeMatch]:
     """
