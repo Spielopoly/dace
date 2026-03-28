@@ -330,6 +330,22 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
 
     # ---- memlet construction hooks ------------------------------------------
 
+    def _build_memlet(self, map_edge: MultiConnectorEdge[Memlet], tasklet_edge: MultiConnectorEdge[Memlet]) -> Memlet:
+        """
+        Build the memlet from *map_edge* to the tile transient.
+
+        We preserve original outer indexing by copying the memlet and only
+        adding ``other_subset`` to describe how the outer slice maps into
+        tile space.
+
+        The canonical default deep-copies the original outer->inner memlet.
+        Non-canonical child classes override this to build a contiguous outer
+        subset that covers the full bounding tile footprint.
+        """
+        new_memlet = copy.deepcopy(map_edge.data)
+        new_memlet.other_subset = self._tile_subset
+        return new_memlet
+
     def _build_input_staging_memlet(self, outer_edge: MultiConnectorEdge[Memlet], tasklet_edge: MultiConnectorEdge[Memlet]) -> Memlet:
         """
         Build the memlet from *outer_entry* to the input tile transient.
@@ -342,9 +358,7 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
         Non-canonical child classes override this to build a contiguous outer
         subset that covers the full bounding tile footprint.
         """
-        new_memlet = copy.deepcopy(outer_edge.data)
-        new_memlet.other_subset = self._tile_subset
-        return new_memlet
+        return self._build_memlet(outer_edge, tasklet_edge)
 
     def _build_output_store_memlet(self, inner_to_outer_edge: MultiConnectorEdge[Memlet], tasklet_out_edge: MultiConnectorEdge[Memlet]) -> Memlet:
         """
@@ -355,9 +369,7 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
         Non-canonical child classes override this to produce a contiguous
         store range.
         """
-        new_memlet = copy.deepcopy(inner_to_outer_edge.data)
-        new_memlet.other_subset = self._tile_subset
-        return new_memlet
+        return self._build_memlet(inner_to_outer_edge, tasklet_out_edge)
 
     # ---- input lowering -----------------------------------------------------
 
@@ -580,7 +592,7 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
         return shape
 
     @staticmethod
-    def _build_contiguous_outer_subset(tasklet_subset: subsets.Subset,
+    def _build_contiguous_outer_subset(tasklet_subset: subsets.Range,
                                        inner_map: nodes.Map) -> subsets.Range:
         """
         Lift scalar tasklet accesses to a contiguous outer subset.
@@ -798,26 +810,19 @@ class ScalarToTileMasked(_ScalarToTileBase):
         Add ``_c_in`` connector for preloaded output values so masked lanes
         can preserve their original values.
         """
-        out_in_conn = self._node_info.out_in or "_c_in"
+        out_in_conn = self._node_info.out_in
         if out_in_conn not in self._library_node.in_connectors:
             self._library_node.add_in_connector(out_in_conn)
 
-    def _build_input_staging_memlet(self, outer_edge: MultiConnectorEdge[Memlet], tasklet_edge: MultiConnectorEdge[Memlet]) -> Memlet:
+    def _build_memlet(self, map_edge: MultiConnectorEdge[Memlet], tasklet_edge: MultiConnectorEdge[Memlet]) -> Memlet:
         """
         Convert scalar index expression(s) to a contiguous outer tile range
         that covers all points visited by the inner map.
         """
-        data_name = cast(str, outer_edge.data.data)
+        data_name = cast(str, map_edge.data.data)
         load_subset = self._build_contiguous_outer_subset(
             tasklet_edge.data.subset, self._inner_entry.map)
         return Memlet(data=data_name, subset=load_subset, other_subset=self._tile_subset)
-
-    def _build_output_store_memlet(self, inner_to_outer_edge: MultiConnectorEdge[Memlet], tasklet_out_edge: MultiConnectorEdge[Memlet]) -> Memlet:
-        """Store full tile back to outer map footprint using a contiguous range."""
-        data_name = cast(str, inner_to_outer_edge.data.data)
-        store_subset = self._build_contiguous_outer_subset(
-            tasklet_out_edge.data.subset, self._inner_entry.map)
-        return Memlet(data=data_name, subset=store_subset, other_subset=self._tile_subset)
 
     def _post_input_lowering(self):
         """
@@ -892,6 +897,6 @@ class ScalarToTileMasked(_ScalarToTileBase):
             Memlet(data=data_name, subset=store_subset, other_subset=self._tile_subset),
         )
 
-        out_in_conn = self._node_info.out_in or "_c_in"
+        out_in_conn = self._node_info.out_in
         self._graph.add_edge(preload_tile, None, self._library_node, out_in_conn,
                              Memlet(data=preload_name, subset=self._tile_subset))
