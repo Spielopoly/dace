@@ -23,8 +23,9 @@ Result (AFTER, canonical)::
 
 Result (AFTER, non-canonical inner maps)::
 
-    OuterMapEntry -> tile_transient_read -> MaskedLibNode -> tile_transient_write -> OuterMapExit
+    OuterMapEntry -> tile_transient_read -> MaskedLibNode -> tile_view -[views]-> C -> OuterMapExit
                     + generated mask transient used to select valid map points
+                    (view writes directly to the output array; masked-out lanes are not touched)
 """
 from __future__ import annotations
 
@@ -58,7 +59,7 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
 
     The ``apply`` method is structured as a template method, calling hooks that
     child classes override to inject specialised behaviour (e.g. mask creation,
-    preload paths, non-canonical memlet construction).
+    view-based output, non-canonical memlet construction).
 
     .. warning::
 
@@ -405,11 +406,8 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
         """
         Hook for adding a preload path of existing output values.
 
-        The masked variant overrides this to preload current destination tile
-        values into the library node's ``_c_in`` connector, so lanes where
-        ``mask == False`` can preserve their original values.
-
-        No-op in the canonical case.
+        No-op by default.  Child classes may override to inject additional
+        dataflow before the output store.
         """
         pass
 
@@ -444,8 +442,8 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
         """
         Hook to configure extra connectors on the library node.
 
-        Overridden by the masked child to add ``_m`` (mask) and ``_c_in``
-        (preloaded output) input connectors.  No-op in the canonical case.
+        No-op in the canonical case.  The masked child relies on
+        ``_post_input_lowering`` to wire the mask connector instead.
         """
         pass
 
@@ -486,7 +484,7 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
         structured as a template method — child classes inject behaviour
         through the hooks ``_configure_library_node``,
         ``_build_input_staging_memlet``, ``_build_output_store_memlet``,
-        ``_post_input_lowering``, and ``_add_output_preload``.
+        and ``_post_input_lowering``.
         """
         self._set_convenience_variables(sdfg, graph)
 
@@ -542,7 +540,7 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
                 continue
 
             data_name = cast(str, inner_to_outer.data.data)
-            # Child hook (e.g. preload existing output values for masked lanes).
+            # Child hook (e.g. output preload for child classes that need it).
             self._add_output_preload(data_name, inner_to_outer, tasklet_out_edge)
             self._add_output_transient_and_connect_edges(inner_to_outer, lib_conn, tasklet_out_edge)
             # Remove the original scalar store path.
@@ -776,14 +774,13 @@ class ScalarToTileMasked(_ScalarToTileBase):
 
     Non-canonical ranges (offset starts, negative/strided bounds) are mapped
     to a bounding tile.  A boolean mask marks valid points and is provided to
-    the masked library node.  Existing output values are preloaded so
-    unmasked lanes are preserved.
+    the masked library node.  Masked-out lanes are simply not written by the
+    library node, so original output values are preserved without an explicit
+    preload path.
 
     Extra connectors on the library node:
 
     - ``_m`` receives the domain-validity mask.
-    - ``_c_in`` receives preloaded old output values so masked ops can keep
-      lanes where ``mask == False``.
     """
 
     def _has_valid_inner_map_ranges(self) -> bool:
@@ -804,15 +801,6 @@ class ScalarToTileMasked(_ScalarToTileBase):
         iteration points from the original inner map, regardless of direction.
         """
         return tuple(self._bounding_tile_shape(self._inner_entry.map))
-
-    def _configure_library_node(self):
-        """
-        Add ``_c_in`` connector for preloaded output values so masked lanes
-        can preserve their original values.
-        """
-        out_in_conn = self._node_info.out_in
-        if out_in_conn not in self._library_node.in_connectors:
-            self._library_node.add_in_connector(out_in_conn)
 
     def _build_memlet(self, map_edge: MultiConnectorEdge[Memlet], tasklet_edge: MultiConnectorEdge[Memlet]) -> Memlet:
         """
@@ -862,41 +850,80 @@ class ScalarToTileMasked(_ScalarToTileBase):
         self._graph.add_edge(mask_source, None, self._library_node, mask_in_conn,
                              Memlet(data=mask_name, subset=self._tile_subset))
 
-    def _add_output_preload(self, data_name: str, inner_to_outer_edge: MultiConnectorEdge[Memlet], tasklet_out_edge: MultiConnectorEdge[Memlet]) -> None:
+    def _add_output_transient_and_connect_edges(self, inner_to_outer_edge: MultiConnectorEdge[Memlet], lib_conn: str, tasklet_out_edge: MultiConnectorEdge[Memlet]) -> tuple[str, nodes.AccessNode]:
         """
-        Preload current destination tile values into ``out_in`` so masked ops
-        can keep lanes where ``mask == False``.
+        Write to the output array through a tile-shaped view.
 
-        Creates a separate preload path:
-        output_array -> outer_entry -> preload_transient -> library_node.out_in
+        A DaCe view aliases the output array with tile-shaped dimensions so
+        the library node sees matching shapes on all connectors.  Since the
+        view IS the output memory, masked-out lanes are never overwritten
+        and their original values are preserved without needing ``_c_in``.
+
+        The view bypasses the outer map exit for the output path: the library
+        node writes through the view directly to the output array, so no
+        exit-scope copy is needed.  The original outer-exit edge and its
+        connectors are removed to avoid a redundant (and incorrectly strided)
+        write-back copy.
         """
+        data_name = cast(str, inner_to_outer_edge.data.data)
         data_desc = self._sdfg.arrays[data_name]
-        store_subset = self._build_contiguous_outer_subset(
+
+        outer_subset = self._build_contiguous_outer_subset(
             tasklet_out_edge.data.subset, self._inner_entry.map)
 
-        preload_name = self._sdfg._find_new_name(data_name + "_tile_in")
-        self._sdfg.add_transient(
-            preload_name,
+        # Identify which array dimensions the tile spans and collect their
+        # strides so the view indexes into the array correctly.
+        view_strides = []
+        for rng, stride in zip(outer_subset, data_desc.strides):
+            start = self._to_sympy_expr(rng[0])
+            end = self._to_sympy_expr(rng[1])
+            if end != start:
+                view_strides.append(stride)
+
+        # Create a tile-shaped view aliasing the output array.
+        view_name, _ = self._sdfg.add_view(
+            data_name + '_tile_view',
             shape=list(self._tile_shape),
             dtype=data_desc.dtype,
             storage=data_desc.storage,
-            lifetime=dtypes.AllocationLifetime.Scope,
-        )
-        preload_tile = self._graph.add_access(preload_name)
-
-        # Read existing values from the output array.
-        preload_node = self._graph.add_access(data_name)
-        preload_in_conn = f"IN_PRELOAD_{preload_name}"
-        preload_out_conn = preload_in_conn.replace("IN_", "OUT_", 1)
-        self._outer_entry.add_in_connector(preload_in_conn)
-        self._outer_entry.add_out_connector(preload_out_conn)
-        self._graph.add_edge(preload_node, None, self._outer_entry, preload_in_conn,
-                             Memlet(data=data_name, subset=store_subset))
-        self._graph.add_edge(
-            self._outer_entry, preload_out_conn, preload_tile, None,
-            Memlet(data=data_name, subset=store_subset, other_subset=self._tile_subset),
+            strides=view_strides,
+            find_new_name=True,
         )
 
-        out_in_conn = self._node_info.out_in
-        self._graph.add_edge(preload_tile, None, self._library_node, out_in_conn,
-                             Memlet(data=preload_name, subset=self._tile_subset))
+        view_node = self._graph.add_access(view_name)
+        data_node = self._graph.add_access(data_name)
+
+        # Library node writes tile result to the view.
+        self._graph.add_edge(self._library_node, lib_conn, view_node, None,
+                             Memlet(data=view_name, subset=self._tile_subset))
+
+        # View writes through to the output array.
+        view_node.add_out_connector('views')
+        self._graph.add_edge(view_node, 'views', data_node, None,
+                             Memlet(data=data_name, subset=outer_subset))
+
+        # Remove the pre-existing outer-exit -> output-array edge.
+        # The view already wrote directly to the array's memory, so the
+        # exit-scope copy is unnecessary.
+        # NOTE: We cannot use remove_memlet_path here because it walks the
+        # full path (including inner-scope edges), conflicting with the base
+        # class apply() which removes the inner_to_outer edge separately.
+        in_conn = inner_to_outer_edge.dst_conn
+        out_conn = in_conn.replace('IN_', 'OUT_', 1)
+        for e in list(self._graph.out_edges(self._outer_exit)):
+            if e.src_conn == out_conn:
+                outer_dst = e.dst
+                self._graph.remove_edge(e)
+                if self._graph.degree(outer_dst) == 0:
+                    self._graph.remove_node(outer_dst)
+                break
+        if in_conn in self._outer_exit.in_connectors:
+            self._outer_exit.remove_in_connector(in_conn)
+        if out_conn in self._outer_exit.out_connectors:
+            self._outer_exit.remove_out_connector(out_conn)
+
+        # Keep the scope well-formed: the output array written through the
+        # view must still be reachable from the outer exit.
+        self._graph.add_edge(data_node, None, self._outer_exit, None, Memlet())
+
+        return view_name, view_node
