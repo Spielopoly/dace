@@ -222,7 +222,7 @@ def test_frontend_large_prime_strided_add_with_nonmultiple_tile_shape(tile_shape
         apply_map_tiling=True,
         tile_shape=tile_shape,
     )
-    assert count >= 1
+    assert count >= 2
 
     lib_nodes = _frontend_library_nodes(sdfg)
     assert any(isinstance(node, TileRuntimeMaskedAddLibraryNode) for node in lib_nodes)
@@ -252,7 +252,7 @@ def test_frontend_large_prime_strided_add_with_nondivisible_ranges(tile_shape):
         apply_map_tiling=True,
         tile_shape=tile_shape,
     )
-    assert count >= 1
+    assert count >= 2
 
     lib_nodes = _frontend_library_nodes(sdfg)
     assert any(isinstance(node, TileRuntimeMaskedAddLibraryNode) for node in lib_nodes)
