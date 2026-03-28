@@ -165,43 +165,42 @@ class ExpandTileElementWiseRuntimeMaskedBinaryOPPure(ExpandTransformation):
 
     environments: list = []
 
-    @staticmethod
-    def expansion_with_op(node: LibraryNode, parent_state: SDFGState,
-                          parent_sdfg: SDFG,
-                          binary_op_string_generator: Callable[[str, str], str]):
-        masked_node = cast(TileRuntimeMaskedBinaryOPLibraryNode, node)
-        a_desc, b_desc, m_desc, c_desc, c_in_desc = _get_masked_tile_descriptors(masked_node, parent_state, parent_sdfg)
-        has_c_in = c_in_desc is not None
+def _expansion_with_op(node: LibraryNode, parent_state: SDFGState,
+                        parent_sdfg: SDFG,
+                        binary_op_string_generator: Callable[[str, str], str]):
+    masked_node = cast(TileRuntimeMaskedBinaryOPLibraryNode, node)
+    a_desc, b_desc, m_desc, c_desc, c_in_desc = _get_masked_tile_descriptors(masked_node, parent_state, parent_sdfg)
+    has_c_in = c_in_desc is not None
 
-        tile_shape = getattr(masked_node, "tile_shape", None)
-        shape: tuple[int] = tuple(tile_shape) if tile_shape is not None else a_desc.shape
-        ndim: int = len(shape)
+    tile_shape = getattr(masked_node, "tile_shape", None)
+    shape: tuple[int] = tuple(tile_shape) if tile_shape is not None else a_desc.shape
+    ndim: int = len(shape)
 
-        try:
-            n_total = 1
-            for s in shape:
-                n_total *= int(s)
-            use_scalar_form = (ndim == 0) or (n_total == 1)
-        except (TypeError, ValueError):
-            use_scalar_form = (ndim == 0)
+    try:
+        n_total = 1
+        for s in shape:
+            n_total *= int(s)
+        use_scalar_form = (ndim == 0) or (n_total == 1)
+    except (TypeError, ValueError):
+        use_scalar_form = (ndim == 0)
 
-        if use_scalar_form:
-            if has_c_in:
-                code = (
-                    f"if (_m) {{ _c = {binary_op_string_generator('_a', '_b')}; }} "
-                    f"else {{ _c = _c_in; }}"
-                )
-            else:
-                code = f"if (_m) {{ _c = {binary_op_string_generator('_a', '_b')}; }}"
+    if use_scalar_form:
+        if has_c_in:
+            code = (
+                f"if (_m) {{ _c = {binary_op_string_generator('_a', '_b')}; }} "
+                f"else {{ _c = _c_in; }}"
+            )
         else:
-            shape_expr = ", ".join(symstr(s) for s in shape)
-            a_strides_expr = ", ".join(symstr(s) for s in a_desc.strides)
-            b_strides_expr = ", ".join(symstr(s) for s in b_desc.strides)
-            m_strides_expr = ", ".join(symstr(s) for s in m_desc.strides)
-            c_strides_expr = ", ".join(symstr(s) for s in c_desc.strides)
-            c_in_strides_expr = ", ".join(symstr(s) for s in c_in_desc.strides) if has_c_in else ""
+            code = f"if (_m) {{ _c = {binary_op_string_generator('_a', '_b')}; }}"
+    else:
+        shape_expr = ", ".join(symstr(s) for s in shape)
+        a_strides_expr = ", ".join(symstr(s) for s in a_desc.strides)
+        b_strides_expr = ", ".join(symstr(s) for s in b_desc.strides)
+        m_strides_expr = ", ".join(symstr(s) for s in m_desc.strides)
+        c_strides_expr = ", ".join(symstr(s) for s in c_desc.strides)
+        c_in_strides_expr = ", ".join(symstr(s) for s in c_in_desc.strides) if has_c_in else ""
 
-            code = f"""
+        code = f"""
 constexpr int ndim = {ndim};
 const std::size_t shape[ndim] = {{{shape_expr}}};
 const std::ptrdiff_t a_strides[ndim] = {{{a_strides_expr}}};
@@ -239,17 +238,17 @@ for (std::size_t i = 0; i < n; ++i) {{
 }}
 """
 
-        inputs = {"_a", "_b", "_m"}
-        if has_c_in:
-            inputs.add("_c_in")
-        tasklet = nodes.Tasklet(
-            label=masked_node.name + "_cutile",
-            inputs=inputs,
-            outputs={"_c"},
-            code=code,
-            language=dtypes.Language.CPP,
-        )
-        return tasklet
+    inputs = {"_a", "_b", "_m"}
+    if has_c_in:
+        inputs.add("_c_in")
+    tasklet = nodes.Tasklet(
+        label=masked_node.name + "_cutile",
+        inputs=inputs,
+        outputs={"_c"},
+        code=code,
+        language=dtypes.Language.CPP,
+    )
+    return tasklet
 
 
 def _get_masked_tile_descriptors(node: TileRuntimeMaskedBinaryOPLibraryNode, state: SDFGState,
@@ -311,7 +310,7 @@ class ExpandTileRuntimeMaskedAddPure(ExpandTileElementWiseRuntimeMaskedBinaryOPP
 
     @staticmethod
     def expansion(node: TileRuntimeMaskedAddLibraryNode, state: SDFGState, sdfg: SDFG) -> nodes.Tasklet:
-        return ExpandTileElementWiseRuntimeMaskedBinaryOPPure.expansion_with_op(
+        return _expansion_with_op(
             node,
             state,
             sdfg,
@@ -342,7 +341,7 @@ class ExpandTileRuntimeMaskedSubtractPure(ExpandTileElementWiseRuntimeMaskedBina
 
     @staticmethod
     def expansion(node: TileRuntimeMaskedSubtractLibraryNode, state: SDFGState, sdfg: SDFG) -> nodes.Tasklet:
-        return ExpandTileElementWiseRuntimeMaskedBinaryOPPure.expansion_with_op(
+        return _expansion_with_op(
             node,
             state,
             sdfg,
