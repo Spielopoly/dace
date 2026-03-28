@@ -36,10 +36,12 @@ import dace
 import sympy as sp
 from dace import Memlet, dtypes, subsets
 from dace.sdfg import SDFG, SDFGState, nodes, utils as sdutil
-from dace.symbolic import symstr
+from dace.sdfg.graph import MultiConnectorEdge
+from dace.sdfg.scope import ScopeSubgraphView
+from dace.symbolic import SymExpr, symstr
 from dace.transformation import transformation as xf
 
-from dace.libraries.cutile.op_registry import match_tasklet_to_tile_library_node, MaskType, TaskletLibraryNodeMatch
+from dace.libraries.cutile.op_registry import match_tasklet_to_tile_library_node, MaskType
 
 
 class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
@@ -103,15 +105,15 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
         self._inner_exit: nodes.MapExit = self.inner_map_exit
         self._outer_exit: nodes.MapExit = self.outer_map_exit
 
-    def _get_scope(self, map_entry: nodes.MapEntry):
+    def _get_scope(self, map_entry: nodes.MapEntry) -> ScopeSubgraphView:
         """Return the scope subgraph of *map_entry*, excluding entry and exit."""
         return self._graph.scope_subgraph(map_entry, include_entry=False, include_exit=False)
 
-    def _get_all_edges_of_node(self, node: nodes.Node):
+    def _get_all_edges_of_node(self, node: nodes.Node) -> list[MultiConnectorEdge[Memlet]]:
         """Return all incoming and outgoing edges of *node*."""
         return list(self._graph.in_edges(node)) + list(self._graph.out_edges(node))
 
-    def _find_path_edge(self, anchor_edge, src: nodes.Node, dst: nodes.Node):
+    def _find_path_edge(self, anchor_edge: MultiConnectorEdge[Memlet], src: nodes.Node, dst: nodes.Node) -> Optional[MultiConnectorEdge[Memlet]]:
         """
         Find the path segment from *src* to *dst* on *anchor_edge*'s memlet path.
 
@@ -127,17 +129,17 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
     # ---- applicability checks -----------------------------------------------
     # These are called from can_be_applied()
 
-    def _has_exactly_one_tasklet_in_inner_scope(self):
+    def _has_exactly_one_tasklet_in_inner_scope(self) -> bool:
         """Inner map scope must contain only the single matched tasklet body."""
         inner_scope = self._get_scope(self._inner_entry)
         return len(inner_scope.nodes()) == 1 \
             and self._tasklet_node in inner_scope.nodes()
 
-    def _has_valid_inner_scope(self):
+    def _has_valid_inner_scope(self) -> bool:
         """Validate that the inner scope is a pure single-tasklet body."""
         return self._has_exactly_one_tasklet_in_inner_scope()
 
-    def _has_valid_outer_scope(self):
+    def _has_valid_outer_scope(self) -> bool:
         """
         Validate that the outer scope holds only this inner map pair and tasklet.
 
@@ -148,11 +150,11 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
         outer_scope = self._get_scope(self._outer_entry)
         return set(outer_scope.nodes()) == {self._inner_entry, self._inner_exit, self._tasklet_node}
 
-    def _has_valid_scope(self):
+    def _has_valid_scope(self) -> bool:
         """Combined inner + outer scope validity check."""
         return self._has_valid_inner_scope() and self._has_valid_outer_scope()
 
-    def _is_tasklet_scalar(self, tasklet: nodes.Tasklet):
+    def _is_tasklet_scalar(self, tasklet: nodes.Tasklet) -> bool:
         """
         Every tasklet access must be scalar (single-point range).
         The op matcher assumes scalar tasklet connectors correspond to one
@@ -182,7 +184,7 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
         """Outer-map ranges are generally unconstrained."""
         return True
 
-    def _has_valid_map_ranges(self):
+    def _has_valid_map_ranges(self) -> bool:
         """Combined inner + outer map range validity check."""
         return self._has_valid_inner_map_ranges() and self._has_valid_outer_map_ranges()
 
@@ -232,7 +234,7 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
         return tuple(self._inner_entry.map.range.size())
 
     @staticmethod
-    def _tile_subset_from_shape(tile_shape) -> subsets.Range:
+    def _tile_subset_from_shape(tile_shape: tuple[sp.Basic | int, ...]) -> subsets.Range:
         """Build a dense local tile range ``[0, extent-1]`` in every dimension."""
         return subsets.Range([(0, d - 1, 1) for d in tile_shape])
 
@@ -273,7 +275,7 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
 
     # ---- input plan ---------------------------------------------------------
 
-    def _create_input_plan(self, input_slots: dict[str, list[str]]):
+    def _create_input_plan(self, input_slots: dict[str, list[str]]) -> dict[tuple[Optional[str], Optional[str]], tuple[MultiConnectorEdge[Memlet], list[str], MultiConnectorEdge[Memlet]]]:
         """
         Build the input plan: a mapping from outer->inner edges to
         ``(outer_edge, lib_conns, tasklet_edge)`` tuples.
@@ -304,7 +306,7 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
 
     # ---- transient creation -------------------------------------------------
 
-    def _create_and_add_tile_transient(self, data_name: str, tile_shape):
+    def _create_and_add_tile_transient(self, data_name: str, tile_shape: tuple[sp.Basic | int, ...]) -> tuple[str, nodes.AccessNode]:
         """
         Create a scope-lifetime transient tile to stage an operand.
 
@@ -328,7 +330,7 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
 
     # ---- memlet construction hooks ------------------------------------------
 
-    def _build_input_staging_memlet(self, outer_edge, tasklet_edge) -> Memlet:
+    def _build_input_staging_memlet(self, outer_edge: MultiConnectorEdge[Memlet], tasklet_edge: MultiConnectorEdge[Memlet]) -> Memlet:
         """
         Build the memlet from *outer_entry* to the input tile transient.
 
@@ -344,7 +346,7 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
         new_memlet.other_subset = self._tile_subset
         return new_memlet
 
-    def _build_output_store_memlet(self, inner_to_outer_edge, tasklet_out_edge) -> Memlet:
+    def _build_output_store_memlet(self, inner_to_outer_edge: MultiConnectorEdge[Memlet], tasklet_out_edge: MultiConnectorEdge[Memlet]) -> Memlet:
         """
         Build the memlet from the output tile transient to *outer_exit*.
 
@@ -359,7 +361,7 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
 
     # ---- input lowering -----------------------------------------------------
 
-    def _add_input_transient_and_connect_edges(self, outer_edge, lib_conns, tasklet_edge):
+    def _add_input_transient_and_connect_edges(self, outer_edge: MultiConnectorEdge[Memlet], lib_conns: list[str], tasklet_edge: MultiConnectorEdge[Memlet]) -> tuple[str, nodes.AccessNode]:
         """
         Create an input tile transient and wire:
           outer_entry -> transient -> library_node (for each lib_conn).
@@ -387,7 +389,7 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
 
     # ---- output lowering ----------------------------------------------------
 
-    def _add_output_preload(self, data_name, inner_to_outer_edge, tasklet_out_edge):
+    def _add_output_preload(self, data_name: str, inner_to_outer_edge: MultiConnectorEdge[Memlet], tasklet_out_edge: MultiConnectorEdge[Memlet]) -> None:
         """
         Hook for adding a preload path of existing output values.
 
@@ -399,7 +401,7 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
         """
         pass
 
-    def _add_output_transient_and_connect_edges(self, inner_to_outer_edge, lib_conn, tasklet_out_edge):
+    def _add_output_transient_and_connect_edges(self, inner_to_outer_edge: MultiConnectorEdge[Memlet], lib_conn: str, tasklet_out_edge: MultiConnectorEdge[Memlet]) -> tuple[str, nodes.AccessNode]:
         """
         Create an output tile transient and wire:
           library_node -> transient -> outer_exit.
@@ -539,7 +541,7 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
     # ---- static utility methods (available to all child classes) -------------
 
     @staticmethod
-    def _to_sympy_expr(expr):
+    def _to_sympy_expr(expr: sp.Basic | SymExpr | int) -> sp.Basic:
         """Convert DaCe symbolic values (including ``SymExpr``) to plain SymPy."""
         if isinstance(expr, dace.symbolic.SymExpr):
             return expr.expr
@@ -560,7 +562,7 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
         return True
 
     @staticmethod
-    def _bounding_tile_shape(inner_map: nodes.Map) -> list:
+    def _bounding_tile_shape(inner_map: nodes.Map) -> list[sp.Basic | int]:
         """
         Compute per-dimension extents of a bounding box for an inner map range.
 
@@ -641,7 +643,7 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
         return subsets.Range(new_ranges)
 
     @staticmethod
-    def _build_mask_condition(tile_shape: list, inner_map: nodes.Map) -> str:
+    def _build_mask_condition(tile_shape: list[sp.Basic | int], inner_map: nodes.Map) -> str:
         """
         Build a predicate string that checks if a tile point is within the
         original (possibly strided/reversed) inner-map iteration domain.
@@ -684,7 +686,7 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
 
     @staticmethod
     def _add_mask_fill_subgraph(graph: SDFGState, mask_name: str,
-                                tile_shape: list,
+                                tile_shape: list[sp.Basic | int],
                                 inner_map: nodes.Map) -> tuple[nodes.AccessNode, nodes.MapEntry]:
         """
         Build a sequential map that fills the mask tile with domain validity.
@@ -800,7 +802,7 @@ class ScalarToTileMasked(_ScalarToTileBase):
         if out_in_conn not in self._library_node.in_connectors:
             self._library_node.add_in_connector(out_in_conn)
 
-    def _build_input_staging_memlet(self, outer_edge, tasklet_edge) -> Memlet:
+    def _build_input_staging_memlet(self, outer_edge: MultiConnectorEdge[Memlet], tasklet_edge: MultiConnectorEdge[Memlet]) -> Memlet:
         """
         Convert scalar index expression(s) to a contiguous outer tile range
         that covers all points visited by the inner map.
@@ -810,7 +812,7 @@ class ScalarToTileMasked(_ScalarToTileBase):
             tasklet_edge.data.subset, self._inner_entry.map)
         return Memlet(data=data_name, subset=load_subset, other_subset=self._tile_subset)
 
-    def _build_output_store_memlet(self, inner_to_outer_edge, tasklet_out_edge) -> Memlet:
+    def _build_output_store_memlet(self, inner_to_outer_edge: MultiConnectorEdge[Memlet], tasklet_out_edge: MultiConnectorEdge[Memlet]) -> Memlet:
         """Store full tile back to outer map footprint using a contiguous range."""
         data_name = cast(str, inner_to_outer_edge.data.data)
         store_subset = self._build_contiguous_outer_subset(
@@ -855,7 +857,7 @@ class ScalarToTileMasked(_ScalarToTileBase):
         self._graph.add_edge(mask_source, None, self._library_node, mask_in_conn,
                              Memlet(data=mask_name, subset=self._tile_subset))
 
-    def _add_output_preload(self, data_name, inner_to_outer_edge, tasklet_out_edge):
+    def _add_output_preload(self, data_name: str, inner_to_outer_edge: MultiConnectorEdge[Memlet], tasklet_out_edge: MultiConnectorEdge[Memlet]) -> None:
         """
         Preload current destination tile values into ``_c_in`` so masked ops
         can keep lanes where ``mask == False``.
