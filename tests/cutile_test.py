@@ -13,8 +13,8 @@ from dace import dtypes, Memlet
 from dace.sdfg import SDFG, nodes
 from dace.libraries.cutile.transformations.pipeline import apply_cutile_pipeline
 from dace.libraries.cutile.transformations.scalar_to_tile_library import (
-    ScalarToTileLibraryCanonical,
-    ScalarToTileLibraryMasked,
+    ScalarToTileCanonical,
+    ScalarToTileMasked,
 )
 from dace.libraries.cutile.nodes import *
 
@@ -298,7 +298,7 @@ def test_can_be_applied_rejects_non_scalar():
         src_conn="c", memlet=Memlet("C[i, j, ii, jj]"),
     )
 
-    count = sdfg.apply_transformations([ScalarToTileLibraryCanonical, ScalarToTileLibraryMasked])
+    count = sdfg.apply_transformations([ScalarToTileCanonical, ScalarToTileMasked])
     assert count == 0, "Should not apply to inner map not starting at 0"
 
 
@@ -339,7 +339,7 @@ def test_can_be_applied_rejects_unknown_op():
         src_conn="c", memlet=Memlet("C[i, j, ii, jj]"),
     )
 
-    count = sdfg.apply_transformations([ScalarToTileLibraryCanonical, ScalarToTileLibraryMasked])
+    count = sdfg.apply_transformations([ScalarToTileCanonical, ScalarToTileMasked])
     assert count == 0, "Should not apply to unknown operation"
 
 

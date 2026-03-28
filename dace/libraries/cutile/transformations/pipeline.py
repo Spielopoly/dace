@@ -11,8 +11,8 @@ from typing import Optional, Tuple
 
 from dace.sdfg import SDFG
 from dace.libraries.cutile.transformations.scalar_to_tile_library import (
-    ScalarToTileLibraryCanonical,
-    ScalarToTileLibraryMasked,
+    ScalarToTileCanonical,
+    ScalarToTileMasked,
 )
 from dace.transformation.dataflow import TrivialChainElimination, MapTiling
 
@@ -69,8 +69,8 @@ def apply_cutile_pipeline(sdfg: SDFG, *,
     count += sdfg.apply_transformations_once_everywhere(
         [
             TrivialChainElimination,
-            ScalarToTileLibraryCanonical,
-            ScalarToTileLibraryMasked,
+            ScalarToTileCanonical,
+            ScalarToTileMasked,
         ],
         validate=validate_all,
         validate_all=validate_all,
