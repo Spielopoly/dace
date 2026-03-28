@@ -858,17 +858,17 @@ class ScalarToTileMasked(_ScalarToTileBase):
             self._graph, mask_name, tile_shape, self._inner_entry.map)
         self._graph.add_edge(self._outer_entry, None, fill_entry, None, Memlet())
 
-        mask_in_conn = self._node_info.mask_in or "_m"
+        mask_in_conn = self._node_info.mask_in
         self._graph.add_edge(mask_source, None, self._library_node, mask_in_conn,
                              Memlet(data=mask_name, subset=self._tile_subset))
 
     def _add_output_preload(self, data_name: str, inner_to_outer_edge: MultiConnectorEdge[Memlet], tasklet_out_edge: MultiConnectorEdge[Memlet]) -> None:
         """
-        Preload current destination tile values into ``_c_in`` so masked ops
+        Preload current destination tile values into ``out_in`` so masked ops
         can keep lanes where ``mask == False``.
 
         Creates a separate preload path:
-        output_array -> outer_entry -> preload_transient -> library_node._c_in
+        output_array -> outer_entry -> preload_transient -> library_node.out_in
         """
         data_desc = self._sdfg.arrays[data_name]
         store_subset = self._build_contiguous_outer_subset(
