@@ -39,6 +39,16 @@
 - Use pytest markers for hardware/software requirements instead of ad-hoc skips (see [pytest.ini](../pytest.ini)).
 - Keep environment-dependent behavior explicit in tests (cache mode, config toggles) when reproducing codegen/serialization behavior.
 - For cuTile pipeline work, ensure regressions cover unnecessary data movement removal before scalar-to-tile lowering.
+- Prefer detailed comments and documentation — don't shorten docstrings or inline comments during refactoring.
+
+## cuTile Library (`dace/libraries/cutile/`)
+- **Transformation architecture**: `_ScalarToTileBase` (template method base) with two concrete child classes:
+  - `ScalarToTileCanonical` — 0-based, unit-stride inner maps → unmasked tile library nodes
+  - `ScalarToTileMasked` — non-canonical inner maps → runtime-masked tile library nodes with preload
+- **PatternNode bug**: `PatternNode.__get__` resolves nodes by integer index in the state's node list. Adding/removing graph nodes shifts indices, causing descriptors to return wrong nodes. Always capture actual node object references at the start of `apply()` (before any graph modifications) and use those throughout. Never use PatternNode descriptors (`self.outer_map_entry` etc.) after modifying the graph.
+- **Op registry** (`op_registry.py`): maps `(operator, TaskletType, MaskType)` triples to `LibraryNodeInfo` via `@register_matcher`. The `match_tasklet_to_tile_library_node()` function uses `classify_tasklet` from `dace.sdfg.tasklet_utils`.
+- **Pipeline** (`pipeline.py`): `apply_cutile_pipeline()` runs `TrivialChainElimination` + `ScalarToTileCanonical` + `ScalarToTileMasked`.
+- **Tests**: `tests/cutile_test.py` (54 test functions), `tests/cutile_frontend_test.py` (6 test functions). Run both after any cuTile changes.
 
 ## Documentation Links
 - Project overview and quick start: [README.md](../README.md)
