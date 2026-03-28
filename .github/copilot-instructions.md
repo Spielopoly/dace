@@ -41,6 +41,16 @@
 - For cuTile pipeline work, ensure regressions cover unnecessary data movement removal before scalar-to-tile lowering.
 - Prefer detailed comments and documentation — don't shorten docstrings or inline comments during refactoring.
 
+## Code Quality
+- After making code changes, **always run the `code-quality-reviewer` agent** as a subagent on the changed files before considering the task complete. Address any findings before finishing.
+- Every function, class, and module should have a docstring that explains **what** it does and **why** it exists.
+- All function parameters and return values should have type hints. Omit return type only when the function returns `None` or when the return type is obvious (e.g. `__init__`).
+- Prefer reusing existing DaCe utilities (e.g. `SDFGState.remove_memlet_path`, `sdfg.utils.*`, `subsets.*`) over reimplementing graph manipulation logic. Search the codebase before writing new utility code.
+- Keep functions small and single-responsibility. If a function does multiple logically distinct steps, split it.
+- Use descriptive variable and function names — avoid cryptic abbreviations or single-letter names outside tight loop indices.
+- Avoid `sp.simplify()` for equality/zero checks on symbolic expressions — it is expensive and unreliable. Prefer structural comparison (`==`, `!=`) or `.is_zero` where appropriate.
+- Flag and remove dead code, unused imports, and stale comments during any refactoring pass.
+
 ## cuTile Library (`dace/libraries/cutile/`)
 - **Transformation architecture**: `_ScalarToTileBase` (template method base) with two concrete child classes:
   - `ScalarToTileCanonical` — 0-based, unit-stride inner maps → unmasked tile library nodes
