@@ -1,5 +1,5 @@
 """
-TileOpLibraryNode – unified element-wise operation library node.
+TileOpLibraryNode – unified element-wise operation library node (unmasked).
 
 Handles both binary and unary operations on tiles:
     Binary:
@@ -19,36 +19,23 @@ from __future__ import annotations
 
 from typing import List, Optional
 
-import dace
-from dace import dtypes, properties
+from dace import dtypes
 from dace.sdfg import SDFG, SDFGState
 from dace.sdfg import nodes
-from dace.sdfg.nodes import LibraryNode
 from dace import library
 from dace.symbolic import symstr
 from dace.transformation.transformation import ExpandTransformation
-from dace.sdfg.validation import InvalidSDFGNodeError
 from ..op_registry import register_op, MaskType, TaskletType
-
-
-# ── Supported operations ─────────────────────────────────────────────
-_BINARY_OPS = ["+", "-", "*", "/"]
-_UNARY_OPS = ["-", "abs", "sin", "cos", "exp", "sqrt", "log"]
-_ALL_OPS = sorted(set(_BINARY_OPS + _UNARY_OPS))
-
-
-def _op_cpp_expr(op: str, left: str, right: str | None = None) -> str:
-    """Return a C++ expression for a binary or unary operation."""
-    if right is not None:
-        return f"({left} {op} {right})"
-    # Unary
-    if op in ("-", "+"):
-        return f"({op}{left})"
-    return f"{op}({left})"
+from ._base import (
+    _TileOpBase,
+    _op_cpp_expr, _get_tile_descriptors, _resolve_shape_and_scalar_form,
+    _build_stride_decls, _resolve_operands, _collect_array_descs,
+    _BINARY_OPS, _UNARY_OPS,
+)
 
 
 @library.node
-class TileOpLibraryNode(LibraryNode):
+class TileOpLibraryNode(_TileOpBase):
     """
     Unified library node for element-wise operations on tiles.
 
@@ -65,148 +52,19 @@ class TileOpLibraryNode(LibraryNode):
     implementations: dict = {}
     default_implementation = "pure"
 
-    op = properties.Property(
-        dtype=str,
-        default="+",
-        desc="Operation symbol, e.g. '+', '-', '*', '/', 'abs', 'sin', …",
-    )
-
-    constant1 = properties.Property(
-        dtype=str,
-        default=None,
-        desc="Left / first constant operand. None means operand comes from _a.",
-        allow_none=True,
-    )
-
-    constant2 = properties.Property(
-        dtype=str,
-        default=None,
-        desc="Right / second constant operand. None means operand comes from _b (binary) or absent (unary).",
-        allow_none=True,
-    )
-
-    tile_shape = properties.ListProperty(
-        element_type=int,
-        default=None,
-        desc=(
-            "Tile dimensions, e.g. [128] for a 1-D tile or [32, 32] for 2-D. "
-            "0-D (scalar) tiles can be represented with an empty list []. "
-            "When None, the shape is inferred from the incoming array descriptors "
-            "at expansion time."
-        ),
-        allow_none=True,
-    )
-
     def __init__(self, name: str = "TileOp", op: str = "+",
                  tile_shape: Optional[List[int]] = None,
                  constant1: Optional[str] = None,
                  constant2: Optional[str] = None,
                  **kwargs):
-        inputs: set[str] = set()
-        if constant1 is None:
-            inputs.add("_a")
-        # Binary ops get _b unless constant2 replaces the right operand.
-        # For ops in both _BINARY_OPS and _UNARY_OPS (e.g. "-"), the default
-        # is binary; callers wanting unary must remove_in_connector("_b").
-        if op in _BINARY_OPS and constant2 is None:
-            inputs.add("_b")
-
-        super().__init__(
-            name,
-            inputs=inputs,
-            outputs={"_c"},
-            **kwargs,
-        )
-        self.op = op
-        self.tile_shape = tile_shape
-        self.constant1 = constant1
-        self.constant2 = constant2
-
-    # ------------------------------------------------------------------
-    @property
-    def is_binary(self) -> bool:
-        return self.constant2 is not None or "_b" in self.in_connectors
+        super().__init__(name, op=op, tile_shape=tile_shape,
+                         constant1=constant1, constant2=constant2, **kwargs)
 
     def validate(self, sdfg: SDFG, state: SDFGState):
-        if self.op not in _ALL_OPS:
-            raise InvalidSDFGNodeError(
-                f"TileOp '{self.name}': unsupported op '{self.op}'. "
-                f"Supported: {_ALL_OPS}",
-                sdfg=sdfg,
-                state_id=state.parent_graph.node_id(state),
-                node_id=state.node_id(self),
-            )
-
-        if self.op not in _BINARY_OPS and self.is_binary:
-            raise InvalidSDFGNodeError(
-                f"TileOp '{self.name}': op '{self.op}' is unary-only "
-                f"but has binary connectors.",
-                sdfg=sdfg,
-                state_id=state.parent_graph.node_id(state),
-                node_id=state.node_id(self),
-            )
-
-        c_node = None
-        for edge in state.out_edges(self):
-            if edge.src_conn == "_c":
-                c_node = edge.dst
-        if c_node is None:
-            raise InvalidSDFGNodeError(
-                f"TileOp '{self.name}': output connector _c must be connected.",
-                sdfg=sdfg,
-                state_id=state.parent_graph.node_id(state),
-                node_id=state.node_id(self),
-            )
-
-        # Check input connectors match expectation
-        if self.constant1 is None:
-            a_node = None
-            for edge in state.in_edges(self):
-                if edge.dst_conn == "_a":
-                    a_node = edge.src
-            if a_node is None:
-                raise InvalidSDFGNodeError(
-                    f"TileOp '{self.name}': connector _a must be connected when constant1 is not set.",
-                    sdfg=sdfg,
-                    state_id=state.parent_graph.node_id(state),
-                    node_id=state.node_id(self),
-                )
-
-        if "_b" in self.in_connectors and self.constant2 is None:
-            b_node = None
-            for edge in state.in_edges(self):
-                if edge.dst_conn == "_b":
-                    b_node = edge.src
-            if b_node is None:
-                raise InvalidSDFGNodeError(
-                    f"TileOp '{self.name}': connector _b must be connected when constant2 is not set.",
-                    sdfg=sdfg,
-                    state_id=state.parent_graph.node_id(state),
-                    node_id=state.node_id(self),
-                )
+        self._validate_common(sdfg, state, "TileOp")
 
 
 # ── C++ expansion (``pure``) ─────────────────────────────────────────
-
-def _get_tile_descriptors(node, state, sdfg):
-    """Return (a_desc, b_desc, c_desc). a_desc/b_desc may be None for constant operands."""
-    a_desc = b_desc = c_desc = None
-    for edge in state.in_edges(node):
-        arr_name = edge.data.data
-        if edge.dst_conn == "_a":
-            a_desc = sdfg.arrays[arr_name]
-        elif edge.dst_conn == "_b":
-            b_desc = sdfg.arrays[arr_name]
-    for edge in state.out_edges(node):
-        arr_name = edge.data.data
-        if edge.src_conn == "_c":
-            c_desc = sdfg.arrays[arr_name]
-    if c_desc is None:
-        raise ValueError(
-            f"TileOp expansion: _c not connected for node '{node.name}'."
-        )
-    return a_desc, b_desc, c_desc
-
 
 @library.register_expansion(TileOpLibraryNode, "pure")
 class ExpandTileOpPure(ExpandTransformation):
@@ -220,20 +78,11 @@ class ExpandTileOpPure(ExpandTransformation):
         constant1 = node.constant1
         constant2 = node.constant2
 
-        a_desc, b_desc, c_desc = _get_tile_descriptors(node, state, sdfg)
+        a_desc, b_desc, c_desc, _, _ = _get_tile_descriptors(node, state, sdfg)
         is_binary = (constant2 is not None) or (b_desc is not None)
 
         ref_desc = a_desc or b_desc or c_desc
-        shape = tuple(node.tile_shape) if node.tile_shape is not None else ref_desc.shape
-        ndim = len(shape)
-
-        try:
-            n_total = 1
-            for s in shape:
-                n_total *= int(s)
-            use_scalar_form = (ndim == 0) or (n_total == 1)
-        except (TypeError, ValueError):
-            use_scalar_form = (ndim == 0)
+        shape, ndim, use_scalar_form = _resolve_shape_and_scalar_form(node, ref_desc)
 
         inputs: set[str] = set()
         if a_desc is not None:
@@ -242,10 +91,8 @@ class ExpandTileOpPure(ExpandTransformation):
             inputs.add("_b")
 
         # Determine operand values for scalar and indexed forms
-        left_scalar = constant1 if constant1 is not None else "_a"
-        right_scalar = constant2 if constant2 is not None else ("_b" if is_binary else None)
-        left_indexed = constant1 if constant1 is not None else "_a[ia]"
-        right_indexed = constant2 if constant2 is not None else ("_b[ib]" if is_binary else None)
+        left_scalar, right_scalar, left_indexed, right_indexed = _resolve_operands(
+            constant1, constant2, is_binary)
 
         if use_scalar_form:
             code = f"_c = {_op_cpp_expr(op, left_scalar, right_scalar)};"
@@ -254,19 +101,9 @@ class ExpandTileOpPure(ExpandTransformation):
             c_strides_expr = ", ".join(symstr(s) for s in c_desc.strides)
 
             # Collect array descriptors that need stride computation
-            array_descs: dict[str, object] = {}
-            if a_desc is not None:
-                array_descs["a"] = a_desc
-            if b_desc is not None:
-                array_descs["b"] = b_desc
+            array_descs = _collect_array_descs(a_desc, b_desc)
 
-            stride_decls = ""
-            index_decls = ""
-            index_updates = ""
-            for key, desc in array_descs.items():
-                stride_decls += f"const std::ptrdiff_t {key}_strides[ndim] = {{{', '.join(symstr(s) for s in desc.strides)}}};\n"
-                index_decls += f"    std::size_t i{key} = 0;\n"
-                index_updates += f"        i{key} += coord * {key}_strides[d];\n"
+            stride_decls, index_decls, index_updates = _build_stride_decls(array_descs)
 
             if not array_descs:
                 # Both operands are constants – fill output tile
