@@ -93,6 +93,7 @@ class TileSymbolicMaskedOpLibraryNode(LibraryNode):
     )
 
     mask_condition = properties.Property(
+        dtype=sp.Basic,
         default=None,
         allow_none=True,
         desc=(
@@ -100,8 +101,6 @@ class TileSymbolicMaskedOpLibraryNode(LibraryNode):
             "per-dimension tile coordinates (0-based).  None means "
             "'always true' (no masking).  Converted to C++ at expansion."
         ),
-        to_json=lambda obj: sp.srepr(obj) if obj is not None else None,
-        from_json=lambda s, **kw: sp.sympify(s) if s is not None else None,
     )
 
     def __init__(self,
