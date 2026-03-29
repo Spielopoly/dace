@@ -751,6 +751,49 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
                        Memlet(data=mask_name, subset=idx_subset))
         return mask_write, fill_entry
 
+    @staticmethod
+    def _build_mask_condition_symbolic(inner_map: nodes.Map) -> sp.Basic:
+        """
+        Build a SymPy boolean expression for tile-point validity.
+
+        Returns a conjunction of per-dimension predicates using ``__m0``,
+        ``__m1``, … as coordinate symbols.  Each sub-clause handles both
+        positive and negative step directions (combined with ``Or``).
+
+        For positive step (low = start):
+            ``__m <= end - start  AND  __m % step == 0``
+
+        For negative step (low = end):
+            ``__m <= start - end  AND  (start - end - __m) % (-step) == 0``
+        """
+        dim_conds: list[sp.Basic] = []
+
+        for d, (start, end, step) in enumerate(inner_map.range):
+            m = sp.Symbol(f"__m{d}")
+            start = _ScalarToTileBase._to_sympy_expr(start)
+            end = _ScalarToTileBase._to_sympy_expr(end)
+            step = _ScalarToTileBase._to_sympy_expr(step)
+
+            # Positive-step sub-clause
+            cond_pos = sp.And(
+                sp.StrictGreaterThan(step, 0),
+                sp.LessThan(m, end - start + 1),
+                sp.Eq(sp.Mod(m, step), 0),
+            )
+            # Negative-step sub-clause
+            cond_neg = sp.And(
+                sp.StrictLessThan(step, 0),
+                sp.LessThan(m, start - end + 1),
+                sp.Eq(sp.Mod(start - end - m, -step), 0),
+            )
+            dim_conds.append(sp.Or(cond_pos, cond_neg))
+
+        if not dim_conds:
+            return sp.true
+        if len(dim_conds) == 1:
+            return dim_conds[0]
+        return sp.And(*dim_conds)
+
 
 # =========================================================================
 # Concrete transformation classes
@@ -784,17 +827,18 @@ class ScalarToTileCanonical(_ScalarToTileBase):
 
 class ScalarToTileMasked(_ScalarToTileBase):
     """
-    Lower non-canonical scalar inner maps to masked cuTile library nodes.
+    Lower non-canonical scalar inner maps to symbolic-masked cuTile library
+    nodes.
 
     Non-canonical ranges (offset starts, negative/strided bounds) are mapped
-    to a bounding tile.  A boolean mask marks valid points and is provided to
-    the masked library node.  Masked-out lanes are simply not written by the
-    library node, so original output values are preserved without an explicit
-    preload path.
+    to a bounding tile.  A symbolic condition is embedded directly in the
+    library node and evaluated per element during expansion—no runtime mask
+    array is allocated or filled.  Masked-out lanes are simply not written by
+    the library node, so original output values are preserved without an
+    explicit preload path.
 
-    Extra connectors on the library node:
-
-    - ``_m`` receives the domain-validity mask.
+    The library node's ``mask_condition`` property is set to a SymPy expression
+    that uses ``__m0``, ``__m1``, … as tile coordinate variables.
     """
 
     def _has_valid_inner_map_ranges(self) -> bool:
@@ -807,7 +851,7 @@ class ScalarToTileMasked(_ScalarToTileBase):
         return True
 
     def _get_mask_type(self) -> MaskType:
-        return MaskType.RUNTIME
+        return MaskType.SYMBOLIC
 
     def _calculate_tile_shape(self) -> tuple:
         """
@@ -826,43 +870,18 @@ class ScalarToTileMasked(_ScalarToTileBase):
             tasklet_edge.data.subset, self._inner_entry.map)
         return Memlet(data=data_name, subset=load_subset, other_subset=self._tile_subset)
 
-    def _post_input_lowering(self):
+    def _configure_library_node(self):
         """
-        Create mask transient, build its fill subgraph, and connect to the
-        library node.
+        Configure the library node and set the symbolic mask condition.
 
-        The mask fill subgraph executes inside the outer map so mask predicates
-        can reference tiled-loop symbols.  Mask storage is aligned with operand
-        storage when possible to avoid introducing unnecessary storage-space
-        transitions.
+        Calls the base class to set ``op`` and constants, then computes
+        the SymPy mask condition from the inner map ranges and stores it
+        on the library node.
         """
-        # Keep mask storage aligned with operand storage when possible.
-        mask_storage = dtypes.StorageType.Default
-        for outer_edge, lib_conns, tasklet_edge in self._input_plan.values():
-            data_name = cast(str, outer_edge.data.data)
-            data_desc = self._sdfg.arrays[data_name]
-            mask_storage = data_desc.storage
-            break
-
-        tile_shape = list(self._tile_shape)
-        # Allocate the mask tile once per outer-map iteration.
-        mask_name = self._sdfg._find_new_name("map_mask_tile")
-        self._sdfg.add_transient(
-            mask_name,
-            shape=tile_shape,
-            dtype=dace.bool,
-            storage=mask_storage,
-            lifetime=dtypes.AllocationLifetime.Scope,
-        )
-
-        # Build producer subgraph that computes per-lane validity predicate.
-        mask_source, fill_entry = self._add_mask_fill_subgraph(
-            self._graph, mask_name, tile_shape, self._inner_entry.map)
-        self._graph.add_edge(self._outer_entry, None, fill_entry, None, Memlet())
-
-        mask_in_conn = self._node_info.mask_in
-        self._graph.add_edge(mask_source, None, self._library_node, mask_in_conn,
-                             Memlet(data=mask_name, subset=self._tile_subset))
+        super()._configure_library_node()
+        condition = self._build_mask_condition_symbolic(
+            self._inner_entry.map)
+        self._library_node.mask_condition = condition
 
     def _add_output_transient_and_connect_edges(self, inner_to_outer_edge: MultiConnectorEdge[Memlet], lib_conn: str, tasklet_out_edge: MultiConnectorEdge[Memlet]) -> tuple[str, nodes.AccessNode]:
         """

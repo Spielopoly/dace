@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from dace.sdfg import nodes
-from dace.libraries.cutile.nodes import TileOpLibraryNode, TileRuntimeMaskedOpLibraryNode
+from dace.libraries.cutile.nodes import TileOpLibraryNode, TileSymbolicMaskedOpLibraryNode
 from dace.libraries.cutile.transformations.pipeline import apply_cutile_pipeline
 
 
@@ -225,7 +225,9 @@ def test_frontend_large_prime_strided_add_with_nonmultiple_tile_shape(tile_shape
     assert count >= 2
 
     lib_nodes = _frontend_library_nodes(sdfg)
-    assert any(isinstance(node, TileRuntimeMaskedOpLibraryNode) for node in lib_nodes)
+    sym_nodes = [n for n in lib_nodes if isinstance(n, TileSymbolicMaskedOpLibraryNode)]
+    assert sym_nodes
+    assert all(n.mask_condition is not None for n in sym_nodes)
 
     sdfg.expand_library_nodes()
     sdfg.validate()
@@ -255,7 +257,9 @@ def test_frontend_large_prime_strided_add_with_nondivisible_ranges(tile_shape):
     assert count >= 2
 
     lib_nodes = _frontend_library_nodes(sdfg)
-    assert any(isinstance(node, TileRuntimeMaskedOpLibraryNode) for node in lib_nodes)
+    sym_nodes = [n for n in lib_nodes if isinstance(n, TileSymbolicMaskedOpLibraryNode)]
+    assert sym_nodes
+    assert all(n.mask_condition is not None for n in sym_nodes)
 
     sdfg.expand_library_nodes()
     sdfg.validate()

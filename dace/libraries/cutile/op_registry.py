@@ -56,6 +56,7 @@ class TaskletLibraryNodeMatch:
 class MaskType(Enum):
     UNMASKED = "unmasked"
     RUNTIME = "runtime"
+    SYMBOLIC = "symbolic"  # mask condition as a SymPy expression, evaluated at expansion time
 
 # Mapping from (operation, tasklet type, mask) to LibraryNodeInfo
 _OP_TO_LIBRARY_NODE: Dict[tuple[str, TaskletType, MaskType], LibraryNodeInfo] = {}
@@ -117,6 +118,7 @@ def match_tasklet_to_tile_library_node(state: dace.SDFGState, tasklet: Tasklet, 
         Currently implemented masks are:
             - MaskType.UNMASKED (library node takes no mask argument)
             - MaskType.RUNTIME (library node takes an additional runtime boolean mask argument)
+            - MaskType.SYMBOLIC (library node embeds a SymPy boolean predicate)
 
     Returns
     -------

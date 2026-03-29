@@ -16,7 +16,7 @@ from dace.libraries.cutile.transformations.scalar_to_tile_library import (
     ScalarToTileCanonical,
     ScalarToTileMasked,
 )
-from dace.libraries.cutile.nodes import TileOpLibraryNode, TileRuntimeMaskedOpLibraryNode
+from dace.libraries.cutile.nodes import TileOpLibraryNode, TileRuntimeMaskedOpLibraryNode, TileSymbolicMaskedOpLibraryNode
 
 
 # ---------------------------------------------------------------------------
@@ -1568,11 +1568,9 @@ def test_noncanonical_add_transforms_to_masked_node_and_contiguous_memlets():
     state = sdfg.states()[0]
     lib_nodes = [n for n in state.nodes() if isinstance(n, nodes.LibraryNode)]
     assert len(lib_nodes) == 1
-    assert isinstance(lib_nodes[0], TileRuntimeMaskedOpLibraryNode)
+    assert isinstance(lib_nodes[0], TileSymbolicMaskedOpLibraryNode)
     assert lib_nodes[0].op == "+"
-
-    transient_names = {name for name, desc in sdfg.arrays.items() if desc.transient}
-    assert any(name.startswith("map_mask_tile") for name in transient_names)
+    assert lib_nodes[0].mask_condition is not None  # should have a real condition
     _assert_no_strided_outer_memlets(state)
 
 
@@ -1620,8 +1618,9 @@ def test_noncanonical_subtract_runtime_numeric_correctness_negative_step():
     state = sdfg.states()[0]
     lib_nodes = [n for n in state.nodes() if isinstance(n, nodes.LibraryNode)]
     assert len(lib_nodes) == 1
-    assert isinstance(lib_nodes[0], TileRuntimeMaskedOpLibraryNode)
+    assert isinstance(lib_nodes[0], TileSymbolicMaskedOpLibraryNode)
     assert lib_nodes[0].op == "-"
+    assert lib_nodes[0].mask_condition is not None
 
     sdfg.expand_library_nodes()
     sdfg.validate()
