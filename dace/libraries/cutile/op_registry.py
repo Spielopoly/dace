@@ -34,6 +34,7 @@ class TaskletClassification:
 
 @dataclass(frozen=True)
 class LibraryNodeInfo:
+    """Registry entry mapping a tasklet op pattern to a library node type and its connector topology."""
     type: Type[LibraryNode]
     node_name: str
     out: str # output connector name
@@ -41,11 +42,14 @@ class LibraryNodeInfo:
     # If None, the library node does not have that input.
     rhs1: Optional[str] = None
     rhs2: Optional[str] = None
+    constant1: Optional[str] = None  # first constant/symbol value (left operand), flows from TaskletClassification
+    constant2: Optional[str] = None  # second constant/symbol value (right operand), flows from TaskletClassification
     mask_in: Optional[str] = None  # name of the library node connector for the mask, if applicable
     out_in: Optional[str] = None  # name of the library node connector for the original output (for masked nodes), if applicable
 
 @dataclass(frozen=True)
 class TaskletLibraryNodeMatch:
+    """Matched pair of a registry entry and the tasklet classification that triggered it."""
     node_info: LibraryNodeInfo
     tasklet_classification: TaskletClassification
 
@@ -53,7 +57,7 @@ class MaskType(Enum):
     UNMASKED = "unmasked"
     RUNTIME = "runtime"
 
-# Mapping from (operation, tasklet type, mask) to (library node class, library node name)
+# Mapping from (operation, tasklet type, mask) to LibraryNodeInfo
 _OP_TO_LIBRARY_NODE: Dict[tuple[str, TaskletType, MaskType], LibraryNodeInfo] = {}
 
 

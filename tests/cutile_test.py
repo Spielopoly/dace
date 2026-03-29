@@ -16,7 +16,7 @@ from dace.libraries.cutile.transformations.scalar_to_tile_library import (
     ScalarToTileCanonical,
     ScalarToTileMasked,
 )
-from dace.libraries.cutile.nodes import *
+from dace.libraries.cutile.nodes import TileOpLibraryNode, TileRuntimeMaskedOpLibraryNode
 
 
 # ---------------------------------------------------------------------------
@@ -225,7 +225,7 @@ def test_scalar_to_tile_add():
     # Exactly one library node
     lib_nodes = [n for n in state.nodes() if isinstance(n, nodes.LibraryNode)]
     assert len(lib_nodes) == 1
-    assert isinstance(lib_nodes[0], TileBinaryOpLibraryNode)
+    assert isinstance(lib_nodes[0], TileOpLibraryNode)
     assert lib_nodes[0].op == "+"
 
     # Only the outer map remains (no inner map)
@@ -259,7 +259,7 @@ def test_scalar_to_tile_add_same_input_operand():
     state = sdfg.states()[0]
     lib_nodes = [n for n in state.nodes() if isinstance(n, nodes.LibraryNode)]
     assert len(lib_nodes) == 1
-    assert isinstance(lib_nodes[0], TileBinaryOpLibraryNode)
+    assert isinstance(lib_nodes[0], TileOpLibraryNode)
     assert lib_nodes[0].op == "+"
 
     lib_node = lib_nodes[0]
@@ -414,7 +414,7 @@ def test_tileadd_runtime_numeric_correctness():
     a_read = state.add_read("A")
     b_read = state.add_read("B")
     c_write = state.add_write("C")
-    add_node = TileBinaryOpLibraryNode("tile_add_runtime_node", op="+")
+    add_node = TileOpLibraryNode("tile_add_runtime_node", op="+")
     state.add_node(add_node)
 
     state.add_edge(a_read, None, add_node, "_a", Memlet("A[0:3, 0:4]"))
@@ -788,7 +788,7 @@ def _make_direct_masked_add_sdfg(shape, name, dtype=dace.float64, mask_dtype=dac
     m_read = state.add_read("MASK")
     c_write = state.add_write("C")
 
-    op_node = TileRuntimeMaskedBinaryOpLibraryNode(name + "_node", op="+", tile_shape=node_tile_shape)
+    op_node = TileRuntimeMaskedOpLibraryNode(name + "_node", op="+", tile_shape=node_tile_shape)
     state.add_node(op_node)
 
     subset = ", ".join(f"0:{s}" for s in actual_shape)
@@ -875,7 +875,7 @@ def _make_direct_binary_sdfg(shape, name, op="+", tile_shape_override=None):
     b_read = state.add_read("B")
     c_write = state.add_write("C")
 
-    op_node = TileBinaryOpLibraryNode(name + "_node", op=op, tile_shape=node_tile_shape)
+    op_node = TileOpLibraryNode(name + "_node", op=op, tile_shape=node_tile_shape)
     state.add_node(op_node)
 
     subset = ", ".join(f"0:{s}" for s in actual_shape)
@@ -920,7 +920,7 @@ def test_scalar_to_tile_subtract():
 
     lib_nodes = [n for n in state.nodes() if isinstance(n, nodes.LibraryNode)]
     assert len(lib_nodes) == 1
-    assert isinstance(lib_nodes[0], TileBinaryOpLibraryNode)
+    assert isinstance(lib_nodes[0], TileOpLibraryNode)
     assert lib_nodes[0].op == "-"
 
     map_entries = [n for n in state.nodes() if isinstance(n, nodes.MapEntry)]
@@ -967,7 +967,7 @@ def test_subtract_structure_matches_expected():
             lib_node = n
 
     assert outer_entry is not None and outer_exit is not None and lib_node is not None
-    assert isinstance(lib_node, TileBinaryOpLibraryNode)
+    assert isinstance(lib_node, TileOpLibraryNode)
     assert lib_node.op == "-"
 
     scope = state.scope_dict()
@@ -1006,7 +1006,7 @@ def test_tilesubtract_runtime_numeric_correctness():
     a_read = state.add_read("A")
     b_read = state.add_read("B")
     c_write = state.add_write("C")
-    sub_node = TileBinaryOpLibraryNode("tile_subtract_runtime_node", op="-")
+    sub_node = TileOpLibraryNode("tile_subtract_runtime_node", op="-")
     state.add_node(sub_node)
 
     state.add_edge(a_read, None, sub_node, "_a", Memlet("A[0:3, 0:4]"))
@@ -1211,7 +1211,7 @@ def test_subtract_self_gives_zero():
     a_read_2 = state.add_read("A")
     c_write = state.add_write("C")
 
-    sub_node = TileBinaryOpLibraryNode("sub_self", op="-")
+    sub_node = TileOpLibraryNode("sub_self", op="-")
     state.add_node(sub_node)
     state.add_edge(a_read_1, None, sub_node, "_a", Memlet("A[0:5, 0:6]"))
     state.add_edge(a_read_2, None, sub_node, "_b", Memlet("A[0:5, 0:6]"))
@@ -1242,7 +1242,7 @@ def test_add_subtract_roundtrip():
     sdfg_add.add_array("B", shape=shape, dtype=dace.float64)
     sdfg_add.add_array("T", shape=shape, dtype=dace.float64)
     st = sdfg_add.add_state()
-    add_node = TileBinaryOpLibraryNode("add_rt_node", op="+")
+    add_node = TileOpLibraryNode("add_rt_node", op="+")
     st.add_node(add_node)
     st.add_edge(st.add_read("A"), None, add_node, "_a", Memlet("A[0:6, 0:7]"))
     st.add_edge(st.add_read("B"), None, add_node, "_b", Memlet("B[0:6, 0:7]"))
@@ -1257,7 +1257,7 @@ def test_add_subtract_roundtrip():
     sdfg_sub.add_array("B", shape=shape, dtype=dace.float64)
     sdfg_sub.add_array("O", shape=shape, dtype=dace.float64)
     st2 = sdfg_sub.add_state()
-    sub_node = TileBinaryOpLibraryNode("sub_rt_node", op="-")
+    sub_node = TileOpLibraryNode("sub_rt_node", op="-")
     st2.add_node(sub_node)
     st2.add_edge(st2.add_read("T"), None, sub_node, "_a", Memlet("T[0:6, 0:7]"))
     st2.add_edge(st2.add_read("B"), None, sub_node, "_b", Memlet("B[0:6, 0:7]"))
@@ -1340,7 +1340,7 @@ def test_tileadd_int32_dtype():
     sdfg.add_array("C", shape=shape, dtype=dace.int32)
 
     state = sdfg.add_state("main")
-    add_node = TileBinaryOpLibraryNode("add_int32", op="+")
+    add_node = TileOpLibraryNode("add_int32", op="+")
     state.add_node(add_node)
     state.add_edge(state.add_read("A"), None, add_node, "_a", Memlet("A[0:5, 0:6]"))
     state.add_edge(state.add_read("B"), None, add_node, "_b", Memlet("B[0:5, 0:6]"))
@@ -1368,7 +1368,7 @@ def test_tilesubtract_int32_dtype():
     sdfg.add_array("C", shape=shape, dtype=dace.int32)
 
     state = sdfg.add_state("main")
-    sub_node = TileBinaryOpLibraryNode("sub_int32", op="-")
+    sub_node = TileOpLibraryNode("sub_int32", op="-")
     state.add_node(sub_node)
     state.add_edge(state.add_read("A"), None, sub_node, "_a", Memlet("A[0:5, 0:6]"))
     state.add_edge(state.add_read("B"), None, sub_node, "_b", Memlet("B[0:5, 0:6]"))
@@ -1568,7 +1568,7 @@ def test_noncanonical_add_transforms_to_masked_node_and_contiguous_memlets():
     state = sdfg.states()[0]
     lib_nodes = [n for n in state.nodes() if isinstance(n, nodes.LibraryNode)]
     assert len(lib_nodes) == 1
-    assert isinstance(lib_nodes[0], TileRuntimeMaskedBinaryOpLibraryNode)
+    assert isinstance(lib_nodes[0], TileRuntimeMaskedOpLibraryNode)
     assert lib_nodes[0].op == "+"
 
     transient_names = {name for name, desc in sdfg.arrays.items() if desc.transient}
@@ -1620,7 +1620,7 @@ def test_noncanonical_subtract_runtime_numeric_correctness_negative_step():
     state = sdfg.states()[0]
     lib_nodes = [n for n in state.nodes() if isinstance(n, nodes.LibraryNode)]
     assert len(lib_nodes) == 1
-    assert isinstance(lib_nodes[0], TileRuntimeMaskedBinaryOpLibraryNode)
+    assert isinstance(lib_nodes[0], TileRuntimeMaskedOpLibraryNode)
     assert lib_nodes[0].op == "-"
 
     sdfg.expand_library_nodes()
@@ -1778,7 +1778,7 @@ def test_tilemaskedadd_validate_rejects_mask_shape_mismatch():
     sdfg.add_array("C", shape=[4, 4], dtype=dace.float64)
 
     state = sdfg.add_state("main")
-    node = TileRuntimeMaskedBinaryOpLibraryNode("bad_shape", op="+")
+    node = TileRuntimeMaskedOpLibraryNode("bad_shape", op="+")
     state.add_node(node)
     state.add_edge(state.add_read("A"), None, node, "_a", Memlet("A[0:4, 0:4]"))
     state.add_edge(state.add_read("B"), None, node, "_b", Memlet("B[0:4, 0:4]"))
@@ -1798,7 +1798,7 @@ def test_tilemaskedadd_validate_rejects_non_integer_mask_dtype():
     sdfg.add_array("C", shape=[4, 4], dtype=dace.float64)
 
     state = sdfg.add_state("main")
-    node = TileRuntimeMaskedBinaryOpLibraryNode("bad_dtype", op="+")
+    node = TileRuntimeMaskedOpLibraryNode("bad_dtype", op="+")
     state.add_node(node)
     state.add_edge(state.add_read("A"), None, node, "_a", Memlet("A[0:4, 0:4]"))
     state.add_edge(state.add_read("B"), None, node, "_b", Memlet("B[0:4, 0:4]"))
@@ -1824,7 +1824,7 @@ def test_tilemultiply_runtime_numeric_correctness():
     a_read = state.add_read("A")
     b_read = state.add_read("B")
     c_write = state.add_write("C")
-    mul_node = TileBinaryOpLibraryNode("tile_multiply_runtime_node", op="*")
+    mul_node = TileOpLibraryNode("tile_multiply_runtime_node", op="*")
     state.add_node(mul_node)
 
     state.add_edge(a_read, None, mul_node, "_a", Memlet("A[0:3, 0:4]"))
@@ -1855,7 +1855,7 @@ def test_tiledivide_runtime_numeric_correctness():
     a_read = state.add_read("A")
     b_read = state.add_read("B")
     c_write = state.add_write("C")
-    div_node = TileBinaryOpLibraryNode("tile_divide_runtime_node", op="/")
+    div_node = TileOpLibraryNode("tile_divide_runtime_node", op="/")
     state.add_node(div_node)
 
     state.add_edge(a_read, None, div_node, "_a", Memlet("A[0:3, 0:4]"))
@@ -1901,7 +1901,7 @@ def test_tiledivide_ndim_2():
 
 
 def test_pipeline_multiply_transforms_correctly():
-    """Pipeline multiply SDFG → TileBinaryOpLibraryNode with op='*'."""
+    """Pipeline multiply SDFG → TileOpLibraryNode with op='*'."""
     mt, nt, t0, t1 = 2, 3, 2, 2
     sdfg = SDFG("tile_multiply_pipeline")
     sdfg.add_array("A", shape=[mt, nt, t0, t1], dtype=dace.float64)
@@ -1937,7 +1937,7 @@ def test_pipeline_multiply_transforms_correctly():
     state = sdfg.states()[0]
     lib_nodes = [n for n in state.nodes() if isinstance(n, nodes.LibraryNode)]
     assert len(lib_nodes) == 1
-    assert isinstance(lib_nodes[0], TileBinaryOpLibraryNode)
+    assert isinstance(lib_nodes[0], TileOpLibraryNode)
     assert lib_nodes[0].op == "*"
 
     sdfg.expand_library_nodes()
@@ -1974,7 +1974,11 @@ def _make_direct_unary_sdfg(shape, name, op="-", tile_shape_override=None):
     a_read = state.add_read("A")
     c_write = state.add_write("C")
 
-    op_node = TileUnaryOpLibraryNode(name + "_node", op=op, tile_shape=node_tile_shape)
+    op_node = TileOpLibraryNode(name + "_node", op=op, tile_shape=node_tile_shape)
+    # Unified TileOpLibraryNode defaults to binary for ambiguous ops like "-";
+    # remove _b to make it unary.
+    if "_b" in op_node.in_connectors:
+        op_node.remove_in_connector("_b")
     state.add_node(op_node)
 
     subset = ", ".join(f"0:{s}" for s in actual_shape)
@@ -2028,7 +2032,7 @@ def test_unary_negate_4d():
 
 
 def test_pipeline_unary_negate_transforms_correctly():
-    """Pipeline unary negate: c = -a → TileUnaryOpLibraryNode with op='-'."""
+    """Pipeline unary negate: c = -a → TileOpLibraryNode with op='-'."""
     mt, nt, t0, t1 = 2, 3, 2, 2
     sdfg = SDFG("tile_negate_pipeline")
     sdfg.add_array("A", shape=[mt, nt, t0, t1], dtype=dace.float64)
@@ -2060,7 +2064,7 @@ def test_pipeline_unary_negate_transforms_correctly():
     state = sdfg.states()[0]
     lib_nodes = [n for n in state.nodes() if isinstance(n, nodes.LibraryNode)]
     assert len(lib_nodes) == 1
-    assert isinstance(lib_nodes[0], TileUnaryOpLibraryNode)
+    assert isinstance(lib_nodes[0], TileOpLibraryNode)
     assert lib_nodes[0].op == "-"
 
     sdfg.expand_library_nodes()
@@ -2099,13 +2103,19 @@ def _make_direct_const_binary_sdfg(shape, name, op="+", constant="2",
     a_read = state.add_read("A")
     c_write = state.add_write("C")
 
-    op_node = TileBinaryOpLibraryNode(
-        name + "_node", op=op, constant=constant,
-        constant_position=constant_position, tile_shape=node_tile_shape)
+    # Map old constant/constant_position to new constant1/constant2
+    if constant_position == "left":
+        op_node = TileOpLibraryNode(
+            name + "_node", op=op, constant1=constant, tile_shape=node_tile_shape)
+        array_conn = "_b"
+    else:
+        op_node = TileOpLibraryNode(
+            name + "_node", op=op, constant2=constant, tile_shape=node_tile_shape)
+        array_conn = "_a"
     state.add_node(op_node)
 
     subset = ", ".join(f"0:{s}" for s in actual_shape)
-    state.add_edge(a_read, None, op_node, "_a", Memlet(f"A[{subset}]"))
+    state.add_edge(a_read, None, op_node, array_conn, Memlet(f"A[{subset}]"))
     state.add_edge(op_node, "_c", c_write, None, Memlet(f"C[{subset}]"))
 
     sdfg.validate()
@@ -2249,10 +2259,9 @@ def test_pipeline_const_add_right_transforms_correctly():
     state = sdfg.states()[0]
     lib_nodes = [n for n in state.nodes() if isinstance(n, nodes.LibraryNode)]
     assert len(lib_nodes) == 1
-    assert isinstance(lib_nodes[0], TileBinaryOpLibraryNode)
+    assert isinstance(lib_nodes[0], TileOpLibraryNode)
     assert lib_nodes[0].op == "+"
-    assert lib_nodes[0].constant == "2"
-    assert lib_nodes[0].constant_position == "right"
+    assert lib_nodes[0].constant2 == "2"
 
     sdfg.expand_library_nodes()
     sdfg.validate()
@@ -2299,10 +2308,9 @@ def test_pipeline_const_left_multiply_transforms_correctly():
     state = sdfg.states()[0]
     lib_nodes = [n for n in state.nodes() if isinstance(n, nodes.LibraryNode)]
     assert len(lib_nodes) == 1
-    assert isinstance(lib_nodes[0], TileBinaryOpLibraryNode)
+    assert isinstance(lib_nodes[0], TileOpLibraryNode)
     assert lib_nodes[0].op == "*"
-    assert lib_nodes[0].constant == "3"
-    assert lib_nodes[0].constant_position == "left"
+    assert lib_nodes[0].constant1 == "3"
 
     sdfg.expand_library_nodes()
     sdfg.validate()
@@ -2340,8 +2348,12 @@ def _make_direct_masked_unary_sdfg(shape, name, op="-", mask_dtype=dace.bool,
     m_read = state.add_read("MASK")
     c_write = state.add_write("C")
 
-    op_node = TileRuntimeMaskedUnaryOpLibraryNode(
+    op_node = TileRuntimeMaskedOpLibraryNode(
         name + "_node", op=op, tile_shape=node_tile_shape)
+    # Unified TileRuntimeMaskedOpLibraryNode defaults to binary for "-";
+    # remove _b to make it unary.
+    if "_b" in op_node.in_connectors:
+        op_node.remove_in_connector("_b")
     state.add_node(op_node)
 
     subset = ", ".join(f"0:{s}" for s in actual_shape)
@@ -2384,8 +2396,8 @@ def test_masked_const_add_right_runtime():
     m_read = state.add_read("MASK")
     c_write = state.add_write("C")
 
-    op_node = TileRuntimeMaskedBinaryOpLibraryNode(
-        "masked_const_add_node", op="+", constant="2", constant_position="right")
+    op_node = TileRuntimeMaskedOpLibraryNode(
+        "masked_const_add_node", op="+", constant2="2")
     state.add_node(op_node)
 
     state.add_edge(a_read, None, op_node, "_a", Memlet("A[0:4, 0:5]"))
@@ -2430,7 +2442,7 @@ def _make_direct_unary_func_sdfg(shape, name, op="sin", tile_shape_override=None
     a_read = state.add_read("A")
     c_write = state.add_write("C")
 
-    op_node = TileUnaryOpLibraryNode(
+    op_node = TileOpLibraryNode(
         name + "_node", op=op, tile_shape=node_tile_shape)
     state.add_node(op_node)
 
@@ -2539,9 +2551,9 @@ def test_const_only_multiply():
     state = sdfg.add_state("main")
     c_write = state.add_write("C")
 
-    op_node = TileBinaryOpLibraryNode(
-        "const_only_mul_node", op="*", constant="2",
-        constant_position="left", constant2="3")
+    op_node = TileOpLibraryNode(
+        "const_only_mul_node", op="*", constant1="2",
+        constant2="3")
     state.add_node(op_node)
 
     subset = ", ".join(f"0:{s}" for s in shape)
@@ -2565,9 +2577,9 @@ def test_const_only_add():
     state = sdfg.add_state("main")
     c_write = state.add_write("C")
 
-    op_node = TileBinaryOpLibraryNode(
-        "const_only_add_node", op="+", constant="10",
-        constant_position="left", constant2="5")
+    op_node = TileOpLibraryNode(
+        "const_only_add_node", op="+", constant1="10",
+        constant2="5")
     state.add_node(op_node)
 
     subset = ", ".join(f"0:{s}" for s in shape)
@@ -2595,8 +2607,8 @@ def test_unary_const_sin():
     state = sdfg.add_state("main")
     c_write = state.add_write("C")
 
-    op_node = TileUnaryOpLibraryNode(
-        "unary_const_sin_node", op="sin", constant="0.0")
+    op_node = TileOpLibraryNode(
+        "unary_const_sin_node", op="sin", constant1="0.0")
     state.add_node(op_node)
 
     subset = ", ".join(f"0:{s}" for s in shape)

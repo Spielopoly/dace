@@ -6,8 +6,7 @@ import numpy as np
 import pytest
 
 from dace.sdfg import nodes
-from dace.libraries.cutile.nodes import TileBinaryOpLibraryNode, TileRuntimeMaskedBinaryOpLibraryNode
-from dace.libraries.cutile.nodes import TileUnaryOpLibraryNode, TileRuntimeMaskedUnaryOpLibraryNode
+from dace.libraries.cutile.nodes import TileOpLibraryNode, TileRuntimeMaskedOpLibraryNode
 from dace.libraries.cutile.transformations.pipeline import apply_cutile_pipeline
 
 
@@ -99,7 +98,7 @@ def test_frontend_vadd_pipeline_structure_and_runtime():
     assert count >= 1
 
     lib_nodes = _frontend_library_nodes(sdfg)
-    assert any(isinstance(node, TileBinaryOpLibraryNode) for node in lib_nodes)
+    assert any(isinstance(node, TileOpLibraryNode) for node in lib_nodes)
 
     tasklet_codes = {
         str(node.code)
@@ -133,7 +132,7 @@ def test_frontend_symbolic_vadd_pipeline_structure_and_runtime():
     assert count >= 1
 
     lib_nodes = _frontend_library_nodes(sdfg)
-    assert any(isinstance(node, TileBinaryOpLibraryNode) for node in lib_nodes)
+    assert any(isinstance(node, TileOpLibraryNode) for node in lib_nodes)
 
     sdfg.expand_library_nodes()
     sdfg.validate()
@@ -161,7 +160,7 @@ def test_frontend_vselfadd_pipeline_structure_and_runtime():
     assert count >= 1
 
     lib_nodes = _frontend_library_nodes(sdfg)
-    assert any(isinstance(node, TileBinaryOpLibraryNode) for node in lib_nodes)
+    assert any(isinstance(node, TileOpLibraryNode) for node in lib_nodes)
 
     sdfg.expand_library_nodes()
     sdfg.validate()
@@ -226,7 +225,7 @@ def test_frontend_large_prime_strided_add_with_nonmultiple_tile_shape(tile_shape
     assert count >= 2
 
     lib_nodes = _frontend_library_nodes(sdfg)
-    assert any(isinstance(node, TileRuntimeMaskedBinaryOpLibraryNode) for node in lib_nodes)
+    assert any(isinstance(node, TileRuntimeMaskedOpLibraryNode) for node in lib_nodes)
 
     sdfg.expand_library_nodes()
     sdfg.validate()
@@ -256,7 +255,7 @@ def test_frontend_large_prime_strided_add_with_nondivisible_ranges(tile_shape):
     assert count >= 2
 
     lib_nodes = _frontend_library_nodes(sdfg)
-    assert any(isinstance(node, TileRuntimeMaskedBinaryOpLibraryNode) for node in lib_nodes)
+    assert any(isinstance(node, TileRuntimeMaskedOpLibraryNode) for node in lib_nodes)
 
     sdfg.expand_library_nodes()
     sdfg.validate()
@@ -366,7 +365,7 @@ def test_frontend_negate_pipeline_structure_and_runtime():
     assert count >= 1
 
     lib_nodes = _frontend_library_nodes(sdfg)
-    assert any(isinstance(node, TileUnaryOpLibraryNode) for node in lib_nodes)
+    assert any(isinstance(node, TileOpLibraryNode) for node in lib_nodes)
 
     sdfg.expand_library_nodes()
     sdfg.validate()
@@ -391,7 +390,7 @@ def test_frontend_abs_pipeline_structure_and_runtime():
     assert count >= 1
 
     lib_nodes = _frontend_library_nodes(sdfg)
-    assert any(isinstance(node, TileUnaryOpLibraryNode) for node in lib_nodes)
+    assert any(isinstance(node, TileOpLibraryNode) for node in lib_nodes)
 
     sdfg.expand_library_nodes()
     sdfg.validate()
@@ -416,7 +415,7 @@ def test_frontend_cos_pipeline_structure_and_runtime():
     assert count >= 1
 
     lib_nodes = _frontend_library_nodes(sdfg)
-    assert any(isinstance(node, TileUnaryOpLibraryNode) for node in lib_nodes)
+    assert any(isinstance(node, TileOpLibraryNode) for node in lib_nodes)
 
     sdfg.expand_library_nodes()
     sdfg.validate()
@@ -441,7 +440,7 @@ def test_frontend_a_minus_const_pipeline_structure_and_runtime():
     assert count >= 1
 
     lib_nodes = _frontend_library_nodes(sdfg)
-    assert any(isinstance(node, TileBinaryOpLibraryNode) for node in lib_nodes)
+    assert any(isinstance(node, TileOpLibraryNode) for node in lib_nodes)
 
     sdfg.expand_library_nodes()
     sdfg.validate()
@@ -466,7 +465,7 @@ def test_frontend_const_minus_a_pipeline_structure_and_runtime():
     assert count >= 1
 
     lib_nodes = _frontend_library_nodes(sdfg)
-    assert any(isinstance(node, TileBinaryOpLibraryNode) for node in lib_nodes)
+    assert any(isinstance(node, TileOpLibraryNode) for node in lib_nodes)
 
     sdfg.expand_library_nodes()
     sdfg.validate()
@@ -491,7 +490,7 @@ def test_frontend_a_times_const_pipeline_structure_and_runtime():
     assert count >= 1
 
     lib_nodes = _frontend_library_nodes(sdfg)
-    assert any(isinstance(node, TileBinaryOpLibraryNode) for node in lib_nodes)
+    assert any(isinstance(node, TileOpLibraryNode) for node in lib_nodes)
 
     sdfg.expand_library_nodes()
     sdfg.validate()

@@ -1,21 +1,22 @@
 """
-Masked cuTile binary operation library nodes.
+Masked cuTile operation library node – unified binary and unary.
 
-Implements element-wise masked binary operations:
-    if mask[idx]:
-        C[idx] = OP(A[idx], B[idx])        (two arrays)
-        C[idx] = OP(A[idx], CONST)         (array + constant)
-        C[idx] = OP(CONST, A[idx])         (constant + array)
-        C[idx] = OP(CONST1, CONST2)        (two constants)
+Implements element-wise masked operations:
+    Binary:
+        if mask[idx]: C[idx] = OP(A[idx], B[idx])
+        if mask[idx]: C[idx] = OP(A[idx], CONST2)
+        if mask[idx]: C[idx] = OP(CONST1, B[idx])
+        if mask[idx]: C[idx] = OP(CONST1, CONST2)
+    Unary:
+        if mask[idx]: C[idx] = OP(A[idx])
+        if mask[idx]: C[idx] = OP(CONST1)
 
 When the mask is false, the output element is left untouched.
-The ``op`` property selects the operation (``+``, ``-``, ``*``, ``/``).
-Optional ``constant`` / ``constant_position`` / ``constant2`` properties
-allow one or both operands to be literal constants.
+``constant1`` replaces the left/first operand, ``constant2`` the right/second.
 """
 from __future__ import annotations
 
-from typing import Optional, cast
+from typing import List, Optional, cast
 
 import dace
 from dace import dtypes, properties
@@ -27,27 +28,24 @@ from dace.sdfg.validation import InvalidSDFGNodeError
 from dace.symbolic import symstr
 from dace.transformation.transformation import ExpandTransformation
 from ..op_registry import TaskletType, MaskType, register_op
-from .binary_op import _binary_cpp_expr
-from . import binary_op
-
-
-_MASKED_BINARY_OPS = binary_op._BINARY_OPS
+from .op import _op_cpp_expr, _BINARY_OPS, _UNARY_OPS, _ALL_OPS
 
 
 @library.node
-class TileRuntimeMaskedBinaryOpLibraryNode(LibraryNode):
+class TileRuntimeMaskedOpLibraryNode(LibraryNode):
     """
-    Generic library node for masked binary operation on tiles:
-        if M: C = A op B  (or A op CONST, CONST op A, CONST1 op CONST2)
-        else: C unchanged
+    Unified library node for masked element-wise operations on tiles.
 
-    Connectors (presence depends on whether constants replace operands)
+    Binary:  if M: C = (constant1 or _a) op (constant2 or _b); else: C unchanged
+    Unary:   if M: C = op(constant1 or _a); else: C unchanged
+
+    Connectors
     ----------
-    _a     (in, optional)  : tile A
-    _b     (in, optional)  : tile B
-    _m     (in)            : tile mask (same shape as output)
-    _c_in  (in, optional)  : initial tile C values used when mask is false
-    _c     (out)           : tile C
+    _a     (in, optional)  : left / first operand tile
+    _b     (in, optional)  : right / second operand tile (binary only)
+    _m     (in)            : boolean mask tile
+    _c_in  (in, optional)  : initial C values used when mask is false
+    _c     (out)           : result tile
     """
 
     implementations: dict = {}
@@ -56,27 +54,20 @@ class TileRuntimeMaskedBinaryOpLibraryNode(LibraryNode):
     op = properties.Property(
         dtype=str,
         default="+",
-        desc="Binary operation symbol, e.g. '+', '-', '*', '/'.",
+        desc="Operation symbol, e.g. '+', '-', '*', '/', 'abs', 'sin', …",
     )
 
-    constant = properties.Property(
+    constant1 = properties.Property(
         dtype=str,
         default=None,
-        desc="First constant operand. None means operand comes from a connector.",
-        allow_none=True,
-    )
-
-    constant_position = properties.Property(
-        dtype=str,
-        default=None,
-        desc="Position of 'constant': 'left' or 'right'. None when no constant.",
+        desc="Left / first constant operand. None means operand comes from _a.",
         allow_none=True,
     )
 
     constant2 = properties.Property(
         dtype=str,
         default=None,
-        desc="Second constant operand. When both constant and constant2 are set, no array connectors are needed.",
+        desc="Right / second constant operand. None means operand comes from _b (binary) or absent (unary).",
         allow_none=True,
     )
 
@@ -93,20 +84,16 @@ class TileRuntimeMaskedBinaryOpLibraryNode(LibraryNode):
     )
 
     def __init__(self,
-                 name: str = "TileMaskedBinaryOp",
+                 name: str = "TileMaskedOp",
                  op: str = "+",
-                 tile_shape: list[int] | None = None,
-                 constant: str | None = None,
-                 constant_position: str | None = None,
-                 constant2: str | None = None,
+                 tile_shape: Optional[List[int]] = None,
+                 constant1: Optional[str] = None,
+                 constant2: Optional[str] = None,
                  **kwargs):
         inputs: set[str] = {"_m"}
-        if constant2 is not None:
-            pass  # both constants — no array connectors
-        elif constant is not None:
+        if constant1 is None:
             inputs.add("_a")
-        else:
-            inputs.add("_a")
+        if op in _BINARY_OPS and constant2 is None:
             inputs.add("_b")
 
         super().__init__(
@@ -117,11 +104,32 @@ class TileRuntimeMaskedBinaryOpLibraryNode(LibraryNode):
         )
         self.op = op
         self.tile_shape = tile_shape
-        self.constant = constant
-        self.constant_position = constant_position
+        self.constant1 = constant1
         self.constant2 = constant2
 
+    @property
+    def is_binary(self) -> bool:
+        return self.constant2 is not None or "_b" in self.in_connectors
+
     def validate(self, sdfg: SDFG, state: SDFGState):
+        if self.op not in _ALL_OPS:
+            raise InvalidSDFGNodeError(
+                f"TileMaskedOp '{self.name}': unsupported op '{self.op}'. "
+                f"Supported: {_ALL_OPS}",
+                sdfg=sdfg,
+                state_id=state.parent_graph.node_id(state),
+                node_id=state.node_id(self),
+            )
+
+        if self.op not in _BINARY_OPS and self.is_binary:
+            raise InvalidSDFGNodeError(
+                f"TileMaskedOp '{self.name}': op '{self.op}' is unary-only "
+                f"but has binary connectors.",
+                sdfg=sdfg,
+                state_id=state.parent_graph.node_id(state),
+                node_id=state.node_id(self),
+            )
+
         m_node = c_node = None
         a_node = b_node = None
         for edge in state.in_edges(self):
@@ -137,7 +145,22 @@ class TileRuntimeMaskedBinaryOpLibraryNode(LibraryNode):
 
         if m_node is None or c_node is None:
             raise InvalidSDFGNodeError(
-                f"TileMaskedBinaryOp '{self.name}': connectors _m and _c must be connected.",
+                f"TileMaskedOp '{self.name}': connectors _m and _c must be connected.",
+                sdfg=sdfg,
+                state_id=state.parent_graph.node_id(state),
+                node_id=state.node_id(self),
+            )
+
+        if self.constant1 is None and a_node is None:
+            raise InvalidSDFGNodeError(
+                f"TileMaskedOp '{self.name}': connector _a must be connected when constant1 is not set.",
+                sdfg=sdfg,
+                state_id=state.parent_graph.node_id(state),
+                node_id=state.node_id(self),
+            )
+        if "_b" in self.in_connectors and self.constant2 is None and b_node is None:
+            raise InvalidSDFGNodeError(
+                f"TileMaskedOp '{self.name}': connector _b must be connected when constant2 is not set.",
                 sdfg=sdfg,
                 state_id=state.parent_graph.node_id(state),
                 node_id=state.node_id(self),
@@ -146,13 +169,11 @@ class TileRuntimeMaskedBinaryOpLibraryNode(LibraryNode):
         c_desc = sdfg.arrays[c_node.data]
         m_desc = sdfg.arrays[m_node.data]
 
-        # Shape checks for connected array operands
         if a_node is not None:
             a_desc = sdfg.arrays[a_node.data]
             if a_desc.shape != c_desc.shape:
                 raise InvalidSDFGNodeError(
-                    f"TileMaskedBinaryOp '{self.name}': shape mismatch — "
-                    f"A={a_desc.shape}, C={c_desc.shape}",
+                    f"TileMaskedOp '{self.name}': shape mismatch — A={a_desc.shape}, C={c_desc.shape}",
                     sdfg=sdfg,
                     state_id=state.parent_graph.node_id(state),
                     node_id=state.node_id(self),
@@ -161,16 +182,14 @@ class TileRuntimeMaskedBinaryOpLibraryNode(LibraryNode):
             b_desc = sdfg.arrays[b_node.data]
             if b_desc.shape != c_desc.shape:
                 raise InvalidSDFGNodeError(
-                    f"TileMaskedBinaryOp '{self.name}': shape mismatch — "
-                    f"B={b_desc.shape}, C={c_desc.shape}",
+                    f"TileMaskedOp '{self.name}': shape mismatch — B={b_desc.shape}, C={c_desc.shape}",
                     sdfg=sdfg,
                     state_id=state.parent_graph.node_id(state),
                     node_id=state.node_id(self),
                 )
         if m_desc.shape != c_desc.shape:
             raise InvalidSDFGNodeError(
-                f"TileMaskedBinaryOp '{self.name}': mask shape mismatch — "
-                f"M={m_desc.shape}, C={c_desc.shape}",
+                f"TileMaskedOp '{self.name}': mask shape mismatch — M={m_desc.shape}, C={c_desc.shape}",
                 sdfg=sdfg,
                 state_id=state.parent_graph.node_id(state),
                 node_id=state.node_id(self),
@@ -183,7 +202,7 @@ class TileRuntimeMaskedBinaryOpLibraryNode(LibraryNode):
         }
         if m_desc.dtype not in supported_mask_dtypes:
             raise InvalidSDFGNodeError(
-                f"TileMaskedBinaryOp '{self.name}': mask dtype must be bool or integer, got M={m_desc.dtype}",
+                f"TileMaskedOp '{self.name}': mask dtype must be bool or integer, got M={m_desc.dtype}",
                 sdfg=sdfg,
                 state_id=state.parent_graph.node_id(state),
                 node_id=state.node_id(self),
@@ -193,8 +212,8 @@ class TileRuntimeMaskedBinaryOpLibraryNode(LibraryNode):
 # ── C++ expansion ────────────────────────────────────────────────────
 
 def _get_masked_tile_descriptors(node, state, sdfg):
-    """Return (a_desc, b_desc, m_desc, c_desc, c_in_desc) for a masked binary node.
-    a_desc and/or b_desc may be None when constants replace them."""
+    """Return (a_desc, b_desc, m_desc, c_desc, c_in_desc).
+    a_desc / b_desc may be None when constants replace them."""
     a_desc = b_desc = m_desc = c_desc = c_in_desc = None
     for edge in state.in_edges(node):
         arr_name = edge.data.data
@@ -216,7 +235,7 @@ def _get_masked_tile_descriptors(node, state, sdfg):
             c_desc = sdfg.arrays[arr_name]
     if None in (m_desc, c_desc):
         raise ValueError(
-            f"TileMaskedBinaryOp expansion: _m and _c must be connected for node '{node.name}'."
+            f"TileMaskedOp expansion: _m and _c must be connected for node '{node.name}'."
         )
     return (
         cast(Optional[dace.data.Data], a_desc),
@@ -227,25 +246,25 @@ def _get_masked_tile_descriptors(node, state, sdfg):
     )
 
 
-@library.register_expansion(TileRuntimeMaskedBinaryOpLibraryNode, "pure")
-class ExpandTileRuntimeMaskedBinaryOpPure(ExpandTransformation):
-    """Expand any TileRuntimeMaskedBinaryOpLibraryNode into a C++ tasklet."""
+@library.register_expansion(TileRuntimeMaskedOpLibraryNode, "pure")
+class ExpandTileRuntimeMaskedOpPure(ExpandTransformation):
+    """Expand TileRuntimeMaskedOpLibraryNode into a C++ tasklet."""
 
     environments: list = []
 
     @staticmethod
-    def expansion(node: TileRuntimeMaskedBinaryOpLibraryNode, state: SDFGState,
+    def expansion(node: TileRuntimeMaskedOpLibraryNode, state: SDFGState,
                   sdfg: SDFG) -> nodes.Tasklet:
         op = node.op
-        constant = node.constant
-        const_pos = node.constant_position
+        constant1 = node.constant1
         constant2 = node.constant2
 
         a_desc, b_desc, m_desc, c_desc, c_in_desc = _get_masked_tile_descriptors(
             node, state, sdfg)
         has_c_in = c_in_desc is not None
-        ref_desc = a_desc or b_desc or c_desc
+        is_binary = (constant2 is not None) or (b_desc is not None)
 
+        ref_desc = a_desc or b_desc or c_desc
         tile_shape = getattr(node, "tile_shape", None)
         shape = tuple(tile_shape) if tile_shape is not None else ref_desc.shape
         ndim = len(shape)
@@ -266,48 +285,31 @@ class ExpandTileRuntimeMaskedBinaryOpPure(ExpandTransformation):
         if has_c_in:
             inputs.add("_c_in")
 
-        # Determine left/right expression atoms
-        if constant2 is not None:
-            left_val = constant if const_pos == "left" else constant2
-            right_val = constant2 if const_pos == "left" else constant
+        # Determine operand values
+        left_scalar = constant1 if constant1 is not None else "_a"
+        right_scalar = constant2 if constant2 is not None else ("_b" if is_binary else None)
+        left_indexed = constant1 if constant1 is not None else "_a[ia]"
+        right_indexed = constant2 if constant2 is not None else ("_b[ib]" if is_binary else None)
 
-            def scalar_expr():
-                return _binary_cpp_expr(op, left_val, right_val)
-
-            def indexed_expr():
-                return _binary_cpp_expr(op, left_val, right_val)
-
-            array_descs = {}  # no array stride computation needed
-        elif constant is not None:
-            def scalar_expr():
-                if const_pos == "left":
-                    return _binary_cpp_expr(op, constant, '_a')
-                return _binary_cpp_expr(op, '_a', constant)
-
-            def indexed_expr():
-                if const_pos == "left":
-                    return _binary_cpp_expr(op, constant, '_a[ia]')
-                return _binary_cpp_expr(op, '_a[ia]', constant)
-
-            array_descs = {"a": a_desc}
-        else:
-            def scalar_expr():
-                return _binary_cpp_expr(op, '_a', '_b')
-
-            def indexed_expr():
-                return _binary_cpp_expr(op, '_a[ia]', '_b[ib]')
-
-            array_descs = {"a": a_desc, "b": b_desc}
+        scalar_expr = _op_cpp_expr(op, left_scalar, right_scalar)
+        indexed_expr = _op_cpp_expr(op, left_indexed, right_indexed)
 
         if use_scalar_form:
             if has_c_in:
-                code = f"if (_m) {{ _c = {scalar_expr()}; }} else {{ _c = _c_in; }}"
+                code = f"if (_m) {{ _c = {scalar_expr}; }} else {{ _c = _c_in; }}"
             else:
-                code = f"if (_m) {{ _c = {scalar_expr()}; }}"
+                code = f"if (_m) {{ _c = {scalar_expr}; }}"
         else:
             shape_expr = ", ".join(symstr(s) for s in shape)
             m_strides_expr = ", ".join(symstr(s) for s in m_desc.strides)
             c_strides_expr = ", ".join(symstr(s) for s in c_desc.strides)
+
+            # Collect array descriptors for stride computation
+            array_descs: dict[str, object] = {}
+            if a_desc is not None:
+                array_descs["a"] = a_desc
+            if b_desc is not None:
+                array_descs["b"] = b_desc
 
             stride_decls = ""
             index_decls = ""
@@ -323,11 +325,45 @@ class ExpandTileRuntimeMaskedBinaryOpPure(ExpandTransformation):
             c_in_else = ""
             if has_c_in:
                 c_in_stride_decl = f"const std::ptrdiff_t c_in_strides[ndim] = {{{', '.join(symstr(s) for s in c_in_desc.strides)}}};"
-                c_in_index_decl = "    std::size_t iin = 0;"
+                c_in_index_decl =   "    std::size_t iin = 0;"
                 c_in_index_update = "        iin += coord * c_in_strides[d];"
-                c_in_else = "else { _c[ic] = _c_in[iin]; }"
+                c_in_else =         "else { _c[ic] = _c_in[iin]; }"
 
-            code = f"""
+            if not array_descs:
+                # Both operands are constants – only mask + output iteration
+                code = f"""
+constexpr int ndim = {ndim};
+const std::size_t shape[ndim] = {{{shape_expr}}};
+const std::ptrdiff_t m_strides[ndim] = {{{m_strides_expr}}};
+const std::ptrdiff_t c_strides[ndim] = {{{c_strides_expr}}};
+{c_in_stride_decl}
+const auto _val = {indexed_expr};
+
+std::size_t n = 1;
+for (int d = 0; d < ndim; ++d) {{
+    n *= shape[d];
+}}
+for (std::size_t i = 0; i < n; ++i) {{
+    std::size_t rem = i;
+    std::size_t im = 0;
+    std::size_t ic = 0;
+{c_in_index_decl}
+    for (int d = ndim - 1; d >= 0; --d) {{
+        const auto extent = shape[d];
+        const std::size_t coord = rem % extent;
+        rem /= extent;
+        im += coord * m_strides[d];
+        ic += coord * c_strides[d];
+{c_in_index_update}
+    }}
+    if (_m[im]) {{
+        _c[ic] = _val;
+    }}
+    {c_in_else}
+}}
+"""
+            else:
+                code = f"""
 constexpr int ndim = {ndim};
 const std::size_t shape[ndim] = {{{shape_expr}}};
 {stride_decls}const std::ptrdiff_t m_strides[ndim] = {{{m_strides_expr}}};
@@ -353,11 +389,12 @@ for (std::size_t i = 0; i < n; ++i) {{
 {c_in_index_update}
     }}
     if (_m[im]) {{
-        _c[ic] = {indexed_expr()};
+        _c[ic] = {indexed_expr};
     }}
     {c_in_else}
 }}
 """
+
         return nodes.Tasklet(
             label=node.name + "_cutile",
             inputs=inputs,
@@ -367,23 +404,28 @@ for (std::size_t i = 0; i < n; ++i) {{
         )
 
 
-# ── Register all masked binary ops ──────────────────────────────────
+# ── Register all masked ops ─────────────────────────────────────────
 
-_OP_DISPLAY_NAMES = {"+": "TileMaskedAdd", "-": "TileMaskedSubtract",
-                     "*": "TileMaskedMultiply", "/": "TileMaskedDivide"}
-_CONST_OP_DISPLAY_NAMES = {
+_MASKED_BINARY_DISPLAY_NAMES = {"+": "TileMaskedAdd", "-": "TileMaskedSubtract",
+                                "*": "TileMaskedMultiply", "/": "TileMaskedDivide"}
+_MASKED_CONST_DISPLAY_NAMES = {
     "+": "TileMaskedConstAdd", "-": "TileMaskedConstSubtract",
     "*": "TileMaskedConstMultiply", "/": "TileMaskedConstDivide",
 }
+_MASKED_UNARY_DISPLAY_NAMES = {
+    "-": "TileMaskedNegate", "abs": "TileMaskedAbs", "sin": "TileMaskedSin",
+    "cos": "TileMaskedCos", "exp": "TileMaskedExp", "sqrt": "TileMaskedSqrt",
+    "log": "TileMaskedLog",
+}
 
-for _op in _MASKED_BINARY_OPS:
+for _op in _BINARY_OPS:
     # Two-array masked binary
     register_op(
         op=_op,
         tasklet_type=TaskletType.ARRAY_ARRAY,
         mask=MaskType.RUNTIME,
-        node_type=TileRuntimeMaskedBinaryOpLibraryNode,
-        node_name=_OP_DISPLAY_NAMES.get(_op, f"TileMaskedBinaryOp_{_op}"),
+        node_type=TileRuntimeMaskedOpLibraryNode,
+        node_name=_MASKED_BINARY_DISPLAY_NAMES.get(_op, f"TileMaskedOp_{_op}"),
         out="_c",
         rhs1="_a",
         rhs2="_b",
@@ -395,11 +437,24 @@ for _op in _MASKED_BINARY_OPS:
         op=_op,
         tasklet_type=TaskletType.ARRAY_SYMBOL,
         mask=MaskType.RUNTIME,
-        node_type=TileRuntimeMaskedBinaryOpLibraryNode,
-        node_name=_CONST_OP_DISPLAY_NAMES.get(_op, f"TileMaskedConstBinaryOp_{_op}"),
+        node_type=TileRuntimeMaskedOpLibraryNode,
+        node_name=_MASKED_CONST_DISPLAY_NAMES.get(_op, f"TileMaskedConstOp_{_op}"),
         out="_c",
         rhs1="_a",
-        rhs2=None,
+        rhs2="_b",
+        mask_in="_m",
+        out_in="_c_in",
+    )
+
+for _op in _UNARY_OPS:
+    register_op(
+        op=_op,
+        tasklet_type=TaskletType.UNARY_ARRAY,
+        mask=MaskType.RUNTIME,
+        node_type=TileRuntimeMaskedOpLibraryNode,
+        node_name=_MASKED_UNARY_DISPLAY_NAMES.get(_op, f"TileMaskedUnaryOp_{_op}"),
+        out="_c",
+        rhs1="_a",
         mask_in="_m",
         out_in="_c_in",
     )

@@ -40,6 +40,10 @@
 - Keep environment-dependent behavior explicit in tests (cache mode, config toggles) when reproducing codegen/serialization behavior.
 - For cuTile pipeline work, ensure regressions cover unnecessary data movement removal before scalar-to-tile lowering.
 - Prefer detailed comments and documentation — don't shorten docstrings or inline comments during refactoring.
+- Don't create local variables for `self.xxx` unless the value is used many times or the expression is long. Access through `self.` directly.
+- Don't use hardcoded connector name strings (e.g. `"_a"`, `"_b"`) when the name is available in a data structure like `LibraryNodeInfo`. Look up connector names from the registry/info objects instead.
+- When merging similar classes, prefer a single unified class over backward-compatible aliases. Replace all usages rather than maintaining aliases.
+- Use `Optional[X]` and `List[X]` from `typing` instead of Python 3.10+ syntax (`X | None`, `list[X]`) for compatibility with Python 3.9+.
 
 ## Code Quality
 - After making code changes, **always run the `code-quality-reviewer` agent** as a subagent on the changed files before considering the task complete. Address any findings before finishing.
@@ -52,13 +56,19 @@
 - Flag and remove dead code, unused imports, and stale comments during any refactoring pass.
 
 ## cuTile Library (`dace/libraries/cutile/`)
+- **Library nodes** (`nodes/`):
+  - `TileOpLibraryNode` (`nodes/op.py`) — unified element-wise op node for both binary and unary operations. Properties: `op`, `constant1`, `constant2`, `tile_shape`. Connectors: `_a` (optional input), `_b` (optional input, binary only), `_c` (output).
+  - `TileRuntimeMaskedOpLibraryNode` (`nodes/op_runtime_map.py`) — masked variant with additional `_m` (mask) and optional `_c_in` connectors. Imports `_op_cpp_expr`, `_BINARY_OPS`, `_UNARY_OPS`, `_ALL_OPS` from `op.py`.
+  - Both support `constant1`/`constant2` to replace array inputs with compile-time constants.
+- **Op registry** (`op_registry.py`): maps `(operator, TaskletType, MaskType)` triples to `LibraryNodeInfo` via `register_op()`. `LibraryNodeInfo` stores connector names (`rhs1`, `rhs2`, `out`, `mask_in`, `out_in`) and constant values. `match_tasklet_to_tile_library_node()` uses `classify_tasklet` from `dace.sdfg.tasklet_utils`.
+- **DaCe library registration**: `register_library()` iterates `module.__dict__` for `LibraryNode` subclasses. Never put multiple names for the same class in a module's namespace or `__all__` — this causes double-registration errors.
 - **Transformation architecture**: `_ScalarToTileBase` (template method base) with two concrete child classes:
   - `ScalarToTileCanonical` — 0-based, unit-stride inner maps → unmasked tile library nodes
   - `ScalarToTileMasked` — non-canonical inner maps → runtime-masked tile library nodes with preload
 - **PatternNode bug**: `PatternNode.__get__` resolves nodes by integer index in the state's node list. Adding/removing graph nodes shifts indices, causing descriptors to return wrong nodes. Always capture actual node object references at the start of `apply()` (before any graph modifications) and use those throughout. Never use PatternNode descriptors (`self.outer_map_entry` etc.) after modifying the graph.
-- **Op registry** (`op_registry.py`): maps `(operator, TaskletType, MaskType)` triples to `LibraryNodeInfo` via `@register_matcher`. The `match_tasklet_to_tile_library_node()` function uses `classify_tasklet` from `dace.sdfg.tasklet_utils`.
 - **Pipeline** (`pipeline.py`): `apply_cutile_pipeline()` runs `TrivialChainElimination` + `ScalarToTileCanonical` + `ScalarToTileMasked`.
-- **Tests**: `tests/cutile_test.py` (54 test functions), `tests/cutile_frontend_test.py` (6 test functions). Run both after any cuTile changes.
+- **Tests**: `tests/cutile_test.py` and `tests/cutile_frontend_test.py`. Run both after any cuTile changes:
+  - `/venv/main/bin/python -m pytest tests/cutile_test.py tests/cutile_frontend_test.py -x -q`
 
 ## Documentation Links
 - Project overview and quick start: [README.md](../README.md)
