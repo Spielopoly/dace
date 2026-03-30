@@ -3,8 +3,10 @@ Shared base class and helpers for cuTile element-wise operation library nodes.
 """
 from __future__ import annotations
 
+import math
 from typing import Collection, List, Optional
 
+import dace
 from dace import properties
 from dace.properties import make_properties
 from dace.sdfg import SDFG, SDFGState
@@ -18,6 +20,13 @@ _BINARY_OPS = ["+", "-", "*", "/"]
 _COMPARISON_OPS = [">", "<", ">=", "<=", "==", "!="]
 _UNARY_OPS = ["-", "abs", "sin", "cos", "exp", "sqrt", "log"]
 _ALL_OPS = sorted(set(_BINARY_OPS + _COMPARISON_OPS + _UNARY_OPS))
+
+# Dtypes accepted for mask / condition tiles
+SUPPORTED_MASK_DTYPES = {
+    dace.bool,
+    dace.int8, dace.uint8, dace.int16, dace.uint16,
+    dace.int32, dace.uint32, dace.int64, dace.uint64,
+}
 
 
 def _op_cpp_expr(op: str, left: str, right: str | None = None) -> str:
@@ -70,9 +79,7 @@ def _resolve_shape_and_scalar_form(node, ref_desc):
     shape = tuple(tile_shape) if tile_shape is not None else ref_desc.shape
     ndim = len(shape)
     try:
-        n_total = 1
-        for s in shape:
-            n_total *= int(s)
+        n_total = math.prod(int(s) for s in shape)
         use_scalar_form = (ndim == 0) or (n_total == 1)
     except (TypeError, ValueError):
         use_scalar_form = (ndim == 0)

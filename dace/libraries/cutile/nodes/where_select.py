@@ -23,7 +23,7 @@ from dace.sdfg.validation import InvalidSDFGNodeError
 from dace.symbolic import symstr
 from dace.transformation.transformation import ExpandTransformation
 
-from ._base import _get_tile_descriptors, _resolve_shape_and_scalar_form
+from ._base import _resolve_shape_and_scalar_form, SUPPORTED_MASK_DTYPES
 
 
 # ── Helper to read tile descriptors for where-select ─────────────────
@@ -135,12 +135,7 @@ class TileWhereSelectLibraryNode(nodes.LibraryNode):
                 )
 
         # Condition must be boolean or integer
-        supported_mask_dtypes = {
-            dace.bool,
-            dace.int8, dace.uint8, dace.int16, dace.uint16,
-            dace.int32, dace.uint32, dace.int64, dace.uint64,
-        }
-        if cond_desc.dtype not in supported_mask_dtypes:
+        if cond_desc.dtype not in SUPPORTED_MASK_DTYPES:
             raise InvalidSDFGNodeError(
                 f"TileWhereSelect '{self.name}': cond dtype must be bool or "
                 f"integer, got {cond_desc.dtype}",

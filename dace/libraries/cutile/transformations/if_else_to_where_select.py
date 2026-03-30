@@ -21,13 +21,12 @@ from __future__ import annotations
 
 import ast
 import copy
-import re
 from typing import Dict, List, Optional, Tuple
 
 import dace
 from dace import Memlet, dtypes, subsets
 from dace.sdfg import SDFG, SDFGState, nodes, utils as sdutil
-from dace.sdfg.state import ConditionalBlock, ControlFlowRegion
+from dace.sdfg.state import ConditionalBlock
 from dace.transformation import transformation as xf
 
 from dace.libraries.cutile.nodes.if_else_op import TileIfElseOpLibraryNode
@@ -46,15 +45,6 @@ _AST_CMP_OPS = {
 
 
 # ── Helpers ──────────────────────────────────────────────────────────
-
-def _nsdfg_array_refs_in_expr(expr_str: str, nsdfg_arrays: set) -> List[str]:
-    """Return NSDFG array/scalar names referenced in *expr_str*."""
-    refs = []
-    for name in nsdfg_arrays:
-        if re.search(r'\b' + re.escape(name) + r'\b', expr_str):
-            refs.append(name)
-    return refs
-
 
 def _parse_condition_expr(
     cond_expr: str, nsdfg_arrays: set,
@@ -509,6 +499,7 @@ class IfElseMapToTileWhere(xf.SingleStateTransformation):
 
         # Find the original nsdfg → inner_exit → outer_exit edge
         # and reuse its memlet for the output store
+        store_memlet = None
         for oe in list(graph.out_edges(nsdfg)):
             if oe.dst is inner_exit and oe.src_conn == output_nsdfg_array:
                 # Find inner_exit → outer_exit edge
@@ -519,6 +510,11 @@ class IfElseMapToTileWhere(xf.SingleStateTransformation):
                                        oe2.dst_conn, store_memlet)
                         break
                 break
+        if store_memlet is None:
+            raise ValueError(
+                f"IfElseMapToTileWhere: could not find output edge from "
+                f"NestedSDFG to outer map exit for '{output_outer_name}'"
+            )
 
         # ── 10. Remove original inner map and NestedSDFG ─────────────
         # Remove edges first

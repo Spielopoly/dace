@@ -18,7 +18,7 @@ from __future__ import annotations
 from typing import List, Optional
 
 import dace
-from dace import dtypes, library, properties
+from dace import library, properties
 from dace.sdfg import SDFG, SDFGState, nodes
 from dace.sdfg.nodes import LibraryNode
 from dace.sdfg.validation import InvalidSDFGNodeError
@@ -26,7 +26,7 @@ from dace.transformation.transformation import ExpandTransformation
 
 from .op import TileOpLibraryNode
 from .where_select import TileWhereSelectLibraryNode
-from ._base import _BINARY_OPS, _COMPARISON_OPS, _UNARY_OPS, _ALL_OPS
+from ._base import _BINARY_OPS, _COMPARISON_OPS, _ALL_OPS
 
 
 # Role name → (internal node label, connector name)

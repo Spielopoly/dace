@@ -7,7 +7,7 @@ Usage::
     count = apply_cutile_pipeline(sdfg)
 """
 from __future__ import annotations
-from typing import Optional, Tuple
+from typing import Tuple
 
 from dace.sdfg import SDFG
 from dace.libraries.cutile.transformations.scalar_to_tile_library import (

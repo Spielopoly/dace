@@ -31,7 +31,7 @@ from ._base import (
     _TileOpBase,
     _op_cpp_expr, _get_tile_descriptors, _resolve_shape_and_scalar_form,
     _build_stride_decls, _resolve_operands, _collect_array_descs,
-    _BINARY_OPS, _UNARY_OPS,
+    _BINARY_OPS, _UNARY_OPS, SUPPORTED_MASK_DTYPES,
 )
 
 
@@ -120,12 +120,7 @@ class TileRuntimeMaskedOpLibraryNode(_TileOpBase):
                 node_id=state.node_id(self),
             )
 
-        supported_mask_dtypes = {
-            dace.bool,
-            dace.int8, dace.uint8, dace.int16, dace.uint16,
-            dace.int32, dace.uint32, dace.int64, dace.uint64,
-        }
-        if m_desc.dtype not in supported_mask_dtypes:
+        if m_desc.dtype not in SUPPORTED_MASK_DTYPES:
             raise InvalidSDFGNodeError(
                 f"TileMaskedOp '{self.name}': mask dtype must be bool or integer, got M={m_desc.dtype}",
                 sdfg=sdfg,

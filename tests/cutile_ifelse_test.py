@@ -17,8 +17,6 @@ from dace.transformation.dataflow import TrivialChainElimination, MapTiling
 from dace.libraries.cutile.transformations.if_else_to_where_select import (
     IfElseMapToTileWhere,
 )
-from dace.libraries.cutile.nodes.where_select import TileWhereSelectLibraryNode
-from dace.libraries.cutile.nodes.op import TileOpLibraryNode
 from dace.libraries.cutile.nodes.if_else_op import TileIfElseOpLibraryNode
 from dace.libraries.cutile.transformations.pipeline import apply_cutile_pipeline
 
@@ -197,13 +195,6 @@ class TestIfElseStructure:
         assert n == 1, f"Expected 1 application, got {n}"
 
     def test_produces_tile_ops(self):
-        sdfg, _ = _tile_and_transform(if_else_add_constant)
-        compound = _collect_lib_nodes(sdfg, TileIfElseOpLibraryNode)
-        assert len(compound) == 1, (
-            f"Expected 1 TileIfElseOpLibraryNode, got {len(compound)}"
-        )
-
-    def test_produces_where_select(self):
         sdfg, _ = _tile_and_transform(if_else_add_constant)
         compound = _collect_lib_nodes(sdfg, TileIfElseOpLibraryNode)
         assert len(compound) == 1, (
@@ -412,6 +403,8 @@ class TestIfElseConditionVariants:
         rng = np.random.default_rng(42)
         A = rng.standard_normal((n, n))
         B = rng.standard_normal((n, n))
+        # Force some elements equal so the true branch is exercised
+        B[:3, :3] = A[:3, :3]
         C = np.zeros((n, n))
         expected = np.where(A == B, A + B, A * B)
 

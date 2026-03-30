@@ -217,7 +217,6 @@ def test_scalar_to_tile_add():
     sdfg = build_tiled_scalar_add_sdfg()
 
     count = apply_cutile_pipeline(sdfg, validate=True, apply_map_tiling=False)
-    print(f"Applied {count} transformations.")
     assert count == 1, f"Expected 1 transformation, got {count}"
 
     state = sdfg.states()[0]
@@ -431,7 +430,6 @@ def test_tileadd_runtime_numeric_correctness():
     c = np.zeros((3, 4), dtype=np.float64)
 
     sdfg(A=a, B=b, C=c)
-    # sdfg.save("cutile_test_tileadd_runtime.sdfg")
 
     np.testing.assert_allclose(c, a + b, rtol=0.0, atol=1e-12)
 
@@ -443,14 +441,10 @@ def test_pipeline_runtime_numeric_correctness_float64():
         tile_shape=(2, 2),
         dtype=dace.float64,
     )
-    
-    # sdfg.save("cutile_test_before_pipeline_float64.sdfg")
 
     count = apply_cutile_pipeline(sdfg, validate=True, apply_map_tiling=False)
-    # sdfg.save("cutile_test_after_pipeline_float64.sdfg")
     assert count == 1
     sdfg.expand_library_nodes()
-    # sdfg.save("cutile_test_after_expansion_float64.sdfg")
     sdfg.validate()
 
     shape = (2, 3, 2, 2)
@@ -471,14 +465,10 @@ def test_pipeline_runtime_numeric_correctness_float32():
         tile_shape=(1, 4),
         dtype=dace.float32,
     )
-    
-    # sdfg.save("cutile_test_before_pipeline_float32.sdfg")
 
     count = apply_cutile_pipeline(sdfg, validate=True, apply_map_tiling=False)
-    # sdfg.save("cutile_test_after_pipeline_float32.sdfg")
     assert count == 1
     sdfg.expand_library_nodes()
-    # sdfg.save("cutile_test_after_expansion_float32.sdfg")
     sdfg.validate()
 
     shape = (3, 2, 1, 4)
@@ -913,7 +903,6 @@ def test_scalar_to_tile_subtract():
     sdfg = build_tiled_scalar_subtract_sdfg()
 
     count = apply_cutile_pipeline(sdfg, validate=True, apply_map_tiling=False)
-    print(f"Applied {count} transformations.")
     assert count == 1, f"Expected 1 transformation, got {count}"
 
     state = sdfg.states()[0]
@@ -1559,11 +1548,9 @@ def test_noncanonical_add_transforms_to_masked_node_and_contiguous_memlets():
         name="tile_add_before_runtime_noncanonical",
         dtype=dace.float64,
     )
-    # sdfg.save("cutile_test_noncanonical_add_before_pipeline.sdfg")
 
     count = apply_cutile_pipeline(sdfg, validate=True, apply_map_tiling=False)
     assert count == 1
-    # sdfg.save("cutile_test_noncanonical_add_runtime_after_pipeline.sdfg")
 
     state = sdfg.states()[0]
     lib_nodes = [n for n in state.nodes() if isinstance(n, nodes.LibraryNode)]
@@ -1609,11 +1596,9 @@ def test_noncanonical_subtract_runtime_numeric_correctness_negative_step():
         name="tile_subtract_runtime_noncanonical_negative",
         dtype=dace.float64,
     )
-    
-    # sdfg.save("cutile_test_noncanonical_subtract_before_pipeline.sdfg")
+
     count = apply_cutile_pipeline(sdfg, validate=True, apply_map_tiling=False)
     assert count == 1
-    # sdfg.save("cutile_test_noncanonical_subtract_after_pipeline.sdfg")
 
     state = sdfg.states()[0]
     lib_nodes = [n for n in state.nodes() if isinstance(n, nodes.LibraryNode)]
@@ -2623,10 +2608,4 @@ def test_unary_const_sin():
 
 
 if __name__ == "__main__":
-    # run all functions with names starting with "test_"
-    for name, fn in sorted(globals().items()):
-        if name.startswith("test_") and callable(fn):
-            print(f"Running {name}...")
-            fn()
-
-    print("\nAll tests passed!")
+    raise SystemExit(pytest.main([__file__, "-v"]))
