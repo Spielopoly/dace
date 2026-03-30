@@ -23,9 +23,10 @@ Result (AFTER, canonical)::
 
 Result (AFTER, non-canonical inner maps)::
 
-    OuterMapEntry -> tile_transient_read -> MaskedLibNode -> tile_view -[views]-> C -> OuterMapExit
-                    + generated mask transient used to select valid map points
-                    (view writes directly to the output array; masked-out lanes are not touched)
+    OuterMapEntry -> tile_transient_read  -> MaskedLibNode -> tile_transient_write -> OuterMapExit
+                  -> preload_transient -> MaskedLibNode._c_in
+                    + symbolic mask condition selects valid map points
+                    (masked-out lanes are preserved via _c_in preload)
 """
 from __future__ import annotations
 
@@ -332,28 +333,24 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
         """
         Build the memlet from *map_edge* to the tile transient.
 
-        We preserve original outer indexing by copying the memlet and only
-        adding ``other_subset`` to describe how the outer slice maps into
-        tile space.
+        We preserve original outer indexing by deep-copying the memlet.
+        The two-edge pattern (outer_entry -> transient -> lib_node) already
+        ensures correct data mapping: each edge has its own data+subset
+        pair, so ``other_subset`` is not needed.
 
         The canonical default deep-copies the original outer->inner memlet.
         Non-canonical child classes override this to build a contiguous outer
         subset that covers the full bounding tile footprint.
         """
         new_memlet = copy.deepcopy(map_edge.data)
-        new_memlet.other_subset = self._tile_subset
         return new_memlet
 
     def _build_input_staging_memlet(self, outer_edge: MultiConnectorEdge[Memlet], tasklet_edge: MultiConnectorEdge[Memlet]) -> Memlet:
         """
         Build the memlet from *outer_entry* to the input tile transient.
 
-        We preserve original outer indexing by copying the memlet and only
-        adding ``other_subset`` to describe how the outer slice maps into
-        tile space.
-
-        The canonical default deep-copies the original outer->inner memlet.
-        Non-canonical child classes override this to build a contiguous outer
+        Delegates to ``_build_memlet`` by default.  Non-canonical child
+        classes override ``_build_memlet`` to build a contiguous outer
         subset that covers the full bounding tile footprint.
         """
         return self._build_memlet(outer_edge, tasklet_edge)
@@ -362,10 +359,8 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
         """
         Build the memlet from the output tile transient to *outer_exit*.
 
-        Symmetric to ``_build_input_staging_memlet``: the canonical default
-        deep-copies the original inner->outer memlet and adds ``other_subset``.
-        Non-canonical child classes override this to produce a contiguous
-        store range.
+        Symmetric to ``_build_input_staging_memlet``: delegates to
+        ``_build_memlet`` by default.
         """
         return self._build_memlet(inner_to_outer_edge, tasklet_out_edge)
 
@@ -385,7 +380,7 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
         data_name = cast(str, outer_edge.data.data)
         trans_name, trans_read = self._create_and_add_tile_transient(data_name, self._tile_shape)
 
-        # outer_entry -> transient (tile-slice memlet with other_subset).
+        # outer_entry -> transient (staging memlet preserves outer indexing).
         staging_memlet = self._build_input_staging_memlet(outer_edge, tasklet_edge)
         self._graph.add_edge(self._outer_entry, outer_edge.src_conn,
                              trans_read, None, staging_memlet)
@@ -426,7 +421,7 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
         self._graph.add_edge(self._library_node, lib_conn, trans_write, None,
                              Memlet(data=trans_name, subset=self._tile_subset))
 
-        # transient -> outer_exit (tile-slice memlet with other_subset).
+        # transient -> outer_exit (store memlet preserves outer indexing).
         store_memlet = self._build_output_store_memlet(inner_to_outer_edge, tasklet_out_edge)
         self._graph.add_edge(trans_write, None, self._outer_exit,
                              inner_to_outer_edge.dst_conn, store_memlet)
@@ -833,9 +828,12 @@ class ScalarToTileMasked(_ScalarToTileBase):
     Non-canonical ranges (offset starts, negative/strided bounds) are mapped
     to a bounding tile.  A symbolic condition is embedded directly in the
     library node and evaluated per element during expansion—no runtime mask
-    array is allocated or filled.  Masked-out lanes are simply not written by
-    the library node, so original output values are preserved without an
-    explicit preload path.
+    array is allocated or filled.
+
+    Masked-out lanes must preserve their original values.  This is achieved
+    by preloading the current output tile into the library node's ``_c_in``
+    connector before the operation executes.  The library node's expansion
+    emits ``else { _c[i] = _c_in[i]; }`` for masked-out elements.
 
     The library node's ``mask_condition`` property is set to a SymPy expression
     that uses ``__m0``, ``__m1``, … as tile coordinate variables.
@@ -868,7 +866,7 @@ class ScalarToTileMasked(_ScalarToTileBase):
         data_name = cast(str, map_edge.data.data)
         load_subset = self._build_contiguous_outer_subset(
             tasklet_edge.data.subset, self._inner_entry.map)
-        return Memlet(data=data_name, subset=load_subset, other_subset=self._tile_subset)
+        return Memlet(data=data_name, subset=load_subset)
 
     def _configure_library_node(self):
         """
@@ -883,80 +881,57 @@ class ScalarToTileMasked(_ScalarToTileBase):
             self._inner_entry.map)
         self._library_node.mask_condition = condition
 
-    def _add_output_transient_and_connect_edges(self, inner_to_outer_edge: MultiConnectorEdge[Memlet], lib_conn: str, tasklet_out_edge: MultiConnectorEdge[Memlet]) -> tuple[str, nodes.AccessNode]:
+    def _add_output_preload(self, data_name: str, inner_to_outer_edge: MultiConnectorEdge[Memlet], tasklet_out_edge: MultiConnectorEdge[Memlet]) -> None:
         """
-        Write to the output array through a tile-shaped view.
+        Preload existing output values so masked-out lanes are preserved.
 
-        A DaCe view aliases the output array with tile-shaped dimensions so
-        the library node sees matching shapes on all connectors.  Since the
-        view IS the output memory, masked-out lanes are never overwritten
-        and their original values are preserved without needing ``_c_in``.
+        Creates a tile-shaped transient that reads the current values from
+        the output array and feeds them to the library node's ``_c_in``
+        connector.  The library node's expansion uses these values for
+        masked-out elements (``else { _c[i] = _c_in[i]; }``).
 
-        The view bypasses the outer map exit for the output path: the library
-        node writes through the view directly to the output array, so no
-        exit-scope copy is needed.  The original outer-exit edge and its
-        connectors are removed to avoid a redundant (and incorrectly strided)
-        write-back copy.
+        Wiring::
+
+            output_array_read -> outer_entry[new_conn] -> preload_transient -> lib_node._c_in
         """
-        data_name = cast(str, inner_to_outer_edge.data.data)
+        # 1. Add _c_in connector to the library node.
+        self._library_node.add_in_connector("_c_in")
+
+        # 2. Create a preload tile transient (same shape/dtype as output).
+        #    We look up the descriptor from the original output array and use
+        #    a distinct name to avoid confusion with the output tile transient.
         data_desc = self._sdfg.arrays[data_name]
+        preload_name = self._sdfg._find_new_name(data_name + "_preload_tile")
+        self._sdfg.add_transient(
+            preload_name,
+            shape=self._tile_shape,
+            dtype=data_desc.dtype,
+            storage=data_desc.storage,
+            lifetime=dtypes.AllocationLifetime.Scope,
+        )
+        preload_node = self._graph.add_access(preload_name)
 
+        # 3. Build the outer subset for reading current values (same range
+        #    the store memlet will use).
         outer_subset = self._build_contiguous_outer_subset(
             tasklet_out_edge.data.subset, self._inner_entry.map)
 
-        # Identify which array dimensions the tile spans and collect their
-        # strides so the view indexes into the array correctly.
-        view_strides = []
-        for rng, stride in zip(outer_subset, data_desc.strides):
-            start = self._to_sympy_expr(rng[0])
-            end = self._to_sympy_expr(rng[1])
-            if end != start:
-                view_strides.append(stride)
+        # 4. Add a new input connector pair on outer_entry.
+        conn_base = self._outer_entry.next_connector("preload")
+        in_conn = "IN_" + conn_base
+        out_conn = "OUT_" + conn_base
+        self._outer_entry.add_in_connector(in_conn)
+        self._outer_entry.add_out_connector(out_conn)
 
-        # Create a tile-shaped view aliasing the output array.
-        view_name, _ = self._sdfg.add_view(
-            data_name + '_tile_view',
-            shape=list(self._tile_shape),
-            dtype=data_desc.dtype,
-            storage=data_desc.storage,
-            strides=view_strides,
-            find_new_name=True,
-        )
-
-        view_node = self._graph.add_access(view_name)
-        data_node = self._graph.add_access(data_name)
-
-        # Library node writes tile result to the view.
-        self._graph.add_edge(self._library_node, lib_conn, view_node, None,
-                             Memlet(data=view_name, subset=self._tile_subset))
-
-        # View writes through to the output array.
-        view_node.add_out_connector('views')
-        self._graph.add_edge(view_node, 'views', data_node, None,
+        # 5. Wire: output_array_read -> outer_entry
+        ext_read = self._graph.add_access(data_name)
+        self._graph.add_edge(ext_read, None, self._outer_entry, in_conn,
                              Memlet(data=data_name, subset=outer_subset))
 
-        # Remove the pre-existing outer-exit -> output-array edge.
-        # The view already wrote directly to the array's memory, so the
-        # exit-scope copy is unnecessary.
-        # NOTE: We cannot use remove_memlet_path here because it walks the
-        # full path (including inner-scope edges), conflicting with the base
-        # class apply() which removes the inner_to_outer edge separately.
-        in_conn = inner_to_outer_edge.dst_conn
-        out_conn = in_conn.replace('IN_', 'OUT_', 1)
-        for e in list(self._graph.out_edges(self._outer_exit)):
-            if e.src_conn == out_conn:
-                outer_dst = e.dst
-                self._graph.remove_edge(e)
-                if self._graph.degree(outer_dst) == 0:
-                    self._graph.remove_node(outer_dst)
-                break
-        if in_conn in self._outer_exit.in_connectors:
-            self._outer_exit.remove_in_connector(in_conn)
-        if out_conn in self._outer_exit.out_connectors:
-            self._outer_exit.remove_out_connector(out_conn)
+        # 6. Wire: outer_entry -> preload_transient
+        self._graph.add_edge(self._outer_entry, out_conn, preload_node, None,
+                             Memlet(data=data_name, subset=outer_subset))
 
-        # Keep the scope well-formed: the output array written through the
-        # view must still be reachable from the outer exit.
-        self._graph.add_edge(data_node, None, self._outer_exit, None, Memlet())
-
-        return view_name, view_node
+        # 7. Wire: preload_transient -> library_node._c_in
+        self._graph.add_edge(preload_node, None, self._library_node, "_c_in",
+                             Memlet(data=preload_name, subset=self._tile_subset))

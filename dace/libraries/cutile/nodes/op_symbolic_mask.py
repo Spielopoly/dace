@@ -112,7 +112,8 @@ class ExpandTileSymbolicMaskedOpPure(ExpandTransformation):
             else "true"
         )
 
-        a_desc, b_desc, c_desc, _, _ = _get_tile_descriptors(node, state, sdfg)
+        a_desc, b_desc, c_desc, _, c_in_desc = _get_tile_descriptors(node, state, sdfg)
+        has_c_in = c_in_desc is not None
         is_binary = (constant2 is not None) or (b_desc is not None)
 
         ref_desc = a_desc or b_desc or c_desc
@@ -123,6 +124,8 @@ class ExpandTileSymbolicMaskedOpPure(ExpandTransformation):
             inputs.add("_a")
         if b_desc is not None:
             inputs.add("_b")
+        if has_c_in:
+            inputs.add("_c_in")
 
         # Determine operand values
         left_scalar, right_scalar, left_indexed, right_indexed = _resolve_operands(
@@ -137,7 +140,19 @@ class ExpandTileSymbolicMaskedOpPure(ExpandTransformation):
                 f"    constexpr std::ptrdiff_t __m{d} = 0;"
                 for d in range(ndim)
             )
-            code = f"""\
+            if has_c_in:
+                code = f"""\
+{{
+{coord_decls}
+    if ({mask_condition}) {{
+        _c = {scalar_expr};
+    }} else {{
+        _c = _c_in;
+    }}
+}}
+"""
+            else:
+                code = f"""\
 {{
 {coord_decls}
     if ({mask_condition}) {{
@@ -160,12 +175,23 @@ class ExpandTileSymbolicMaskedOpPure(ExpandTransformation):
                 for d in range(ndim)
             )
 
+            c_in_stride_decl = ""
+            c_in_index_decl = ""
+            c_in_index_update = ""
+            c_in_else = ""
+            if has_c_in:
+                c_in_stride_decl = f"const std::ptrdiff_t c_in_strides[ndim] = {{{', '.join(symstr(s) for s in c_in_desc.strides)}}};"
+                c_in_index_decl =   "    std::size_t iin = 0;"
+                c_in_index_update = "        iin += coord * c_in_strides[d];"
+                c_in_else =         "else { _c[ic] = _c_in[iin]; }"
+
             if not array_descs:
                 # Both operands are constants
                 code = f"""\
 constexpr int ndim = {ndim};
 const std::size_t shape[ndim] = {{{shape_expr}}};
 const std::ptrdiff_t c_strides[ndim] = {{{c_strides_expr}}};
+{c_in_stride_decl}
 const auto _val = {indexed_expr};
 
 std::size_t n = 1;
@@ -175,6 +201,7 @@ for (int d = 0; d < ndim; ++d) {{
 for (std::size_t i = 0; i < n; ++i) {{
     std::size_t rem = i;
     std::size_t ic = 0;
+{c_in_index_decl}
     std::size_t __coords[ndim];
     for (int d = ndim - 1; d >= 0; --d) {{
         const auto extent = shape[d];
@@ -182,11 +209,13 @@ for (std::size_t i = 0; i < n; ++i) {{
         rem /= extent;
         __coords[d] = coord;
         ic += coord * c_strides[d];
+{c_in_index_update}
     }}
 {coord_aliases}
     if ({mask_condition}) {{
         _c[ic] = _val;
     }}
+    {c_in_else}
 }}
 """
             else:
@@ -194,6 +223,7 @@ for (std::size_t i = 0; i < n; ++i) {{
 constexpr int ndim = {ndim};
 const std::size_t shape[ndim] = {{{shape_expr}}};
 {stride_decls}const std::ptrdiff_t c_strides[ndim] = {{{c_strides_expr}}};
+{c_in_stride_decl}
 
 std::size_t n = 1;
 for (int d = 0; d < ndim; ++d) {{
@@ -203,18 +233,20 @@ for (int d = 0; d < ndim; ++d) {{
 for (std::size_t i = 0; i < n; ++i) {{
     std::size_t rem = i;
 {index_decls}    std::size_t ic = 0;
+{c_in_index_decl}
     std::size_t __coords[ndim];
     for (int d = ndim - 1; d >= 0; --d) {{
         const auto extent = shape[d];
         const std::size_t coord = rem % extent;
         rem /= extent;
 {index_updates}        ic += coord * c_strides[d];
-        __coords[d] = coord;
+{c_in_index_update}        __coords[d] = coord;
     }}
 {coord_aliases}
     if ({mask_condition}) {{
         _c[ic] = {indexed_expr};
     }}
+    {c_in_else}
 }}
 """
 

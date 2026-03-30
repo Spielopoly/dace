@@ -378,10 +378,8 @@ class IfElseMapToTileWhere(xf.SingleStateTransformation):
                         continue
                     wired_tiles.add(tile_name)
 
-                    # Build staging memlet: preserve outer indexing,
-                    # add other_subset for tile mapping
+                    # Build staging memlet: preserve outer indexing
                     staging_memlet = copy.deepcopy(ie.data)
-                    staging_memlet.other_subset = tile_subset
                     graph.add_edge(outer_entry, ie.src_conn,
                                    tile_node, None, staging_memlet)
                     break
@@ -484,7 +482,6 @@ class IfElseMapToTileWhere(xf.SingleStateTransformation):
                 for oe2 in graph.out_edges(inner_exit):
                     if oe2.data.data == output_outer_name:
                         store_memlet = copy.deepcopy(oe2.data)
-                        store_memlet.other_subset = tile_subset
                         graph.add_edge(out_tile_node, None, outer_exit,
                                        oe2.dst_conn, store_memlet)
                         break
