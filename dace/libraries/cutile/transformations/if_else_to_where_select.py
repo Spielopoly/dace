@@ -9,15 +9,13 @@ Pattern (BEFORE, after MapTiling)::
 Result (AFTER)::
 
     OuterMapEntry → [input tile transients]
-                  → [TileOp(comparison) → cond_tile]
-                  → [TileOp(true branch) → true_tile]
-                  → [TileOp(false branch) → false_tile]
-                  → [TileWhereSelect(cond, true, false) → output tile]
+                  → TileIfElseOpLibraryNode
+                  → [output tile]
                   → OuterMapExit
 
-Both branches are executed unconditionally on full tiles. A where-select node
-picks the correct result per element based on the condition mask. This mirrors
-``cuda.tile.where(cond, x, y)`` from NVIDIA's cuTile library.
+Both branches are executed unconditionally on full tiles inside the compound
+node's expansion SDFG.  A where-select picks the correct result per element
+based on the condition mask.
 """
 from __future__ import annotations
 
@@ -32,8 +30,7 @@ from dace.sdfg import SDFG, SDFGState, nodes, utils as sdutil
 from dace.sdfg.state import ConditionalBlock, ControlFlowRegion
 from dace.transformation import transformation as xf
 
-from dace.libraries.cutile.nodes.op import TileOpLibraryNode
-from dace.libraries.cutile.nodes.where_select import TileWhereSelectLibraryNode
+from dace.libraries.cutile.nodes.if_else_op import TileIfElseOpLibraryNode
 from dace.libraries.cutile.op_registry import (
     match_tasklet_to_tile_library_node,
     MaskType,
@@ -115,12 +112,11 @@ def _parse_condition_expr(
 class IfElseMapToTileWhere(xf.SingleStateTransformation):
     """
     Replace a tiled map whose inner scope is a NestedSDFG with an if-else
-    ConditionalBlock by tile-level operations and a where-select node.
+    ConditionalBlock by a single ``TileIfElseOpLibraryNode``.
 
-    Both branches are executed unconditionally on full tiles.  A boolean
-    condition tile is computed element-wise from the original branch
-    condition, and a ``TileWhereSelectLibraryNode`` picks the correct
-    result per element.
+    The compound node's expansion executes both branches unconditionally
+    on full tiles and uses a where-select to pick the correct result per
+    element based on the condition mask.
     """
 
     outer_map_entry = xf.PatternNode(nodes.MapEntry)
@@ -384,80 +380,117 @@ class IfElseMapToTileWhere(xf.SingleStateTransformation):
                                    tile_node, None, staging_memlet)
                     break
 
-        # ── 6. Create condition mask tile via TileOp comparison ────
+        # ── 6. Analyze condition and classify branch tasklets ─────
         nsdfg_arrays = set(inner_sdfg.arrays.keys())
         parsed = _parse_condition_expr(cond_expr, nsdfg_arrays)
         assert parsed is not None, f"Unsupported condition: {cond_expr}"
         cmp_op, cond_left, cond_right, cond_const = parsed
 
-        cond_tile_name = sdfg._find_new_name("cond_tile")
-        sdfg.add_transient(
-            cond_tile_name,
-            shape=tile_shape,
-            dtype=dace.bool,
-            lifetime=dtypes.AllocationLifetime.Scope,
-        )
+        # Classify both branch tasklets
+        branch_cls = {}   # "true"/"false" → (match, tasklet)
+        for tag, bstate in [("true", true_state), ("false", false_state)]:
+            tasklets = [n for n in bstate.nodes()
+                        if isinstance(n, nodes.Tasklet)]
+            assert len(tasklets) == 1
+            match = match_tasklet_to_tile_library_node(
+                bstate, tasklets[0], MaskType.UNMASKED,
+                promote_scalars=True)
+            assert match is not None
+            branch_cls[tag] = (match, tasklets[0])
 
-        # Build the comparison TileOp library node.
-        cmp_node = TileOpLibraryNode(
-            name="TileOp_condition",
-            op=cmp_op,
-            tile_shape=list(tile_shape),
-            constant2=cond_const,   # None when comparing two arrays
-        )
-        graph.add_node(cmp_node)
+        true_cls = branch_cls["true"][0].tasklet_classification
+        false_cls = branch_cls["false"][0].tasklet_classification
 
-        # Connect left operand (_a) from existing tile transient.
-        left_tile = nsdfg_to_tile[cond_left]
-        left_node = outer_to_tile[nsdfg_to_outer[cond_left]][1]
-        graph.add_edge(left_node, None, cmp_node, "_a",
-                       Memlet(data=left_tile, subset=tile_subset))
+        # Determine effective constants per branch.  Unary negate (-A)
+        # must be expressed as binary ``0 - A`` for the compound node
+        # because "-" is in _BINARY_OPS and the validator expects rhs2.
+        branch_const: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
+        for tag in ("true", "false"):
+            cls = branch_cls[tag][0].tasklet_classification
+            c1, c2 = cls.constant1, cls.constant2
+            if (cls.op == "-" and cls.rhs2 is None
+                    and c1 is None and c2 is None):
+                # Unary negate → binary 0 - A
+                c1 = "0"
+            branch_const[tag] = (c1, c2)
 
-        # Connect right operand (_b) or remove the connector.
+        # ── 7. Build input_roles for the compound node ───────────────
+        # Map NSDFG array names → list of roles they fulfil.
+        nsdfg_roles: Dict[str, List[str]] = {}
+
+        # Condition roles
+        nsdfg_roles.setdefault(cond_left, []).append("cond_left")
         if cond_right is not None:
-            right_tile = nsdfg_to_tile[cond_right]
-            right_node = outer_to_tile[nsdfg_to_outer[cond_right]][1]
-            graph.add_edge(right_node, None, cmp_node, "_b",
-                           Memlet(data=right_tile, subset=tile_subset))
-        else:
-            # Right is a constant – remove unused _b connector.
-            if "_b" in cmp_node.in_connectors:
-                cmp_node.remove_in_connector("_b")
+            nsdfg_roles.setdefault(cond_right, []).append("cond_right")
 
-        # Connect output.
-        cond_tile_write = graph.add_access(cond_tile_name)
-        graph.add_edge(cmp_node, "_c", cond_tile_write, None,
-                       Memlet(data=cond_tile_name, subset=tile_subset))
+        # Branch roles (true / false)
+        for tag, bstate in [("true", true_state), ("false", false_state)]:
+            cls = branch_cls[tag][0].tasklet_classification
+            tasklet = branch_cls[tag][1]
+            inp_map = self._get_tasklet_input_mapping(bstate, tasklet)
+            is_unary_negate = (cls.op == "-" and cls.rhs2 is None
+                               and cls.constant1 is None
+                               and cls.constant2 is None)
+            if is_unary_negate:
+                # rhs1 becomes rhs2 (binary 0 - A)
+                if cls.rhs1 is not None:
+                    arr = inp_map.get(cls.rhs1)
+                    if arr is not None:
+                        nsdfg_roles.setdefault(arr, []).append(
+                            f"{tag}_rhs2")
+            else:
+                if cls.rhs1 is not None and cls.constant1 is None:
+                    arr = inp_map.get(cls.rhs1)
+                    if arr is not None:
+                        nsdfg_roles.setdefault(arr, []).append(
+                            f"{tag}_rhs1")
+                if cls.rhs2 is not None and cls.constant2 is None:
+                    arr = inp_map.get(cls.rhs2)
+                    if arr is not None:
+                        nsdfg_roles.setdefault(arr, []).append(
+                            f"{tag}_rhs2")
 
-        # ── 7. Create TileOps for both branches ─────────────────────
-        true_tile_name, true_tile_node = self._create_branch_tile_op(
-            graph, sdfg, "true", true_state, inner_sdfg,
-            nsdfg_to_tile, nsdfg_to_outer, outer_to_tile,
-            tile_shape, tile_subset,
+        # Assign numbered connectors to unique outer arrays.
+        outer_to_conn: Dict[str, str] = {}
+        conn_idx = 0
+        for nsdfg_name in nsdfg_roles:
+            outer_name = nsdfg_to_outer.get(nsdfg_name)
+            if outer_name is not None and outer_name not in outer_to_conn:
+                outer_to_conn[outer_name] = f"_in{conn_idx}"
+                conn_idx += 1
+
+        # Build input_roles: connector → list of roles
+        input_roles: Dict[str, List[str]] = {}
+        for nsdfg_name, roles in nsdfg_roles.items():
+            outer_name = nsdfg_to_outer.get(nsdfg_name)
+            if outer_name is not None and outer_name in outer_to_conn:
+                conn = outer_to_conn[outer_name]
+                input_roles.setdefault(conn, []).extend(roles)
+
+        # ── 8. Create TileIfElseOpLibraryNode ────────────────────────
+        compound_node = TileIfElseOpLibraryNode(
+            name="TileIfElseOp",
+            cond_op=cmp_op,
+            cond_constant=cond_const,
+            true_op=true_cls.op,
+            true_constant1=branch_const["true"][0],
+            true_constant2=branch_const["true"][1],
+            false_op=false_cls.op,
+            false_constant1=branch_const["false"][0],
+            false_constant2=branch_const["false"][1],
+            tile_shape=list(tile_shape),
+            input_roles=input_roles,
+            num_inputs=len(outer_to_conn),
         )
-        false_tile_name, false_tile_node = self._create_branch_tile_op(
-            graph, sdfg, "false", false_state, inner_sdfg,
-            nsdfg_to_tile, nsdfg_to_outer, outer_to_tile,
-            tile_shape, tile_subset,
-        )
+        graph.add_node(compound_node)
 
-        # ── 8. Create TileWhereSelect node ──────────────────────────
-        where_node = TileWhereSelectLibraryNode(
-            "TileWhereSelect", tile_shape=list(tile_shape))
-        graph.add_node(where_node)
-
-        # Connect condition - reuse the write node from the condition map
-        graph.add_edge(cond_tile_write, None, where_node, "_cond",
-                       Memlet(data=cond_tile_name, subset=tile_subset))
-
-        # Connect true/false tiles - reuse result nodes from branch tile ops
-        graph.add_edge(true_tile_node, None, where_node, "_x",
-                       Memlet(data=true_tile_name, subset=tile_subset))
-        graph.add_edge(false_tile_node, None, where_node, "_y",
-                       Memlet(data=false_tile_name, subset=tile_subset))
+        # Wire tile transients → compound node inputs
+        for outer_name, conn_name in outer_to_conn.items():
+            tile_name, tile_node = outer_to_tile[outer_name]
+            graph.add_edge(tile_node, None, compound_node, conn_name,
+                           Memlet(data=tile_name, subset=tile_subset))
 
         # ── 9. Connect output to outer exit ──────────────────────────
-        # Find the output connector and original memlet
         output_nsdfg_array = self._get_branch_output_array(true_state)
         output_outer_name = nsdfg_to_outer[output_nsdfg_array]
 
@@ -471,7 +504,7 @@ class IfElseMapToTileWhere(xf.SingleStateTransformation):
         )
         out_tile_node = graph.add_access(out_tile_name)
 
-        graph.add_edge(where_node, "_c", out_tile_node, None,
+        graph.add_edge(compound_node, "_out", out_tile_node, None,
                        Memlet(data=out_tile_name, subset=tile_subset))
 
         # Find the original nsdfg → inner_exit → outer_exit edge
@@ -500,120 +533,3 @@ class IfElseMapToTileWhere(xf.SingleStateTransformation):
         graph.remove_node(nsdfg)
         graph.remove_node(inner_entry)
         graph.remove_node(inner_exit)
-
-    # ── Branch TileOp creation ───────────────────────────────────────
-
-    @staticmethod
-    def _create_branch_tile_op(
-        graph: SDFGState,
-        sdfg: SDFG,
-        branch_tag: str,
-        branch_state: SDFGState,
-        inner_sdfg: SDFG,
-        nsdfg_to_tile: Dict[str, str],
-        nsdfg_to_outer: Dict[str, str],
-        outer_to_tile: Dict[str, Tuple[str, nodes.AccessNode]],
-        tile_shape: tuple,
-        tile_subset: subsets.Range,
-    ) -> Tuple[str, nodes.AccessNode]:
-        """
-        Create a TileOp library node for one branch of the if-else.
-
-        Returns ``(result_tile_name, result_tile_node)``.
-        """
-        # Find the tasklet in the branch state
-        tasklets = [n for n in branch_state.nodes()
-                    if isinstance(n, nodes.Tasklet)]
-        assert len(tasklets) == 1
-        tasklet = tasklets[0]
-
-        # Classify the tasklet (promote scalars to array-level)
-        match = match_tasklet_to_tile_library_node(
-            branch_state, tasklet, MaskType.UNMASKED, promote_scalars=True)
-        assert match is not None
-        node_info = match.node_info
-        classification = match.tasklet_classification
-
-        # Create the TileOp library node
-        lib_node = TileOpLibraryNode(
-            name=f"TileOp_{branch_tag}",
-            op=classification.op,
-            tile_shape=list(tile_shape),
-            constant1=classification.constant1,
-            constant2=classification.constant2,
-        )
-        graph.add_node(lib_node)
-
-        # Map tasklet input connectors to NSDFG arrays
-        tasklet_input_map = IfElseMapToTileWhere._get_tasklet_input_mapping(
-            branch_state, tasklet)
-
-        # Connect inputs from tile transients
-        # Map classification rhs to library node connectors
-        rhs_to_lib = {}
-        if classification.rhs1 is not None and node_info.rhs1 is not None:
-            rhs_to_lib[classification.rhs1] = node_info.rhs1
-        if classification.rhs2 is not None and node_info.rhs2 is not None:
-            rhs_to_lib[classification.rhs2] = node_info.rhs2
-
-        connected_lib_conns = set()
-        for tasklet_conn, lib_conn in rhs_to_lib.items():
-            if tasklet_conn not in tasklet_input_map:
-                continue
-            nsdfg_array = tasklet_input_map[tasklet_conn]
-            tile_name = nsdfg_to_tile.get(nsdfg_array)
-            if tile_name is None:
-                continue
-
-            if lib_conn in connected_lib_conns:
-                continue
-            connected_lib_conns.add(lib_conn)
-
-            # Remove constant-replaced connectors
-            if (lib_conn == node_info.rhs1 and classification.constant1 is not None):
-                if lib_conn in lib_node.in_connectors:
-                    lib_node.remove_in_connector(lib_conn)
-                continue
-            if (lib_conn == node_info.rhs2 and classification.constant2 is not None):
-                if lib_conn in lib_node.in_connectors:
-                    lib_node.remove_in_connector(lib_conn)
-                continue
-
-            # Reuse the existing tile transient node from outer_to_tile
-            # so graph stays scope-reachable.
-            outer_name = nsdfg_to_outer[nsdfg_array]
-            tile_node = outer_to_tile[outer_name][1]
-            graph.add_edge(tile_node, None, lib_node, lib_conn,
-                           Memlet(data=tile_name, subset=tile_subset))
-
-        # Remove unused input connectors for constants/unary ops
-        if classification.constant1 is not None and node_info.rhs1:
-            if node_info.rhs1 in lib_node.in_connectors:
-                lib_node.remove_in_connector(node_info.rhs1)
-        if classification.constant2 is not None and node_info.rhs2:
-            if node_info.rhs2 in lib_node.in_connectors:
-                lib_node.remove_in_connector(node_info.rhs2)
-        if node_info.rhs2 is None:
-            # Unary op: remove any extra binary connector
-            for conn in list(lib_node.in_connectors):
-                if conn not in connected_lib_conns:
-                    lib_node.remove_in_connector(conn)
-
-        # Create output tile transient
-        output_nsdfg_array = IfElseMapToTileWhere._get_branch_output_array(
-            branch_state)
-        outer_name = nsdfg_to_outer[output_nsdfg_array]
-        result_name = sdfg._find_new_name(f"{branch_tag}_tile")
-        sdfg.add_transient(
-            result_name,
-            shape=tile_shape,
-            dtype=sdfg.arrays[outer_name].dtype,
-            storage=sdfg.arrays[outer_name].storage,
-            lifetime=dtypes.AllocationLifetime.Scope,
-        )
-        result_node = graph.add_access(result_name)
-
-        graph.add_edge(lib_node, node_info.out, result_node, None,
-                       Memlet(data=result_name, subset=tile_subset))
-
-        return result_name, result_node

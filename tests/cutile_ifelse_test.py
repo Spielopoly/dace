@@ -19,6 +19,7 @@ from dace.libraries.cutile.transformations.if_else_to_where_select import (
 )
 from dace.libraries.cutile.nodes.where_select import TileWhereSelectLibraryNode
 from dace.libraries.cutile.nodes.op import TileOpLibraryNode
+from dace.libraries.cutile.nodes.if_else_op import TileIfElseOpLibraryNode
 from dace.libraries.cutile.transformations.pipeline import apply_cutile_pipeline
 
 
@@ -197,16 +198,16 @@ class TestIfElseStructure:
 
     def test_produces_tile_ops(self):
         sdfg, _ = _tile_and_transform(if_else_add_constant)
-        tile_ops = _collect_lib_nodes(sdfg, TileOpLibraryNode)
-        assert len(tile_ops) == 3, (
-            f"Expected 3 TileOps (condition + true + false), got {len(tile_ops)}"
+        compound = _collect_lib_nodes(sdfg, TileIfElseOpLibraryNode)
+        assert len(compound) == 1, (
+            f"Expected 1 TileIfElseOpLibraryNode, got {len(compound)}"
         )
 
     def test_produces_where_select(self):
         sdfg, _ = _tile_and_transform(if_else_add_constant)
-        ws = _collect_lib_nodes(sdfg, TileWhereSelectLibraryNode)
-        assert len(ws) == 1, (
-            f"Expected 1 TileWhereSelect, got {len(ws)}"
+        compound = _collect_lib_nodes(sdfg, TileIfElseOpLibraryNode)
+        assert len(compound) == 1, (
+            f"Expected 1 TileIfElseOpLibraryNode, got {len(compound)}"
         )
 
     def test_no_nested_sdfg_remains(self):
@@ -431,7 +432,7 @@ class TestIfElsePipeline:
         count = apply_cutile_pipeline(sdfg, apply_map_tiling=True)
         assert count > 0
 
-        ws = _collect_lib_nodes(sdfg, TileWhereSelectLibraryNode)
+        ws = _collect_lib_nodes(sdfg, TileIfElseOpLibraryNode)
         assert len(ws) == 1
 
     def test_pipeline_numeric_correctness(self):
