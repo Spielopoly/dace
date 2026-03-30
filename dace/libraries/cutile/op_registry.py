@@ -103,7 +103,19 @@ def register_op(op: str, tasklet_type: TaskletType, mask: MaskType, node_type: T
     _OP_TO_LIBRARY_NODE[(op, tasklet_type, mask)] = LibraryNodeInfo(type=node_type, **library_node_kwargs)
 
 
-def match_tasklet_to_tile_library_node(state: dace.SDFGState, tasklet: Tasklet, mask: MaskType) -> Optional[TaskletLibraryNodeMatch]:
+# Mapping from scalar-level TaskletType to tile-level (array) equivalent.
+# Used when matching scalar tasklets inside NestedSDFGs to tile library nodes.
+_SCALAR_TO_ARRAY_TYPE = {
+    TaskletType.SCALAR_SYMBOL: TaskletType.ARRAY_SYMBOL,
+    TaskletType.SCALAR_SCALAR: TaskletType.ARRAY_ARRAY,
+    TaskletType.SCALAR_ARRAY: TaskletType.SCALAR_ARRAY,      # already mixed
+    TaskletType.UNARY_SCALAR: TaskletType.UNARY_ARRAY,
+    TaskletType.ARRAY_SCALAR: TaskletType.ARRAY_ARRAY,
+}
+
+
+def match_tasklet_to_tile_library_node(state: dace.SDFGState, tasklet: Tasklet, mask: MaskType,
+                                       promote_scalars: bool = False) -> Optional[TaskletLibraryNodeMatch]:
     """
     Match a tasklet to a tile library node class based on its code.
 
@@ -119,6 +131,12 @@ def match_tasklet_to_tile_library_node(state: dace.SDFGState, tasklet: Tasklet, 
             - MaskType.UNMASKED (library node takes no mask argument)
             - MaskType.RUNTIME (library node takes an additional runtime boolean mask argument)
             - MaskType.SYMBOLIC (library node embeds a SymPy boolean predicate)
+    promote_scalars : bool
+        If True, scalar-level tasklet classifications (e.g. ``SCALAR_SYMBOL``)
+        are promoted to their array-level equivalents (e.g. ``ARRAY_SYMBOL``)
+        before lookup.  This is useful when matching tasklets inside
+        NestedSDFGs where the data are 0-dimensional scalars that will be
+        lifted to tile-level arrays by the calling transformation.
 
     Returns
     -------
@@ -131,5 +149,13 @@ def match_tasklet_to_tile_library_node(state: dace.SDFGState, tasklet: Tasklet, 
     if key in _OP_TO_LIBRARY_NODE:
         info = _OP_TO_LIBRARY_NODE[key]
         return TaskletLibraryNodeMatch(info, classification)
-    else:
-        return None
+
+    if promote_scalars:
+        promoted = _SCALAR_TO_ARRAY_TYPE.get(classification.type)
+        if promoted is not None:
+            key2 = (classification.op, promoted, mask)
+            if key2 in _OP_TO_LIBRARY_NODE:
+                info = _OP_TO_LIBRARY_NODE[key2]
+                return TaskletLibraryNodeMatch(info, classification)
+
+    return None

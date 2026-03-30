@@ -15,8 +15,9 @@ from dace.symbolic import symstr
 
 # ── Supported operations ─────────────────────────────────────────────
 _BINARY_OPS = ["+", "-", "*", "/"]
+_COMPARISON_OPS = [">", "<", ">=", "<=", "==", "!="]
 _UNARY_OPS = ["-", "abs", "sin", "cos", "exp", "sqrt", "log"]
-_ALL_OPS = sorted(set(_BINARY_OPS + _UNARY_OPS))
+_ALL_OPS = sorted(set(_BINARY_OPS + _COMPARISON_OPS + _UNARY_OPS))
 
 
 def _op_cpp_expr(op: str, left: str, right: str | None = None) -> str:
@@ -168,8 +169,8 @@ class _TileOpBase(LibraryNode):
         inputs: set[str] = set(extra_inputs)
         if constant1 is None:
             inputs.add("_a")
-        # Binary ops get _b unless constant2 replaces the right operand.
-        if op in _BINARY_OPS and constant2 is None:
+        # Binary and comparison ops get _b unless constant2 replaces the right operand.
+        if (op in _BINARY_OPS or op in _COMPARISON_OPS) and constant2 is None:
             inputs.add("_b")
 
         super().__init__(
@@ -203,7 +204,7 @@ class _TileOpBase(LibraryNode):
                 node_id=state.node_id(self),
             )
 
-        if self.op not in _BINARY_OPS and self.is_binary:
+        if self.op not in _BINARY_OPS and self.op not in _COMPARISON_OPS and self.is_binary:
             raise InvalidSDFGNodeError(
                 f"{label} '{self.name}': op '{self.op}' is unary-only "
                 f"but has binary connectors.",

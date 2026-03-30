@@ -14,6 +14,9 @@ from dace.libraries.cutile.transformations.scalar_to_tile_library import (
     ScalarToTileCanonical,
     ScalarToTileMasked,
 )
+from dace.libraries.cutile.transformations.if_else_to_where_select import (
+    IfElseMapToTileWhere,
+)
 from dace.transformation.dataflow import TrivialChainElimination, MapTiling
 
 
@@ -72,6 +75,13 @@ def apply_cutile_pipeline(sdfg: SDFG, *,
             ScalarToTileCanonical,
             ScalarToTileMasked,
         ],
+        validate=validate_all,
+        validate_all=validate_all,
+    )
+
+    # Phase 2: Replace if-else patterns with where-select library nodes
+    count += sdfg.apply_transformations_once_everywhere(
+        [IfElseMapToTileWhere],
         validate=validate_all,
         validate_all=validate_all,
     )

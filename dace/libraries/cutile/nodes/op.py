@@ -30,7 +30,7 @@ from ._base import (
     _TileOpBase,
     _op_cpp_expr, _get_tile_descriptors, _resolve_shape_and_scalar_form,
     _build_stride_decls, _resolve_operands, _collect_array_descs,
-    _BINARY_OPS, _UNARY_OPS,
+    _BINARY_OPS, _COMPARISON_OPS, _UNARY_OPS,
 )
 
 
@@ -230,5 +230,57 @@ for _op in _UNARY_OPS:
         mask=MaskType.UNMASKED,
         node_type=TileOpLibraryNode,
         node_name=_UNARY_DISPLAY_NAMES.get(_op, f"TileUnaryOp_{_op}") + "Const",
+        out="_c",
+    )
+
+
+# ── Comparison ops ───────────────────────────────────────────────────
+
+_CMP_DISPLAY_NAMES = {
+    ">": "TileGreaterThan", "<": "TileLessThan",
+    ">=": "TileGreaterEqual", "<=": "TileLessEqual",
+    "==": "TileEqual", "!=": "TileNotEqual",
+}
+_CMP_CONST_DISPLAY_NAMES = {
+    ">": "TileConstGreaterThan", "<": "TileConstLessThan",
+    ">=": "TileConstGreaterEqual", "<=": "TileConstLessEqual",
+    "==": "TileConstEqual", "!=": "TileConstNotEqual",
+}
+_CMP_SYMBOL_DISPLAY_NAMES = {
+    ">": "TileSymbolGreaterThan", "<": "TileSymbolLessThan",
+    ">=": "TileSymbolGreaterEqual", "<=": "TileSymbolLessEqual",
+    "==": "TileSymbolEqual", "!=": "TileSymbolNotEqual",
+}
+
+for _op in _COMPARISON_OPS:
+    # Two-array comparison
+    register_op(
+        op=_op,
+        tasklet_type=TaskletType.ARRAY_ARRAY,
+        mask=MaskType.UNMASKED,
+        node_type=TileOpLibraryNode,
+        node_name=_CMP_DISPLAY_NAMES[_op],
+        out="_c",
+        rhs1="_a",
+        rhs2="_b",
+    )
+    # Array + constant
+    register_op(
+        op=_op,
+        tasklet_type=TaskletType.ARRAY_SYMBOL,
+        mask=MaskType.UNMASKED,
+        node_type=TileOpLibraryNode,
+        node_name=_CMP_CONST_DISPLAY_NAMES[_op],
+        out="_c",
+        rhs1="_a",
+        rhs2="_b",
+    )
+    # Two constants
+    register_op(
+        op=_op,
+        tasklet_type=TaskletType.SYMBOL_SYMBOL,
+        mask=MaskType.UNMASKED,
+        node_type=TileOpLibraryNode,
+        node_name=_CMP_SYMBOL_DISPLAY_NAMES[_op],
         out="_c",
     )
