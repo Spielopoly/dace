@@ -10,6 +10,8 @@ from __future__ import annotations
 from typing import Tuple
 
 from dace.sdfg import SDFG
+from dace.sdfg import nodes as sdfg_nodes
+from dace.sdfg.construction_utils import normalize_conditional_blocks_in_nsdfg
 from dace.libraries.cutile.transformations.scalar_to_tile_library import (
     ScalarToTileCanonical,
     ScalarToTileMasked,
@@ -78,6 +80,16 @@ def apply_cutile_pipeline(sdfg: SDFG, *,
         validate=validate_all,
         validate_all=validate_all,
     )
+
+    # Phase 1.5: Normalize conditional blocks in NestedSDFGs
+    # Split 2-branch if-else blocks into sequential single-branch blocks
+    # and duplicate conditions across top-level nodes for each branch.
+    # This pre-normalizes the structure so IfElseMapToTileWhere operates
+    # on a simpler, uniform pattern.
+    for state in sdfg.all_states():
+        for node in state.nodes():
+            if isinstance(node, sdfg_nodes.NestedSDFG):
+                normalize_conditional_blocks_in_nsdfg(node.sdfg)
 
     # Phase 2: Replace if-else patterns with where-select library nodes
     count += sdfg.apply_transformations_once_everywhere(

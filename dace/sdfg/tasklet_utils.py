@@ -90,6 +90,32 @@ def _token_split(string_to_check: str) -> Set[str]:
     return tokens
 
 
+def token_split_variable_names(string_to_check: str) -> Set[str]:
+    """
+    Splits a string into variable name tokens, ignoring delimiters and non-identifiers.
+    Uses `str.isidentifier` on individual tokens.
+
+    The input string is split on empty space and brackets (` `, `(`, `)`, `[`, `]`).
+
+    Parameters
+    ----------
+    string_to_check : str
+        The string to split into tokens.
+
+    Returns
+    -------
+    Set[str]
+        The set of tokens extracted from the string.
+    """
+    # Split while keeping delimiters
+    tokens = re.split(r'(\s+|[()\[\]])', string_to_check)
+
+    # Replace tokens that exactly match src
+    tokens = {token.strip() for token in tokens if token not in ["[", "]", "(", ")"] and token.isidentifier()}
+
+    return tokens
+
+
 def _extract_constant_from_ast_str(src: str) -> str:
     """
     Extract a numeric constant from a Python code string using AST parsing.
