@@ -212,14 +212,12 @@ class IfElseMapToTileWhere(xf.SingleStateTransformation):
         If a single 2-branch ConditionalBlock is found instead, the
         method auto-normalizes it in-place before matching.
         """
-        from dace.sdfg.construction_utils import normalize_conditional_blocks_in_nsdfg
 
         cond_blocks = [n for n in inner_sdfg.nodes()
                        if isinstance(n, ConditionalBlock)]
 
-        # Auto-normalize if we see the pre-normalization pattern
+        
         if len(cond_blocks) == 1 and len(cond_blocks[0].branches) == 2:
-            normalize_conditional_blocks_in_nsdfg(inner_sdfg)
             cond_blocks = [n for n in inner_sdfg.nodes()
                            if isinstance(n, ConditionalBlock)]
 

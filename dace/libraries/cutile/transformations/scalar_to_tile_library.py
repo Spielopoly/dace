@@ -218,7 +218,7 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
             return False
         if not self._has_valid_map_ranges():
             return False
-        if match_tasklet_to_tile_library_node(graph, self._tasklet_node, self._get_mask_type()) is None:
+        if match_tasklet_to_tile_library_node(graph, self._tasklet_node, self._get_mask_type(), promote_scalars=True) is None:
             return False
 
         return True
@@ -499,7 +499,7 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
 
         # Resolve the matching library node and classification.
         # The op matcher maps the tasklet code to a concrete cuTile node type.
-        op_match = match_tasklet_to_tile_library_node(graph, self._tasklet_node, self._get_mask_type())
+        op_match = match_tasklet_to_tile_library_node(graph, self._tasklet_node, self._get_mask_type(), promote_scalars=True)
         if op_match is None:
             raise ValueError("No matching library node found for tasklet")
         self._node_info = op_match.node_info
