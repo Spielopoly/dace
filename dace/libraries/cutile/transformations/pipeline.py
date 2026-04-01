@@ -7,7 +7,6 @@ Usage::
     count = apply_cutile_pipeline(sdfg)
 """
 from __future__ import annotations
-from typing import Tuple
 
 from dace.sdfg import SDFG
 from dace.sdfg import nodes as sdfg_nodes
@@ -19,15 +18,21 @@ from dace.libraries.cutile.transformations.scalar_to_tile_library import (
 from dace.libraries.cutile.transformations.if_else_to_where_select import (
     IfElseMapToTileWhere,
 )
-from dace.transformation.dataflow import TrivialChainElimination, MapTiling
+from dace.transformation.dataflow import MapTiling, TrivialTaskletElimination, TrivialChainElimination
 
+
+def _simplify(sdfg: SDFG):
+    """Helper function to apply a few simplification transformations before the main pipeline."""
+    sdfg.apply_transformations_repeated([TrivialChainElimination])
+    sdfg.apply_transformations_repeated([TrivialTaskletElimination])
+    sdfg.simplify()
 
 
 def apply_cutile_pipeline(sdfg: SDFG, *,
                           validate: bool = True,
                           validate_all: bool = True,
                           apply_map_tiling: bool = True,
-                          tile_shape: Tuple[int, ...] = (16, 16, 16)) -> int:
+                          tile_shape: tuple[int, ...] = (16, 16, 16)) -> int:
     """
     Apply the full cuTile transformation pipeline to an SDFG.
 
@@ -56,6 +61,8 @@ def apply_cutile_pipeline(sdfg: SDFG, *,
     """
     count = 0
     
+    _simplify(sdfg)
+    
     # Apply MapTiling to create tiled patterns
     if apply_map_tiling:
         options = {
@@ -69,19 +76,9 @@ def apply_cutile_pipeline(sdfg: SDFG, *,
             options=options,
         )
 
+    _simplify(sdfg)
 
-    # Phase 1: Replace scalar tasklets with library nodes
-    count += sdfg.apply_transformations_once_everywhere(
-        [
-            TrivialChainElimination,
-            ScalarToTileCanonical,
-            ScalarToTileMasked,
-        ],
-        validate=validate_all,
-        validate_all=validate_all,
-    )
-
-    # Phase 1.5: Normalize conditional blocks in NestedSDFGs
+    # Phase 1: Normalize conditional blocks in NestedSDFGs
     # Split 2-branch if-else blocks into sequential single-branch blocks
     # and duplicate conditions across top-level nodes for each branch.
     # This pre-normalizes the structure so IfElseMapToTileWhere operates
@@ -91,9 +88,13 @@ def apply_cutile_pipeline(sdfg: SDFG, *,
             if isinstance(node, sdfg_nodes.NestedSDFG):
                 normalize_conditional_blocks_in_nsdfg(node.sdfg)
 
-    # Phase 2: Replace if-else patterns with where-select library nodes
+    # Phase 2: Replace scalar tasklets with library nodes
     count += sdfg.apply_transformations_once_everywhere(
-        [IfElseMapToTileWhere],
+        [
+            ScalarToTileCanonical,
+            ScalarToTileMasked,
+            IfElseMapToTileWhere
+        ],
         validate=validate_all,
         validate_all=validate_all,
     )

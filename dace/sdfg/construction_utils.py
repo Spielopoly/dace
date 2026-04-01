@@ -183,7 +183,7 @@ def extract_condition_var_and_assignment(parent_graph: ControlFlowRegion,
     return cond_var, new_cond
 
 
-def split_branches(parent_graph: ControlFlowRegion,
+def _split_branches(parent_graph: ControlFlowRegion,
                    if_block: ConditionalBlock) -> Tuple['ConditionalBlock', 'ConditionalBlock']:
     """
     Split a two-branch ConditionalBlock into two sequential single-branch blocks.
@@ -343,7 +343,7 @@ def duplicate_condition_across_top_level_nodes(parent_graph: ControlFlowRegion,
     return applied
 
 
-def normalize_conditional_blocks_in_nsdfg(nsdfg_sdfg: 'dace.SDFG') -> bool:
+def normalize_conditional_blocks_in_nsdfg(nsdfg_sdfg: dace.SDFG) -> bool:
     """
     Walk the inner SDFG of a NestedSDFG, find ConditionalBlocks, and normalize them.
 
@@ -365,7 +365,7 @@ def normalize_conditional_blocks_in_nsdfg(nsdfg_sdfg: 'dace.SDFG') -> bool:
     for cfr in nsdfg_sdfg.all_control_flow_regions():
         for node in list(cfr.nodes()):
             if isinstance(node, ConditionalBlock) and len(node.branches) == 2:
-                first_if, second_if = split_branches(cfr, node)
+                first_if, second_if = _split_branches(cfr, node)
                 applied = True
                 # Try duplicating conditions in each resulting single-branch block
                 for single_if in [first_if, second_if]:

@@ -129,10 +129,10 @@ def test_frontend_symbolic_vadd_pipeline_structure_and_runtime():
         apply_map_tiling=True,
         tile_shape=(4, 3),
     )
-    assert count >= 1
+    assert count >= 1, f"Expected at least 1 transformation, but got {count}"
 
     lib_nodes = _frontend_library_nodes(sdfg)
-    assert any(isinstance(node, TileOpLibraryNode) for node in lib_nodes)
+    assert any(isinstance(node, TileOpLibraryNode) for node in lib_nodes), "Expected at least one TileOpLibraryNode in the transformed SDFG."
 
     sdfg.expand_library_nodes()
     sdfg.validate()
@@ -174,14 +174,15 @@ def test_frontend_vselfadd_pipeline_structure_and_runtime():
 
 
 def test_frontend_noncanonical_strided_add_pipeline_structure_and_runtime():
-    """Frontend non-canonical strided map should keep structure and run correctly."""
+    """Frontend non-canonical strided map should not not get replaced by library
+    nodes because we do not apply map tiling and run correctly."""
     sdfg = frontend_noncanonical_vadd_program.to_sdfg(simplify=True)
     count = apply_cutile_pipeline(
         sdfg,
         validate=True,
         apply_map_tiling=False,
     )
-    assert count >= 1
+    assert count == 0
 
     state = sdfg.states()[0]
     map_entries = [n for n in state.nodes() if isinstance(n, nodes.MapEntry)]

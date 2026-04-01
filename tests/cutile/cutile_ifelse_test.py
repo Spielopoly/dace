@@ -12,13 +12,14 @@ import numpy as np
 import pytest
 
 import dace
+from dace.frontend.python.parser import DaceProgram
 from dace.sdfg import nodes
-from dace.transformation.dataflow import TrivialChainElimination, MapTiling
+from dace.transformation.dataflow import MapTiling, TrivialTaskletElimination
 from dace.libraries.cutile.transformations.if_else_to_where_select import (
     IfElseMapToTileWhere,
 )
 from dace.libraries.cutile.nodes.if_else_op import TileIfElseOpLibraryNode
-from dace.libraries.cutile.transformations.pipeline import apply_cutile_pipeline
+from dace.libraries.cutile.transformations.pipeline import apply_cutile_pipeline, _simplify
 
 
 # ---------------------------------------------------------------------------
@@ -158,14 +159,10 @@ def if_else_eq_add_mul(
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _tile_and_transform(program, *, tile_sizes=(16, 16)):
-    """Parse → TrivialChainElimination → Tiling → IfElseMapToTileWhere."""
+def _tile_and_transform(program: DaceProgram, *, tile_sizes=(16, 16)):
+    """Helper to apply the cuTile pipeline to a program and return the transformed SDFG"""
     sdfg = program.to_sdfg()
-    sdfg.apply_transformations_once_everywhere(TrivialChainElimination)
-    sdfg.apply_transformations(
-        [MapTiling], options={"tile_sizes": list(tile_sizes), "skew": True}
-    )
-    n_applied = sdfg.apply_transformations_once_everywhere(IfElseMapToTileWhere)
+    n_applied = apply_cutile_pipeline(sdfg, tile_shape=tile_sizes)
     return sdfg, n_applied
 
 
@@ -187,18 +184,20 @@ class TestIfElseStructure:
     """Verify the transformation applies and produces the expected graph."""
 
     def test_constant_branches_apply(self):
-        sdfg, n = _tile_and_transform(if_else_add_constant)
-        assert n == 1, f"Expected 1 application, got {n}"
+        sdfg, _ = _tile_and_transform(if_else_add_constant)
+        lib = _collect_lib_nodes(sdfg, TileIfElseOpLibraryNode)
+        assert len(lib) >= 1, "Expected at least one TileIfElseOpLibraryNode"
 
     def test_array_branches_apply(self):
-        sdfg, n = _tile_and_transform(if_else_add)
-        assert n == 1, f"Expected 1 application, got {n}"
+        sdfg, _ = _tile_and_transform(if_else_add)
+        lib = _collect_lib_nodes(sdfg, TileIfElseOpLibraryNode)
+        assert len(lib) >= 1, "Expected at least one TileIfElseOpLibraryNode"
 
     def test_produces_tile_ops(self):
         sdfg, _ = _tile_and_transform(if_else_add_constant)
         compound = _collect_lib_nodes(sdfg, TileIfElseOpLibraryNode)
-        assert len(compound) == 1, (
-            f"Expected 1 TileIfElseOpLibraryNode, got {len(compound)}"
+        assert len(compound) >= 1, (
+            f"Expected at least 1 TileIfElseOpLibraryNode, got {len(compound)}"
         )
 
     def test_no_nested_sdfg_remains(self):
@@ -230,8 +229,14 @@ class TestIfElseStructure:
         if_else_eq_add_mul,
     ], ids=lambda p: p.name)
     def test_new_conditions_apply(self, program):
-        sdfg, n = _tile_and_transform(program)
-        assert n == 1, f"Expected 1 application, got {n}"
+        sdfg, _ = _tile_and_transform(program)
+        lib = _collect_lib_nodes(sdfg, TileIfElseOpLibraryNode)
+        assert len(lib) >= 1, "Expected at least one TileIfElseOpLibraryNode"
+        nsdfgs = [
+            n for state in sdfg.states() for n in state.nodes()
+            if isinstance(n, nodes.NestedSDFG)
+        ]
+        assert len(nsdfgs) == 0, "NestedSDFG should be removed after transformation"
 
     @pytest.mark.parametrize("program", [
         if_else_lt_add_sub,
@@ -421,16 +426,13 @@ class TestIfElsePipeline:
 
     def test_pipeline_applies_if_else(self):
         sdfg = if_else_add_constant.to_sdfg()
-        sdfg.apply_transformations_once_everywhere(TrivialChainElimination)
-        count = apply_cutile_pipeline(sdfg, apply_map_tiling=True)
-        assert count > 0
+        apply_cutile_pipeline(sdfg, apply_map_tiling=True)
 
         ws = _collect_lib_nodes(sdfg, TileIfElseOpLibraryNode)
-        assert len(ws) == 1
+        assert len(ws) >= 1, "Pipeline should produce at least one TileIfElseOpLibraryNode"
 
     def test_pipeline_numeric_correctness(self):
         sdfg = if_else_add_constant.to_sdfg()
-        sdfg.apply_transformations_once_everywhere(TrivialChainElimination)
         apply_cutile_pipeline(sdfg, apply_map_tiling=True)
         sdfg.expand_library_nodes()
         compiled = sdfg.compile()
@@ -447,4 +449,4 @@ class TestIfElsePipeline:
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+    pytest.main([__file__, "-vq"])

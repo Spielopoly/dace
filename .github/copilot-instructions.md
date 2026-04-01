@@ -66,9 +66,9 @@
   - `ScalarToTileCanonical` — 0-based, unit-stride inner maps → unmasked tile library nodes
   - `ScalarToTileMasked` — non-canonical inner maps → runtime-masked tile library nodes with preload
 - **PatternNode bug**: `PatternNode.__get__` resolves nodes by integer index in the state's node list. Adding/removing graph nodes shifts indices, causing descriptors to return wrong nodes. Always capture actual node object references at the start of `apply()` (before any graph modifications) and use those throughout. Never use PatternNode descriptors (`self.outer_map_entry` etc.) after modifying the graph.
-- **Pipeline** (`pipeline.py`): `apply_cutile_pipeline()` runs `TrivialChainElimination` + `ScalarToTileCanonical` + `ScalarToTileMasked`.
-- **Tests**: `tests/cutile_test.py` and `tests/cutile_frontend_test.py`. Run both after any cuTile changes:
-  - `/venv/main/bin/python -m pytest tests/cutile_test.py tests/cutile_frontend_test.py -x -q`
+- **Pipeline** (`pipeline.py`): `apply_cutile_pipeline()` runs `TrivialTaskletElimination` + `ScalarToTileCanonical` + `ScalarToTileMasked`.
+- **Tests**: `tests/cutile/cutile_test.py` and `tests/cutile/cutile_frontend_test.py`, `tests/cutile/cutile_if_else_op_test.py`, `tests/cutile/cutile_if_else_test.py`. Run all after any cuTile changes:
+  - `/venv/main/bin/python -m pytest tests/cutile/cutile_test.py tests/cutile/cutile_frontend_test.py tests/cutile/cutile_if_else_op_test.py tests/cutile/cutile_if_else_test.py -x -q`
 
 ## Documentation Links
 - Project overview and quick start: [README.md](../README.md)
