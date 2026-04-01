@@ -203,81 +203,55 @@ class IfElseMapToTileWhere(xf.SingleStateTransformation):
         Returns ``(cond_block, cond_expr, true_state, false_state)`` or
         ``None`` if the pattern is not matched.
 
-        Expects the normalized structure produced by
-        :func:`~dace.sdfg.construction_utils.normalize_conditional_blocks_in_nsdfg`::
+        Expected CFG structure::
 
-            empty_state --(assigns condition symbol)-->
-            ConditionalBlock_true(1 branch) --> ConditionalBlock_false(1 branch)
+            empty_state --(assigns condition symbol)--> ConditionalBlock
 
-        If a single 2-branch ConditionalBlock is found instead, the
-        method auto-normalizes it in-place before matching.
+        The ConditionalBlock must have exactly 2 branches: one with a
+        condition and one with ``None`` (else).
         """
-
+        # Find ConditionalBlocks
         cond_blocks = [n for n in inner_sdfg.nodes()
                        if isinstance(n, ConditionalBlock)]
+        if len(cond_blocks) != 1:
+            return None
+        cond_block = cond_blocks[0]
 
-        
-        if len(cond_blocks) == 1 and len(cond_blocks[0].branches) == 2:
-            cond_blocks = [n for n in inner_sdfg.nodes()
-                           if isinstance(n, ConditionalBlock)]
-
-        if len(cond_blocks) != 2:
+        if len(cond_block.branches) != 2:
             return None
 
-        cb0, cb1 = cond_blocks
+        # Identify the condition expression from an incoming interstate edge
+        ies = inner_sdfg.in_edges(cond_block)
+        cond_expr = None
+        cond_symbol = None
 
-        # Determine ordering: find which comes first in the CFG
-        edges_0_to_1 = inner_sdfg.edges_between(cb0, cb1)
-        edges_1_to_0 = inner_sdfg.edges_between(cb1, cb0)
-
-        if len(edges_0_to_1) == 1:
-            first_block, second_block = cb0, cb1
-        elif len(edges_1_to_0) == 1:
-            first_block, second_block = cb1, cb0
+        # Determine which branch is "if" (has condition) and which is "else"
+        (cond0, body0), (cond1, body1) = cond_block.branches
+        if cond0 is not None and cond1 is None:
+            cond_symbol = cond0.as_string.strip()
+            true_body, false_body = body0, body1
+        elif cond0 is None and cond1 is not None:
+            cond_symbol = cond1.as_string.strip()
+            true_body, false_body = body1, body0
         else:
             return None
 
-        # Each must have exactly 1 branch
-        if len(first_block.branches) != 1 or len(second_block.branches) != 1:
-            return None
-
-        cond_first, body_first = first_block.branches[0]
-        cond_second, body_second = second_block.branches[0]
-
-        # Verify condition polarity: the negated branch has "== 0" suffix
-        # If first_block has the negation, swap: true is the non-negated one
-        first_cond_str = cond_first.as_string.strip() if cond_first is not None else ""
-        second_cond_str = cond_second.as_string.strip() if cond_second is not None else ""
-        if first_cond_str.endswith("== 0") and not second_cond_str.endswith("== 0"):
-            first_block, second_block = second_block, first_block
-            cond_first, body_first = first_block.branches[0]
-            cond_second, body_second = second_block.branches[0]
-
-        # Both must have conditions (not None)
-        if cond_first is None or cond_second is None:
-            return None
-
-        # Extract the condition expression from interstate edges before first block
-        ies = inner_sdfg.in_edges(first_block)
-        cond_symbol = cond_first.as_string.strip()
-        cond_expr = None
-
+        # Find the condition assignment in interstate edges
         for ie in ies:
             if cond_symbol in ie.data.assignments:
                 cond_expr = ie.data.assignments[cond_symbol]
                 break
 
         if cond_expr is None:
-            # Condition may already be fully resolved
-            cond_expr = cond_symbol
+            return None
 
-        # Each body must have exactly 1 state
-        true_states = list(body_first.all_states())
-        false_states = list(body_second.all_states())
+        # Each body must have exactly one state
+        true_states = list(true_body.all_states())
+        false_states = list(false_body.all_states())
         if len(true_states) != 1 or len(false_states) != 1:
             return None
 
-        return first_block, cond_expr, true_states[0], false_states[0]
+        return cond_block, cond_expr, true_states[0], false_states[0]
 
     @staticmethod
     def _get_branch_output_array(state: SDFGState) -> Optional[str]:

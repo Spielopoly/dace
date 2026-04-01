@@ -8,24 +8,22 @@ Usage::
 """
 from __future__ import annotations
 
+from .utils import duplicate_conditions_for_whole_sdfgs
 from dace.sdfg import SDFG
 from dace.sdfg import nodes as sdfg_nodes
 from dace.sdfg.state import ConditionalBlock
-from dace.sdfg.construction_utils import normalize_conditional_blocks_in_nsdfg
-from dace.libraries.cutile.transformations.scalar_to_tile_library import (
+from .scalar_to_tile_library import (
     ScalarToTileCanonical,
     ScalarToTileMasked,
 )
-from dace.libraries.cutile.transformations.if_else_to_where_select import (
+from .if_else_to_where_select import (
     IfElseMapToTileWhere,
 )
 from dace.transformation.dataflow import MapTiling, TrivialTaskletElimination, TrivialChainElimination
 from dace.transformation.interstate.loop_lifting import LoopLifting
 from dace.transformation.interstate.loop_to_map import LoopToMap
 from dace.transformation.passes.split_tasklets import SplitTasklets
-from dace.transformation.passes.scalar_fission import ScalarFission
 from dace.transformation.dataflow.map_fission import MapFission
-from dace.transformation.passes.full_map_fusion import FullMapFusion
 from dace.transformation import pass_pipeline as ppl
 
 
@@ -49,14 +47,11 @@ def apply_cutile_pipeline(sdfg: SDFG, *,
      1. **Simplify** – trivial tasklet/chain elimination and standard simplify.
      2. **LoopLifting / LoopToMap** – convert state-machine loops into maps.
      3. **SplitTasklets** – split multi-statement tasklets into single ops.
-     4. **ScalarFission** – disambiguate scalar data flow.
-     5. **MapFission** – fission maps into single-operation maps.
-     6. **Simplify** – clean up after preprocessing.
-     7. **FullMapFusion** – fuse maps with matching iteration spaces.
-     8. **MapTiling** – tile maps to the given tile shape.
-     9. **Simplify** – clean up after tiling.
-     10. **Normalize conditional blocks** in NestedSDFGs.
-     11. **ScalarToTileCanonical / ScalarToTileMasked / IfElseMapToTileWhere**
+     4. **MapFission** – fission maps into single-operation maps.
+     5. **Simplify** – clean up after preprocessing.
+     6. **MapTiling** – tile maps to the given tile shape.
+     7. **Normalize conditional blocks** in NestedSDFGs.
+     8. **ScalarToTileCanonical / ScalarToTileMasked / IfElseMapToTileWhere**
          – replace scalar tasklets with cuTile library nodes.
 
     Parameters
@@ -79,6 +74,8 @@ def apply_cutile_pipeline(sdfg: SDFG, *,
     """
     count = 0
     
+    # Step 1: Initial simplification
+    # Removes trivial tasklets and unnecessary access nodes
     _simplify(sdfg)
 
     # ── Preprocessing: Canonicalize the SDFG for tiling ──────────────
@@ -100,7 +97,7 @@ def apply_cutile_pipeline(sdfg: SDFG, *,
     if split_result is not None:
         count += split_result if isinstance(split_result, int) else 1
 
-    # Step 5: Fission maps with complex subgraphs into single-operation maps
+    # Step 4: Fission maps with complex subgraphs into single-operation maps
     # Each resulting map should have exactly one computational node,
     # which can then be matched against tile library node patterns.
     # NOTE: Skip MapFission when the SDFG contains NestedSDFGs with
@@ -118,16 +115,10 @@ def apply_cutile_pipeline(sdfg: SDFG, *,
             [MapFission], validate=False, validate_all=False,
         )
 
-    # Clean up after preprocessing
+    # Step 5: Clean up after preprocessing
     _simplify(sdfg)
 
-    # Step 8: Fuse maps with matching ranges before tiling
-    # This merges maps that operate on the same iteration space,
-    # so that a single tiled map covers the fused computation.
-    fuse_pipeline = ppl.Pipeline([FullMapFusion(strict_dataflow=True)])
-    fuse_pipeline.apply_pass(sdfg, {})
-
-    # Apply MapTiling to create tiled patterns
+    # Step 6: Apply MapTiling to create tiled patterns
     if apply_map_tiling:
         options = {
             "tile_sizes": tile_shape,
@@ -140,19 +131,14 @@ def apply_cutile_pipeline(sdfg: SDFG, *,
             options=options,
         )
 
-    _simplify(sdfg)
+    # Step 7: Normalize conditional blocks in NestedSDFGs
+    # Duplicate conditions across top-level nodes for each branch.
+    # TODO: Not sure if this is actually useful for this pipeline
+    # We'll need more tests for this, and actually implement it properly
+    # So far we only have tests for sdfgs where this does not apply
+    duplicate_conditions_for_whole_sdfgs(sdfg)
 
-    # Phase 1: Normalize conditional blocks in NestedSDFGs
-    # Split 2-branch if-else blocks into sequential single-branch blocks
-    # and duplicate conditions across top-level nodes for each branch.
-    # This pre-normalizes the structure so IfElseMapToTileWhere operates
-    # on a simpler, uniform pattern.
-    for state in sdfg.all_states():
-        for node in state.nodes():
-            if isinstance(node, sdfg_nodes.NestedSDFG):
-                normalize_conditional_blocks_in_nsdfg(node.sdfg)
-
-    # Phase 2: Replace scalar tasklets with library nodes
+    # Step 8: Replace scalar tasklets with library nodes
     count += sdfg.apply_transformations_once_everywhere(
         [
             ScalarToTileCanonical,

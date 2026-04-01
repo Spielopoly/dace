@@ -341,33 +341,3 @@ def duplicate_condition_across_top_level_nodes(parent_graph: ControlFlowRegion,
             parent_graph.sdfg.reset_cfg_list()
             sdutil.set_nested_sdfg_parent_references(parent_graph.sdfg)
     return applied
-
-
-def normalize_conditional_blocks_in_nsdfg(nsdfg_sdfg: dace.SDFG) -> bool:
-    """
-    Walk the inner SDFG of a NestedSDFG, find ConditionalBlocks, and normalize them.
-
-    Normalization consists of two steps:
-    1. Split 2-branch ConditionalBlocks into sequential single-branch ones.
-    2. Duplicate conditions across top-level nodes in each branch.
-
-    Parameters
-    ----------
-    nsdfg_sdfg : dace.SDFG
-        The inner SDFG of a NestedSDFG node.
-
-    Returns
-    -------
-    bool
-        ``True`` if any normalization was applied.
-    """
-    applied = False
-    for cfr in nsdfg_sdfg.all_control_flow_regions():
-        for node in list(cfr.nodes()):
-            if isinstance(node, ConditionalBlock) and len(node.branches) == 2:
-                first_if, second_if = _split_branches(cfr, node)
-                applied = True
-                # Try duplicating conditions in each resulting single-branch block
-                for single_if in [first_if, second_if]:
-                    duplicate_condition_across_top_level_nodes(cfr, single_if)
-    return applied
