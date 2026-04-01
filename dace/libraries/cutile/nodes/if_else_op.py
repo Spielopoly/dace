@@ -4,40 +4,32 @@ element-wise tile operations.
 
 Encapsulates the pattern::
 
-    C = where(A cond_op B_or_const, true_op(...), false_op(...))
+    C = where(condition(...), true_op(...), false_op(...))
 
 The expansion SDFG composes four inner library nodes:
 
-1. ``TileOpLibraryNode`` for the condition comparison
+1. A tasklet that evaluates the SymPy condition expression
 2. ``TileOpLibraryNode`` for the true branch
 3. ``TileOpLibraryNode`` for the false branch
 4. ``TileWhereSelectLibraryNode`` for the final selection
 """
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Any, List, Optional
+
+import sympy as sp
 
 import dace
 from dace import library, properties
 from dace.sdfg import SDFG, SDFGState, nodes
 from dace.sdfg.nodes import LibraryNode
 from dace.sdfg.validation import InvalidSDFGNodeError
+from dace.symbolic import symstr
 from dace.transformation.transformation import ExpandTransformation
 
 from .op import TileOpLibraryNode
 from .where_select import TileWhereSelectLibraryNode
 from ._base import _BINARY_OPS, _COMPARISON_OPS, _ALL_OPS
-
-
-# Role name → (internal node label, connector name)
-_ROLE_TO_NODE_CONN = {
-    "cond_left": ("cmp", "_a"),
-    "cond_right": ("cmp", "_b"),
-    "true_rhs1": ("true_branch", "_a"),
-    "true_rhs2": ("true_branch", "_b"),
-    "false_rhs1": ("false_branch", "_a"),
-    "false_rhs2": ("false_branch", "_b"),
-}
 
 
 def _get_if_else_descriptors(node, state, sdfg):
@@ -72,9 +64,7 @@ def _get_if_else_descriptors(node, state, sdfg):
 
 def _required_roles(node):
     """Return the set of roles required by *node*'s configuration."""
-    required = {"cond_left"}
-    if node.cond_constant is None:
-        required.add("cond_right")
+    required = set()
     # True branch
     if node.true_constant1 is None:
         required.add("true_rhs1")
@@ -99,7 +89,7 @@ class TileIfElseOpLibraryNode(LibraryNode):
 
     ::
 
-        C = where(A cond_op B_or_const, true_op(...), false_op(...))
+        C = where(condition(...), true_op(...), false_op(...))
 
     The output connector is named ``_out`` (not ``_c``) to avoid
     name collisions with the ``_c`` connectors of expanded inner
@@ -114,14 +104,13 @@ class TileIfElseOpLibraryNode(LibraryNode):
     implementations: dict = {}
     default_implementation = "pure"
 
-    cond_op = properties.Property(
-        dtype=str, default=">",
-        desc="Comparison operator for the condition.",
-    )
-    cond_constant = properties.Property(
-        dtype=str, default=None, allow_none=True,
-        desc="Constant for condition RHS. None means RHS comes from "
-             "an input connector.",
+    condition = properties.Property(
+        dtype=sp.Basic, default=None, allow_none=True,
+        desc=(
+            "SymPy boolean expression for the if-condition. "
+            "Its free symbols must match input connector names "
+            "(e.g., _in0, _in1)."
+        ),
     )
     true_op = properties.Property(
         dtype=str, default="+",
@@ -159,14 +148,13 @@ class TileIfElseOpLibraryNode(LibraryNode):
     )
 
     def __init__(self, name="TileIfElseOp", *,
-                 cond_op=">", cond_constant=None,
+                 condition=None,
                  true_op="+", true_constant1=None, true_constant2=None,
                  false_op="+", false_constant1=None, false_constant2=None,
                  tile_shape=None, input_roles=None, num_inputs=1, **kwargs):
         inputs = {f"_in{i}" for i in range(num_inputs)}
         super().__init__(name, inputs=inputs, outputs={"_out"}, **kwargs)
-        self.cond_op = cond_op
-        self.cond_constant = cond_constant
+        self.condition = condition
         self.true_op = true_op
         self.true_constant1 = true_constant1
         self.true_constant2 = true_constant2
@@ -180,13 +168,24 @@ class TileIfElseOpLibraryNode(LibraryNode):
         sid = state.parent_graph.node_id(state)
         nid = state.node_id(self)
 
-        # --- operator validity ---
-        if self.cond_op not in _COMPARISON_OPS:
+        # --- condition validity ---
+        if self.condition is None:
             raise InvalidSDFGNodeError(
-                f"TileIfElseOp '{self.name}': cond_op '{self.cond_op}' "
-                f"not in {_COMPARISON_OPS}",
+                f"TileIfElseOp '{self.name}': condition must be set.",
                 sdfg=sdfg, state_id=sid, node_id=nid,
             )
+
+        cond_symbols = {str(sym) for sym in self.condition.free_symbols}
+        bad_symbols = cond_symbols - set(self.in_connectors)
+        if bad_symbols:
+            raise InvalidSDFGNodeError(
+                f"TileIfElseOp '{self.name}': condition symbol(s) "
+                f"{bad_symbols} do not match input connectors "
+                f"{set(self.in_connectors)}.",
+                sdfg=sdfg, state_id=sid, node_id=nid,
+            )
+
+        # --- operator validity ---
         if self.true_op not in _ALL_OPS:
             raise InvalidSDFGNodeError(
                 f"TileIfElseOp '{self.name}': true_op '{self.true_op}' "
@@ -239,10 +238,10 @@ class TileIfElseOpLibraryNode(LibraryNode):
 
 # ── Expansion ────────────────────────────────────────────────────────
 
-@library.register_expansion(TileIfElseOpLibraryNode, "pure")
+@library.register_expansion(TileIfElseOpLibraryNode, "pure")  # type: ignore[arg-type]
 class ExpandTileIfElseOpPure(ExpandTransformation):
     """Expand into an SDFG with four inner library nodes
-    (cmp, true_branch, false_branch, where)."""
+    (condition_eval, true_branch, false_branch, where)."""
 
     environments: list = []
 
@@ -293,11 +292,6 @@ class ExpandTileIfElseOpPure(ExpandTransformation):
                 role_to_input[role] = conn
 
         # ── inner library nodes ──────────────────────────────────────
-        cmp_node = TileOpLibraryNode(
-            "cmp", op=node.cond_op,
-            tile_shape=node.tile_shape,
-            constant2=node.cond_constant,
-        )
         true_node = TileOpLibraryNode(
             "true_branch", op=node.true_op,
             tile_shape=node.tile_shape,
@@ -314,7 +308,87 @@ class ExpandTileIfElseOpPure(ExpandTransformation):
             "where", tile_shape=node.tile_shape,
         )
 
-        inner_state.add_node(cmp_node)
+        # Build condition-evaluation tasklet from SymPy expression.
+        if node.condition is None:
+            raise ValueError(
+                f"TileIfElseOp expansion: condition is missing for node "
+                f"'{node.name}'."
+            )
+        cond_connectors = sorted({str(sym) for sym in node.condition.free_symbols})
+        for conn in cond_connectors:
+            if conn not in in_descs:
+                raise ValueError(
+                    f"TileIfElseOp expansion: condition symbol '{conn}' "
+                    f"is not wired as an input connector for node "
+                    f"'{node.name}'."
+                )
+
+        cond_expr = node.condition.xreplace(
+            {sp.Symbol(conn): sp.Symbol(f"{conn}_val") for conn in cond_connectors}
+        )
+        cond_expr_cpp = symstr(cond_expr, cpp_mode=True)
+
+        cond_input_map = {
+            conn: f"__cond_in{idx}" for idx, conn in enumerate(cond_connectors)
+        }
+
+        ndim = len(ref_shape)
+        shape_expr = ", ".join(symstr(s) for s in ref_shape)
+        cond_tile_strides = ", ".join(
+            symstr(s) for s in inner_sdfg.arrays["cond_tile"].strides
+        )
+        cond_stride_decls = ""
+        cond_index_decls = ""
+        cond_index_updates = ""
+        cond_value_decls = ""
+        for conn in cond_connectors:
+            tasklet_conn = cond_input_map[conn]
+            in_strides = ", ".join(symstr(s) for s in in_descs[conn].strides)
+            cond_stride_decls += (
+                f"const std::ptrdiff_t {tasklet_conn}_strides[ndim] = "
+                f"{{{in_strides}}};\n"
+            )
+            cond_index_decls += f"    std::size_t i_{tasklet_conn} = 0;\n"
+            cond_index_updates += (
+                f"        i_{tasklet_conn} += coord * {tasklet_conn}_strides[d];\n"
+            )
+            cond_value_decls += (
+                f"    const auto {conn}_val = "
+                f"{tasklet_conn}[i_{tasklet_conn}];\n"
+            )
+
+        cond_code = f"""
+constexpr int ndim = {ndim};
+const std::size_t shape[ndim] = {{{shape_expr}}};
+{cond_stride_decls}const std::ptrdiff_t cond_strides[ndim] = {{{cond_tile_strides}}};
+
+std::size_t n = 1;
+for (int d = 0; d < ndim; ++d) {{
+    n *= shape[d];
+}}
+
+for (std::size_t i = 0; i < n; ++i) {{
+    std::size_t rem = i;
+{cond_index_decls}    std::size_t i_cond = 0;
+    for (int d = ndim - 1; d >= 0; --d) {{
+        const auto extent = shape[d];
+        const std::size_t coord = rem % extent;
+        rem /= extent;
+{cond_index_updates}        i_cond += coord * cond_strides[d];
+    }}
+{cond_value_decls}    _c[i_cond] = ({cond_expr_cpp});
+}}
+"""
+
+        cond_node = nodes.Tasklet(
+            label="condition_eval",
+            inputs=set(cond_input_map.values()),
+            outputs={"_c"},
+            code=cond_code,
+            language=dace.dtypes.Language.CPP,
+        )
+
+        inner_state.add_node(cond_node)
         inner_state.add_node(true_node)
         inner_state.add_node(false_node)
         inner_state.add_node(where_node)
@@ -331,9 +405,17 @@ class ExpandTileIfElseOpPure(ExpandTransformation):
                 dace.Memlet.from_array(in_conn, desc),
             )
 
-        # Wire condition
-        _wire_input("cond_left", cmp_node, "_a")
-        _wire_input("cond_right", cmp_node, "_b")
+        # Wire condition inputs used by the SymPy expression
+        for conn in cond_connectors:
+            cond_acc = inner_state.add_read(conn)
+            desc = inner_sdfg.arrays[conn]
+            inner_state.add_edge(
+                cond_acc,
+                None,
+                cond_node,
+                cond_input_map[conn],
+                dace.Memlet.from_array(conn, desc),
+            )
 
         # Wire true branch
         _wire_input("true_rhs1", true_node, "_a")
@@ -354,9 +436,9 @@ class ExpandTileIfElseOpPure(ExpandTransformation):
         true_arr = inner_sdfg.arrays["true_tile"]
         false_arr = inner_sdfg.arrays["false_tile"]
 
-        # cmp → cond_tile → where._cond
+        # condition_eval → cond_tile → where._cond
         inner_state.add_edge(
-            cmp_node, "_c", cond_acc, None,
+            cond_node, "_c", cond_acc, None,
             dace.Memlet.from_array("cond_tile", cond_arr),
         )
         inner_state.add_edge(

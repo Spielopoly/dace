@@ -19,11 +19,11 @@ based on the condition mask.
 """
 from __future__ import annotations
 
-import ast
 import copy
 from typing import Dict, List, Optional, Tuple
 
 import dace
+import sympy as sp
 from dace import Memlet, dtypes, subsets
 from dace.sdfg import SDFG, SDFGState, nodes, utils as sdutil
 from dace.sdfg.state import ConditionalBlock
@@ -36,65 +36,29 @@ from dace.libraries.cutile.op_registry import (
 )
 
 
-# ── AST comparison-operator map ──────────────────────────────────────
-
-_AST_CMP_OPS = {
-    ast.Gt: ">", ast.Lt: "<", ast.GtE: ">=", ast.LtE: "<=",
-    ast.Eq: "==", ast.NotEq: "!=",
-}
-
-
 # ── Helpers ──────────────────────────────────────────────────────────
 
-def _parse_condition_expr(
+def _to_sympy_condition(
     cond_expr: str, nsdfg_arrays: set,
-) -> Optional[Tuple[str, Optional[str], Optional[str], Optional[str]]]:
-    """Parse a condition expression into comparison components.
+) -> Optional[sp.Basic]:
+    """Convert a condition expression string to a SymPy expression.
 
-    Returns ``(op, left_ref, right_ref, constant)`` where:
-
-    * *op* is one of ``">", "<", ">=", "<=", "==", "!="``.
-    * *left_ref* is the NSDFG array name on the left (always present).
-    * *right_ref* is the NSDFG array name on the right, or ``None``
-      when the right operand is a constant.
-    * *constant* is the string representation of the constant operand,
-      or ``None`` when the right operand is an array reference.
-
-    Returns ``None`` if the expression cannot be parsed.
+    All free symbols in the resulting expression must map to NSDFG array
+    names. Returns ``None`` if parsing fails or unknown symbols appear.
     """
     try:
-        tree = ast.parse(cond_expr, mode="eval")
-    except SyntaxError:
+        expr = dace.symbolic.pystr_to_symbolic(cond_expr, simplify=False)
+    except Exception:
         return None
 
-    body = tree.body
-    if not isinstance(body, ast.Compare):
-        return None
-    if len(body.ops) != 1 or len(body.comparators) != 1:
+    if not isinstance(expr, sp.Basic):
         return None
 
-    op_str = _AST_CMP_OPS.get(type(body.ops[0]))
-    if op_str is None:
+    symbols = {str(sym) for sym in expr.free_symbols}
+    if not symbols.issubset(nsdfg_arrays):
         return None
 
-    # Left operand – must be an NSDFG array reference.
-    if not isinstance(body.left, ast.Name) or body.left.id not in nsdfg_arrays:
-        return None
-    left_ref = body.left.id
-
-    # Right operand – either another reference or a literal constant.
-    right_node = body.comparators[0]
-    if isinstance(right_node, ast.Name) and right_node.id in nsdfg_arrays:
-        return op_str, left_ref, right_node.id, None
-    if isinstance(right_node, ast.Constant):
-        return op_str, left_ref, None, str(right_node.value)
-    # Handle negative constants: ast.UnaryOp(op=USub, operand=Constant)
-    if (isinstance(right_node, ast.UnaryOp)
-            and isinstance(right_node.op, ast.USub)
-            and isinstance(right_node.operand, ast.Constant)):
-        return op_str, left_ref, None, str(-right_node.operand.value)
-
-    return None
+    return expr
 
 
 # ── Transformation ───────────────────────────────────────────────────
@@ -116,7 +80,7 @@ class IfElseMapToTileWhere(xf.SingleStateTransformation):
     outer_map_exit = xf.PatternNode(nodes.MapExit)
 
     @classmethod
-    def expressions(cls):
+    def expressions(cls):  # type: ignore[override]
         return [sdutil.node_path_graph(
             cls.outer_map_entry,
             cls.inner_map_entry,
@@ -160,6 +124,23 @@ class IfElseMapToTileWhere(xf.SingleStateTransformation):
             return False
 
         cond_block, cond_expr, branch_true_state, branch_false_state = info
+
+        nsdfg_arrays = set(nsdfg.sdfg.arrays.keys())
+        cond_sympy = _to_sympy_condition(cond_expr, nsdfg_arrays)
+        if cond_sympy is None:
+            return False
+        cond_symbols = [str(sym) for sym in cond_sympy.free_symbols]
+        if any(sym not in nsdfg.in_connectors for sym in cond_symbols):
+            return False
+
+        # Each condition symbol must be both declared and wired from outer scope.
+        wired_inputs = {
+            ie.dst_conn
+            for ie in graph.in_edges(nsdfg)
+            if ie.dst_conn is not None and ie.data.data is not None
+        }
+        if any(sym not in wired_inputs for sym in cond_symbols):
+            return False
 
         # Each branch must have exactly one tasklet with one output
         for bstate in (branch_true_state, branch_false_state):
@@ -283,7 +264,7 @@ class IfElseMapToTileWhere(xf.SingleStateTransformation):
 
     # ── apply ────────────────────────────────────────────────────────
 
-    def apply(self, graph: SDFGState, sdfg: SDFG):
+    def apply(self, graph: SDFGState, sdfg: SDFG):  # type: ignore[override]
         outer_entry: nodes.MapEntry = self.outer_map_entry
         inner_entry: nodes.MapEntry = self.inner_map_entry
         nsdfg: nodes.NestedSDFG = self.nsdfg_node
@@ -370,11 +351,16 @@ class IfElseMapToTileWhere(xf.SingleStateTransformation):
                                    tile_node, None, staging_memlet)
                     break
 
-        # ── 6. Analyze condition and classify branch tasklets ─────
+        # ── 6. Convert condition and classify branch tasklets ───────
         nsdfg_arrays = set(inner_sdfg.arrays.keys())
-        parsed = _parse_condition_expr(cond_expr, nsdfg_arrays)
-        assert parsed is not None, f"Unsupported condition: {cond_expr}"
-        cmp_op, cond_left, cond_right, cond_const = parsed
+        cond_sympy = _to_sympy_condition(cond_expr, nsdfg_arrays)
+        assert cond_sympy is not None, f"Unsupported condition: {cond_expr}"
+        cond_symbols = sorted(str(sym) for sym in cond_sympy.free_symbols)
+        for sym in cond_symbols:
+            assert sym in nsdfg.in_connectors, (
+                "Condition may only reference NestedSDFG inputs; "
+                f"got symbol '{sym}' in '{cond_expr}'"
+            )
 
         # Classify both branch tasklets
         branch_cls = {}   # "true"/"false" → (match, tasklet)
@@ -408,11 +394,6 @@ class IfElseMapToTileWhere(xf.SingleStateTransformation):
         # Map NSDFG array names → list of roles they fulfil.
         nsdfg_roles: Dict[str, List[str]] = {}
 
-        # Condition roles
-        nsdfg_roles.setdefault(cond_left, []).append("cond_left")
-        if cond_right is not None:
-            nsdfg_roles.setdefault(cond_right, []).append("cond_right")
-
         # Branch roles (true / false)
         for tag, bstate in [("true", true_state), ("false", false_state)]:
             cls = branch_cls[tag][0].tasklet_classification
@@ -440,14 +421,40 @@ class IfElseMapToTileWhere(xf.SingleStateTransformation):
                         nsdfg_roles.setdefault(arr, []).append(
                             f"{tag}_rhs2")
 
-        # Assign numbered connectors to unique outer arrays.
+        # Assign numbered connectors to unique outer arrays referenced by
+        # either branch operands or condition symbols.
+        needed_nsdfg_names = list(nsdfg_roles.keys())
+        for sym in cond_symbols:
+            if sym not in needed_nsdfg_names:
+                needed_nsdfg_names.append(sym)
+
         outer_to_conn: Dict[str, str] = {}
         conn_idx = 0
-        for nsdfg_name in nsdfg_roles:
+        for nsdfg_name in needed_nsdfg_names:
             outer_name = nsdfg_to_outer.get(nsdfg_name)
             if outer_name is not None and outer_name not in outer_to_conn:
                 outer_to_conn[outer_name] = f"_in{conn_idx}"
                 conn_idx += 1
+
+        # Rewrite condition symbols from NSDFG names to connector names
+        # expected by the compound node expansion.
+        cond_subs = {}
+        for fsym in cond_sympy.free_symbols:
+            sym = str(fsym)
+            outer_name = nsdfg_to_outer.get(sym)
+            if outer_name is None:
+                raise ValueError(
+                    "IfElseMapToTileWhere: condition symbol "
+                    f"'{sym}' is not mapped to an outer array."
+                )
+            conn_name = outer_to_conn.get(outer_name)
+            if conn_name is None:
+                raise ValueError(
+                    "IfElseMapToTileWhere: no input connector assigned for "
+                    f"condition symbol '{sym}' (outer '{outer_name}')."
+                )
+            cond_subs[fsym] = sp.Symbol(conn_name)
+        node_condition = cond_sympy.xreplace(cond_subs)
 
         # Build input_roles: connector → list of roles
         input_roles: Dict[str, List[str]] = {}
@@ -460,8 +467,7 @@ class IfElseMapToTileWhere(xf.SingleStateTransformation):
         # ── 8. Create TileIfElseOpLibraryNode ────────────────────────
         compound_node = TileIfElseOpLibraryNode(
             name="TileIfElseOp",
-            cond_op=cmp_op,
-            cond_constant=cond_const,
+            condition=node_condition,
             true_op=true_cls.op,
             true_constant1=branch_const["true"][0],
             true_constant2=branch_const["true"][1],
@@ -482,6 +488,11 @@ class IfElseMapToTileWhere(xf.SingleStateTransformation):
 
         # ── 9. Connect output to outer exit ──────────────────────────
         output_nsdfg_array = self._get_branch_output_array(true_state)
+        if output_nsdfg_array is None:
+            raise ValueError(
+                "IfElseMapToTileWhere: true branch does not expose an output "
+                "array to connect."
+            )
         output_outer_name = nsdfg_to_outer[output_nsdfg_array]
 
         out_tile_name = sdfg._find_new_name(output_outer_name + "_out_tile")

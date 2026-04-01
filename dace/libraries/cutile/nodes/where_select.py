@@ -18,6 +18,7 @@ from typing import List, Optional
 
 import dace
 from dace import dtypes, library, properties
+from dace.data.core import Array
 from dace.sdfg import SDFG, SDFGState, nodes
 from dace.sdfg.validation import InvalidSDFGNodeError
 from dace.symbolic import symstr
@@ -28,11 +29,8 @@ from ._base import _resolve_shape_and_scalar_form, SUPPORTED_MASK_DTYPES
 
 # ── Helper to read tile descriptors for where-select ─────────────────
 
-def _get_where_descriptors(node, state, sdfg):
-    """Return (cond_desc, x_desc, y_desc, c_desc).
-
-    All may be None except *c_desc* which is always required.
-    """
+def _get_where_descriptors(node: nodes.LibraryNode, state: SDFGState, sdfg: SDFG) -> tuple[Array, Array, Array, Array]:
+    """Return (cond_desc, x_desc, y_desc, c_desc)."""
     cond_desc = x_desc = y_desc = c_desc = None
     for edge in state.in_edges(node):
         arr_name = edge.data.data
@@ -50,11 +48,14 @@ def _get_where_descriptors(node, state, sdfg):
             continue
         if edge.src_conn == "_c":
             c_desc = sdfg.arrays[arr_name]
-    if c_desc is None:
-        raise ValueError(
-            f"TileWhereSelect expansion: _c not connected for node '{node.name}'."
+    if any(desc is None for desc in [cond_desc, x_desc, y_desc, c_desc]):
+        raise InvalidSDFGNodeError(
+            f"TileWhereSelect expansion: Not all inputs connected for node '{node.name}'.",
+            sdfg=sdfg,
+            state_id=state.parent_graph.node_id(state),
+            node_id=state.node_id(node),
         )
-    return cond_desc, x_desc, y_desc, c_desc
+    return cond_desc, x_desc, y_desc, c_desc # type: ignore
 
 
 # ── Library node ─────────────────────────────────────────────────────
@@ -100,28 +101,6 @@ class TileWhereSelectLibraryNode(nodes.LibraryNode):
     def validate(self, sdfg: SDFG, state: SDFGState):
         cond_desc, x_desc, y_desc, c_desc = _get_where_descriptors(
             self, state, sdfg)
-
-        if cond_desc is None:
-            raise InvalidSDFGNodeError(
-                f"TileWhereSelect '{self.name}': _cond must be connected.",
-                sdfg=sdfg,
-                state_id=state.parent_graph.node_id(state),
-                node_id=state.node_id(self),
-            )
-        if x_desc is None:
-            raise InvalidSDFGNodeError(
-                f"TileWhereSelect '{self.name}': _x must be connected.",
-                sdfg=sdfg,
-                state_id=state.parent_graph.node_id(state),
-                node_id=state.node_id(self),
-            )
-        if y_desc is None:
-            raise InvalidSDFGNodeError(
-                f"TileWhereSelect '{self.name}': _y must be connected.",
-                sdfg=sdfg,
-                state_id=state.parent_graph.node_id(state),
-                node_id=state.node_id(self),
-            )
 
         # All shapes must match
         for tag, desc in [("X", x_desc), ("Y", y_desc), ("cond", cond_desc)]:
