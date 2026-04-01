@@ -33,6 +33,7 @@
   - `/venv/main/bin/python -m pytest tests/sdfg -m "not gpu"`
 - GPU-only changes should also run:
   - `/venv/main/bin/python -m pytest tests -m "gpu" --timeout=300`
+- For unknown reason you cannot import the dace module in interactive python sessions, so create a temporary test script that imports the module and run it with `/venv/main/bin/python` if you need to quickly test something interactively.
 
 ## Conventions
 - Place tests under [tests](../tests) with names matching `test_*.py`, `*_test.py`, or `*_cudatest.py` (see [pytest.ini](../pytest.ini)).
@@ -43,7 +44,6 @@
 - Don't create local variables for `self.xxx` unless the value is used many times or the expression is long. Access through `self.` directly.
 - Don't use hardcoded connector name strings (e.g. `"_a"`, `"_b"`) when the name is available in a data structure like `LibraryNodeInfo`. Look up connector names from the registry/info objects instead.
 - When merging similar classes, prefer a single unified class over backward-compatible aliases. Replace all usages rather than maintaining aliases.
-- Use `Optional[X]` and `List[X]` from `typing` instead of Python 3.10+ syntax (`X | None`, `list[X]`) for compatibility with Python 3.9+.
 
 ## Code Quality
 - After making code changes, **always run the `code-quality-reviewer` agent** as a subagent on the changed files before considering the task complete. Address any findings before finishing.
@@ -69,12 +69,3 @@
 - **Pipeline** (`pipeline.py`): `apply_cutile_pipeline()` runs `TrivialTaskletElimination` + `ScalarToTileCanonical` + `ScalarToTileMasked`.
 - **Tests**: `tests/cutile/cutile_test.py` and `tests/cutile/cutile_frontend_test.py`, `tests/cutile/cutile_if_else_op_test.py`, `tests/cutile/cutile_if_else_test.py`. Run all after any cuTile changes:
   - `/venv/main/bin/python -m pytest tests/cutile/cutile_test.py tests/cutile/cutile_frontend_test.py tests/cutile/cutile_if_else_op_test.py tests/cutile/cutile_if_else_test.py -x -q`
-
-## Documentation Links
-- Project overview and quick start: [README.md](../README.md)
-- Contribution and coding rules: [CONTRIBUTING.md](../CONTRIBUTING.md)
-- Design documentation index: [doc/design/README.md](../doc/design/README.md)
-- Setup and packaging details: [setup.py](../setup.py)
-- CI examples for robust test commands:
-  - [general-ci.yml](../.github/workflows/general-ci.yml)
-  - [gpu-ci.yml](../.github/workflows/gpu-ci.yml)
