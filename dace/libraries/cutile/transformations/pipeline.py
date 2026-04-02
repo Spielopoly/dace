@@ -27,8 +27,8 @@ from dace.transformation.passes.fusion_inline import InlineSDFGs, FuseStates
 from dace.transformation import pass_pipeline as ppl
 
 
-def _simplify(sdfg: SDFG):
-    """Helper function to apply a few simplification transformations before the main pipeline."""
+def _simplify(sdfg: SDFG) -> None:
+    """Apply trivial tasklet/chain elimination and standard simplification."""
     sdfg.apply_transformations_repeated([TrivialChainElimination])
     sdfg.apply_transformations_repeated([TrivialTaskletElimination])
     sdfg.simplify()
@@ -37,41 +37,24 @@ def _simplify(sdfg: SDFG):
 def _apply_map_tiling_to_all_maps(sdfg: SDFG,
                                    tile_shape: tuple[int, ...],
                                    validate: bool = False) -> int:
-    """
-    Apply MapTiling to all MapEntry nodes in the SDFG.
-    
-    This function collects all MapEntry nodes before tiling begins, then applies
-    MapTiling to each one individually. This ensures that all original maps are
-    tiled, not just the first one found by pattern matching.
-    
-    The transformation is applied only once per original map to avoid re-tiling
-    newly created tile maps, which would cause an infinite loop.
-    
-    Applicability: MapTiling is applied to each map if:
-      - The map_entry node still exists in its state (may be removed by earlier tiling)
-      - The map_entry is still a valid MapEntry node
-      - The transformation itself succeeds (see notes below)
-    
-    Exception Handling: This function uses narrow exception handling:
-      - ValueError is caught when MapTiling.apply_to() fails (e.g., incompatible map structure)
-      - This allows graceful skipping of maps that cannot be tiled, while letting
-        unexpected errors propagate for visibility
-      - Unexpected exceptions (KeyError, IndexError, etc.) will bubble up to signal
-        potential bugs in the SDFG structure or MapTiling logic
-    
-    Parameters
-    ----------
-    sdfg : SDFG
-        The SDFG to transform.
-    tile_shape : tuple[int, ...]
-        Tile sizes for MapTiling.
-    validate : bool
-        Whether to validate after each transformation.
-    
-    Returns
-    -------
-    int
-        Total number of MapTiling transformations applied.
+    """Apply MapTiling to all MapEntry nodes in the SDFG.
+
+    Collects all MapEntry nodes before tiling begins, then applies MapTiling
+    to each one individually.  This ensures that all original maps are tiled
+    without re-tiling newly created tile maps.
+
+    Exception handling: ``ValueError`` raised by ``MapTiling.apply_to()``
+    (e.g. incompatible map structure) is caught and silently skipped.
+    Unexpected exceptions propagate for visibility.
+
+    Args:
+        sdfg: The SDFG to transform.
+        tile_shape: Tile sizes for :class:`~dace.transformation.dataflow.MapTiling`.
+        validate: Whether to validate the SDFG after each transformation.
+
+    Returns:
+        Total number of :class:`~dace.transformation.dataflow.MapTiling`
+        transformations applied.
     """
     count = 0
     
@@ -124,8 +107,7 @@ def apply_cutile_pipeline(sdfg: SDFG, *,
                           apply_map_tiling: bool = True,
                           tile_shape: tuple[int, ...] = (16, 16, 16),
                           debug_save_sdfg_steps: bool = False) -> int:
-    """
-    Apply the full cuTile transformation pipeline to an SDFG.
+    """Apply the full cuTile transformation pipeline to an SDFG.
 
     Pipeline stages:
 
@@ -139,22 +121,18 @@ def apply_cutile_pipeline(sdfg: SDFG, *,
      8. **ScalarToTileCanonical / ScalarToTileMasked / IfElseMapToTileWhere**
          – replace scalar tasklets with cuTile library nodes.
 
-    Parameters
-    ----------
-    sdfg : SDFG
-        The SDFG to transform (modified in-place).
-    validate : bool
-        Validate the SDFG after the full pipeline.
-    validate_all : bool
-        Validate after every single transformation application.
-    apply_map_tiling : bool
-        Whether to apply MapTiling.
-    tile_shape : tuple[int, ...]
-        Tile sizes for MapTiling.
+    Args:
+        sdfg: The SDFG to transform (modified in-place).
+        validate: Validate the SDFG after the full pipeline.
+        validate_all: Validate after every single transformation application.
+        apply_map_tiling: Whether to apply
+            :class:`~dace.transformation.dataflow.MapTiling`.
+        tile_shape: Tile sizes for
+            :class:`~dace.transformation.dataflow.MapTiling`.
+        debug_save_sdfg_steps: When ``True``, save the SDFG to disk after
+            each pipeline step for debugging.
 
-    Returns
-    -------
-    int
+    Returns:
         Total number of transformations applied.
     """
     count = 0

@@ -45,12 +45,23 @@ from sympy.parsing.sympy_parser import parse_expr
 # ── Helpers ──────────────────────────────────────────────────────────
 
 def _to_sympy_condition(
-    cond_expr: str, nsdfg_arrays: set,
+    cond_expr: str,
+    nsdfg_arrays: set,
 ) -> Optional[sp.Basic]:
     """Convert a condition expression string to a SymPy expression.
 
     All free symbols in the resulting expression must map to NSDFG array
     names. Returns ``None`` if parsing fails or unknown symbols appear.
+
+    Args:
+        cond_expr: A condition string from an interstate edge assignment (e.g.
+            ``"A > 0"``, ``"mask"``).
+        nsdfg_arrays: Set of array names declared in the nested SDFG.  Every
+            free symbol in the parsed expression must appear in this set.
+
+    Returns:
+        A parsed :class:`sympy.Basic` expression, or ``None`` if the
+        expression could not be parsed or references unknown symbols.
     """
     expr = dace.symbolic.pystr_to_symbolic(cond_expr, simplify=False)
 
@@ -69,18 +80,16 @@ def _build_sympy_expr(
 ) -> sp.Basic:
     """Build a SymPy expression from a classified operation.
 
-    Parameters
-    ----------
-    op : str
-        Operation string (e.g. ``"+"``, ``"abs"``, ``"sin"``).
-    left : sp.Basic
-        Left / first operand (Symbol or Number).
-    right : sp.Basic or None
-        Right / second operand.  ``None`` for unary operations.
+    Args:
+        op: Operation string (e.g. ``"+"``, ``"abs"``, ``"sin"``).
+        left: Left / first operand (Symbol or Number).
+        right: Right / second operand.  ``None`` for unary operations.
 
-    Returns
-    -------
-    sp.Basic
+    Returns:
+        A SymPy expression combining the operands with the operation.
+
+    Raises:
+        ValueError: If *left* or *op* is ``None``.
     """
     if left is None:
         raise ValueError("Left operand cannot be None")
@@ -111,6 +120,16 @@ class IfElseMapToTileWhere(xf.SingleStateTransformation):
 
     @classmethod
     def expressions(cls):  # type: ignore[override]
+        """Return the pattern graph that triggers this transformation.
+
+        DaCe matches this path-shaped subgraph pattern before invoking
+        :meth:`can_be_applied` for the stricter semantic checks.
+
+        Returns:
+            A list containing a single path graph:
+            ``outer_map_entry → inner_map_entry → nsdfg_node``
+            ``→ inner_map_exit → outer_map_exit``.
+        """
         return [sdutil.node_path_graph(
             cls.outer_map_entry,
             cls.inner_map_entry,
@@ -123,6 +142,29 @@ class IfElseMapToTileWhere(xf.SingleStateTransformation):
 
     def can_be_applied(self, graph: SDFGState, expr_index: int,
                        sdfg: SDFG, permissive: bool = False) -> bool:
+        """Check whether this transformation is applicable to the matched subgraph.
+
+        Validates the following conditions:
+
+        * The inner scope contains only the :class:`~dace.sdfg.nodes.NestedSDFG`.
+        * The outer scope contains only the inner map pair and the NestedSDFG.
+        * The inner map is canonical (0-based, unit stride).
+        * The NestedSDFG encodes an if-else ConditionalBlock pattern.
+        * The condition expression can be parsed to a SymPy expression
+          referencing only wired NSDFG input connectors.
+        * Each branch contains exactly one supported element-wise tasklet.
+        * Both branches write to the same output connector.
+
+        Args:
+            graph: The SDFG state containing the matched subgraph.
+            expr_index: Index of the matched expression (always 0 here).
+            sdfg: The top-level SDFG.
+            permissive: Unused; present for API compatibility.
+
+        Returns:
+            ``True`` if all conditions are satisfied and the transformation
+            can be applied.
+        """
         outer_entry: nodes.MapEntry = self.outer_map_entry
         inner_entry: nodes.MapEntry = self.inner_map_entry
         nsdfg: nodes.NestedSDFG = self.nsdfg_node
@@ -207,11 +249,7 @@ class IfElseMapToTileWhere(xf.SingleStateTransformation):
     @staticmethod
     def _analyze_nsdfg(inner_sdfg: SDFG) -> Optional[Tuple[
             ConditionalBlock, str, SDFGState, SDFGState]]:
-        """
-        Analyze a NestedSDFG for the if-else pattern.
-
-        Returns ``(cond_block, cond_expr, true_state, false_state)`` or
-        ``None`` if the pattern is not matched.
+        """Analyse a NestedSDFG for the if-else ConditionalBlock pattern.
 
         Expected CFG structure::
 
@@ -219,6 +257,13 @@ class IfElseMapToTileWhere(xf.SingleStateTransformation):
 
         The ConditionalBlock must have exactly 2 branches: one with a
         condition and one with ``None`` (else).
+
+        Args:
+            inner_sdfg: The SDFG to analyse (from a NestedSDFG node).
+
+        Returns:
+            A 4-tuple ``(cond_block, cond_expr, true_state, false_state)``
+            if the pattern matches, or ``None`` if it does not.
         """
         # Find ConditionalBlocks
         cond_blocks = [n for n in inner_sdfg.nodes()
@@ -265,7 +310,16 @@ class IfElseMapToTileWhere(xf.SingleStateTransformation):
 
     @staticmethod
     def _get_branch_output_array(state: SDFGState) -> Optional[str]:
-        """Get the data name written by the single tasklet in a branch state."""
+        """Get the data name written by the single tasklet in a branch state.
+
+        Args:
+            state: The branch :class:`~dace.sdfg.SDFGState` containing
+                exactly one :class:`~dace.sdfg.nodes.Tasklet`.
+
+        Returns:
+            The ``data`` name of the access node written by the tasklet,
+            or ``None`` if the pattern is not matched.
+        """
         tasklets = [n for n in state.nodes() if isinstance(n, nodes.Tasklet)]
         if len(tasklets) != 1:
             return None
@@ -278,10 +332,16 @@ class IfElseMapToTileWhere(xf.SingleStateTransformation):
     @staticmethod
     def _get_tasklet_input_mapping(state: SDFGState,
                                    tasklet: nodes.Tasklet) -> Dict[str, str]:
-        """
-        Map tasklet input connector names to NSDFG array names.
+        """Map tasklet input connector names to NSDFG array names.
 
-        Returns ``{tasklet_conn: nsdfg_array_name}``.
+        Args:
+            state: The :class:`~dace.sdfg.SDFGState` containing *tasklet*.
+            tasklet: The :class:`~dace.sdfg.nodes.Tasklet` whose incoming
+                edges are inspected.
+
+        Returns:
+            A dict ``{tasklet_connector_name: nsdfg_array_name}`` for every
+            wired input connector.
         """
         mapping = {}
         for ie in state.in_edges(tasklet):
@@ -293,7 +353,25 @@ class IfElseMapToTileWhere(xf.SingleStateTransformation):
 
     # ── apply ────────────────────────────────────────────────────────
 
-    def apply(self, graph: SDFGState, sdfg: SDFG):  # type: ignore[override]
+    def apply(self, graph: SDFGState, sdfg: SDFG) -> None:  # type: ignore[override]
+        """Apply the transformation: replace the if-else map with a tile compound node.
+
+        Performs the following graph rewrite:
+
+        1. Analyses the NestedSDFG to extract the condition and branch
+           SymPy expressions.
+        2. Derives the tile shape from the inner map ranges.
+        3. Creates input tile transients and wires them from the outer map
+           entry.
+        4. Builds a :class:`~dace.libraries.cutile.nodes.if_else_op.TileIfElseOpLibraryNode`
+           with the extracted expressions and connects all inputs.
+        5. Creates an output tile transient and wires it to the outer map exit.
+        6. Removes the original inner map entry/exit and NestedSDFG nodes.
+
+        Args:
+            graph: The SDFG state containing the matched subgraph.
+            sdfg: The top-level SDFG.
+        """
         outer_entry: nodes.MapEntry = self.outer_map_entry
         inner_entry: nodes.MapEntry = self.inner_map_entry
         nsdfg: nodes.NestedSDFG = self.nsdfg_node

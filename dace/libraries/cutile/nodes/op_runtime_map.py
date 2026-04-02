@@ -66,13 +66,47 @@ class TileRuntimeMaskedOpLibraryNode(TileOpBase):
                  constant2: Optional[str] = None,
                  expr=None,
                  out_connector: str = "_out",
-                 **kwargs):
+                 **kwargs) -> None:
+        """Initialise the runtime-masked element-wise tile operation node.
+
+        The ``_m`` connector for the boolean mask tile is always added as an
+        input.  An optional ``_c_in`` connector can be wired to supply the
+        original output values for masked-out lanes.
+
+        Args:
+            name: Node display name in the SDFG (default ``"TileMaskedOp"``).
+            op: Operation symbol or function name (e.g. ``"+"``, ``"abs"``).
+            tile_shape: Fixed tile extents, or ``None`` to infer at expansion.
+            constant1: Literal C++ value replacing the left/first operand.
+                When ``None`` the ``_a`` input connector is created.
+            constant2: Literal C++ value replacing the right/second operand.
+                When ``None`` the ``_b`` input connector is created for binary ops.
+            expr: Optional SymPy expression for multi-op mode.
+            out_connector: Name of the single output connector (default
+                ``"_out"``).
+            **kwargs: Forwarded to :class:`TileOpBase`.
+        """
         super().__init__(name, op=op, tile_shape=tile_shape,
                          constant1=constant1, constant2=constant2,
                          expr=expr, out_connector=out_connector,
                          extra_inputs={"_m"}, **kwargs)
 
-    def validate(self, sdfg: SDFG, state: SDFGState):
+    def validate(self, sdfg: SDFG, state: SDFGState) -> None:
+        """Validate the runtime-masked op node before code generation.
+
+        Extends the common validation check with mask-specific constraints:
+        the ``_m`` connector must be connected, and the shapes of all present
+        operand tiles must match the output tile.  The mask dtype must also be
+        boolean or an integer type.
+
+        Args:
+            sdfg: The SDFG containing this node.
+            state: The state containing this node.
+
+        Raises:
+            :class:`dace.sdfg.validation.InvalidSDFGNodeError`: If any
+                connector, shape, or dtype constraint is violated.
+        """
         self._validate_common(sdfg, state, "TileMaskedOp")
         out_conn = get_output_connector_name(self)
 
@@ -93,6 +127,15 @@ class TileRuntimeMaskedOpLibraryNode(TileOpBase):
         if m_node is None:
             raise InvalidSDFGNodeError(
                 f"TileMaskedOp '{self.name}': connector _m must be connected.",
+                sdfg=sdfg,
+                state_id=state.parent_graph.node_id(state),
+                node_id=state.node_id(self),
+            )
+
+        if c_node is None:
+            out_conn = get_output_connector_name(self)
+            raise InvalidSDFGNodeError(
+                f"TileMaskedOp '{self.name}': output connector '{out_conn}' must be connected.",
                 sdfg=sdfg,
                 state_id=state.parent_graph.node_id(state),
                 node_id=state.node_id(self),
@@ -147,6 +190,22 @@ class ExpandTileRuntimeMaskedOpPure(ExpandTransformation):
     @staticmethod
     def expansion(node: TileRuntimeMaskedOpLibraryNode, state: SDFGState,
                   sdfg: SDFG) -> nodes.Tasklet:
+        """Expand the node into a C++ masked element-wise tasklet.
+
+        Generates a C++ loop that applies the configured operation to every
+        element of the input tile(s) where the mask is non-zero.  When a
+        ``_c_in`` is connected, masked-out lanes copy from ``_c_in``;
+        otherwise they are left unmodified in the output.
+
+        Args:
+            node: The :class:`TileRuntimeMaskedOpLibraryNode` to expand.
+            state: The SDFG state containing *node*.
+            sdfg: The SDFG owning the state.
+
+        Returns:
+            A :class:`dace.sdfg.nodes.Tasklet` implementing the masked
+            operation in C++.
+        """
         out_conn = get_output_connector_name(node)
 
         if node.expr is not None:

@@ -15,14 +15,18 @@ from dace.sdfg.nodes import LibraryNode, Tasklet
 
 @dataclass(frozen=True)
 class TaskletClassification:
-    """
-    - type (TaskletType): The classified tasklet type
-    - lhs (str): Output connector name (left-hand side variable)
-    - rhs1 (str or None):  Input connector/operand name left of the operator/first function argument
-    - rhs2 (str or None): Input connector/operand name right of the operator/second function argument
-    - constant1 (str or None): First constant/symbol value left of the operator/first function argument
-    - constant2 (str or None): Second constant/symbol value right of the operator/second function argument
-    - op (str): Operation symbol or function name
+    """Classified result of a single-statement tasklet.
+
+    Attributes:
+        type: The classified tasklet type.
+        lhs: Output connector name (left-hand side variable).
+        rhs1: Input connector / operand name for the left operand or first
+            function argument, or ``None``.
+        rhs2: Input connector / operand name for the right operand or second
+            function argument, or ``None``.
+        constant1: First constant value replacing the left operand, or ``None``.
+        constant2: Second constant value replacing the right operand, or ``None``.
+        op: Operation symbol or function name.
     """
     type: TaskletType
     lhs: str
@@ -54,6 +58,11 @@ class TaskletLibraryNodeMatch:
     tasklet_classification: TaskletClassification
 
 class MaskType(Enum):
+    """Mask variant selector for cuTile library node matching.
+
+    Determines which set of registered library nodes the op matcher considers
+    when classifying a tasklet.
+    """
     UNMASKED = "unmasked"
     RUNTIME = "runtime"
     SYMBOLIC = "symbolic"  # mask condition as a SymPy expression, evaluated at expansion time
@@ -63,42 +72,28 @@ _OP_TO_LIBRARY_NODE: Dict[tuple[str, TaskletType, MaskType], LibraryNodeInfo] = 
 
 
 def register_op(op: str, tasklet_type: TaskletType, mask: MaskType, node_type: Type[LibraryNode], **library_node_kwargs):
-    """
-    Register a cuTile library node for a specific operation pattern.
+    """Register a cuTile library node for a specific operation pattern.
 
-    Parameters
-    ----------
-    op : str
-        Operation symbol or function name to match (e.g., "+", "-", "*", "/").
-    tasklet_type : TaskletType
-        The classified tasklet type to match (e.g., ARRAY_ARRAY, UNARY_ARRAY, ARRAY_SYMBOL).
-    mask : MaskType
-        The mask type to match (e.g., UNMASKED, RUNTIME).
-    node_type : Type[LibraryNode]
-        The library node class to instantiate.
-    library_node_kwargs :
-        Keyword arguments used to construct a :class:`LibraryNodeInfo` instance. The following
-        keys are expected:
+    Args:
+        op: Operation symbol or function name to match (e.g. ``"+"``,
+            ``"-"``, ``"*"``, ``"/"``).
+        tasklet_type: The classified tasklet type to match (e.g.
+            ``ARRAY_ARRAY``, ``UNARY_ARRAY``, ``ARRAY_SYMBOL``).
+        mask: The mask type to match (e.g. ``UNMASKED``, ``RUNTIME``).
+        node_type: The library node class to instantiate.
+        **library_node_kwargs: Keyword arguments forwarded to
+            :class:`LibraryNodeInfo`.  Expected keys:
 
-        - ``node_name`` (str, required):
-            Name of the library node to create (used as the node's label/name in the SDFG).
-        - ``out`` (str, required):
-            Name of the output connector of the library node that corresponds to the tasklet
-            left-hand side (``lhs``).
-        - ``rhs1`` (str, optional):
-            Name of the first input connector of the library node. When present, the tasklet's
-            ``rhs1`` connector is connected to this connector.
-        - ``rhs2`` (str, optional):
-            Name of the second input connector of the library node. When present, the tasklet's
-            ``rhs2`` connector is connected to this connector.
-        - ``mask_in`` (str, optional):
-            Name of the input connector that receives a runtime boolean mask, for masked
-            operations (e.g., when ``mask`` is :class:`MaskType.RUNTIME`). If not provided,
-            the library node is assumed not to take a mask input.
-        - ``out_in`` (str, optional):
-            Name of an additional input connector that can receive the original output value
-            for masked nodes (e.g., to implement "update where masked" semantics). If not
-            provided, the library node is assumed not to take such an input.
+            - ``node_name`` (*str*, required): Label / name of the library
+              node in the SDFG.
+            - ``out`` (*str*, required): Output connector name corresponding
+              to the tasklet LHS.
+            - ``rhs1`` (*str*, optional): First input connector name.
+            - ``rhs2`` (*str*, optional): Second input connector name.
+            - ``mask_in`` (*str*, optional): Mask input connector for runtime
+              masked ops.
+            - ``out_in`` (*str*, optional): Pre-existing output connector for
+              masked nodes that implement update-where semantics.
     """
     _OP_TO_LIBRARY_NODE[(op, tasklet_type, mask)] = LibraryNodeInfo(type=node_type, **library_node_kwargs)
 
@@ -116,32 +111,28 @@ _SCALAR_TO_ARRAY_TYPE = {
 
 def match_tasklet_to_tile_library_node(state: dace.SDFGState, tasklet: Tasklet, mask: MaskType,
                                        promote_scalars: bool = False) -> Optional[TaskletLibraryNodeMatch]:
-    """
-    Match a tasklet to a tile library node class based on its code.
+    """Match a tasklet to a tile library node class based on its code.
 
-    Parameters
-    ----------
-    state : dace.SDFGState
-        The state containing the tasklet.
-    tasklet : dace.nodes.Tasklet
-        The tasklet to match.
-    mask : MaskType
-        Select a masked library node variant
-        Currently implemented masks are:
-            - MaskType.UNMASKED (library node takes no mask argument)
-            - MaskType.RUNTIME (library node takes an additional runtime boolean mask argument)
-            - MaskType.SYMBOLIC (library node embeds a SymPy boolean predicate)
-    promote_scalars : bool
-        If True, scalar-level tasklet classifications (e.g. ``SCALAR_SYMBOL``)
-        are promoted to their array-level equivalents (e.g. ``ARRAY_SYMBOL``)
-        before lookup.  This is useful when matching tasklets inside
-        NestedSDFGs where the data are 0-dimensional scalars that will be
-        lifted to tile-level arrays by the calling transformation.
+    Args:
+        state: The state containing *tasklet*.
+        tasklet: The :class:`~dace.sdfg.nodes.Tasklet` to match.
+        mask: Selects the masked library node variant.  Supported values:
 
-    Returns
-    -------
-    Optional[TaskletLibraryNodeMatch]
-        A TaskletLibraryNodeMatch containing the matched library node class and tasklet classification if a match is found, otherwise None.
+            - ``MaskType.UNMASKED`` – library node takes no mask argument.
+            - ``MaskType.RUNTIME`` – library node takes an additional runtime
+              boolean mask argument.
+            - ``MaskType.SYMBOLIC`` – library node embeds a SymPy boolean
+              predicate evaluated at expansion time.
+        promote_scalars: When ``True``, scalar-level tasklet classifications
+            (e.g. ``SCALAR_SYMBOL``) are promoted to their array-level
+            equivalents (e.g. ``ARRAY_SYMBOL``) before the registry lookup.
+            Useful when matching tasklets inside NestedSDFGs whose 0-D scalar
+            data will be lifted to tile-level arrays.
+
+    Returns:
+        A :class:`TaskletLibraryNodeMatch` containing the matched library
+        node class and tasklet classification, or ``None`` if no match is
+        found.
     """
     classification = TaskletClassification(**classify_tasklet(state, tasklet))
     

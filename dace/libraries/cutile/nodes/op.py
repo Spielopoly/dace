@@ -60,13 +60,38 @@ class TileOpLibraryNode(TileOpBase):
                  constant2: Optional[str] = None,
                  expr=None,
                  out_connector: str = "_out",
-                 **kwargs):
+                 **kwargs) -> None:
+        """Initialise the unmasked element-wise tile operation node.
+
+        Args:
+            name: Node display name in the SDFG (default ``"TileOp"``).
+            op: Operation symbol or function name (e.g. ``"+"``, ``"abs"``).
+            tile_shape: Fixed tile extents, or ``None`` to infer at expansion.
+            constant1: Literal C++ value replacing the left/first operand.
+                When ``None`` the ``_a`` input connector is created.
+            constant2: Literal C++ value replacing the right/second operand.
+                When ``None`` the ``_b`` input connector is created for binary ops.
+            expr: Optional SymPy expression for multi-op mode.
+            out_connector: Name of the single output connector (default
+                ``"_out"``).
+            **kwargs: Forwarded to :class:`TileOpBase`.
+        """
         super().__init__(name, op=op, tile_shape=tile_shape,
                          constant1=constant1, constant2=constant2,
                          expr=expr, out_connector=out_connector,
                          **kwargs)
 
-    def validate(self, sdfg: SDFG, state: SDFGState):
+    def validate(self, sdfg: SDFG, state: SDFGState) -> None:
+        """Validate the node before code generation.
+
+        Args:
+            sdfg: The SDFG containing this node.
+            state: The state containing this node.
+
+        Raises:
+            :class:`~dace.sdfg.validation.InvalidSDFGNodeError`: If any
+                connector or operation constraint is violated.
+        """
         self._validate_common(sdfg, state, "TileOp")
 
 
@@ -80,7 +105,21 @@ class ExpandTileOpPure(ExpandTransformation):
 
     @staticmethod
     def expansion(node: TileOpLibraryNode, state: SDFGState, sdfg: SDFG) -> nodes.Tasklet:
-        node = cast(TileOpLibraryNode, node)
+        """Expand the node into a C++ element-wise tasklet.
+
+        Generates a C++ loop (or scalar assignment for single-element tiles)
+        that applies the configured operation to every element of the input
+        tile(s) and writes the result to the output tile.
+
+        Args:
+            node: The :class:`TileOpLibraryNode` to expand.
+            state: The SDFG state containing *node*.
+            sdfg: The SDFG owning the state.
+
+        Returns:
+            A :class:`~dace.sdfg.nodes.Tasklet` implementing the operation in
+            C++.
+        """
         out_conn = get_output_connector_name(node)
         if node.expr is not None:
             # ── Multi-op expression mode ──────────────────────────────────

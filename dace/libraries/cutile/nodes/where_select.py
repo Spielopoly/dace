@@ -29,8 +29,28 @@ from .base import resolve_shape_and_scalar_form, TileNodeBase, SUPPORTED_MASK_DT
 
 # ── Helper to read tile descriptors for where-select ─────────────────
 
-def _get_where_descriptors(node: nodes.LibraryNode, state: SDFGState, sdfg: SDFG) -> tuple[Array, Array, Array, Array]:
-    """Return (cond_desc, x_desc, y_desc, c_desc)."""
+def _get_where_descriptors(
+    node: nodes.LibraryNode,
+    state: SDFGState,
+    sdfg: SDFG,
+) -> tuple[Array, Array, Array, Array]:
+    """Return ``(cond_desc, x_desc, y_desc, c_desc)`` for *node*.
+
+    Walks the incoming and outgoing edges of the where-select *node* to
+    resolve the array descriptors for all four connectors.
+
+    Args:
+        node: A :class:`TileWhereSelectLibraryNode` instance.
+        state: The SDFG state containing *node*.
+        sdfg: The SDFG owning the state.
+
+    Returns:
+        A 4-tuple ``(cond_desc, x_desc, y_desc, c_desc)``.
+
+    Raises:
+        :class:`dace.sdfg.validation.InvalidSDFGNodeError`: If any of the
+            four connectors is not connected.
+    """
     cond_desc = x_desc = y_desc = c_desc = None
     for edge in state.in_edges(node):
         arr_name = edge.data.data
@@ -82,7 +102,16 @@ class TileWhereSelectLibraryNode(TileNodeBase):
 
     def __init__(self, name: str = "TileWhereSelect",
                  tile_shape: Optional[List[int]] = None,
-                 **kwargs):
+                 **kwargs) -> None:
+        """Initialise the element-wise conditional selection node.
+
+        Args:
+            name: Node display name in the SDFG (default
+                ``"TileWhereSelect"``).
+            tile_shape: Fixed tile extents, or ``None`` to infer at expansion
+                from the connected input descriptors.
+            **kwargs: Forwarded to :class:`TileNodeBase`.
+        """
         super().__init__(
             name,
             inputs={"_cond", "_x", "_y"},
@@ -91,8 +120,22 @@ class TileWhereSelectLibraryNode(TileNodeBase):
         )
         self.tile_shape = tile_shape
 
-    def validate(self, sdfg: SDFG, state: SDFGState):
-        self._validate_connectors_connected(sdfg, state, "TileWhereSelect")
+    def validate(self, sdfg: SDFG, state: SDFGState) -> None:
+        """Validate the where-select node before code generation.
+
+        Checks that all four connectors are wired, that every input tile
+        shares the same shape as the output, that the condition tile has a
+        boolean or integer dtype, and that ``X`` and ``Y`` share the output
+        dtype.
+
+        Args:
+            sdfg: The SDFG containing this node.
+            state: The state containing this node.
+
+        Raises:
+            :class:`~dace.sdfg.validation.InvalidSDFGNodeError`: If any
+                shape or dtype constraint is violated.
+        """
         cond_desc, x_desc, y_desc, c_desc = _get_where_descriptors(
             self, state, sdfg)
 
@@ -147,6 +190,21 @@ class ExpandTileWhereSelectPure(ExpandTransformation):
     @staticmethod
     def expansion(node: TileWhereSelectLibraryNode, state: SDFGState,
                   sdfg: SDFG) -> nodes.Tasklet:
+        """Expand the node into a C++ element-wise selection tasklet.
+
+        Generates ``_c[i] = _cond[i] ? _x[i] : _y[i]`` for every element
+        index *i*, or the scalar form ``_c = _cond ? _x : _y`` for
+        single-element tiles.
+
+        Args:
+            node: The :class:`TileWhereSelectLibraryNode` to expand.
+            state: The SDFG state containing *node*.
+            sdfg: The SDFG owning the state.
+
+        Returns:
+            A :class:`~dace.sdfg.nodes.Tasklet` implementing the where-select
+            in C++.
+        """
         cond_desc, x_desc, y_desc, c_desc = _get_where_descriptors(
             node, state, sdfg)
 

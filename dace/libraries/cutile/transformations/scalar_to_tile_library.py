@@ -97,7 +97,20 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
 
     # ---- convenience helpers ------------------------------------------------
 
-    def _set_convenience_variables(self, sdfg: SDFG, graph: SDFGState):
+    def _set_convenience_variables(self, sdfg: SDFG, graph: SDFGState) -> None:
+        """Capture the matched SDFG nodes as instance attributes.
+
+        Must be called at the start of both :meth:`can_be_applied` and
+        :meth:`apply` before any graph modifications occur.  The
+        ``PatternNode`` descriptors resolve nodes by integer index in the
+        state's node list; adding or removing nodes shifts those indices and
+        makes subsequent descriptor accesses return wrong nodes.  Capturing
+        the actual node objects here avoids that hazard.
+
+        Args:
+            sdfg: The SDFG being transformed.
+            graph: The state containing the matched subgraph.
+        """
         self._sdfg = sdfg
         self._graph = graph
         # Capture actual node objects NOW, before any graph modifications.
@@ -204,12 +217,20 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
 
     def can_be_applied(self, graph: SDFGState, expr_index: int,
                        sdfg: SDFG, permissive: bool = False) -> bool:
-        """
-        Validate that the matched subgraph is a pure element-wise inner loop.
+        """Validate that the matched subgraph is a pure element-wise inner loop.
 
         The transformation only applies when the inner map has no extra nodes,
         tasklet accesses are scalar, and there is a registered tile operator
         for the tasklet code.
+
+        Args:
+            graph: The SDFG state containing the matched subgraph.
+            expr_index: Index of the matched expression (always 0).
+            sdfg: The top-level SDFG.
+            permissive: Unused; present for API compatibility.
+
+        Returns:
+            ``True`` if all conditions are satisfied.
         """
         self._set_convenience_variables(sdfg, graph)
 
@@ -457,9 +478,8 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
 
     # ---- main apply (template method) ---------------------------------------
 
-    def apply(self, graph: SDFGState, sdfg: SDFG):  # type: ignore
-        """
-        Apply the transformation: replace the inner scalar map with a tile
+    def apply(self, graph: SDFGState, sdfg: SDFG) -> None:  # type: ignore
+        """Apply the transformation: replace the inner scalar map with a tile
         library call.
 
         ``can_be_applied`` already validated pattern shape and operator
@@ -468,6 +488,10 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
         through the hooks ``_configure_library_node``,
         ``_build_input_staging_memlet``, ``_build_output_store_memlet``,
         and ``_post_input_lowering``.
+
+        Args:
+            graph: The SDFG state containing the matched subgraph.
+            sdfg: The top-level SDFG.
         """
         self._set_convenience_variables(sdfg, graph)
 
@@ -535,19 +559,33 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
 
     @staticmethod
     def _to_sympy_expr(expr: sp.Basic | SymExpr | int) -> sp.Basic:
-        """Convert DaCe symbolic values (including ``SymExpr``) to plain SymPy."""
+        """Convert DaCe symbolic values (including ``SymExpr``) to plain SymPy.
+
+        Args:
+            expr: A SymPy expression, a DaCe :class:`~dace.symbolic.SymExpr`,
+                or an integer literal to convert.
+
+        Returns:
+            An equivalent plain :class:`sympy.Basic` expression.
+        """
         if isinstance(expr, dace.symbolic.SymExpr):
             return expr.expr
         return sp.sympify(expr)
 
     @staticmethod
     def _bounding_tile_shape(inner_map: nodes.Map) -> list[sp.Basic | int]:
-        """
-        Compute per-dimension extents of a bounding box for an inner map range.
+        """Compute per-dimension extents of a bounding box for an inner map range.
 
         Using ``Min``/``Max`` handles both increasing and decreasing ranges
         uniformly.  The result is symbolic and may include expressions that
         are only resolved at runtime.
+
+        Args:
+            inner_map: The inner :class:`~dace.sdfg.nodes.Map` whose range to
+                compute the bounding box from.
+
+        Returns:
+            A list of per-dimension extents (symbolic or integer).
         """
         shape = []
         for start, end, _ in inner_map.range:
@@ -561,14 +599,29 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
     @staticmethod
     def _build_contiguous_outer_subset(tasklet_subset: subsets.Range,
                                        inner_map: nodes.Map) -> subsets.Range:
-        """
-        Lift scalar tasklet accesses to a contiguous outer subset.
+        """Lift scalar tasklet accesses to a contiguous outer subset.
 
-        For each accessed dimension, substitute the inner-map parameter with
-        its min/max reachable values and build a conservative contiguous range.
+        For each accessed dimension, substitutes the inner-map parameter with
+        its min/max reachable values and builds a conservative contiguous range.
         This converts the scalar index expression(s) used in the inner map to
         a contiguous outer tile range that covers all points visited by the
         inner map.
+
+        Args:
+            tasklet_subset: The scalar :class:`~dace.subsets.Range` on the
+                tasklet access memlet to lift.
+            inner_map: The inner :class:`~dace.sdfg.nodes.Map` whose parameter
+                bounds are used for substitution.
+
+        Returns:
+            A :class:`~dace.subsets.Range` covering all outer-space points
+            reachable from the inner-map iteration.
+
+        Raises:
+            TypeError: If *tasklet_subset* is not a
+                :class:`~dace.subsets.Range`.
+            ValueError: If a subset dimension depends on more than one
+                inner-map parameter.
         """
         if not isinstance(tasklet_subset, subsets.Range):
             raise TypeError("Expected range subset on tasklet memlet.")
@@ -623,18 +676,28 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
 
     @staticmethod
     def _build_mask_condition_symbolic(inner_map: nodes.Map) -> sp.Basic:
-        """
-        Build a SymPy boolean expression for tile-point validity.
+        """Build a SymPy boolean expression for tile-point validity.
 
         Returns a conjunction of per-dimension predicates using ``__m0``,
         ``__m1``, … as coordinate symbols.  Each sub-clause handles both
         positive and negative step directions (combined with ``Or``).
 
-        For positive step (low = start):
-            ``__m <= end - start  AND  __m % step == 0``
+        For positive step (low = start)::
 
-        For negative step (low = end):
-            ``__m <= start - end  AND  (start - end - __m) % (-step) == 0``
+            __m <= end - start  AND  __m % step == 0
+
+        For negative step (low = end)::
+
+            __m <= start - end  AND  (start - end - __m) % (-step) == 0
+
+        Args:
+            inner_map: The inner :class:`~dace.sdfg.nodes.Map` whose range
+                encodes the valid coordinate set.
+
+        Returns:
+            A SymPy boolean expression over ``__m0``, ``__m1``, … symbols
+            that is ``True`` exactly for tile coordinates that correspond to
+            points in the original inner-map iteration space.
         """
         dim_conds: list[sp.Basic] = []
 
@@ -682,6 +745,16 @@ class ScalarToTileCanonical(_ScalarToTileBase):
     """
 
     def _has_valid_inner_map_ranges(self) -> bool:
+        """Return ``True`` only when all inner-map ranges are canonical.
+
+        Canonical means every dimension starts at ``0`` with stride ``1``.
+        Non-canonical ranges (offset start, non-unit stride) are handled by
+        :class:`ScalarToTileMasked` instead.
+
+        Returns:
+            ``True`` if every dimension satisfies ``start == 0`` and
+            ``step == 1``.
+        """
         ranges = self._inner_entry.map.range
         if not isinstance(ranges, subsets.Range):
             return False
@@ -692,6 +765,7 @@ class ScalarToTileCanonical(_ScalarToTileBase):
         return True
 
     def _get_mask_type(self) -> MaskType:
+        """Return ``MaskType.UNMASKED`` since canonical maps need no mask."""
         return MaskType.UNMASKED
 
 
@@ -715,6 +789,17 @@ class ScalarToTileMasked(_ScalarToTileBase):
     """
 
     def _has_valid_inner_map_ranges(self) -> bool:
+        """Return ``True`` for non-canonical inner maps with non-zero strides.
+
+        Accepts any map range as long as no dimension has a zero step (which
+        would represent an infinite loop).  Also rejects canonical maps so
+        that :class:`ScalarToTileCanonical` takes priority over them.
+
+        Returns:
+            ``True`` if every dimension has a non-zero step and the map is
+            non-canonical (i.e. :class:`ScalarToTileCanonical` would reject
+            it).
+        """
         for start, end, step in self._inner_entry.map.range:
             if step == 0:
                 return False
@@ -724,28 +809,42 @@ class ScalarToTileMasked(_ScalarToTileBase):
         return True
 
     def _get_mask_type(self) -> MaskType:
+        """Return ``MaskType.SYMBOLIC`` for symbolic-mask tile ops."""
         return MaskType.SYMBOLIC
 
     def _calculate_tile_shape(self) -> tuple:
-        """
+        """Return the bounding tile shape derived from the inner map ranges.
+
         The bounding tile is the smallest axis-aligned tile that contains all
         iteration points from the original inner map, regardless of direction.
+
+        Returns:
+            A tuple of per-dimension extents (symbolic or integer).
         """
         return tuple(self._bounding_tile_shape(self._inner_entry.map))
 
     def _build_memlet(self, map_edge: MultiConnectorEdge[Memlet], tasklet_edge: MultiConnectorEdge[Memlet]) -> Memlet:
-        """
-        Convert scalar index expression(s) to a contiguous outer tile range
+        """Build a contiguous outer-subset memlet covering the inner map's footprint.
+
+        Converts scalar index expression(s) to a contiguous outer tile range
         that covers all points visited by the inner map.
+
+        Args:
+            map_edge: The outer-entry-to-inner-entry edge whose ``data.data``
+                names the source array.
+            tasklet_edge: The tasklet access edge whose subset provides the
+                scalar index expression to lift.
+
+        Returns:
+            A :class:`~dace.Memlet` with a contiguous outer subset.
         """
         data_name = cast(str, map_edge.data.data)
         load_subset = self._build_contiguous_outer_subset(
             tasklet_edge.data.subset, self._inner_entry.map)
         return Memlet(data=data_name, subset=load_subset)
 
-    def _configure_library_node(self):
-        """
-        Configure the library node and set the symbolic mask condition.
+    def _configure_library_node(self) -> None:
+        """Configure the library node and set the symbolic mask condition.
 
         Calls the base class to set ``op`` and constants, then computes
         the SymPy mask condition from the inner map ranges and stores it
@@ -757,8 +856,7 @@ class ScalarToTileMasked(_ScalarToTileBase):
         self._library_node.mask_condition = condition
 
     def _add_output_preload(self, data_name: str, inner_to_outer_edge: MultiConnectorEdge[Memlet], tasklet_out_edge: MultiConnectorEdge[Memlet]) -> None:
-        """
-        Preload existing output values so masked-out lanes are preserved.
+        """Preload existing output values so masked-out lanes are preserved.
 
         Creates a tile-shaped transient that reads the current values from
         the output array and feeds them to the library node's ``_c_in``
@@ -768,6 +866,14 @@ class ScalarToTileMasked(_ScalarToTileBase):
         Wiring::
 
             output_array_read -> outer_entry[new_conn] -> preload_transient -> lib_node._c_in
+
+        Args:
+            data_name: Name of the output array whose current values are
+                preloaded.
+            inner_to_outer_edge: The inner-exit-to-outer-exit edge used to
+                derive the outer subset for the preload read.
+            tasklet_out_edge: The tasklet output edge used to derive the
+                scalar subset for the contiguous-outer-subset computation.
         """
         # 1. Add _c_in connector to the library node.
         self._library_node.add_in_connector("_c_in")

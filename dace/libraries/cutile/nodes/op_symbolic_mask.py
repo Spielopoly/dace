@@ -36,7 +36,14 @@ from .base import (
 
 
 def _sympy_condition_to_cpp(cond: sp.Basic) -> str:
-    """Convert a SymPy boolean/relational expression to a C++ string."""
+    """Convert a SymPy boolean/relational expression to a C++ string.
+
+    Args:
+        cond: A SymPy boolean or relational expression.
+
+    Returns:
+        The equivalent C++ expression string.
+    """
     return symstr(cond, cpp_mode=True)
 
 
@@ -85,14 +92,44 @@ class TileSymbolicMaskedOpLibraryNode(TileOpBase):
                  expr=None,
                  out_connector: str = "_out",
                  mask_condition: Optional[sp.Basic] = None,
-                 **kwargs):
+                 **kwargs) -> None:
+        """Initialise the symbolic-masked element-wise tile operation node.
+
+        Args:
+            name: Node display name in the SDFG (default
+                ``"TileSymbolicMaskedOp"``).
+            op: Operation symbol or function name (e.g. ``"+"``, ``"abs"``).
+            tile_shape: Fixed tile extents, or ``None`` to infer at expansion.
+            constant1: Literal C++ value replacing the left/first operand.
+                When ``None`` the ``_a`` input connector is created.
+            constant2: Literal C++ value replacing the right/second operand.
+                When ``None`` the ``_b`` input connector is created for binary
+                ops.
+            expr: Optional SymPy expression for multi-op mode.
+            out_connector: Name of the single output connector (default
+                ``"_out"``).
+            mask_condition: SymPy boolean expression that uses ``__m0``,
+                ``__m1``, … as per-dimension tile coordinates.  ``None``
+                means *always true* (no masking).
+            **kwargs: Forwarded to :class:`TileOpBase`.
+        """
         super().__init__(name, op=op, tile_shape=tile_shape,
                          constant1=constant1, constant2=constant2,
                          expr=expr, out_connector=out_connector,
                          **kwargs)
         self.mask_condition = mask_condition
 
-    def validate(self, sdfg: SDFG, state: SDFGState):
+    def validate(self, sdfg: SDFG, state: SDFGState) -> None:
+        """Validate the symbolic-masked op node before code generation.
+
+        Args:
+            sdfg: The SDFG containing this node.
+            state: The state containing this node.
+
+        Raises:
+            :class:`dace.sdfg.validation.InvalidSDFGNodeError`: If any
+                connector or operation constraint is violated.
+        """
         self._validate_common(sdfg, state, "TileSymbolicMaskedOp")
 
 
@@ -107,6 +144,22 @@ class ExpandTileSymbolicMaskedOpPure(ExpandTransformation):
     @staticmethod
     def expansion(node: TileSymbolicMaskedOpLibraryNode, state: SDFGState,
                   sdfg: SDFG) -> nodes.Tasklet:
+        """Expand the node into a C++ tasklet with an inlined symbolic condition.
+
+        Converts ``mask_condition`` from a SymPy expression to a C++ boolean
+        string and embeds it as a per-element guard in the generated loop.
+        Elements that fail the condition are skipped (or restored from
+        ``_c_in`` when that connector is present).
+
+        Args:
+            node: The :class:`TileSymbolicMaskedOpLibraryNode` to expand.
+            state: The SDFG state containing *node*.
+            sdfg: The SDFG owning the state.
+
+        Returns:
+            A :class:`dace.sdfg.nodes.Tasklet` implementing the
+            symbolically-masked operation in C++.
+        """
         out_conn = get_output_connector_name(node)
         op = node.op
         constant1 = node.constant1

@@ -4,9 +4,10 @@ Shared base class and helpers for cuTile element-wise operation library nodes.
 from __future__ import annotations
 
 import math
-from typing import Collection, List, Optional
+from typing import Collection, Dict, List, Optional, Set, Tuple
 
 import dace
+from dace.data.core import Data as DataDesc
 import sympy as sp
 from dace import properties
 from dace.properties import make_properties
@@ -30,8 +31,17 @@ SUPPORTED_MASK_DTYPES = {
 }
 
 
-def op_cpp_expr(op: str, left: str, right: str | None = None) -> str:
-    """Return a C++ expression for a binary or unary operation."""
+def op_cpp_expr(op: str, left: str, right: Optional[str] = None) -> str:
+    """Return a C++ expression string for a binary or unary operation.
+
+    Args:
+        op: Operation symbol or function name (e.g. ``"+"``, ``"abs"``).
+        left: Left/first operand as a C++ expression string.
+        right: Right/second operand string, or ``None`` for unary ops.
+
+    Returns:
+        A C++ expression string wrapping the operation.
+    """
     if right is not None:
         return f"({left} {op} {right})"
     # Unary
@@ -40,10 +50,17 @@ def op_cpp_expr(op: str, left: str, right: str | None = None) -> str:
     return f"{op}({left})"
 
 
-def get_output_connector_name(node) -> str:
+def get_output_connector_name(node: LibraryNode) -> str:
     """Return the single output connector name for *node*.
 
-    cuTile op nodes are defined with exactly one output connector.
+    Args:
+        node: A cuTile library node with exactly one output connector.
+
+    Returns:
+        The name of the single output connector.
+
+    Raises:
+        ValueError: If the node has zero or more than one output connector.
     """
     if len(node.out_connectors) != 1:
         raise ValueError(
@@ -55,11 +72,28 @@ def get_output_connector_name(node) -> str:
 
 # ── Expansion helpers ────────────────────────────────────────────────
 
-def get_tile_descriptors(node, state, sdfg):
-    """Return (a_desc, b_desc, c_desc, m_desc, c_in_desc).
+def get_tile_descriptors(
+    node: LibraryNode,
+    state: SDFGState,
+    sdfg: SDFG,
+) -> Tuple[Optional[DataDesc], Optional[DataDesc], DataDesc, Optional[DataDesc], Optional[DataDesc]]:
+    """Return ``(a_desc, b_desc, c_desc, m_desc, c_in_desc)`` for *node*.
 
-    a_desc / b_desc / m_desc / c_in_desc may be None when the
-    corresponding connector is absent or replaced by a constant.
+    Resolves array descriptors for the standard cuTile op connectors by
+    walking the incoming and outgoing edges of *node*.
+
+    Args:
+        node: The cuTile library node to inspect.
+        state: The SDFG state containing *node*.
+        sdfg: The SDFG owning the state.
+
+    Returns:
+        A 5-tuple ``(a_desc, b_desc, c_desc, m_desc, c_in_desc)`` where
+        ``a_desc``, ``b_desc``, ``m_desc``, and ``c_in_desc`` may be ``None``
+        when the corresponding connector is absent or replaced by a constant.
+
+    Raises:
+        ValueError: If the output connector is not wired.
     """
     out_conn = get_output_connector_name(node)
     a_desc = b_desc = c_desc = m_desc = c_in_desc = None
@@ -88,8 +122,26 @@ def get_tile_descriptors(node, state, sdfg):
     return a_desc, b_desc, c_desc, m_desc, c_in_desc
 
 
-def resolve_shape_and_scalar_form(node, ref_desc):
-    """Return (shape, ndim, use_scalar_form) from the node's tile_shape or a reference descriptor."""
+def resolve_shape_and_scalar_form(
+    node: LibraryNode,
+    ref_desc: DataDesc,
+) -> Tuple[tuple, int, bool]:
+    """Return ``(shape, ndim, use_scalar_form)`` for *node*.
+
+    Derives the tile shape from ``node.tile_shape`` when set, falling back
+    to ``ref_desc.shape``.  A *scalar form* is used when the tile has zero
+    or one total element (i.e. ``ndim == 0`` or product of shape is 1).
+
+    Args:
+        node: The cuTile library node whose ``tile_shape`` property to read.
+        ref_desc: Fallback array descriptor used when ``node.tile_shape`` is
+            ``None``.
+
+    Returns:
+        A 3-tuple ``(shape, ndim, use_scalar_form)`` where ``shape`` is a
+        tuple of extents, ``ndim`` is its length, and ``use_scalar_form`` is
+        ``True`` when the tile collapses to a single element.
+    """
     tile_shape = node.tile_shape
     shape = tuple(tile_shape) if tile_shape is not None else ref_desc.shape
     ndim = len(shape)
@@ -101,11 +153,20 @@ def resolve_shape_and_scalar_form(node, ref_desc):
     return shape, ndim, use_scalar_form
 
 
-def build_stride_decls(array_descs: dict[str, object]):
-    """Build C++ stride declarations, index variable declarations, and index update lines.
+def build_stride_decls(array_descs: Dict[str, DataDesc]) -> Tuple[str, str, str]:
+    """Build C++ stride, index, and update declaration strings.
 
-    Returns (stride_decls, index_decls, index_updates) as strings ready
-    for embedding in a C++ code template.
+    Generates three code fragments used inside cuTile C++ expansion templates:
+    stride constant arrays, index variable declarations, and per-dimension
+    index increment lines.
+
+    Args:
+        array_descs: Mapping from short connector key (``"a"``, ``"b"``, …)
+            to the corresponding array descriptor.
+
+    Returns:
+        A 3-tuple ``(stride_decls, index_decls, index_updates)`` — each a
+        multi-line C++ string ready for embedding in a code template.
     """
     stride_decls = ""
     index_decls = ""
@@ -117,8 +178,26 @@ def build_stride_decls(array_descs: dict[str, object]):
     return stride_decls, index_decls, index_updates
 
 
-def resolve_operands(constant1, constant2, is_binary):
-    """Return (left_scalar, right_scalar, left_indexed, right_indexed) for C++ codegen."""
+def resolve_operands(
+    constant1: Optional[str],
+    constant2: Optional[str],
+    is_binary: bool,
+) -> Tuple[str, Optional[str], str, Optional[str]]:
+    """Return operand strings for scalar and indexed C++ code emitting.
+
+    Each position may be a constant literal or a pointer/variable name.
+
+    Args:
+        constant1: Left/first constant literal, or ``None`` to use ``_a``.
+        constant2: Right/second constant literal, or ``None`` to use ``_b``
+            (binary) or nothing (unary).
+        is_binary: Whether the operation takes two operands.
+
+    Returns:
+        A 4-tuple ``(left_scalar, right_scalar, left_indexed, right_indexed)``
+        with C++ expression strings for both scalar and indexed access forms.
+        ``right_scalar`` and ``right_indexed`` are ``None`` for unary ops.
+    """
     left_scalar = constant1 if constant1 is not None else "_a"
     right_scalar = constant2 if constant2 is not None else ("_b" if is_binary else None)
     left_indexed = constant1 if constant1 is not None else "_a[ia]"
@@ -126,9 +205,21 @@ def resolve_operands(constant1, constant2, is_binary):
     return left_scalar, right_scalar, left_indexed, right_indexed
 
 
-def collect_array_descs(a_desc, b_desc):
-    """Return dict of non-None operand descriptors keyed by short name."""
-    descs: dict[str, object] = {}
+def collect_array_descs(
+    a_desc: Optional[DataDesc],
+    b_desc: Optional[DataDesc],
+) -> Dict[str, DataDesc]:
+    """Return a dict of non-``None`` operand descriptors keyed by short name.
+
+    Args:
+        a_desc: Descriptor for the ``_a`` (left/first) operand, or ``None``.
+        b_desc: Descriptor for the ``_b`` (right/second) operand, or ``None``.
+
+    Returns:
+        A dict mapping ``"a"`` and/or ``"b"`` to their respective descriptors,
+        omitting keys whose descriptor is ``None``.
+    """
+    descs: Dict[str, DataDesc] = {}
     if a_desc is not None:
         descs["a"] = a_desc
     if b_desc is not None:
@@ -136,20 +227,43 @@ def collect_array_descs(a_desc, b_desc):
     return descs
 
 
-def expr_connectors(expr) -> list:
-    """Return sorted list of connector names derived from *expr*'s SymPy symbols.
+def expr_connectors(expr: sp.Basic) -> List[str]:
+    """Return a sorted list of connector names derived from *expr*'s free symbols.
 
     Every :class:`sympy.Symbol` in *expr*'s free symbols is treated as an
     array input connector (regardless of naming convention).
+
+    Args:
+        expr: A SymPy expression whose free symbols will be extracted.
+
+    Returns:
+        Sorted list of symbol name strings to use as connector names.
     """
     return sorted(str(s) for s in expr.free_symbols if isinstance(s, sp.Symbol))
 
 
-def get_all_input_descs(node, state, sdfg):
+def get_all_input_descs(
+    node: LibraryNode,
+    state: SDFGState,
+    sdfg: SDFG,
+) -> Tuple[Dict[str, DataDesc], DataDesc]:
     """Return ``(input_descs, c_desc)`` for *node*.
 
-    *input_descs* maps each input connector name to its array descriptor.
-    *c_desc* is the descriptor for the output connector.
+    Walks all edges of *node* to build a complete mapping of input connector
+    names to their array descriptors and resolves the single output descriptor.
+
+    Args:
+        node: The cuTile library node to inspect.
+        state: The SDFG state containing *node*.
+        sdfg: The SDFG owning the state.
+
+    Returns:
+        A 2-tuple ``(input_descs, c_desc)`` where *input_descs* maps each
+        input connector name to its array descriptor, and *c_desc* is the
+        descriptor for the output connector.
+
+    Raises:
+        ValueError: If the output connector is not wired.
     """
     out_conn = get_output_connector_name(node)
     input_descs = {}
@@ -173,13 +287,33 @@ def get_all_input_descs(node, state, sdfg):
     return input_descs, c_desc
 
 
-def build_multi_op_code(expr, input_descs: dict, c_desc, tile_shape, out_conn: str = "_out") -> str:
-    """Generate C++ loop code for an arbitrary SymPy *expr*.
+def build_multi_op_code(
+    expr: sp.Basic,
+    input_descs: Dict[str, DataDesc],
+    c_desc: DataDesc,
+    tile_shape: Optional[List[int]],
+    out_conn: str = "_out",
+) -> str:
+    """Generate C++ loop code for an arbitrary SymPy expression.
 
-    Each key in *input_descs* maps a connector name (e.g. ``_a``, ``_in0``)
-    to the array descriptor for that connector.  Numeric literals in the
-    expression (SymPy ``Number`` nodes) are emitted as C++ literals by
-    ``symstr``.
+    Emits a C++ snippet that evaluates *expr* element-wise across a tile,
+    reading from each connector in *input_descs* and writing to *out_conn*.
+    Numeric literals in the expression (SymPy ``Number`` nodes) are emitted
+    as C++ literals via ``symstr``.
+
+    Args:
+        expr: The SymPy expression to evaluate.  Its free symbols must match
+            the keys of *input_descs*.
+        input_descs: Mapping from connector name (e.g. ``"_a"``, ``"_in0"``)
+            to the corresponding array descriptor.
+        c_desc: Array descriptor for the output connector.
+        tile_shape: Explicit tile extents, or ``None`` to use ``c_desc.shape``.
+        out_conn: Name of the C++ output variable / connector (default
+            ``"_out"``).
+
+    Returns:
+        A self-contained C++ code string suitable for use in a
+        :class:`~dace.sdfg.nodes.Tasklet`.
     """
     connectors = sorted(input_descs.keys())
     shape = tuple(tile_shape) if tile_shape is not None else c_desc.shape
@@ -245,8 +379,20 @@ for (std::size_t i = 0; i < n; ++i) {{
 
 # ── Connector utilities ──────────────────────────────────────────────
 
-def get_connected_sets(node, state) -> tuple[set[str], set[str]]:
-    """Return the sets of connected input and output connector names for *node*."""
+def get_connected_sets(
+    node: LibraryNode,
+    state: SDFGState,
+) -> Tuple[Set[str], Set[str]]:
+    """Return the sets of connected input and output connector names for *node*.
+
+    Args:
+        node: The library node to inspect.
+        state: The SDFG state containing *node*.
+
+    Returns:
+        A 2-tuple ``(connected_ins, connected_outs)`` of sets of connector
+        name strings.
+    """
     connected_ins: set[str] = set()
     for edge in state.in_edges(node):
         if edge.dst_conn is not None:
@@ -280,10 +426,17 @@ class TileNodeBase(LibraryNode):
         allow_none=True,
     )
 
-    def _validate_connectors_connected(self, sdfg: SDFG, state: SDFGState, label: str):
+    def _validate_connectors_connected(self, sdfg: SDFG, state: SDFGState, label: str) -> None:
         """Check that every input and output connector is wired to an edge.
 
-        Raises :class:`InvalidSDFGNodeError` for any unconnected connector.
+        Args:
+            sdfg: The SDFG containing this node.
+            state: The state containing this node.
+            label: Human-readable node type name for error messages.
+
+        Raises:
+            :class:`dace.sdfg.validation.InvalidSDFGNodeError`: For any
+                unconnected connector.
         """
         connected_ins, connected_outs = get_connected_sets(self, state)
         for conn in self.in_connectors:
@@ -356,11 +509,35 @@ class TileOpBase(TileNodeBase):
                  tile_shape: Optional[List[int]] = None,
                  constant1: Optional[str] = None,
                  constant2: Optional[str] = None,
-                 expr=None,
+                 expr: Optional[sp.Basic] = None,
                  out_connector: str = "_out",
                  extra_inputs: Collection[str] = frozenset(),
-                 **kwargs):
-        inputs: set[str] = set(extra_inputs)
+                 **kwargs) -> None:
+        """Initialise the base tile operation node.
+
+        Derives input connectors automatically from *expr*'s free symbols
+        (multi-op mode) or from the combination of *op* arity and the
+        presence/absence of *constant1* / *constant2* (single-op mode).
+
+        Args:
+            name: Node display name in the SDFG.
+            op: Operation symbol or function name (e.g. ``"+"``, ``"abs"``).
+            tile_shape: Fixed tile extents, or ``None`` to infer at expansion.
+            constant1: Literal C++ value replacing the left/first operand.
+                When ``None`` the ``_a`` input connector is created.
+            constant2: Literal C++ value replacing the right/second operand.
+                When ``None`` the ``_b`` input connector is created for
+                binary ops.
+            expr: Optional SymPy expression for multi-op mode.  When set,
+                all free symbols become input connectors and *op*, *constant1*,
+                and *constant2* are ignored.
+            out_connector: Name of the single output connector (default
+                ``"_out"``).
+            extra_inputs: Additional input connector names to add beyond those
+                derived from *expr* / *op* / constants.
+            **kwargs: Forwarded to :class:`~dace.sdfg.nodes.LibraryNode`.
+        """
+        inputs: Set[str] = set(extra_inputs)
         if expr is not None:
             # Multi-op mode: connectors derived from expression free symbols.
             inputs.update(expr_connectors(expr))
@@ -386,13 +563,26 @@ class TileOpBase(TileNodeBase):
     # ------------------------------------------------------------------
     @property
     def is_binary(self) -> bool:
+        """``True`` when the node has two operands (binary op).
+
+        A node is considered binary when either ``constant2`` is set
+        (constant right operand) or the ``_b`` input connector is present
+        (array right operand).
+        """
         return self.constant2 is not None or "_b" in self.in_connectors
 
-    def _validate_common(self, sdfg: SDFG, state: SDFGState, label: str):
+    def _validate_common(self, sdfg: SDFG, state: SDFGState, label: str) -> None:
         """Run the validation checks shared by all tile-op variants.
 
-        *label* is used in error messages (e.g. ``"TileOp"``,
-        ``"TileMaskedOp"``).
+        Args:
+            sdfg: The SDFG containing this node.
+            state: The state containing this node.
+            label: Human-readable node type name used in error messages
+                (e.g. ``"TileOp"``, ``"TileMaskedOp"``).
+
+        Raises:
+            :class:`~dace.sdfg.validation.InvalidSDFGNodeError`: If any
+                validation constraint is violated.
         """
         out_conn = get_output_connector_name(self)
 

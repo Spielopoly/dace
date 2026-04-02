@@ -15,7 +15,7 @@ The expansion SDFG composes four inner library nodes:
 """
 from __future__ import annotations
 
-from typing import cast
+from typing import Dict, Optional, Tuple, cast
 
 import sympy as sp
 
@@ -78,9 +78,32 @@ class TileIfElseOpLibraryNode(TileNodeBase):
         ),
     )
 
-    def __init__(self, name="TileIfElseOp", *,
-                 condition=None, true_expr=None, false_expr=None,
-                 tile_shape=None, num_inputs=None, **kwargs):
+    def __init__(self, name: str = "TileIfElseOp", *,
+                 condition: Optional[sp.Basic] = None,
+                 true_expr: Optional[sp.Basic] = None,
+                 false_expr: Optional[sp.Basic] = None,
+                 tile_shape: Optional[list] = None,
+                 num_inputs: Optional[int] = None,
+                 **kwargs) -> None:
+        """Initialise the compound conditional element-wise tile operation node.
+
+        Input connectors are derived automatically from the union of free
+        symbols across all three SymPy expressions unless *num_inputs* is
+        provided to create connectors ``_in0`` … ``_in{num_inputs-1}``
+        explicitly.
+
+        Args:
+            name: Node display name in the SDFG (default
+                ``"TileIfElseOp"``).
+            condition: SymPy boolean expression for the if-condition.
+            true_expr: SymPy expression for the true branch output.
+            false_expr: SymPy expression for the false branch output.
+            tile_shape: Fixed tile extents, or ``None`` to infer at expansion.
+            num_inputs: When provided, create exactly this many input
+                connectors (``_in0``, …, ``_in{num_inputs-1}``) regardless
+                of the expressions.
+            **kwargs: Forwarded to :class:`TileNodeBase`.
+        """
         if num_inputs is not None:
             inputs = {f"_in{i}" for i in range(num_inputs)}
         else:
@@ -98,7 +121,21 @@ class TileIfElseOpLibraryNode(TileNodeBase):
         self.false_expr = false_expr
         self.tile_shape = tile_shape
 
-    def validate(self, sdfg: SDFG, state: SDFGState):
+    def validate(self, sdfg: SDFG, state: SDFGState) -> None:
+        """Validate the if-else compound node before code generation.
+
+        Checks that all connectors are wired, that ``condition``,
+        ``true_expr``, and ``false_expr`` are all set, and that every free
+        symbol in each expression corresponds to an input connector.
+
+        Args:
+            sdfg: The SDFG containing this node.
+            state: The state containing this node.
+
+        Raises:
+            :class:`~dace.sdfg.validation.InvalidSDFGNodeError`: If any
+                expression is ``None`` or a symbol does not match a connector.
+        """
         self._validate_connectors_connected(sdfg, state, "TileIfElseOp")
 
         sid = state.parent_graph.node_id(state)
@@ -137,7 +174,22 @@ class ExpandTileIfElseOpPure(ExpandTransformation):
     @staticmethod
     def expansion(node: TileIfElseOpLibraryNode, state: SDFGState,
                   sdfg: SDFG) -> SDFG:
-        node = cast(TileIfElseOpLibraryNode, node)
+        """Expand the node into a nested SDFG with four inner library nodes.
+
+        Builds an inner SDFG that evaluates ``condition``, ``true_expr``, and
+        ``false_expr`` on full tiles using three :class:`TileOpLibraryNode`
+        instances and then selects the correct result per element with a
+        :class:`TileWhereSelectLibraryNode`.
+
+        Args:
+            node: The :class:`TileIfElseOpLibraryNode` to expand.
+            state: The SDFG state containing *node*.
+            sdfg: The SDFG owning the state.
+
+        Returns:
+            An inner :class:`~dace.sdfg.SDFG` that implements the conditional
+            operation as a composition of tile library nodes.
+        """
         in_descs, out_desc = get_all_input_descs(node, state, sdfg)
 
         # ── inner SDFG skeleton ──────────────────────────────────────
@@ -175,9 +227,19 @@ class ExpandTileIfElseOpPure(ExpandTransformation):
         inner_state = inner_sdfg.add_state(node.name + "_state")
 
         # ── helper: rename expression symbols with a prefix ──────────
-        def _rename_expr(expr, prefix):
-            """Rename free symbols in *expr* to ``{prefix}{i}`` and
-            return ``(renamed_expr, {orig_sym_name: new_name})``."""
+        def _rename_expr(
+            expr: sp.Basic, prefix: str
+        ) -> Tuple[sp.Basic, Dict[str, str]]:
+            """Rename free symbols in *expr* to ``{prefix}{i}``.
+
+            Args:
+                expr: The SymPy expression whose free symbols to rename.
+                prefix: String prefix for the generated connector names.
+
+            Returns:
+                A 2-tuple ``(renamed_expr, rename_map)`` where *rename_map*
+                maps each original symbol name to its generated name.
+            """
             syms = sorted(
                 str(s) for s in expr.free_symbols
                 if isinstance(s, sp.Symbol)
@@ -221,7 +283,20 @@ class ExpandTileIfElseOpPure(ExpandTransformation):
         inner_state.add_node(where_node)
 
         # ── helper: wire renamed connectors to inner SDFG arrays ─────
-        def _wire_sub_node(sub_node, rename_map):
+        def _wire_sub_node(
+            sub_node: TileOpLibraryNode, rename_map: Dict[str, str]
+        ) -> None:
+            """Wire a sub-node's renamed input connectors to inner SDFG access nodes.
+
+            For each ``(original_symbol, new_connector)`` pair in *rename_map*,
+            adds a read access node for the original inner SDFG array and
+            connects it to the sub-node's renamed connector.
+
+            Args:
+                sub_node: The inner library node to wire.
+                rename_map: Mapping from original symbol name to the renamed
+                    connector name used in *sub_node*.
+            """
             for orig_sym, new_conn in sorted(rename_map.items()):
                 acc = inner_state.add_read(orig_sym)
                 desc = inner_sdfg.arrays[orig_sym]
