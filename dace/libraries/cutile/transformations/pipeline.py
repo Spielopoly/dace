@@ -202,19 +202,6 @@ def apply_cutile_pipeline(sdfg: SDFG, *,
         count += split_result if isinstance(split_result, int) else 1
     debug_save_sdfg()
     
-    # Step 3.5: Inline SDFGs to avoid issues with MapFission on nested SDFGs
-    inline_pipeline = ppl.Pipeline([FuseStates(), InlineSDFGs()])
-    inline_result = inline_pipeline.apply_pass(sdfg, {})
-
-    if isinstance(inline_result, int):
-        count += inline_result
-    elif isinstance(inline_result, dict):
-        count += sum(v for v in inline_result.values() if isinstance(v, int))
-    elif inline_result is not None:
-        count += 1
-
-    debug_save_sdfg()
-    
 
     # Step 4: Fission maps with complex subgraphs into single-operation maps
     # Each resulting map should have exactly one computational node,
@@ -273,12 +260,13 @@ def apply_cutile_pipeline(sdfg: SDFG, *,
     debug_save_sdfg()
     
     # Step 10: Map Fusion to fuse together all the random maps created by the previous transformations
-    count += sdfg.apply_transformations_repeated(
-        [MapFusionVertical, MapFusionHorizontal],
-        validate=validate_all,
-        validate_all=validate_all,
-    )
-    debug_save_sdfg()
+    # NOTE: This seems to have issues with missing symbols that should have been added by MapTiling?
+    # count += sdfg.apply_transformations_repeated(
+    #     [MapFusionVertical, MapFusionHorizontal],
+    #     validate=validate_all,
+    #     validate_all=validate_all,
+    # )
+    # debug_save_sdfg()
     
     # Step 11: Simplify again after fusion
     _simplify(sdfg)
