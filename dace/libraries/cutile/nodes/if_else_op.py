@@ -27,13 +27,13 @@ from dace.transformation.transformation import ExpandTransformation
 
 from .op import TileOpLibraryNode
 from .where_select import TileWhereSelectLibraryNode
-from ._base import _TileNodeBase, _get_all_input_descs
+from .base import TileNodeBase, get_all_input_descs
 
 
 # ── Library node ─────────────────────────────────────────────────────
 
 @library.node
-class TileIfElseOpLibraryNode(_TileNodeBase):
+class TileIfElseOpLibraryNode(TileNodeBase):
     """
     Compound library node for conditional element-wise tile operations.
 
@@ -138,7 +138,7 @@ class ExpandTileIfElseOpPure(ExpandTransformation):
     def expansion(node: TileIfElseOpLibraryNode, state: SDFGState,
                   sdfg: SDFG) -> SDFG:
         node = cast(TileIfElseOpLibraryNode, node)
-        in_descs, out_desc = _get_all_input_descs(node, state, sdfg)
+        in_descs, out_desc = get_all_input_descs(node, state, sdfg)
 
         # ── inner SDFG skeleton ──────────────────────────────────────
         inner_sdfg = SDFG(node.name + "_sdfg")

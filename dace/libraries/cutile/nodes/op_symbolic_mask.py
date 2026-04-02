@@ -25,12 +25,12 @@ from dace.sdfg import nodes
 from dace.symbolic import symstr
 from dace.transformation.transformation import ExpandTransformation
 from ..op_registry import TaskletType, MaskType, register_op
-from ._base import (
-    _TileOpBase,
-    _expr_connectors,
-    _get_output_connector_name,
-    _op_cpp_expr, _get_tile_descriptors, _resolve_shape_and_scalar_form,
-    _build_stride_decls, _resolve_operands, _collect_array_descs,
+from .base import (
+    TileOpBase,
+    expr_connectors,
+    get_output_connector_name,
+    op_cpp_expr, get_tile_descriptors, resolve_shape_and_scalar_form,
+    build_stride_decls, resolve_operands, collect_array_descs,
     _BINARY_OPS, _UNARY_OPS,
 )
 
@@ -41,7 +41,7 @@ def _sympy_condition_to_cpp(cond: sp.Basic) -> str:
 
 
 @library.node
-class TileSymbolicMaskedOpLibraryNode(_TileOpBase):
+class TileSymbolicMaskedOpLibraryNode(TileOpBase):
     """
     Element-wise masked tile op using a symbolic (compile-time) predicate.
 
@@ -107,7 +107,7 @@ class ExpandTileSymbolicMaskedOpPure(ExpandTransformation):
     @staticmethod
     def expansion(node: TileSymbolicMaskedOpLibraryNode, state: SDFGState,
                   sdfg: SDFG) -> nodes.Tasklet:
-        out_conn = _get_output_connector_name(node)
+        out_conn = get_output_connector_name(node)
         op = node.op
         constant1 = node.constant1
         constant2 = node.constant2
@@ -119,7 +119,7 @@ class ExpandTileSymbolicMaskedOpPure(ExpandTransformation):
             else "true"
         )
 
-        a_desc, b_desc, c_desc, _, c_in_desc = _get_tile_descriptors(node, state, sdfg)
+        a_desc, b_desc, c_desc, _, c_in_desc = get_tile_descriptors(node, state, sdfg)
         has_c_in = c_in_desc is not None
 
         if node.expr is not None:
@@ -131,7 +131,7 @@ class ExpandTileSymbolicMaskedOpPure(ExpandTransformation):
                     continue
                 in_descs[edge.dst_conn] = sdfg.arrays[arr_name]
 
-            expr_inputs = _expr_connectors(node.expr)
+            expr_inputs = expr_connectors(node.expr)
             missing = [c for c in expr_inputs if c not in in_descs]
             if missing:
                 raise ValueError(
@@ -140,7 +140,7 @@ class ExpandTileSymbolicMaskedOpPure(ExpandTransformation):
                 )
 
             ref_desc = c_desc
-            shape, ndim, use_scalar_form = _resolve_shape_and_scalar_form(node, ref_desc)
+            shape, ndim, use_scalar_form = resolve_shape_and_scalar_form(node, ref_desc)
 
             def _lv(conn: str) -> str:
                 return conn.lstrip("_")
@@ -260,7 +260,7 @@ for (std::size_t i = 0; i < n; ++i) {{
         is_binary = (constant2 is not None) or (b_desc is not None)
 
         ref_desc = a_desc or b_desc or c_desc
-        shape, ndim, use_scalar_form = _resolve_shape_and_scalar_form(node, ref_desc)
+        shape, ndim, use_scalar_form = resolve_shape_and_scalar_form(node, ref_desc)
 
         inputs: set[str] = set()
         if a_desc is not None:
@@ -271,11 +271,11 @@ for (std::size_t i = 0; i < n; ++i) {{
             inputs.add("_c_in")
 
         # Determine operand values
-        left_scalar, right_scalar, left_indexed, right_indexed = _resolve_operands(
+        left_scalar, right_scalar, left_indexed, right_indexed = resolve_operands(
             constant1, constant2, is_binary)
 
-        scalar_expr = _op_cpp_expr(op, left_scalar, right_scalar)
-        indexed_expr = _op_cpp_expr(op, left_indexed, right_indexed)
+        scalar_expr = op_cpp_expr(op, left_scalar, right_scalar)
+        indexed_expr = op_cpp_expr(op, left_indexed, right_indexed)
 
         if use_scalar_form:
             # Declare coordinate variables at 0 for condition evaluation
@@ -308,9 +308,9 @@ for (std::size_t i = 0; i < n; ++i) {{
             c_strides_expr = ", ".join(symstr(s) for s in c_desc.strides)
 
             # Collect array descriptors for stride computation
-            array_descs = _collect_array_descs(a_desc, b_desc)
+            array_descs = collect_array_descs(a_desc, b_desc)
 
-            stride_decls, index_decls, index_updates = _build_stride_decls(array_descs)
+            stride_decls, index_decls, index_updates = build_stride_decls(array_descs)
 
             # Named coordinate aliases for the mask condition
             coord_aliases = "\n".join(

@@ -28,18 +28,18 @@ from dace.sdfg.validation import InvalidSDFGNodeError
 from dace.symbolic import symstr
 from dace.transformation.transformation import ExpandTransformation
 from ..op_registry import TaskletType, MaskType, register_op
-from ._base import (
-    _TileOpBase,
-    _expr_connectors,
-    _get_output_connector_name,
-    _op_cpp_expr, _get_tile_descriptors, _resolve_shape_and_scalar_form,
-    _build_stride_decls, _resolve_operands, _collect_array_descs,
+from .base import (
+    TileOpBase,
+    expr_connectors,
+    get_output_connector_name,
+    op_cpp_expr, get_tile_descriptors, resolve_shape_and_scalar_form,
+    build_stride_decls, resolve_operands, collect_array_descs,
     _BINARY_OPS, _UNARY_OPS, SUPPORTED_MASK_DTYPES,
 )
 
 
 @library.node
-class TileRuntimeMaskedOpLibraryNode(_TileOpBase):
+class TileRuntimeMaskedOpLibraryNode(TileOpBase):
     """
     Unified library node for masked element-wise operations on tiles.
 
@@ -74,7 +74,7 @@ class TileRuntimeMaskedOpLibraryNode(_TileOpBase):
 
     def validate(self, sdfg: SDFG, state: SDFGState):
         self._validate_common(sdfg, state, "TileMaskedOp")
-        out_conn = _get_output_connector_name(self)
+        out_conn = get_output_connector_name(self)
 
         # Additional mask-specific validation
         m_node = c_node = None
@@ -147,7 +147,7 @@ class ExpandTileRuntimeMaskedOpPure(ExpandTransformation):
     @staticmethod
     def expansion(node: TileRuntimeMaskedOpLibraryNode, state: SDFGState,
                   sdfg: SDFG) -> nodes.Tasklet:
-        out_conn = _get_output_connector_name(node)
+        out_conn = get_output_connector_name(node)
 
         if node.expr is not None:
             # ── Multi-op expression mode with runtime mask ────────────────
@@ -173,7 +173,7 @@ class ExpandTileRuntimeMaskedOpPure(ExpandTransformation):
                     f"'{node.name}'."
                 )
 
-            expr_inputs = _expr_connectors(node.expr)
+            expr_inputs = expr_connectors(node.expr)
             missing = [c for c in expr_inputs if c not in in_descs]
             if missing:
                 raise ValueError(
@@ -181,7 +181,7 @@ class ExpandTileRuntimeMaskedOpPure(ExpandTransformation):
                     f"{missing} for node '{node.name}'."
                 )
 
-            shape, ndim, use_scalar_form = _resolve_shape_and_scalar_form(node, out_desc)
+            shape, ndim, use_scalar_form = resolve_shape_and_scalar_form(node, out_desc)
             m_desc = in_descs["_m"]
             has_c_in = "_c_in" in in_descs
             c_in_desc = in_descs.get("_c_in")
@@ -290,7 +290,7 @@ for (std::size_t i = 0; i < n; ++i) {{
         constant1 = node.constant1
         constant2 = node.constant2
 
-        a_desc, b_desc, c_desc, m_desc, c_in_desc = _get_tile_descriptors(
+        a_desc, b_desc, c_desc, m_desc, c_in_desc = get_tile_descriptors(
             node, state, sdfg)
         if m_desc is None:
             raise ValueError(
@@ -300,7 +300,7 @@ for (std::size_t i = 0; i < n; ++i) {{
         is_binary = (constant2 is not None) or (b_desc is not None)
 
         ref_desc = a_desc or b_desc or c_desc
-        shape, ndim, use_scalar_form = _resolve_shape_and_scalar_form(node, ref_desc)
+        shape, ndim, use_scalar_form = resolve_shape_and_scalar_form(node, ref_desc)
 
         inputs: set[str] = {"_m"}
         if a_desc is not None:
@@ -311,11 +311,11 @@ for (std::size_t i = 0; i < n; ++i) {{
             inputs.add("_c_in")
 
         # Determine operand values
-        left_scalar, right_scalar, left_indexed, right_indexed = _resolve_operands(
+        left_scalar, right_scalar, left_indexed, right_indexed = resolve_operands(
             constant1, constant2, is_binary)
 
-        scalar_expr = _op_cpp_expr(op, left_scalar, right_scalar)
-        indexed_expr = _op_cpp_expr(op, left_indexed, right_indexed)
+        scalar_expr = op_cpp_expr(op, left_scalar, right_scalar)
+        indexed_expr = op_cpp_expr(op, left_indexed, right_indexed)
 
         if use_scalar_form:
             if has_c_in:
@@ -328,9 +328,9 @@ for (std::size_t i = 0; i < n; ++i) {{
             c_strides_expr = ", ".join(symstr(s) for s in c_desc.strides)
 
             # Collect array descriptors for stride computation
-            array_descs = _collect_array_descs(a_desc, b_desc)
+            array_descs = collect_array_descs(a_desc, b_desc)
 
-            stride_decls, index_decls, index_updates = _build_stride_decls(array_descs)
+            stride_decls, index_decls, index_updates = build_stride_decls(array_descs)
 
             c_in_stride_decl = ""
             c_in_index_decl = ""

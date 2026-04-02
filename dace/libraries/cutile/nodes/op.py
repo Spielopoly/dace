@@ -26,18 +26,18 @@ from dace import library
 from dace.symbolic import symstr
 from dace.transformation.transformation import ExpandTransformation
 from ..op_registry import register_op, MaskType, TaskletType
-from ._base import (
-    _TileOpBase,
-    _get_output_connector_name,
-    _op_cpp_expr, _get_tile_descriptors, _resolve_shape_and_scalar_form,
-    _build_stride_decls, _resolve_operands, _collect_array_descs,
-    _get_all_input_descs, _build_multi_op_code,
+from .base import (
+    TileOpBase,
+    get_output_connector_name,
+    op_cpp_expr, get_tile_descriptors, resolve_shape_and_scalar_form,
+    build_stride_decls, resolve_operands, collect_array_descs,
+    get_all_input_descs, build_multi_op_code,
     _BINARY_OPS, _UNARY_OPS,
 )
 
 
 @library.node
-class TileOpLibraryNode(_TileOpBase):
+class TileOpLibraryNode(TileOpBase):
     """
     Unified library node for element-wise operations on tiles.
 
@@ -81,11 +81,11 @@ class ExpandTileOpPure(ExpandTransformation):
     @staticmethod
     def expansion(node: TileOpLibraryNode, state: SDFGState, sdfg: SDFG) -> nodes.Tasklet:
         node = cast(TileOpLibraryNode, node)
-        out_conn = _get_output_connector_name(node)
+        out_conn = get_output_connector_name(node)
         if node.expr is not None:
             # ── Multi-op expression mode ──────────────────────────────────
-            input_descs, c_desc = _get_all_input_descs(node, state, sdfg)
-            code = _build_multi_op_code(
+            input_descs, c_desc = get_all_input_descs(node, state, sdfg)
+            code = build_multi_op_code(
                 node.expr, input_descs, c_desc, node.tile_shape, out_conn=out_conn)
             return nodes.Tasklet(
                 label=node.name + "_cutile",
@@ -100,11 +100,11 @@ class ExpandTileOpPure(ExpandTransformation):
         constant1 = node.constant1
         constant2 = node.constant2
 
-        a_desc, b_desc, c_desc, _, _ = _get_tile_descriptors(node, state, sdfg)
+        a_desc, b_desc, c_desc, _, _ = get_tile_descriptors(node, state, sdfg)
         is_binary = (constant2 is not None) or (b_desc is not None)
 
         ref_desc = a_desc or b_desc or c_desc
-        shape, ndim, use_scalar_form = _resolve_shape_and_scalar_form(node, ref_desc)
+        shape, ndim, use_scalar_form = resolve_shape_and_scalar_form(node, ref_desc)
 
         inputs: set[str] = set()
         if a_desc is not None:
@@ -113,23 +113,23 @@ class ExpandTileOpPure(ExpandTransformation):
             inputs.add("_b")
 
         # Determine operand values for scalar and indexed forms
-        left_scalar, right_scalar, left_indexed, right_indexed = _resolve_operands(
+        left_scalar, right_scalar, left_indexed, right_indexed = resolve_operands(
             constant1, constant2, is_binary)
 
         if use_scalar_form:
-            code = f"{out_conn} = {_op_cpp_expr(op, left_scalar, right_scalar)};"
+            code = f"{out_conn} = {op_cpp_expr(op, left_scalar, right_scalar)};"
         else:
             shape_expr = ", ".join(symstr(s) for s in shape)
             c_strides_expr = ", ".join(symstr(s) for s in c_desc.strides)
 
             # Collect array descriptors that need stride computation
-            array_descs = _collect_array_descs(a_desc, b_desc)
+            array_descs = collect_array_descs(a_desc, b_desc)
 
-            stride_decls, index_decls, index_updates = _build_stride_decls(array_descs)
+            stride_decls, index_decls, index_updates = build_stride_decls(array_descs)
 
             if not array_descs:
                 # Both operands are constants – fill output tile
-                expr = _op_cpp_expr(op, left_indexed, right_indexed)
+                expr = op_cpp_expr(op, left_indexed, right_indexed)
                 code = f"""
 constexpr int ndim = {ndim};
 const std::size_t shape[ndim] = {{{shape_expr}}};
@@ -153,7 +153,7 @@ for (std::size_t i = 0; i < n; ++i) {{
 }}
 """
             else:
-                expr = _op_cpp_expr(op, left_indexed, right_indexed)
+                expr = op_cpp_expr(op, left_indexed, right_indexed)
                 code = f"""
 constexpr int ndim = {ndim};
 const std::size_t shape[ndim] = {{{shape_expr}}};

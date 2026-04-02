@@ -24,7 +24,7 @@ from dace.sdfg.validation import InvalidSDFGNodeError
 from dace.symbolic import symstr
 from dace.transformation.transformation import ExpandTransformation
 
-from ._base import _resolve_shape_and_scalar_form, _TileNodeBase, SUPPORTED_MASK_DTYPES
+from .base import resolve_shape_and_scalar_form, TileNodeBase, SUPPORTED_MASK_DTYPES
 
 
 # ── Helper to read tile descriptors for where-select ─────────────────
@@ -61,7 +61,7 @@ def _get_where_descriptors(node: nodes.LibraryNode, state: SDFGState, sdfg: SDFG
 # ── Library node ─────────────────────────────────────────────────────
 
 @library.node
-class TileWhereSelectLibraryNode(_TileNodeBase):
+class TileWhereSelectLibraryNode(TileNodeBase):
     """
     Element-wise conditional selection: ``C = where(cond, X, Y)``.
 
@@ -151,7 +151,7 @@ class ExpandTileWhereSelectPure(ExpandTransformation):
             node, state, sdfg)
 
         ref_desc = c_desc
-        shape, ndim, use_scalar_form = _resolve_shape_and_scalar_form(
+        shape, ndim, use_scalar_form = resolve_shape_and_scalar_form(
             node, ref_desc)
 
         if use_scalar_form:

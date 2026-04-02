@@ -30,7 +30,7 @@ SUPPORTED_MASK_DTYPES = {
 }
 
 
-def _op_cpp_expr(op: str, left: str, right: str | None = None) -> str:
+def op_cpp_expr(op: str, left: str, right: str | None = None) -> str:
     """Return a C++ expression for a binary or unary operation."""
     if right is not None:
         return f"({left} {op} {right})"
@@ -40,7 +40,7 @@ def _op_cpp_expr(op: str, left: str, right: str | None = None) -> str:
     return f"{op}({left})"
 
 
-def _get_output_connector_name(node) -> str:
+def get_output_connector_name(node) -> str:
     """Return the single output connector name for *node*.
 
     cuTile op nodes are defined with exactly one output connector.
@@ -55,13 +55,13 @@ def _get_output_connector_name(node) -> str:
 
 # ── Expansion helpers ────────────────────────────────────────────────
 
-def _get_tile_descriptors(node, state, sdfg):
+def get_tile_descriptors(node, state, sdfg):
     """Return (a_desc, b_desc, c_desc, m_desc, c_in_desc).
 
     a_desc / b_desc / m_desc / c_in_desc may be None when the
     corresponding connector is absent or replaced by a constant.
     """
-    out_conn = _get_output_connector_name(node)
+    out_conn = get_output_connector_name(node)
     a_desc = b_desc = c_desc = m_desc = c_in_desc = None
     for edge in state.in_edges(node):
         arr_name = edge.data.data
@@ -88,7 +88,7 @@ def _get_tile_descriptors(node, state, sdfg):
     return a_desc, b_desc, c_desc, m_desc, c_in_desc
 
 
-def _resolve_shape_and_scalar_form(node, ref_desc):
+def resolve_shape_and_scalar_form(node, ref_desc):
     """Return (shape, ndim, use_scalar_form) from the node's tile_shape or a reference descriptor."""
     tile_shape = node.tile_shape
     shape = tuple(tile_shape) if tile_shape is not None else ref_desc.shape
@@ -101,7 +101,7 @@ def _resolve_shape_and_scalar_form(node, ref_desc):
     return shape, ndim, use_scalar_form
 
 
-def _build_stride_decls(array_descs: dict[str, object]):
+def build_stride_decls(array_descs: dict[str, object]):
     """Build C++ stride declarations, index variable declarations, and index update lines.
 
     Returns (stride_decls, index_decls, index_updates) as strings ready
@@ -117,7 +117,7 @@ def _build_stride_decls(array_descs: dict[str, object]):
     return stride_decls, index_decls, index_updates
 
 
-def _resolve_operands(constant1, constant2, is_binary):
+def resolve_operands(constant1, constant2, is_binary):
     """Return (left_scalar, right_scalar, left_indexed, right_indexed) for C++ codegen."""
     left_scalar = constant1 if constant1 is not None else "_a"
     right_scalar = constant2 if constant2 is not None else ("_b" if is_binary else None)
@@ -126,7 +126,7 @@ def _resolve_operands(constant1, constant2, is_binary):
     return left_scalar, right_scalar, left_indexed, right_indexed
 
 
-def _collect_array_descs(a_desc, b_desc):
+def collect_array_descs(a_desc, b_desc):
     """Return dict of non-None operand descriptors keyed by short name."""
     descs: dict[str, object] = {}
     if a_desc is not None:
@@ -136,7 +136,7 @@ def _collect_array_descs(a_desc, b_desc):
     return descs
 
 
-def _expr_connectors(expr) -> list:
+def expr_connectors(expr) -> list:
     """Return sorted list of connector names derived from *expr*'s SymPy symbols.
 
     Every :class:`sympy.Symbol` in *expr*'s free symbols is treated as an
@@ -145,13 +145,13 @@ def _expr_connectors(expr) -> list:
     return sorted(str(s) for s in expr.free_symbols if isinstance(s, sp.Symbol))
 
 
-def _get_all_input_descs(node, state, sdfg):
+def get_all_input_descs(node, state, sdfg):
     """Return ``(input_descs, c_desc)`` for *node*.
 
     *input_descs* maps each input connector name to its array descriptor.
     *c_desc* is the descriptor for the output connector.
     """
-    out_conn = _get_output_connector_name(node)
+    out_conn = get_output_connector_name(node)
     input_descs = {}
     c_desc = None
     for edge in state.in_edges(node):
@@ -173,7 +173,7 @@ def _get_all_input_descs(node, state, sdfg):
     return input_descs, c_desc
 
 
-def _build_multi_op_code(expr, input_descs: dict, c_desc, tile_shape, out_conn: str = "_out") -> str:
+def build_multi_op_code(expr, input_descs: dict, c_desc, tile_shape, out_conn: str = "_out") -> str:
     """Generate C++ loop code for an arbitrary SymPy *expr*.
 
     Each key in *input_descs* maps a connector name (e.g. ``_a``, ``_in0``)
@@ -245,7 +245,7 @@ for (std::size_t i = 0; i < n; ++i) {{
 
 # ── Connector utilities ──────────────────────────────────────────────
 
-def _get_connected_sets(node, state) -> tuple[set[str], set[str]]:
+def get_connected_sets(node, state) -> tuple[set[str], set[str]]:
     """Return the sets of connected input and output connector names for *node*."""
     connected_ins: set[str] = set()
     for edge in state.in_edges(node):
@@ -261,7 +261,7 @@ def _get_connected_sets(node, state) -> tuple[set[str], set[str]]:
 # ── Base library node ────────────────────────────────────────────────
 
 @make_properties
-class _TileNodeBase(LibraryNode):
+class TileNodeBase(LibraryNode):
     """Abstract base for cuTile library nodes that operate on tiles.
 
     Provides the ``tile_shape`` property and a reusable
@@ -285,7 +285,7 @@ class _TileNodeBase(LibraryNode):
 
         Raises :class:`InvalidSDFGNodeError` for any unconnected connector.
         """
-        connected_ins, connected_outs = _get_connected_sets(self, state)
+        connected_ins, connected_outs = get_connected_sets(self, state)
         for conn in self.in_connectors:
             if conn not in connected_ins:
                 raise InvalidSDFGNodeError(
@@ -305,7 +305,7 @@ class _TileNodeBase(LibraryNode):
 
 
 @make_properties
-class _TileOpBase(_TileNodeBase):
+class TileOpBase(TileNodeBase):
     """Abstract base for all cuTile element-wise operation library nodes.
 
     Provides the shared properties (``op``, ``constant1``,
@@ -363,7 +363,7 @@ class _TileOpBase(_TileNodeBase):
         inputs: set[str] = set(extra_inputs)
         if expr is not None:
             # Multi-op mode: connectors derived from expression free symbols.
-            inputs.update(_expr_connectors(expr))
+            inputs.update(expr_connectors(expr))
         else:
             if constant1 is None:
                 inputs.add("_a")
@@ -394,11 +394,11 @@ class _TileOpBase(_TileNodeBase):
         *label* is used in error messages (e.g. ``"TileOp"``,
         ``"TileMaskedOp"``).
         """
-        out_conn = _get_output_connector_name(self)
+        out_conn = get_output_connector_name(self)
 
         if self.expr is not None:
             # Multi-op mode: validate expression symbols match connectors.
-            connected_ins, connected_outs = _get_connected_sets(self, state)
+            connected_ins, connected_outs = get_connected_sets(self, state)
 
             if out_conn not in connected_outs:
                 raise InvalidSDFGNodeError(
@@ -408,7 +408,7 @@ class _TileOpBase(_TileNodeBase):
                     node_id=state.node_id(self),
                 )
 
-            expr_conns = set(_expr_connectors(self.expr))
+            expr_conns = set(expr_connectors(self.expr))
             if out_conn in expr_conns:
                 raise InvalidSDFGNodeError(
                     f"{label} '{self.name}': '{out_conn}' cannot be used as an "
@@ -438,7 +438,7 @@ class _TileOpBase(_TileNodeBase):
                     )
         else:
             # Classic single-op mode: selective connector checks.
-            connected_ins, connected_outs = _get_connected_sets(self, state)
+            connected_ins, connected_outs = get_connected_sets(self, state)
 
             if out_conn not in connected_outs:
                 raise InvalidSDFGNodeError(
