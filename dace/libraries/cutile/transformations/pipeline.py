@@ -38,7 +38,8 @@ def apply_cutile_pipeline(sdfg: SDFG, *,
                           validate: bool = True,
                           validate_all: bool = True,
                           apply_map_tiling: bool = True,
-                          tile_shape: tuple[int, ...] = (16, 16, 16)) -> int:
+                          tile_shape: tuple[int, ...] = (16, 16, 16),
+                          debug_save_sdfg_steps: bool = False) -> int:
     """
     Apply the full cuTile transformation pipeline to an SDFG.
 
@@ -74,9 +75,26 @@ def apply_cutile_pipeline(sdfg: SDFG, *,
     """
     count = 0
     
+    _pipeline_step = -1
+    import time
+    current_time = time.strftime("%Y%m%d-%H%M%S")
+    dirname = f"/workspace/cutile_pipeline_debug_sdfgs/{current_time}"
+    import os
+    os.makedirs(dirname, exist_ok=True)
+    def debug_save_sdfg():
+        if debug_save_sdfg_steps:
+            nonlocal _pipeline_step
+            _pipeline_step += 1
+            name = f"{dirname}/step_{_pipeline_step}.sdfg"
+            
+            sdfg.save(name)
+    
+    debug_save_sdfg()
+    
     # Step 1: Initial simplification
     # Removes trivial tasklets and unnecessary access nodes
     _simplify(sdfg)
+    debug_save_sdfg()
 
     # ── Preprocessing: Canonicalize the SDFG for tiling ──────────────
 
@@ -89,6 +107,7 @@ def apply_cutile_pipeline(sdfg: SDFG, *,
     count += sdfg.apply_transformations_repeated(
         [LoopToMap], validate=False, validate_all=False,
     )
+    debug_save_sdfg()
 
     # Step 3: Split multi-statement tasklets into single-operation tasklets
     # This enables pattern matching against individual operations for
@@ -96,6 +115,7 @@ def apply_cutile_pipeline(sdfg: SDFG, *,
     split_result = SplitTasklets().apply_pass(sdfg, {})
     if split_result is not None:
         count += split_result if isinstance(split_result, int) else 1
+    debug_save_sdfg()
 
     # Step 4: Fission maps with complex subgraphs into single-operation maps
     # Each resulting map should have exactly one computational node,
@@ -114,9 +134,11 @@ def apply_cutile_pipeline(sdfg: SDFG, *,
         count += sdfg.apply_transformations_repeated(
             [MapFission], validate=False, validate_all=False,
         )
+    debug_save_sdfg()
 
     # Step 5: Clean up after preprocessing
     _simplify(sdfg)
+    debug_save_sdfg()
 
     # Step 6: Apply MapTiling to create tiled patterns
     if apply_map_tiling:
@@ -124,12 +146,13 @@ def apply_cutile_pipeline(sdfg: SDFG, *,
             "tile_sizes": tile_shape,
             "skew": True,
         }
-        count += sdfg.apply_transformations(
+        count += sdfg.apply_transformations_once_everywhere(
             [MapTiling],
             validate=validate_all,
             validate_all=validate_all,
             options=options,
         )
+    debug_save_sdfg()
 
     # Step 7: Normalize conditional blocks in NestedSDFGs
     # Duplicate conditions across top-level nodes for each branch.
@@ -137,9 +160,10 @@ def apply_cutile_pipeline(sdfg: SDFG, *,
     # We'll need more tests for this, and actually implement it properly
     # So far we only have tests for sdfgs where this does not apply
     duplicate_conditions_for_whole_sdfgs(sdfg)
+    debug_save_sdfg()
 
     # Step 8: Replace scalar tasklets with library nodes
-    count += sdfg.apply_transformations_once_everywhere(
+    count += sdfg.apply_transformations_repeated(
         [
             ScalarToTileCanonical,
             ScalarToTileMasked,
@@ -148,6 +172,7 @@ def apply_cutile_pipeline(sdfg: SDFG, *,
         validate=validate_all,
         validate_all=validate_all,
     )
+    debug_save_sdfg()
 
     if validate or validate_all:
         sdfg.validate()
