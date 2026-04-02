@@ -32,7 +32,7 @@ from ._base import (
     _op_cpp_expr, _get_tile_descriptors, _resolve_shape_and_scalar_form,
     _build_stride_decls, _resolve_operands, _collect_array_descs,
     _get_all_input_descs, _build_multi_op_code,
-    _BINARY_OPS, _COMPARISON_OPS, _UNARY_OPS,
+    _BINARY_OPS, _UNARY_OPS,
 )
 
 
@@ -186,23 +186,33 @@ for (std::size_t i = 0; i < n; ++i) {{
 
 
 # ── Register all supported ops ──────────────────────────────────────
-
-_BINARY_DISPLAY_NAMES = {"+": "TileAdd", "-": "TileSubtract", "*": "TileMultiply", "/": "TileDivide"}
+_BINARY_DISPLAY_NAMES = {
+    "+": "TileAdd", "-": "TileSubtract", "*": "TileMultiply", "/": "TileDivide",
+    ">": "TileGreaterThan", "<": "TileLessThan",
+    ">=": "TileGreaterEqual", "<=": "TileLessEqual",
+    "==": "TileEqual", "!=": "TileNotEqual",
+}
 _CONST_BINARY_DISPLAY_NAMES = {
     "+": "TileConstAdd", "-": "TileConstSubtract",
     "*": "TileConstMultiply", "/": "TileConstDivide",
+    ">": "TileConstGreaterThan", "<": "TileConstLessThan",
+    ">=": "TileConstGreaterEqual", "<=": "TileConstLessEqual",
+    "==": "TileConstEqual", "!=": "TileConstNotEqual",
 }
 _SYMBOL_BINARY_DISPLAY_NAMES = {
     "+": "TileSymbolAdd", "-": "TileSymbolSubtract",
     "*": "TileSymbolMultiply", "/": "TileSymbolDivide",
+    ">": "TileSymbolGreaterThan", "<": "TileSymbolLessThan",
+    ">=": "TileSymbolGreaterEqual", "<=": "TileSymbolLessEqual",
+    "==": "TileSymbolEqual", "!=": "TileSymbolNotEqual",
 }
 _UNARY_DISPLAY_NAMES = {
     "-": "TileNegate", "abs": "TileAbs", "sin": "TileSin",
     "cos": "TileCos", "exp": "TileExp", "sqrt": "TileSqrt", "log": "TileLog",
 }
 
-for _op in _BINARY_OPS:
-    # Two-array binary
+for _op in [*_BINARY_OPS]:
+    # Two-array binary/comparison
     register_op(
         op=_op,
         tasklet_type=TaskletType.ARRAY_ARRAY,
@@ -252,57 +262,5 @@ for _op in _UNARY_OPS:
         mask=MaskType.UNMASKED,
         node_type=TileOpLibraryNode,
         node_name=_UNARY_DISPLAY_NAMES.get(_op, f"TileUnaryOp_{_op}") + "Const",
-        out="_out",
-    )
-
-
-# ── Comparison ops ───────────────────────────────────────────────────
-
-_CMP_DISPLAY_NAMES = {
-    ">": "TileGreaterThan", "<": "TileLessThan",
-    ">=": "TileGreaterEqual", "<=": "TileLessEqual",
-    "==": "TileEqual", "!=": "TileNotEqual",
-}
-_CMP_CONST_DISPLAY_NAMES = {
-    ">": "TileConstGreaterThan", "<": "TileConstLessThan",
-    ">=": "TileConstGreaterEqual", "<=": "TileConstLessEqual",
-    "==": "TileConstEqual", "!=": "TileConstNotEqual",
-}
-_CMP_SYMBOL_DISPLAY_NAMES = {
-    ">": "TileSymbolGreaterThan", "<": "TileSymbolLessThan",
-    ">=": "TileSymbolGreaterEqual", "<=": "TileSymbolLessEqual",
-    "==": "TileSymbolEqual", "!=": "TileSymbolNotEqual",
-}
-
-for _op in _COMPARISON_OPS:
-    # Two-array comparison
-    register_op(
-        op=_op,
-        tasklet_type=TaskletType.ARRAY_ARRAY,
-        mask=MaskType.UNMASKED,
-        node_type=TileOpLibraryNode,
-        node_name=_CMP_DISPLAY_NAMES[_op],
-        out="_out",
-        rhs1="_a",
-        rhs2="_b",
-    )
-    # Array + constant
-    register_op(
-        op=_op,
-        tasklet_type=TaskletType.ARRAY_SYMBOL,
-        mask=MaskType.UNMASKED,
-        node_type=TileOpLibraryNode,
-        node_name=_CMP_CONST_DISPLAY_NAMES[_op],
-        out="_out",
-        rhs1="_a",
-        rhs2="_b",
-    )
-    # Two constants
-    register_op(
-        op=_op,
-        tasklet_type=TaskletType.SYMBOL_SYMBOL,
-        mask=MaskType.UNMASKED,
-        node_type=TileOpLibraryNode,
-        node_name=_CMP_SYMBOL_DISPLAY_NAMES[_op],
         out="_out",
     )
