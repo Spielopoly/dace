@@ -243,15 +243,77 @@ for (std::size_t i = 0; i < n; ++i) {{
 """
 
 
+# ── Connector utilities ──────────────────────────────────────────────
+
+def _get_connected_sets(node, state) -> tuple[set[str], set[str]]:
+    """Return the sets of connected input and output connector names for *node*."""
+    connected_ins: set[str] = set()
+    for edge in state.in_edges(node):
+        if edge.dst_conn is not None:
+            connected_ins.add(edge.dst_conn)
+    connected_outs: set[str] = set()
+    for edge in state.out_edges(node):
+        if edge.src_conn is not None:
+            connected_outs.add(edge.src_conn)
+    return connected_ins, connected_outs
+
+
 # ── Base library node ────────────────────────────────────────────────
 
 @make_properties
-class _TileOpBase(LibraryNode):
+class _TileNodeBase(LibraryNode):
+    """Abstract base for cuTile library nodes that operate on tiles.
+
+    Provides the ``tile_shape`` property and a reusable
+    ``_validate_connectors_connected`` helper.
+    """
+
+    tile_shape = properties.ListProperty(
+        element_type=int,
+        default=None,
+        desc=(
+            "Tile dimensions, e.g. [128] for a 1-D tile or [32, 32] for 2-D. "
+            "0-D (scalar) tiles can be represented with an empty list []. "
+            "When None, the shape is inferred from the incoming array descriptors "
+            "at expansion time."
+        ),
+        allow_none=True,
+    )
+
+    def _validate_connectors_connected(self, sdfg: SDFG, state: SDFGState, label: str):
+        """Check that every input and output connector is wired to an edge.
+
+        Raises :class:`InvalidSDFGNodeError` for any unconnected connector.
+        """
+        connected_ins, connected_outs = _get_connected_sets(self, state)
+        for conn in self.in_connectors:
+            if conn not in connected_ins:
+                raise InvalidSDFGNodeError(
+                    f"{label} '{self.name}': input connector '{conn}' must be connected.",
+                    sdfg=sdfg,
+                    state_id=state.parent_graph.node_id(state),
+                    node_id=state.node_id(self),
+                )
+        for conn in self.out_connectors:
+            if conn not in connected_outs:
+                raise InvalidSDFGNodeError(
+                    f"{label} '{self.name}': output connector '{conn}' must be connected.",
+                    sdfg=sdfg,
+                    state_id=state.parent_graph.node_id(state),
+                    node_id=state.node_id(self),
+                )
+
+
+@make_properties
+class _TileOpBase(_TileNodeBase):
     """Abstract base for all cuTile element-wise operation library nodes.
 
-    Provides the four shared properties (``op``, ``constant1``,
-    ``constant2``, ``tile_shape``), common constructor logic,
+    Provides the shared properties (``op``, ``constant1``,
+    ``constant2``), common constructor logic,
     ``is_binary``, and a reusable ``_validate_common`` helper.
+
+    Inherits ``tile_shape`` and ``_validate_connectors_connected`` from
+    :class:`_TileNodeBase`.
 
     Concrete subclasses **must** still be decorated with ``@library.node``
     and define their own ``implementations`` / ``default_implementation``.
@@ -287,18 +349,6 @@ class _TileOpBase(LibraryNode):
         dtype=str,
         default=None,
         desc="Right / second constant operand. None means operand comes from _b (binary) or absent (unary).",
-        allow_none=True,
-    )
-
-    tile_shape = properties.ListProperty(
-        element_type=int,
-        default=None,
-        desc=(
-            "Tile dimensions, e.g. [128] for a 1-D tile or [32, 32] for 2-D. "
-            "0-D (scalar) tiles can be represented with an empty list []. "
-            "When None, the shape is inferred from the incoming array descriptors "
-            "at expansion time."
-        ),
         allow_none=True,
     )
 
@@ -344,27 +394,20 @@ class _TileOpBase(LibraryNode):
         *label* is used in error messages (e.g. ``"TileOp"``,
         ``"TileMaskedOp"``).
         """
-        # Find connected nodes in a single pass over edges
-        in_nodes: dict[str, object] = {}
-        for edge in state.in_edges(self):
-            if edge.dst_conn is not None:
-                in_nodes[edge.dst_conn] = edge.src
-        out_nodes: dict[str, object] = {}
-        for edge in state.out_edges(self):
-            if edge.src_conn is not None:
-                out_nodes[edge.src_conn] = edge.dst
-
         out_conn = _get_output_connector_name(self)
-        if out_conn not in out_nodes:
-            raise InvalidSDFGNodeError(
-                f"{label} '{self.name}': output connector {out_conn} must be connected.",
-                sdfg=sdfg,
-                state_id=state.parent_graph.node_id(state),
-                node_id=state.node_id(self),
-            )
 
         if self.expr is not None:
             # Multi-op mode: validate expression symbols match connectors.
+            connected_ins, connected_outs = _get_connected_sets(self, state)
+
+            if out_conn not in connected_outs:
+                raise InvalidSDFGNodeError(
+                    f"{label} '{self.name}': output connector {out_conn} must be connected.",
+                    sdfg=sdfg,
+                    state_id=state.parent_graph.node_id(state),
+                    node_id=state.node_id(self),
+                )
+
             expr_conns = set(_expr_connectors(self.expr))
             if out_conn in expr_conns:
                 raise InvalidSDFGNodeError(
@@ -385,7 +428,7 @@ class _TileOpBase(LibraryNode):
                     node_id=state.node_id(self),
                 )
             for conn in self.in_connectors:
-                if conn not in in_nodes:
+                if conn not in connected_ins:
                     raise InvalidSDFGNodeError(
                         f"{label} '{self.name}': input connector '{conn}' "
                         f"must be connected in multi-op mode.",
@@ -394,6 +437,17 @@ class _TileOpBase(LibraryNode):
                         node_id=state.node_id(self),
                     )
         else:
+            # Classic single-op mode: selective connector checks.
+            connected_ins, connected_outs = _get_connected_sets(self, state)
+
+            if out_conn not in connected_outs:
+                raise InvalidSDFGNodeError(
+                    f"{label} '{self.name}': output connector {out_conn} must be connected.",
+                    sdfg=sdfg,
+                    state_id=state.parent_graph.node_id(state),
+                    node_id=state.node_id(self),
+                )
+
             if self.op not in _ALL_OPS:
                 raise InvalidSDFGNodeError(
                     f"{label} '{self.name}': unsupported op '{self.op}'. "
@@ -412,7 +466,7 @@ class _TileOpBase(LibraryNode):
                     node_id=state.node_id(self),
                 )
 
-            if self.constant1 is None and "_a" not in in_nodes:
+            if self.constant1 is None and "_a" not in connected_ins:
                 raise InvalidSDFGNodeError(
                     f"{label} '{self.name}': connector _a must be connected when constant1 is not set.",
                     sdfg=sdfg,
@@ -420,7 +474,7 @@ class _TileOpBase(LibraryNode):
                     node_id=state.node_id(self),
                 )
 
-            if "_b" in self.in_connectors and self.constant2 is None and "_b" not in in_nodes:
+            if "_b" in self.in_connectors and self.constant2 is None and "_b" not in connected_ins:
                 raise InvalidSDFGNodeError(
                     f"{label} '{self.name}': connector _b must be connected when constant2 is not set.",
                     sdfg=sdfg,

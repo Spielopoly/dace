@@ -24,7 +24,7 @@ from dace.sdfg.validation import InvalidSDFGNodeError
 from dace.symbolic import symstr
 from dace.transformation.transformation import ExpandTransformation
 
-from ._base import _resolve_shape_and_scalar_form, SUPPORTED_MASK_DTYPES
+from ._base import _resolve_shape_and_scalar_form, _TileNodeBase, SUPPORTED_MASK_DTYPES
 
 
 # ── Helper to read tile descriptors for where-select ─────────────────
@@ -61,7 +61,7 @@ def _get_where_descriptors(node: nodes.LibraryNode, state: SDFGState, sdfg: SDFG
 # ── Library node ─────────────────────────────────────────────────────
 
 @library.node
-class TileWhereSelectLibraryNode(nodes.LibraryNode):
+class TileWhereSelectLibraryNode(_TileNodeBase):
     """
     Element-wise conditional selection: ``C = where(cond, X, Y)``.
 
@@ -80,13 +80,6 @@ class TileWhereSelectLibraryNode(nodes.LibraryNode):
     implementations: dict = {}
     default_implementation = "pure"
 
-    tile_shape = properties.ListProperty(
-        element_type=int,
-        default=None,
-        desc="Tile dimensions. When None, inferred from descriptors at expansion time.",
-        allow_none=True,
-    )
-
     def __init__(self, name: str = "TileWhereSelect",
                  tile_shape: Optional[List[int]] = None,
                  **kwargs):
@@ -99,6 +92,7 @@ class TileWhereSelectLibraryNode(nodes.LibraryNode):
         self.tile_shape = tile_shape
 
     def validate(self, sdfg: SDFG, state: SDFGState):
+        self._validate_connectors_connected(sdfg, state, "TileWhereSelect")
         cond_desc, x_desc, y_desc, c_desc = _get_where_descriptors(
             self, state, sdfg)
 

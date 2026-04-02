@@ -34,6 +34,7 @@ from dace.libraries.cutile.op_registry import (
     match_tasklet_to_tile_library_node,
     MaskType,
 )
+from sympy.parsing.sympy_parser import parse_expr
 
 
 # ── Helpers ──────────────────────────────────────────────────────────
@@ -59,6 +60,33 @@ def _to_sympy_condition(
         return None
 
     return expr
+
+
+def _build_sympy_expr(
+    op: str, left: sp.Basic, right: Optional[sp.Basic] = None,
+) -> sp.Basic:
+    """Build a SymPy expression from a classified operation.
+
+    Parameters
+    ----------
+    op : str
+        Operation string (e.g. ``"+"``, ``"abs"``, ``"sin"``).
+    left : sp.Basic
+        Left / first operand (Symbol or Number).
+    right : sp.Basic or None
+        Right / second operand.  ``None`` for unary operations.
+
+    Returns
+    -------
+    sp.Basic
+    """
+    if left is None:
+        raise ValueError("Left operand cannot be None")
+    if op is None:
+        raise ValueError("Operator cannot be None")
+    if right is None:
+        return parse_expr(f"{op}({left})")
+    return parse_expr(f"({left}) {op} ({right})")
 
 
 # ── Transformation ───────────────────────────────────────────────────
@@ -374,60 +402,37 @@ class IfElseMapToTileWhere(xf.SingleStateTransformation):
             assert match is not None
             branch_cls[tag] = (match, tasklets[0])
 
-        true_cls = branch_cls["true"][0].tasklet_classification
-        false_cls = branch_cls["false"][0].tasklet_classification
+        # ── 7. Build SymPy expressions for branches ─────────────────
+        # Collect NSDFG arrays used by branch operands.
+        needed_nsdfg_names: List[str] = []
+        # tag → {"rhs1": nsdfg_array, "rhs2": nsdfg_array} for non-constant operands
+        branch_operand_arrays: Dict[str, Dict[str, str]] = {}
 
-        # Determine effective constants per branch.  Unary negate (-A)
-        # must be expressed as binary ``0 - A`` for the compound node
-        # because "-" is in _BINARY_OPS and the validator expects rhs2.
-        branch_const: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
-        for tag in ("true", "false"):
-            cls = branch_cls[tag][0].tasklet_classification
-            c1, c2 = cls.constant1, cls.constant2
-            if (cls.op == "-" and cls.rhs2 is None
-                    and c1 is None and c2 is None):
-                # Unary negate → binary 0 - A
-                c1 = "0"
-            branch_const[tag] = (c1, c2)
-
-        # ── 7. Build input_roles for the compound node ───────────────
-        # Map NSDFG array names → list of roles they fulfil.
-        nsdfg_roles: Dict[str, List[str]] = {}
-
-        # Branch roles (true / false)
         for tag, bstate in [("true", true_state), ("false", false_state)]:
             cls = branch_cls[tag][0].tasklet_classification
             tasklet = branch_cls[tag][1]
             inp_map = self._get_tasklet_input_mapping(bstate, tasklet)
-            is_unary_negate = (cls.op == "-" and cls.rhs2 is None
-                               and cls.constant1 is None
-                               and cls.constant2 is None)
-            if is_unary_negate:
-                # rhs1 becomes rhs2 (binary 0 - A)
-                if cls.rhs1 is not None:
-                    arr = inp_map.get(cls.rhs1)
-                    if arr is not None:
-                        nsdfg_roles.setdefault(arr, []).append(
-                            f"{tag}_rhs2")
-            else:
-                if cls.rhs1 is not None and cls.constant1 is None:
-                    arr = inp_map.get(cls.rhs1)
-                    if arr is not None:
-                        nsdfg_roles.setdefault(arr, []).append(
-                            f"{tag}_rhs1")
-                if cls.rhs2 is not None and cls.constant2 is None:
-                    arr = inp_map.get(cls.rhs2)
-                    if arr is not None:
-                        nsdfg_roles.setdefault(arr, []).append(
-                            f"{tag}_rhs2")
+            operand_arrays: Dict[str, str] = {}
+            if cls.rhs1 is not None and cls.constant1 is None:
+                arr = inp_map.get(cls.rhs1)
+                if arr is not None:
+                    operand_arrays["rhs1"] = arr
+                    if arr not in needed_nsdfg_names:
+                        needed_nsdfg_names.append(arr)
+            if cls.rhs2 is not None and cls.constant2 is None:
+                arr = inp_map.get(cls.rhs2)
+                if arr is not None:
+                    operand_arrays["rhs2"] = arr
+                    if arr not in needed_nsdfg_names:
+                        needed_nsdfg_names.append(arr)
+            branch_operand_arrays[tag] = operand_arrays
 
-        # Assign numbered connectors to unique outer arrays referenced by
-        # either branch operands or condition symbols.
-        needed_nsdfg_names = list(nsdfg_roles.keys())
+        # Add condition symbols.
         for sym in cond_symbols:
             if sym not in needed_nsdfg_names:
                 needed_nsdfg_names.append(sym)
 
+        # Assign numbered connectors to unique outer arrays.
         outer_to_conn: Dict[str, str] = {}
         conn_idx = 0
         for nsdfg_name in needed_nsdfg_names:
@@ -436,8 +441,32 @@ class IfElseMapToTileWhere(xf.SingleStateTransformation):
                 outer_to_conn[outer_name] = f"_in{conn_idx}"
                 conn_idx += 1
 
-        # Rewrite condition symbols from NSDFG names to connector names
-        # expected by the compound node expansion.
+        def _nsdfg_to_conn_sym(name: str) -> sp.Symbol:
+            return sp.Symbol(outer_to_conn[nsdfg_to_outer[name]])
+
+        # Build a SymPy expression for each branch.
+        branch_exprs: Dict[str, sp.Basic] = {}
+        for tag in ("true", "false"):
+            cls = branch_cls[tag][0].tasklet_classification
+            oa = branch_operand_arrays[tag]
+            # Left / first operand
+            if cls.constant1 is not None:
+                left = sp.sympify(cls.constant1)
+            elif "rhs1" in oa:
+                left = _nsdfg_to_conn_sym(oa["rhs1"])
+            else:
+                raise ValueError(
+                    f"IfElseMapToTileWhere: {tag} branch has no left operand"
+                )
+            # Right / second operand (None for unary)
+            right: Optional[sp.Basic] = None
+            if cls.constant2 is not None:
+                right = sp.sympify(cls.constant2)
+            elif "rhs2" in oa:
+                right = _nsdfg_to_conn_sym(oa["rhs2"])
+            branch_exprs[tag] = _build_sympy_expr(cls.op, left, right)
+
+        # Rewrite condition symbols from NSDFG names to connector names.
         cond_subs = {}
         for fsym in cond_sympy.free_symbols:
             sym = str(fsym)
@@ -456,27 +485,13 @@ class IfElseMapToTileWhere(xf.SingleStateTransformation):
             cond_subs[fsym] = sp.Symbol(conn_name)
         node_condition = cond_sympy.xreplace(cond_subs)
 
-        # Build input_roles: connector → list of roles
-        input_roles: Dict[str, List[str]] = {}
-        for nsdfg_name, roles in nsdfg_roles.items():
-            outer_name = nsdfg_to_outer.get(nsdfg_name)
-            if outer_name is not None and outer_name in outer_to_conn:
-                conn = outer_to_conn[outer_name]
-                input_roles.setdefault(conn, []).extend(roles)
-
         # ── 8. Create TileIfElseOpLibraryNode ────────────────────────
         compound_node = TileIfElseOpLibraryNode(
             name="TileIfElseOp",
             condition=node_condition,
-            true_op=true_cls.op,
-            true_constant1=branch_const["true"][0],
-            true_constant2=branch_const["true"][1],
-            false_op=false_cls.op,
-            false_constant1=branch_const["false"][0],
-            false_constant2=branch_const["false"][1],
+            true_expr=branch_exprs["true"],
+            false_expr=branch_exprs["false"],
             tile_shape=list(tile_shape),
-            input_roles=input_roles,
-            num_inputs=len(outer_to_conn),
         )
         graph.add_node(compound_node)
 

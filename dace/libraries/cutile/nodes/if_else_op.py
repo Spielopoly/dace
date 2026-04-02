@@ -4,99 +4,51 @@ element-wise tile operations.
 
 Encapsulates the pattern::
 
-    C = where(condition(...), true_op(...), false_op(...))
+    C = where(condition(...), true_expr(...), false_expr(...))
 
 The expansion SDFG composes four inner library nodes:
 
 1. ``TileOpLibraryNode`` (with ``expr``) evaluating the SymPy condition
-2. ``TileOpLibraryNode`` for the true branch
-3. ``TileOpLibraryNode`` for the false branch
+2. ``TileOpLibraryNode`` for the true branch expression
+3. ``TileOpLibraryNode`` for the false branch expression
 4. ``TileWhereSelectLibraryNode`` for the final selection
 """
 from __future__ import annotations
 
-from typing import List, Optional, cast
+from typing import cast
 
 import sympy as sp
 
 import dace
 from dace import library, properties
 from dace.sdfg import SDFG, SDFGState, nodes
-from dace.sdfg.nodes import LibraryNode
 from dace.sdfg.validation import InvalidSDFGNodeError
 from dace.transformation.transformation import ExpandTransformation
 
 from .op import TileOpLibraryNode
 from .where_select import TileWhereSelectLibraryNode
-from ._base import _BINARY_OPS, _COMPARISON_OPS, _ALL_OPS
-
-
-def _get_if_else_descriptors(node, state, sdfg):
-    """Return *(in_descs, out_desc)* for a TileIfElseOpLibraryNode.
-
-    *in_descs* maps connector name (``_in0``, ``_in1``, …) to the
-    corresponding array descriptor from the parent SDFG.
-    *out_desc* is the descriptor for ``_out``.
-    """
-    in_descs = {}
-    out_desc = None
-    for edge in state.in_edges(node):
-        arr_name = edge.data.data
-        if arr_name is None:
-            continue
-        conn = edge.dst_conn
-        if conn is not None:
-            in_descs[conn] = sdfg.arrays[arr_name]
-    for edge in state.out_edges(node):
-        arr_name = edge.data.data
-        if arr_name is None:
-            continue
-        if edge.src_conn == "_out":
-            out_desc = sdfg.arrays[arr_name]
-    if out_desc is None:
-        raise ValueError(
-            f"TileIfElseOp expansion: _out not connected for node "
-            f"'{node.name}'."
-        )
-    return in_descs, out_desc
-
-
-def _required_roles(node):
-    """Return the set of roles required by *node*'s configuration."""
-    required = set()
-    # True branch
-    if node.true_constant1 is None:
-        required.add("true_rhs1")
-    if (node.true_op in _BINARY_OPS or node.true_op in _COMPARISON_OPS):
-        if node.true_constant2 is None:
-            required.add("true_rhs2")
-    # False branch
-    if node.false_constant1 is None:
-        required.add("false_rhs1")
-    if (node.false_op in _BINARY_OPS or node.false_op in _COMPARISON_OPS):
-        if node.false_constant2 is None:
-            required.add("false_rhs2")
-    return required
+from ._base import _TileNodeBase, _get_all_input_descs
 
 
 # ── Library node ─────────────────────────────────────────────────────
 
 @library.node
-class TileIfElseOpLibraryNode(LibraryNode):
+class TileIfElseOpLibraryNode(_TileNodeBase):
     """
     Compound library node for conditional element-wise tile operations.
 
     ::
 
-        C = where(condition(...), true_op(...), false_op(...))
+        C = where(condition(...), true_expr(...), false_expr(...))
 
-    The output connector is named ``_out`` (not ``_c``) to avoid
-    name collisions with the ``_out`` connectors of expanded inner
-    TileOp / TileWhereSelect tasklets inside the expansion SDFG.
+    The three SymPy expressions (``condition``, ``true_expr``,
+    ``false_expr``) define the behaviour.  Input connectors are
+    derived automatically from the union of free symbols across all
+    three expressions.
 
     Connectors
     ----------
-    _in0, _in1, …  (in)  : input tiles (count set at construction)
+    _in0, _in1, …  (in)  : input tiles (derived from expressions)
     _out            (out) : result tile
     """
 
@@ -111,161 +63,66 @@ class TileIfElseOpLibraryNode(LibraryNode):
             "(e.g., _in0, _in1)."
         ),
     )
-    true_op = properties.Property(
-        dtype=str, default="+",
-        desc="Operation for the true branch.",
+    true_expr = properties.Property(
+        dtype=sp.Basic, default=None, allow_none=True,
+        desc=(
+            "SymPy expression for the true branch. "
+            "Its free symbols must be a subset of input connectors."
+        ),
     )
-    true_constant1 = properties.Property(
-        dtype=str, default=None, allow_none=True,
-        desc="True branch left/first constant operand.",
-    )
-    true_constant2 = properties.Property(
-        dtype=str, default=None, allow_none=True,
-        desc="True branch right/second constant operand.",
-    )
-    false_op = properties.Property(
-        dtype=str, default="+",
-        desc="Operation for the false branch.",
-    )
-    false_constant1 = properties.Property(
-        dtype=str, default=None, allow_none=True,
-        desc="False branch left/first constant operand.",
-    )
-    false_constant2 = properties.Property(
-        dtype=str, default=None, allow_none=True,
-        desc="False branch right/second constant operand.",
-    )
-    tile_shape = properties.ListProperty(
-        element_type=int, default=None, allow_none=True,
-        desc="Tile dimensions. None means inferred at expansion time.",
-    )
-    input_roles = properties.DictProperty(
-        key_type=str, value_type=list,
-        allow_none=True, default=None,
-        desc="Maps connector name to list of roles, e.g. "
-             "{'_in0': ['cond_left', 'true_rhs1']}.",
+    false_expr = properties.Property(
+        dtype=sp.Basic, default=None, allow_none=True,
+        desc=(
+            "SymPy expression for the false branch. "
+            "Its free symbols must be a subset of input connectors."
+        ),
     )
 
     def __init__(self, name="TileIfElseOp", *,
-                 condition=None,
-                 true_op="+", true_constant1=None, true_constant2=None,
-                 false_op="+", false_constant1=None, false_constant2=None,
-                 tile_shape=None, input_roles=None, num_inputs=1, **kwargs):
-        inputs = {f"_in{i}" for i in range(num_inputs)}
+                 condition=None, true_expr=None, false_expr=None,
+                 tile_shape=None, num_inputs=None, **kwargs):
+        if num_inputs is not None:
+            inputs = {f"_in{i}" for i in range(num_inputs)}
+        else:
+            all_symbols: set[str] = set()
+            for expr in (condition, true_expr, false_expr):
+                if expr is not None:
+                    all_symbols.update(
+                        str(s) for s in expr.free_symbols
+                        if isinstance(s, sp.Symbol)
+                    )
+            inputs = all_symbols
         super().__init__(name, inputs=inputs, outputs={"_out"}, **kwargs)
         self.condition = condition
-        self.true_op = true_op
-        self.true_constant1 = true_constant1
-        self.true_constant2 = true_constant2
-        self.false_op = false_op
-        self.false_constant1 = false_constant1
-        self.false_constant2 = false_constant2
+        self.true_expr = true_expr
+        self.false_expr = false_expr
         self.tile_shape = tile_shape
-        self.input_roles = input_roles if input_roles is not None else {}
 
     def validate(self, sdfg: SDFG, state: SDFGState):
+        self._validate_connectors_connected(sdfg, state, "TileIfElseOp")
+
         sid = state.parent_graph.node_id(state)
         nid = state.node_id(self)
 
-        # --- condition validity ---
-        if self.condition is None:
-            raise InvalidSDFGNodeError(
-                f"TileIfElseOp '{self.name}': condition must be set.",
-                sdfg=sdfg, state_id=sid, node_id=nid,
-            )
-
-        cond_symbols = {str(sym) for sym in self.condition.free_symbols}
-        bad_symbols = cond_symbols - set(self.in_connectors)
-        if bad_symbols:
-            raise InvalidSDFGNodeError(
-                f"TileIfElseOp '{self.name}': condition symbol(s) "
-                f"{bad_symbols} do not match input connectors "
-                f"{set(self.in_connectors)}.",
-                sdfg=sdfg, state_id=sid, node_id=nid,
-            )
-
-        # --- operator validity ---
-        if self.true_op not in _ALL_OPS:
-            raise InvalidSDFGNodeError(
-                f"TileIfElseOp '{self.name}': true_op '{self.true_op}' "
-                f"not in {_ALL_OPS}",
-                sdfg=sdfg, state_id=sid, node_id=nid,
-            )
-        if self.false_op not in _ALL_OPS:
-            raise InvalidSDFGNodeError(
-                f"TileIfElseOp '{self.name}': false_op '{self.false_op}' "
-                f"not in {_ALL_OPS}",
-                sdfg=sdfg, state_id=sid, node_id=nid,
-            )
-
-        # --- all input connectors must be connected ---
-        connected_ins = set()
-        for edge in state.in_edges(self):
-            if edge.dst_conn is not None:
-                connected_ins.add(edge.dst_conn)
-        for conn in self.in_connectors:
-            if conn not in connected_ins:
+        for attr_name in ("condition", "true_expr", "false_expr"):
+            if getattr(self, attr_name) is None:
                 raise InvalidSDFGNodeError(
-                    f"TileIfElseOp '{self.name}': input connector "
-                    f"{conn} not connected.",
+                    f"TileIfElseOp '{self.name}': {attr_name} must be set.",
                     sdfg=sdfg, state_id=sid, node_id=nid,
                 )
 
-        # --- output _out must be connected ---
-        connected_outs = set()
-        for edge in state.out_edges(self):
-            if edge.src_conn is not None:
-                connected_outs.add(edge.src_conn)
-        if "_out" not in connected_outs:
-            raise InvalidSDFGNodeError(
-                f"TileIfElseOp '{self.name}': output _out not connected.",
-                sdfg=sdfg, state_id=sid, node_id=nid,
-            )
-
-        # --- input_roles keys must reference valid input connectors ---
-        role_map = self.input_roles or {}
-        invalid_role_keys = set(role_map.keys()) - set(self.in_connectors)
-        if invalid_role_keys:
-            raise InvalidSDFGNodeError(
-                f"TileIfElseOp '{self.name}': input_roles contain unknown "
-                f"connector(s): {invalid_role_keys}",
-                sdfg=sdfg, state_id=sid, node_id=nid,
-            )
-        dangling_role_keys = set(role_map.keys()) - connected_ins
-        if dangling_role_keys:
-            raise InvalidSDFGNodeError(
-                f"TileIfElseOp '{self.name}': input_roles reference "
-                f"unconnected connector(s): {dangling_role_keys}",
-                sdfg=sdfg, state_id=sid, node_id=nid,
-            )
-
-        # --- each semantic role must be assigned at most once ---
-        role_owner: dict[str, str] = {}
-        duplicate_roles: set[str] = set()
-        for conn, roles in role_map.items():
-            for role in roles:
-                if role in role_owner and role_owner[role] != conn:
-                    duplicate_roles.add(role)
-                else:
-                    role_owner[role] = conn
-        if duplicate_roles:
-            raise InvalidSDFGNodeError(
-                f"TileIfElseOp '{self.name}': role(s) assigned more than "
-                f"once: {duplicate_roles}",
-                sdfg=sdfg, state_id=sid, node_id=nid,
-            )
-
-        # --- input_roles must cover all required roles ---
-        all_assigned = set()
-        for roles in role_map.values():
-            all_assigned.update(roles)
-        missing = _required_roles(self) - all_assigned
-        if missing:
-            raise InvalidSDFGNodeError(
-                f"TileIfElseOp '{self.name}': input_roles missing "
-                f"required roles: {missing}",
-                sdfg=sdfg, state_id=sid, node_id=nid,
-            )
+        in_conns = set(self.in_connectors)
+        for attr_name in ("condition", "true_expr", "false_expr"):
+            expr = getattr(self, attr_name)
+            expr_syms = {str(s) for s in expr.free_symbols
+                         if isinstance(s, sp.Symbol)}
+            bad = expr_syms - in_conns
+            if bad:
+                raise InvalidSDFGNodeError(
+                    f"TileIfElseOp '{self.name}': {attr_name} symbol(s) "
+                    f"{bad} do not match input connectors {in_conns}.",
+                    sdfg=sdfg, state_id=sid, node_id=nid,
+                )
 
 
 # ── Expansion ────────────────────────────────────────────────────────
@@ -281,7 +138,7 @@ class ExpandTileIfElseOpPure(ExpandTransformation):
     def expansion(node: TileIfElseOpLibraryNode, state: SDFGState,
                   sdfg: SDFG) -> SDFG:
         node = cast(TileIfElseOpLibraryNode, node)
-        in_descs, out_desc = _get_if_else_descriptors(node, state, sdfg)
+        in_descs, out_desc = _get_all_input_descs(node, state, sdfg)
 
         # ── inner SDFG skeleton ──────────────────────────────────────
         inner_sdfg = SDFG(node.name + "_sdfg")
@@ -293,8 +150,7 @@ class ExpandTileIfElseOpPure(ExpandTransformation):
                 strides=desc.strides, storage=desc.storage,
             )
 
-        # Non-transient output (named _out to avoid clashing with the
-        # _c connector on the inner TileOp / TileWhereSelect tasklets)
+        # Non-transient output
         inner_sdfg.add_array(
             "_out", shape=out_desc.shape, dtype=out_desc.dtype,
             strides=out_desc.strides, storage=out_desc.storage,
@@ -318,51 +174,24 @@ class ExpandTileIfElseOpPure(ExpandTransformation):
 
         inner_state = inner_sdfg.add_state(node.name + "_state")
 
-        # ── reverse-map: role → connector name ───────────────────────
-        role_to_input: dict[str, str] = {}
-        for conn, roles in (node.input_roles or {}).items():
-            for role in roles:
-                role_to_input[role] = conn
-
-        # ── inner library nodes ──────────────────────────────────────
-        true_node = TileOpLibraryNode(
-            "true_branch", op=node.true_op,
-            tile_shape=node.tile_shape,
-            constant1=node.true_constant1,
-            constant2=node.true_constant2,
-            out_connector="__true_out",
-        )
-        false_node = TileOpLibraryNode(
-            "false_branch", op=node.false_op,
-            tile_shape=node.tile_shape,
-            constant1=node.false_constant1,
-            constant2=node.false_constant2,
-            out_connector="__false_out",
-        )
-        where_node = TileWhereSelectLibraryNode(
-            "where", tile_shape=node.tile_shape,
-        )
-
-        # Build condition node using TileOpLibraryNode with an expr.
-        #
-        # The inner SDFG arrays are named '_in0', '_in1', etc.  DaCe
-        # forbids tasklet connector names from matching SDFG array names,
-        # so we rename the condition symbols to '_ci0', '_ci1', etc.
-        # ('ci' = condition input) and wire back to the original arrays.
-        if node.condition is None:
-            raise ValueError(
-                f"TileIfElseOp expansion: condition is missing for node "
-                f"'{node.name}'."
+        # ── helper: rename expression symbols with a prefix ──────────
+        def _rename_expr(expr, prefix):
+            """Rename free symbols in *expr* to ``{prefix}{i}`` and
+            return ``(renamed_expr, {orig_sym_name: new_name})``."""
+            syms = sorted(
+                str(s) for s in expr.free_symbols
+                if isinstance(s, sp.Symbol)
             )
+            rename_map = {s: f"{prefix}{i}" for i, s in enumerate(syms)}
+            renamed = expr.xreplace(
+                {sp.Symbol(s): sp.Symbol(rename_map[s]) for s in syms}
+            )
+            return renamed, rename_map
 
-        cond_syms = sorted(
-            str(s) for s in node.condition.free_symbols if isinstance(s, sp.Symbol)
-        )
-        # Map: original symbol name → renamed connector name
-        cond_conn_rename = {s: f"_ci{i}" for i, s in enumerate(cond_syms)}
-        cond_expr_renamed = node.condition.xreplace(
-            {sp.Symbol(s): sp.Symbol(cond_conn_rename[s]) for s in cond_syms}
-        )
+        # ── build inner library nodes ────────────────────────────────
+        cond_expr_renamed, cond_rename = _rename_expr(node.condition, "_ci")
+        true_expr_renamed, true_rename = _rename_expr(node.true_expr, "_ti")
+        false_expr_renamed, false_rename = _rename_expr(node.false_expr, "_fi")
 
         cond_node = TileOpLibraryNode(
             "condition_eval",
@@ -370,53 +199,42 @@ class ExpandTileIfElseOpPure(ExpandTransformation):
             tile_shape=node.tile_shape,
             out_connector="__cond_out",
         )
+        true_node = TileOpLibraryNode(
+            "true_branch",
+            expr=true_expr_renamed,
+            tile_shape=node.tile_shape,
+            out_connector="__true_out",
+        )
+        false_node = TileOpLibraryNode(
+            "false_branch",
+            expr=false_expr_renamed,
+            tile_shape=node.tile_shape,
+            out_connector="__false_out",
+        )
+        where_node = TileWhereSelectLibraryNode(
+            "where", tile_shape=node.tile_shape,
+        )
 
         inner_state.add_node(cond_node)
         inner_state.add_node(true_node)
         inner_state.add_node(false_node)
         inner_state.add_node(where_node)
 
-        # ── helper: wire _inX → sub-node connector via role ──────────
-        def _wire_input(role, sub_node, sub_conn):
-            if role not in role_to_input:
-                return  # operand is a constant – no array connection
-            in_conn = role_to_input[role]
-            if in_conn not in inner_sdfg.arrays:
-                raise ValueError(
-                    f"TileIfElseOp expansion: role '{role}' references "
-                    f"unknown input connector '{in_conn}' for node "
-                    f"'{node.name}'."
+        # ── helper: wire renamed connectors to inner SDFG arrays ─────
+        def _wire_sub_node(sub_node, rename_map):
+            for orig_sym, new_conn in sorted(rename_map.items()):
+                acc = inner_state.add_read(orig_sym)
+                desc = inner_sdfg.arrays[orig_sym]
+                inner_state.add_edge(
+                    acc, None, sub_node, new_conn,
+                    dace.Memlet.from_array(orig_sym, desc),
                 )
-            access = inner_state.add_read(in_conn)
-            desc = inner_sdfg.arrays[in_conn]
-            inner_state.add_edge(
-                access, None, sub_node, sub_conn,
-                dace.Memlet.from_array(in_conn, desc),
-            )
 
-        # Wire condition inputs: renamed connector ← original inner SDFG array
-        for orig_sym, ci_conn in sorted(cond_conn_rename.items()):
-            cond_acc = inner_state.add_read(orig_sym)
-            desc = inner_sdfg.arrays[orig_sym]
-            inner_state.add_edge(
-                cond_acc,
-                None,
-                cond_node,
-                ci_conn,
-                dace.Memlet.from_array(orig_sym, desc),
-            )
-
-        # Wire true branch
-        _wire_input("true_rhs1", true_node, "_a")
-        _wire_input("true_rhs2", true_node, "_b")
-
-        # Wire false branch
-        _wire_input("false_rhs1", false_node, "_a")
-        _wire_input("false_rhs2", false_node, "_b")
+        _wire_sub_node(cond_node, cond_rename)
+        _wire_sub_node(true_node, true_rename)
+        _wire_sub_node(false_node, false_rename)
 
         # ── sub-node outputs → transients → where-select ─────────────
-        # Use a single access node per transient so that a clear
-        # dataflow path (write → read) is visible within the state.
         cond_acc = inner_state.add_access("cond_tile")
         true_acc = inner_state.add_access("true_tile")
         false_acc = inner_state.add_access("false_tile")
