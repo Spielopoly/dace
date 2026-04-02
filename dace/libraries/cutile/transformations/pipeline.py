@@ -34,6 +34,90 @@ def _simplify(sdfg: SDFG):
     sdfg.simplify()
 
 
+def _apply_map_tiling_to_all_maps(sdfg: SDFG,
+                                   tile_shape: tuple[int, ...],
+                                   validate: bool = False) -> int:
+    """
+    Apply MapTiling to all MapEntry nodes in the SDFG.
+    
+    This function collects all MapEntry nodes before tiling begins, then applies
+    MapTiling to each one individually. This ensures that all original maps are
+    tiled, not just the first one found by pattern matching.
+    
+    The transformation is applied only once per original map to avoid re-tiling
+    newly created tile maps, which would cause an infinite loop.
+    
+    Applicability: MapTiling is applied to each map if:
+      - The map_entry node still exists in its state (may be removed by earlier tiling)
+      - The map_entry is still a valid MapEntry node
+      - The transformation itself succeeds (see notes below)
+    
+    Exception Handling: This function uses narrow exception handling:
+      - ValueError is caught when MapTiling.apply_to() fails (e.g., incompatible map structure)
+      - This allows graceful skipping of maps that cannot be tiled, while letting
+        unexpected errors propagate for visibility
+      - Unexpected exceptions (KeyError, IndexError, etc.) will bubble up to signal
+        potential bugs in the SDFG structure or MapTiling logic
+    
+    Parameters
+    ----------
+    sdfg : SDFG
+        The SDFG to transform.
+    tile_shape : tuple[int, ...]
+        Tile sizes for MapTiling.
+    validate : bool
+        Whether to validate after each transformation.
+    
+    Returns
+    -------
+    int
+        Total number of MapTiling transformations applied.
+    """
+    count = 0
+    
+    # Collect all MapEntry nodes from all states before any tiling
+    map_entries_to_tile = []
+    for state in sdfg.all_states():
+        for node in state.nodes():
+            if isinstance(node, sdfg_nodes.MapEntry):
+                map_entries_to_tile.append((state, node))
+            elif isinstance(node, sdfg_nodes.NestedSDFG):
+                count += _apply_map_tiling_to_all_maps(node.sdfg, tile_shape, validate)
+    
+    # Apply MapTiling to each original MapEntry exactly once
+    options = {
+        "tile_sizes": tile_shape,
+        "skew": True,
+        "tile_trivial": True,
+    }
+    
+    for state, map_entry in map_entries_to_tile:
+        # Check that the map entry still exists in the state
+        # (it may have been removed or transformed by previous tiling)
+        if map_entry not in state.nodes():
+            continue
+        
+        # Verify the node is still a valid MapEntry before attempting
+        if not isinstance(map_entry, sdfg_nodes.MapEntry):
+            continue
+            
+        try:
+            # Apply MapTiling directly to this map entry.
+            # MapTiling.apply_to() raises ValueError if the transformation
+            # cannot be applied (e.g., map structure incompatible with tiling).
+            MapTiling.apply_to(sdfg, options=options, map_entry=map_entry, verify=True)
+            count += 1
+            if validate:
+                sdfg.validate()
+        except ValueError:
+            # MapTiling.apply_to() raises ValueError when can_be_applied() fails
+            # or when transformation preconditions are not met. Skip this map.
+            # Examples: map that is already trivially tiled, maps with complex memlet patterns.
+            continue
+    
+    return count
+
+
 def apply_cutile_pipeline(sdfg: SDFG, *,
                           validate: bool = True,
                           validate_all: bool = True,
@@ -142,15 +226,10 @@ def apply_cutile_pipeline(sdfg: SDFG, *,
 
     # Step 6: Apply MapTiling to create tiled patterns
     if apply_map_tiling:
-        options = {
-            "tile_sizes": tile_shape,
-            "skew": True,
-        }
-        count += sdfg.apply_transformations_once_everywhere(
-            [MapTiling],
+        count += _apply_map_tiling_to_all_maps(
+            sdfg,
+            tile_shape=tile_shape,
             validate=validate_all,
-            validate_all=validate_all,
-            options=options,
         )
     debug_save_sdfg()
 
@@ -172,6 +251,10 @@ def apply_cutile_pipeline(sdfg: SDFG, *,
         validate=validate_all,
         validate_all=validate_all,
     )
+    debug_save_sdfg()
+    
+    # Step 9: Simplify again
+    _simplify(sdfg)
     debug_save_sdfg()
 
     if validate or validate_all:
