@@ -8,14 +8,14 @@ Encapsulates the pattern::
 
 The expansion SDFG composes four inner library nodes:
 
-1. A tasklet that evaluates the SymPy condition expression
+1. ``TileOpLibraryNode`` (with ``expr``) evaluating the SymPy condition
 2. ``TileOpLibraryNode`` for the true branch
 3. ``TileOpLibraryNode`` for the false branch
 4. ``TileWhereSelectLibraryNode`` for the final selection
 """
 from __future__ import annotations
 
-from typing import Any, List, Optional
+from typing import List, Optional, cast
 
 import sympy as sp
 
@@ -24,7 +24,6 @@ from dace import library, properties
 from dace.sdfg import SDFG, SDFGState, nodes
 from dace.sdfg.nodes import LibraryNode
 from dace.sdfg.validation import InvalidSDFGNodeError
-from dace.symbolic import symstr
 from dace.transformation.transformation import ExpandTransformation
 
 from .op import TileOpLibraryNode
@@ -92,7 +91,7 @@ class TileIfElseOpLibraryNode(LibraryNode):
         C = where(condition(...), true_op(...), false_op(...))
 
     The output connector is named ``_out`` (not ``_c``) to avoid
-    name collisions with the ``_c`` connectors of expanded inner
+    name collisions with the ``_out`` connectors of expanded inner
     TileOp / TileWhereSelect tasklets inside the expansion SDFG.
 
     Connectors
@@ -223,9 +222,42 @@ class TileIfElseOpLibraryNode(LibraryNode):
                 sdfg=sdfg, state_id=sid, node_id=nid,
             )
 
+        # --- input_roles keys must reference valid input connectors ---
+        role_map = self.input_roles or {}
+        invalid_role_keys = set(role_map.keys()) - set(self.in_connectors)
+        if invalid_role_keys:
+            raise InvalidSDFGNodeError(
+                f"TileIfElseOp '{self.name}': input_roles contain unknown "
+                f"connector(s): {invalid_role_keys}",
+                sdfg=sdfg, state_id=sid, node_id=nid,
+            )
+        dangling_role_keys = set(role_map.keys()) - connected_ins
+        if dangling_role_keys:
+            raise InvalidSDFGNodeError(
+                f"TileIfElseOp '{self.name}': input_roles reference "
+                f"unconnected connector(s): {dangling_role_keys}",
+                sdfg=sdfg, state_id=sid, node_id=nid,
+            )
+
+        # --- each semantic role must be assigned at most once ---
+        role_owner: dict[str, str] = {}
+        duplicate_roles: set[str] = set()
+        for conn, roles in role_map.items():
+            for role in roles:
+                if role in role_owner and role_owner[role] != conn:
+                    duplicate_roles.add(role)
+                else:
+                    role_owner[role] = conn
+        if duplicate_roles:
+            raise InvalidSDFGNodeError(
+                f"TileIfElseOp '{self.name}': role(s) assigned more than "
+                f"once: {duplicate_roles}",
+                sdfg=sdfg, state_id=sid, node_id=nid,
+            )
+
         # --- input_roles must cover all required roles ---
         all_assigned = set()
-        for roles in (self.input_roles or {}).values():
+        for roles in role_map.values():
             all_assigned.update(roles)
         missing = _required_roles(self) - all_assigned
         if missing:
@@ -248,6 +280,7 @@ class ExpandTileIfElseOpPure(ExpandTransformation):
     @staticmethod
     def expansion(node: TileIfElseOpLibraryNode, state: SDFGState,
                   sdfg: SDFG) -> SDFG:
+        node = cast(TileIfElseOpLibraryNode, node)
         in_descs, out_desc = _get_if_else_descriptors(node, state, sdfg)
 
         # ── inner SDFG skeleton ──────────────────────────────────────
@@ -297,95 +330,45 @@ class ExpandTileIfElseOpPure(ExpandTransformation):
             tile_shape=node.tile_shape,
             constant1=node.true_constant1,
             constant2=node.true_constant2,
+            out_connector="__true_out",
         )
         false_node = TileOpLibraryNode(
             "false_branch", op=node.false_op,
             tile_shape=node.tile_shape,
             constant1=node.false_constant1,
             constant2=node.false_constant2,
+            out_connector="__false_out",
         )
         where_node = TileWhereSelectLibraryNode(
             "where", tile_shape=node.tile_shape,
         )
 
-        # Build condition-evaluation tasklet from SymPy expression.
+        # Build condition node using TileOpLibraryNode with an expr.
+        #
+        # The inner SDFG arrays are named '_in0', '_in1', etc.  DaCe
+        # forbids tasklet connector names from matching SDFG array names,
+        # so we rename the condition symbols to '_ci0', '_ci1', etc.
+        # ('ci' = condition input) and wire back to the original arrays.
         if node.condition is None:
             raise ValueError(
                 f"TileIfElseOp expansion: condition is missing for node "
                 f"'{node.name}'."
             )
-        cond_connectors = sorted({str(sym) for sym in node.condition.free_symbols})
-        for conn in cond_connectors:
-            if conn not in in_descs:
-                raise ValueError(
-                    f"TileIfElseOp expansion: condition symbol '{conn}' "
-                    f"is not wired as an input connector for node "
-                    f"'{node.name}'."
-                )
 
-        cond_expr = node.condition.xreplace(
-            {sp.Symbol(conn): sp.Symbol(f"{conn}_val") for conn in cond_connectors}
+        cond_syms = sorted(
+            str(s) for s in node.condition.free_symbols if isinstance(s, sp.Symbol)
         )
-        cond_expr_cpp = symstr(cond_expr, cpp_mode=True)
-
-        cond_input_map = {
-            conn: f"__cond_in{idx}" for idx, conn in enumerate(cond_connectors)
-        }
-
-        ndim = len(ref_shape)
-        shape_expr = ", ".join(symstr(s) for s in ref_shape)
-        cond_tile_strides = ", ".join(
-            symstr(s) for s in inner_sdfg.arrays["cond_tile"].strides
+        # Map: original symbol name → renamed connector name
+        cond_conn_rename = {s: f"_ci{i}" for i, s in enumerate(cond_syms)}
+        cond_expr_renamed = node.condition.xreplace(
+            {sp.Symbol(s): sp.Symbol(cond_conn_rename[s]) for s in cond_syms}
         )
-        cond_stride_decls = ""
-        cond_index_decls = ""
-        cond_index_updates = ""
-        cond_value_decls = ""
-        for conn in cond_connectors:
-            tasklet_conn = cond_input_map[conn]
-            in_strides = ", ".join(symstr(s) for s in in_descs[conn].strides)
-            cond_stride_decls += (
-                f"const std::ptrdiff_t {tasklet_conn}_strides[ndim] = "
-                f"{{{in_strides}}};\n"
-            )
-            cond_index_decls += f"    std::size_t i_{tasklet_conn} = 0;\n"
-            cond_index_updates += (
-                f"        i_{tasklet_conn} += coord * {tasklet_conn}_strides[d];\n"
-            )
-            cond_value_decls += (
-                f"    const auto {conn}_val = "
-                f"{tasklet_conn}[i_{tasklet_conn}];\n"
-            )
 
-        cond_code = f"""
-constexpr int ndim = {ndim};
-const std::size_t shape[ndim] = {{{shape_expr}}};
-{cond_stride_decls}const std::ptrdiff_t cond_strides[ndim] = {{{cond_tile_strides}}};
-
-std::size_t n = 1;
-for (int d = 0; d < ndim; ++d) {{
-    n *= shape[d];
-}}
-
-for (std::size_t i = 0; i < n; ++i) {{
-    std::size_t rem = i;
-{cond_index_decls}    std::size_t i_cond = 0;
-    for (int d = ndim - 1; d >= 0; --d) {{
-        const auto extent = shape[d];
-        const std::size_t coord = rem % extent;
-        rem /= extent;
-{cond_index_updates}        i_cond += coord * cond_strides[d];
-    }}
-{cond_value_decls}    _c[i_cond] = ({cond_expr_cpp});
-}}
-"""
-
-        cond_node = nodes.Tasklet(
-            label="condition_eval",
-            inputs=set(cond_input_map.values()),
-            outputs={"_c"},
-            code=cond_code,
-            language=dace.dtypes.Language.CPP,
+        cond_node = TileOpLibraryNode(
+            "condition_eval",
+            expr=cond_expr_renamed,
+            tile_shape=node.tile_shape,
+            out_connector="__cond_out",
         )
 
         inner_state.add_node(cond_node)
@@ -398,6 +381,12 @@ for (std::size_t i = 0; i < n; ++i) {{
             if role not in role_to_input:
                 return  # operand is a constant – no array connection
             in_conn = role_to_input[role]
+            if in_conn not in inner_sdfg.arrays:
+                raise ValueError(
+                    f"TileIfElseOp expansion: role '{role}' references "
+                    f"unknown input connector '{in_conn}' for node "
+                    f"'{node.name}'."
+                )
             access = inner_state.add_read(in_conn)
             desc = inner_sdfg.arrays[in_conn]
             inner_state.add_edge(
@@ -405,16 +394,16 @@ for (std::size_t i = 0; i < n; ++i) {{
                 dace.Memlet.from_array(in_conn, desc),
             )
 
-        # Wire condition inputs used by the SymPy expression
-        for conn in cond_connectors:
-            cond_acc = inner_state.add_read(conn)
-            desc = inner_sdfg.arrays[conn]
+        # Wire condition inputs: renamed connector ← original inner SDFG array
+        for orig_sym, ci_conn in sorted(cond_conn_rename.items()):
+            cond_acc = inner_state.add_read(orig_sym)
+            desc = inner_sdfg.arrays[orig_sym]
             inner_state.add_edge(
                 cond_acc,
                 None,
                 cond_node,
-                cond_input_map[conn],
-                dace.Memlet.from_array(conn, desc),
+                ci_conn,
+                dace.Memlet.from_array(orig_sym, desc),
             )
 
         # Wire true branch
@@ -438,7 +427,7 @@ for (std::size_t i = 0; i < n; ++i) {{
 
         # condition_eval → cond_tile → where._cond
         inner_state.add_edge(
-            cond_node, "_c", cond_acc, None,
+            cond_node, "__cond_out", cond_acc, None,
             dace.Memlet.from_array("cond_tile", cond_arr),
         )
         inner_state.add_edge(
@@ -448,7 +437,7 @@ for (std::size_t i = 0; i < n; ++i) {{
 
         # true_branch → true_tile → where._x
         inner_state.add_edge(
-            true_node, "_c", true_acc, None,
+            true_node, "__true_out", true_acc, None,
             dace.Memlet.from_array("true_tile", true_arr),
         )
         inner_state.add_edge(
@@ -458,7 +447,7 @@ for (std::size_t i = 0; i < n; ++i) {{
 
         # false_branch → false_tile → where._y
         inner_state.add_edge(
-            false_node, "_c", false_acc, None,
+            false_node, "__false_out", false_acc, None,
             dace.Memlet.from_array("false_tile", false_arr),
         )
         inner_state.add_edge(

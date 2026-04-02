@@ -141,6 +141,34 @@ def test_validate_bad_condition_symbol():
         node.validate(sdfg, state)
 
 
+def test_validate_unknown_input_roles_key():
+    node = TileIfElseOpLibraryNode(
+        "t", condition=sp.Symbol("_in0") > 0,
+        true_op="+", true_constant2="1",
+        false_op="*", false_constant2="2",
+        num_inputs=1,
+        input_roles={"_in9": ["true_rhs1", "false_rhs1"]},
+    )
+    sdfg, state = _make_simple_sdfg(node)
+    with pytest.raises(InvalidSDFGNodeError, match="unknown connector"):
+        node.validate(sdfg, state)
+
+
+def test_validate_duplicate_role_assignment():
+    node = TileIfElseOpLibraryNode(
+        "t", condition=sp.Symbol("_in0") > 0,
+        true_op="+", false_op="*",
+        num_inputs=2,
+        input_roles={
+            "_in0": ["true_rhs1", "false_rhs1"],
+            "_in1": ["true_rhs1", "true_rhs2", "false_rhs2"],
+        },
+    )
+    sdfg, state = _make_simple_sdfg(node)
+    with pytest.raises(InvalidSDFGNodeError, match="assigned more than once"):
+        node.validate(sdfg, state)
+
+
 def test_validate_success():
     node = TileIfElseOpLibraryNode(
         "t", condition=sp.Symbol("_in0") > 0,

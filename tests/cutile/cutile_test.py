@@ -242,7 +242,7 @@ def test_scalar_to_tile_add():
     # Library node has correct connectors
     lib = lib_nodes[0]
     assert set(lib.in_connectors.keys()) == {"_a", "_b"}
-    assert set(lib.out_connectors.keys()) == {"_c"}
+    assert set(lib.out_connectors.keys()) == {"_out"}
 
     # Validate final SDFG
     sdfg.validate()
@@ -418,7 +418,7 @@ def test_tileadd_runtime_numeric_correctness():
 
     state.add_edge(a_read, None, add_node, "_a", Memlet("A[0:3, 0:4]"))
     state.add_edge(b_read, None, add_node, "_b", Memlet("B[0:3, 0:4]"))
-    state.add_edge(add_node, "_c", c_write, None, Memlet("C[0:3, 0:4]"))
+    state.add_edge(add_node, "_out", c_write, None, Memlet("C[0:3, 0:4]"))
 
     sdfg.validate()
     sdfg.expand_library_nodes()
@@ -785,7 +785,7 @@ def _make_direct_masked_add_sdfg(shape, name, dtype=dace.float64, mask_dtype=dac
     state.add_edge(a_read, None, op_node, "_a", Memlet(f"A[{subset}]"))
     state.add_edge(b_read, None, op_node, "_b", Memlet(f"B[{subset}]"))
     state.add_edge(m_read, None, op_node, "_m", Memlet(f"MASK[{subset}]"))
-    state.add_edge(op_node, "_c", c_write, None, Memlet(f"C[{subset}]"))
+    state.add_edge(op_node, "_out", c_write, None, Memlet(f"C[{subset}]"))
 
     sdfg.validate()
     return sdfg, actual_shape
@@ -871,7 +871,7 @@ def _make_direct_binary_sdfg(shape, name, op="+", tile_shape_override=None):
     subset = ", ".join(f"0:{s}" for s in actual_shape)
     state.add_edge(a_read, None, op_node, "_a", Memlet(f"A[{subset}]"))
     state.add_edge(b_read, None, op_node, "_b", Memlet(f"B[{subset}]"))
-    state.add_edge(op_node, "_c", c_write, None, Memlet(f"C[{subset}]"))
+    state.add_edge(op_node, "_out", c_write, None, Memlet(f"C[{subset}]"))
 
     sdfg.validate()
     return sdfg, actual_shape
@@ -923,7 +923,7 @@ def test_scalar_to_tile_subtract():
 
     lib = lib_nodes[0]
     assert set(lib.in_connectors.keys()) == {"_a", "_b"}
-    assert set(lib.out_connectors.keys()) == {"_c"}
+    assert set(lib.out_connectors.keys()) == {"_out"}
 
     sdfg.validate()
 
@@ -1000,7 +1000,7 @@ def test_tilesubtract_runtime_numeric_correctness():
 
     state.add_edge(a_read, None, sub_node, "_a", Memlet("A[0:3, 0:4]"))
     state.add_edge(b_read, None, sub_node, "_b", Memlet("B[0:3, 0:4]"))
-    state.add_edge(sub_node, "_c", c_write, None, Memlet("C[0:3, 0:4]"))
+    state.add_edge(sub_node, "_out", c_write, None, Memlet("C[0:3, 0:4]"))
 
     sdfg.validate()
     sdfg.expand_library_nodes()
@@ -1204,7 +1204,7 @@ def test_subtract_self_gives_zero():
     state.add_node(sub_node)
     state.add_edge(a_read_1, None, sub_node, "_a", Memlet("A[0:5, 0:6]"))
     state.add_edge(a_read_2, None, sub_node, "_b", Memlet("A[0:5, 0:6]"))
-    state.add_edge(sub_node, "_c", c_write, None, Memlet("C[0:5, 0:6]"))
+    state.add_edge(sub_node, "_out", c_write, None, Memlet("C[0:5, 0:6]"))
 
     sdfg.validate()
     sdfg.expand_library_nodes()
@@ -1235,7 +1235,7 @@ def test_add_subtract_roundtrip():
     st.add_node(add_node)
     st.add_edge(st.add_read("A"), None, add_node, "_a", Memlet("A[0:6, 0:7]"))
     st.add_edge(st.add_read("B"), None, add_node, "_b", Memlet("B[0:6, 0:7]"))
-    st.add_edge(add_node, "_c", st.add_write("T"), None, Memlet("T[0:6, 0:7]"))
+    st.add_edge(add_node, "_out", st.add_write("T"), None, Memlet("T[0:6, 0:7]"))
     sdfg_add.expand_library_nodes()
     t = np.zeros(shape, dtype=np.float64)
     sdfg_add(A=a, B=b, T=t)
@@ -1250,7 +1250,7 @@ def test_add_subtract_roundtrip():
     st2.add_node(sub_node)
     st2.add_edge(st2.add_read("T"), None, sub_node, "_a", Memlet("T[0:6, 0:7]"))
     st2.add_edge(st2.add_read("B"), None, sub_node, "_b", Memlet("B[0:6, 0:7]"))
-    st2.add_edge(sub_node, "_c", st2.add_write("O"), None, Memlet("O[0:6, 0:7]"))
+    st2.add_edge(sub_node, "_out", st2.add_write("O"), None, Memlet("O[0:6, 0:7]"))
     sdfg_sub.expand_library_nodes()
     out = np.zeros(shape, dtype=np.float64)
     sdfg_sub(T=t, B=b, O=out)
@@ -1333,7 +1333,7 @@ def test_tileadd_int32_dtype():
     state.add_node(add_node)
     state.add_edge(state.add_read("A"), None, add_node, "_a", Memlet("A[0:5, 0:6]"))
     state.add_edge(state.add_read("B"), None, add_node, "_b", Memlet("B[0:5, 0:6]"))
-    state.add_edge(add_node, "_c", state.add_write("C"), None, Memlet("C[0:5, 0:6]"))
+    state.add_edge(add_node, "_out", state.add_write("C"), None, Memlet("C[0:5, 0:6]"))
 
     sdfg.validate()
     sdfg.expand_library_nodes()
@@ -1361,7 +1361,7 @@ def test_tilesubtract_int32_dtype():
     state.add_node(sub_node)
     state.add_edge(state.add_read("A"), None, sub_node, "_a", Memlet("A[0:5, 0:6]"))
     state.add_edge(state.add_read("B"), None, sub_node, "_b", Memlet("B[0:5, 0:6]"))
-    state.add_edge(sub_node, "_c", state.add_write("C"), None, Memlet("C[0:5, 0:6]"))
+    state.add_edge(sub_node, "_out", state.add_write("C"), None, Memlet("C[0:5, 0:6]"))
 
     sdfg.validate()
     sdfg.expand_library_nodes()
@@ -1767,7 +1767,7 @@ def test_tilemaskedadd_validate_rejects_mask_shape_mismatch():
     state.add_edge(state.add_read("A"), None, node, "_a", Memlet("A[0:4, 0:4]"))
     state.add_edge(state.add_read("B"), None, node, "_b", Memlet("B[0:4, 0:4]"))
     state.add_edge(state.add_read("MASK"), None, node, "_m", Memlet("MASK[0:4, 0:3]"))
-    state.add_edge(node, "_c", state.add_write("C"), None, Memlet("C[0:4, 0:4]"))
+    state.add_edge(node, "_out", state.add_write("C"), None, Memlet("C[0:4, 0:4]"))
 
     with pytest.raises(Exception):
         sdfg.validate()
@@ -1787,7 +1787,7 @@ def test_tilemaskedadd_validate_rejects_non_integer_mask_dtype():
     state.add_edge(state.add_read("A"), None, node, "_a", Memlet("A[0:4, 0:4]"))
     state.add_edge(state.add_read("B"), None, node, "_b", Memlet("B[0:4, 0:4]"))
     state.add_edge(state.add_read("MASK"), None, node, "_m", Memlet("MASK[0:4, 0:4]"))
-    state.add_edge(node, "_c", state.add_write("C"), None, Memlet("C[0:4, 0:4]"))
+    state.add_edge(node, "_out", state.add_write("C"), None, Memlet("C[0:4, 0:4]"))
 
     with pytest.raises(Exception):
         sdfg.validate()
@@ -1813,7 +1813,7 @@ def test_tilemultiply_runtime_numeric_correctness():
 
     state.add_edge(a_read, None, mul_node, "_a", Memlet("A[0:3, 0:4]"))
     state.add_edge(b_read, None, mul_node, "_b", Memlet("B[0:3, 0:4]"))
-    state.add_edge(mul_node, "_c", c_write, None, Memlet("C[0:3, 0:4]"))
+    state.add_edge(mul_node, "_out", c_write, None, Memlet("C[0:3, 0:4]"))
 
     sdfg.validate()
     sdfg.expand_library_nodes()
@@ -1844,7 +1844,7 @@ def test_tiledivide_runtime_numeric_correctness():
 
     state.add_edge(a_read, None, div_node, "_a", Memlet("A[0:3, 0:4]"))
     state.add_edge(b_read, None, div_node, "_b", Memlet("B[0:3, 0:4]"))
-    state.add_edge(div_node, "_c", c_write, None, Memlet("C[0:3, 0:4]"))
+    state.add_edge(div_node, "_out", c_write, None, Memlet("C[0:3, 0:4]"))
 
     sdfg.validate()
     sdfg.expand_library_nodes()
@@ -1967,7 +1967,7 @@ def _make_direct_unary_sdfg(shape, name, op="-", tile_shape_override=None):
 
     subset = ", ".join(f"0:{s}" for s in actual_shape)
     state.add_edge(a_read, None, op_node, "_a", Memlet(f"A[{subset}]"))
-    state.add_edge(op_node, "_c", c_write, None, Memlet(f"C[{subset}]"))
+    state.add_edge(op_node, "_out", c_write, None, Memlet(f"C[{subset}]"))
 
     sdfg.validate()
     return sdfg, actual_shape
@@ -2100,7 +2100,7 @@ def _make_direct_const_binary_sdfg(shape, name, op="+", constant="2",
 
     subset = ", ".join(f"0:{s}" for s in actual_shape)
     state.add_edge(a_read, None, op_node, array_conn, Memlet(f"A[{subset}]"))
-    state.add_edge(op_node, "_c", c_write, None, Memlet(f"C[{subset}]"))
+    state.add_edge(op_node, "_out", c_write, None, Memlet(f"C[{subset}]"))
 
     sdfg.validate()
     return sdfg, actual_shape
@@ -2343,7 +2343,7 @@ def _make_direct_masked_unary_sdfg(shape, name, op="-", mask_dtype=dace.bool,
     subset = ", ".join(f"0:{s}" for s in actual_shape)
     state.add_edge(a_read, None, op_node, "_a", Memlet(f"A[{subset}]"))
     state.add_edge(m_read, None, op_node, "_m", Memlet(f"MASK[{subset}]"))
-    state.add_edge(op_node, "_c", c_write, None, Memlet(f"C[{subset}]"))
+    state.add_edge(op_node, "_out", c_write, None, Memlet(f"C[{subset}]"))
 
     sdfg.validate()
     return sdfg, actual_shape
@@ -2386,7 +2386,7 @@ def test_masked_const_add_right_runtime():
 
     state.add_edge(a_read, None, op_node, "_a", Memlet("A[0:4, 0:5]"))
     state.add_edge(m_read, None, op_node, "_m", Memlet("MASK[0:4, 0:5]"))
-    state.add_edge(op_node, "_c", c_write, None, Memlet("C[0:4, 0:5]"))
+    state.add_edge(op_node, "_out", c_write, None, Memlet("C[0:4, 0:5]"))
 
     sdfg.validate()
     sdfg.expand_library_nodes()
@@ -2432,7 +2432,7 @@ def _make_direct_unary_func_sdfg(shape, name, op="sin", tile_shape_override=None
 
     subset = ", ".join(f"0:{s}" for s in actual_shape)
     state.add_edge(a_read, None, op_node, "_a", Memlet(f"A[{subset}]"))
-    state.add_edge(op_node, "_c", c_write, None, Memlet(f"C[{subset}]"))
+    state.add_edge(op_node, "_out", c_write, None, Memlet(f"C[{subset}]"))
 
     sdfg.validate()
     return sdfg, actual_shape
@@ -2541,7 +2541,7 @@ def test_const_only_multiply():
     state.add_node(op_node)
 
     subset = ", ".join(f"0:{s}" for s in shape)
-    state.add_edge(op_node, "_c", c_write, None, Memlet(f"C[{subset}]"))
+    state.add_edge(op_node, "_out", c_write, None, Memlet(f"C[{subset}]"))
 
     sdfg.validate()
     sdfg.expand_library_nodes()
@@ -2567,7 +2567,7 @@ def test_const_only_add():
     state.add_node(op_node)
 
     subset = ", ".join(f"0:{s}" for s in shape)
-    state.add_edge(op_node, "_c", c_write, None, Memlet(f"C[{subset}]"))
+    state.add_edge(op_node, "_out", c_write, None, Memlet(f"C[{subset}]"))
 
     sdfg.validate()
     sdfg.expand_library_nodes()
@@ -2596,7 +2596,7 @@ def test_unary_const_sin():
     state.add_node(op_node)
 
     subset = ", ".join(f"0:{s}" for s in shape)
-    state.add_edge(op_node, "_c", c_write, None, Memlet(f"C[{subset}]"))
+    state.add_edge(op_node, "_out", c_write, None, Memlet(f"C[{subset}]"))
 
     sdfg.validate()
     sdfg.expand_library_nodes()

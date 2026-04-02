@@ -7,6 +7,7 @@ import math
 from typing import Collection, List, Optional
 
 import dace
+import sympy as sp
 from dace import properties
 from dace.properties import make_properties
 from dace.sdfg import SDFG, SDFGState
@@ -39,6 +40,19 @@ def _op_cpp_expr(op: str, left: str, right: str | None = None) -> str:
     return f"{op}({left})"
 
 
+def _get_output_connector_name(node) -> str:
+    """Return the single output connector name for *node*.
+
+    cuTile op nodes are defined with exactly one output connector.
+    """
+    if len(node.out_connectors) != 1:
+        raise ValueError(
+            f"TileOp expansion: expected exactly one output connector for "
+            f"node '{node.name}', got {set(node.out_connectors)}."
+        )
+    return next(iter(node.out_connectors))
+
+
 # ── Expansion helpers ────────────────────────────────────────────────
 
 def _get_tile_descriptors(node, state, sdfg):
@@ -47,6 +61,7 @@ def _get_tile_descriptors(node, state, sdfg):
     a_desc / b_desc / m_desc / c_in_desc may be None when the
     corresponding connector is absent or replaced by a constant.
     """
+    out_conn = _get_output_connector_name(node)
     a_desc = b_desc = c_desc = m_desc = c_in_desc = None
     for edge in state.in_edges(node):
         arr_name = edge.data.data
@@ -64,11 +79,11 @@ def _get_tile_descriptors(node, state, sdfg):
         arr_name = edge.data.data
         if arr_name is None:
             continue
-        if edge.src_conn == "_c":
+        if edge.src_conn == out_conn:
             c_desc = sdfg.arrays[arr_name]
     if c_desc is None:
         raise ValueError(
-            f"TileOp expansion: _c not connected for node '{node.name}'."
+            f"TileOp expansion: {out_conn} not connected for node '{node.name}'."
         )
     return a_desc, b_desc, c_desc, m_desc, c_in_desc
 
@@ -121,6 +136,113 @@ def _collect_array_descs(a_desc, b_desc):
     return descs
 
 
+def _expr_connectors(expr) -> list:
+    """Return sorted list of connector names derived from *expr*'s SymPy symbols.
+
+    Every :class:`sympy.Symbol` in *expr*'s free symbols is treated as an
+    array input connector (regardless of naming convention).
+    """
+    return sorted(str(s) for s in expr.free_symbols if isinstance(s, sp.Symbol))
+
+
+def _get_all_input_descs(node, state, sdfg):
+    """Return ``(input_descs, c_desc)`` for *node*.
+
+    *input_descs* maps each input connector name to its array descriptor.
+    *c_desc* is the descriptor for the output connector.
+    """
+    out_conn = _get_output_connector_name(node)
+    input_descs = {}
+    c_desc = None
+    for edge in state.in_edges(node):
+        arr_name = edge.data.data
+        if arr_name is None:
+            continue
+        if edge.dst_conn is not None:
+            input_descs[edge.dst_conn] = sdfg.arrays[arr_name]
+    for edge in state.out_edges(node):
+        arr_name = edge.data.data
+        if arr_name is None:
+            continue
+        if edge.src_conn == out_conn:
+            c_desc = sdfg.arrays[arr_name]
+    if c_desc is None:
+        raise ValueError(
+            f"TileOp expansion: {out_conn} not connected for node '{node.name}'."
+        )
+    return input_descs, c_desc
+
+
+def _build_multi_op_code(expr, input_descs: dict, c_desc, tile_shape, out_conn: str = "_out") -> str:
+    """Generate C++ loop code for an arbitrary SymPy *expr*.
+
+    Each key in *input_descs* maps a connector name (e.g. ``_a``, ``_in0``)
+    to the array descriptor for that connector.  Numeric literals in the
+    expression (SymPy ``Number`` nodes) are emitted as C++ literals by
+    ``symstr``.
+    """
+    connectors = sorted(input_descs.keys())
+    shape = tuple(tile_shape) if tile_shape is not None else c_desc.shape
+    ndim = len(shape)
+    try:
+        n_total = math.prod(int(s) for s in shape)
+        use_scalar_form = (ndim == 0) or (n_total == 1)
+    except (TypeError, ValueError):
+        use_scalar_form = (ndim == 0)
+
+    # Strip leading '_' from connector names for C++ local variable names.
+    def _lv(conn: str) -> str:
+        return conn.lstrip("_")
+
+    # Replace each connector symbol with a _val variable so the generated
+    # C++ expression is readable and avoids pointer-name confusion.
+    val_subs = {sp.Symbol(conn): sp.Symbol(f"{_lv(conn)}_val") for conn in connectors}
+    cpp_expr_str = symstr(expr.xreplace(val_subs), cpp_mode=True)
+
+    if use_scalar_form:
+        val_reads = "".join(
+            f"const auto {_lv(conn)}_val = {conn};\n" for conn in connectors
+        )
+        return f"{val_reads}{out_conn} = {cpp_expr_str};"
+
+    shape_expr = ", ".join(symstr(s) for s in shape)
+    c_strides_expr = ", ".join(symstr(s) for s in c_desc.strides)
+    stride_decls = ""
+    index_decls = ""
+    index_updates = ""
+    val_decls = ""
+    for conn in connectors:
+        desc = input_descs[conn]
+        k = _lv(conn)
+        strides_str = ", ".join(symstr(s) for s in desc.strides)
+        stride_decls += f"const std::ptrdiff_t {k}_strides[ndim] = {{{strides_str}}};\n"
+        index_decls += f"    std::size_t i{k} = 0;\n"
+        index_updates += f"        i{k} += coord * {k}_strides[d];\n"
+        val_decls += f"    const auto {k}_val = {conn}[i{k}];\n"
+
+    return f"""
+constexpr int ndim = {ndim};
+const std::size_t shape[ndim] = {{{shape_expr}}};
+{stride_decls}const std::ptrdiff_t c_strides[ndim] = {{{c_strides_expr}}};
+
+std::size_t n = 1;
+for (int d = 0; d < ndim; ++d) {{
+    n *= shape[d];
+}}
+for (std::size_t i = 0; i < n; ++i) {{
+    std::size_t rem = i;
+{index_decls}    std::size_t ic = 0;
+    for (int d = ndim - 1; d >= 0; --d) {{
+        const auto extent = shape[d];
+        const std::size_t coord = rem % extent;
+        rem /= extent;
+{index_updates}        ic += coord * c_strides[d];
+    }}
+{val_decls}    {out_conn}[ic] = {cpp_expr_str};
+}}
+"""
+
+
 # ── Base library node ────────────────────────────────────────────────
 
 @make_properties
@@ -139,6 +261,19 @@ class _TileOpBase(LibraryNode):
         dtype=str,
         default="+",
         desc="Operation symbol, e.g. '+', '-', '*', '/', 'abs', 'sin', …",
+    )
+
+    expr = properties.Property(
+        dtype=sp.Basic,
+        default=None,
+        allow_none=True,
+        desc=(
+            "Optional arbitrary SymPy expression for multi-op mode. "
+            "When set, every SymPy Symbol in the expression becomes an "
+            "input connector; ``op``, ``constant1``, and ``constant2`` "
+            "are ignored.  Example: "
+            "``sp.Symbol('_a') * (sp.Symbol('_b') + sp.Symbol('_d'))``."
+        ),
     )
 
     constant1 = properties.Property(
@@ -171,25 +306,32 @@ class _TileOpBase(LibraryNode):
                  tile_shape: Optional[List[int]] = None,
                  constant1: Optional[str] = None,
                  constant2: Optional[str] = None,
+                 expr=None,
+                 out_connector: str = "_out",
                  extra_inputs: Collection[str] = frozenset(),
                  **kwargs):
         inputs: set[str] = set(extra_inputs)
-        if constant1 is None:
-            inputs.add("_a")
-        # Binary and comparison ops get _b unless constant2 replaces the right operand.
-        if (op in _BINARY_OPS or op in _COMPARISON_OPS) and constant2 is None:
-            inputs.add("_b")
+        if expr is not None:
+            # Multi-op mode: connectors derived from expression free symbols.
+            inputs.update(_expr_connectors(expr))
+        else:
+            if constant1 is None:
+                inputs.add("_a")
+            # Binary and comparison ops get _b unless constant2 replaces the right operand.
+            if (op in _BINARY_OPS or op in _COMPARISON_OPS) and constant2 is None:
+                inputs.add("_b")
 
         super().__init__(
             name,
             inputs=inputs,
-            outputs={"_c"},
+            outputs={out_connector},
             **kwargs,
         )
         self.op = op
         self.tile_shape = tile_shape
         self.constant1 = constant1
         self.constant2 = constant2
+        self.expr = expr
 
     # ------------------------------------------------------------------
     @property
@@ -202,24 +344,6 @@ class _TileOpBase(LibraryNode):
         *label* is used in error messages (e.g. ``"TileOp"``,
         ``"TileMaskedOp"``).
         """
-        if self.op not in _ALL_OPS:
-            raise InvalidSDFGNodeError(
-                f"{label} '{self.name}': unsupported op '{self.op}'. "
-                f"Supported: {_ALL_OPS}",
-                sdfg=sdfg,
-                state_id=state.parent_graph.node_id(state),
-                node_id=state.node_id(self),
-            )
-
-        if self.op not in _BINARY_OPS and self.op not in _COMPARISON_OPS and self.is_binary:
-            raise InvalidSDFGNodeError(
-                f"{label} '{self.name}': op '{self.op}' is unary-only "
-                f"but has binary connectors.",
-                sdfg=sdfg,
-                state_id=state.parent_graph.node_id(state),
-                node_id=state.node_id(self),
-            )
-
         # Find connected nodes in a single pass over edges
         in_nodes: dict[str, object] = {}
         for edge in state.in_edges(self):
@@ -230,26 +354,76 @@ class _TileOpBase(LibraryNode):
             if edge.src_conn is not None:
                 out_nodes[edge.src_conn] = edge.dst
 
-        if "_c" not in out_nodes:
+        out_conn = _get_output_connector_name(self)
+        if out_conn not in out_nodes:
             raise InvalidSDFGNodeError(
-                f"{label} '{self.name}': output connector _c must be connected.",
+                f"{label} '{self.name}': output connector {out_conn} must be connected.",
                 sdfg=sdfg,
                 state_id=state.parent_graph.node_id(state),
                 node_id=state.node_id(self),
             )
 
-        if self.constant1 is None and "_a" not in in_nodes:
-            raise InvalidSDFGNodeError(
-                f"{label} '{self.name}': connector _a must be connected when constant1 is not set.",
-                sdfg=sdfg,
-                state_id=state.parent_graph.node_id(state),
-                node_id=state.node_id(self),
-            )
+        if self.expr is not None:
+            # Multi-op mode: validate expression symbols match connectors.
+            expr_conns = set(_expr_connectors(self.expr))
+            if out_conn in expr_conns:
+                raise InvalidSDFGNodeError(
+                    f"{label} '{self.name}': '{out_conn}' cannot be used as an "
+                    f"expression input symbol because it is reserved for the "
+                    f"output connector.",
+                    sdfg=sdfg,
+                    state_id=state.parent_graph.node_id(state),
+                    node_id=state.node_id(self),
+                )
+            bad = expr_conns - set(self.in_connectors)
+            if bad:
+                raise InvalidSDFGNodeError(
+                    f"{label} '{self.name}': expr symbol(s) {bad} do not "
+                    f"match input connectors {set(self.in_connectors)}.",
+                    sdfg=sdfg,
+                    state_id=state.parent_graph.node_id(state),
+                    node_id=state.node_id(self),
+                )
+            for conn in self.in_connectors:
+                if conn not in in_nodes:
+                    raise InvalidSDFGNodeError(
+                        f"{label} '{self.name}': input connector '{conn}' "
+                        f"must be connected in multi-op mode.",
+                        sdfg=sdfg,
+                        state_id=state.parent_graph.node_id(state),
+                        node_id=state.node_id(self),
+                    )
+        else:
+            if self.op not in _ALL_OPS:
+                raise InvalidSDFGNodeError(
+                    f"{label} '{self.name}': unsupported op '{self.op}'. "
+                    f"Supported: {_ALL_OPS}",
+                    sdfg=sdfg,
+                    state_id=state.parent_graph.node_id(state),
+                    node_id=state.node_id(self),
+                )
 
-        if "_b" in self.in_connectors and self.constant2 is None and "_b" not in in_nodes:
-            raise InvalidSDFGNodeError(
-                f"{label} '{self.name}': connector _b must be connected when constant2 is not set.",
-                sdfg=sdfg,
-                state_id=state.parent_graph.node_id(state),
-                node_id=state.node_id(self),
-            )
+            if self.op not in _BINARY_OPS and self.op not in _COMPARISON_OPS and self.is_binary:
+                raise InvalidSDFGNodeError(
+                    f"{label} '{self.name}': op '{self.op}' is unary-only "
+                    f"but has binary connectors.",
+                    sdfg=sdfg,
+                    state_id=state.parent_graph.node_id(state),
+                    node_id=state.node_id(self),
+                )
+
+            if self.constant1 is None and "_a" not in in_nodes:
+                raise InvalidSDFGNodeError(
+                    f"{label} '{self.name}': connector _a must be connected when constant1 is not set.",
+                    sdfg=sdfg,
+                    state_id=state.parent_graph.node_id(state),
+                    node_id=state.node_id(self),
+                )
+
+            if "_b" in self.in_connectors and self.constant2 is None and "_b" not in in_nodes:
+                raise InvalidSDFGNodeError(
+                    f"{label} '{self.name}': connector _b must be connected when constant2 is not set.",
+                    sdfg=sdfg,
+                    state_id=state.parent_graph.node_id(state),
+                    node_id=state.node_id(self),
+                )

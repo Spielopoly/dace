@@ -19,6 +19,7 @@ from __future__ import annotations
 from typing import List, Optional
 
 import dace
+import sympy as sp
 from dace import dtypes
 from dace import library
 from dace.sdfg import SDFG, SDFGState
@@ -29,6 +30,8 @@ from dace.transformation.transformation import ExpandTransformation
 from ..op_registry import TaskletType, MaskType, register_op
 from ._base import (
     _TileOpBase,
+    _expr_connectors,
+    _get_output_connector_name,
     _op_cpp_expr, _get_tile_descriptors, _resolve_shape_and_scalar_form,
     _build_stride_decls, _resolve_operands, _collect_array_descs,
     _BINARY_OPS, _UNARY_OPS, SUPPORTED_MASK_DTYPES,
@@ -49,7 +52,7 @@ class TileRuntimeMaskedOpLibraryNode(_TileOpBase):
     _b     (in, optional)  : right / second operand tile (binary only)
     _m     (in)            : boolean mask tile
     _c_in  (in, optional)  : initial C values used when mask is false
-    _c     (out)           : result tile
+    _out   (out)           : result tile
     """
 
     implementations: dict = {}
@@ -61,13 +64,17 @@ class TileRuntimeMaskedOpLibraryNode(_TileOpBase):
                  tile_shape: Optional[List[int]] = None,
                  constant1: Optional[str] = None,
                  constant2: Optional[str] = None,
+                 expr=None,
+                 out_connector: str = "_out",
                  **kwargs):
         super().__init__(name, op=op, tile_shape=tile_shape,
                          constant1=constant1, constant2=constant2,
+                         expr=expr, out_connector=out_connector,
                          extra_inputs={"_m"}, **kwargs)
 
     def validate(self, sdfg: SDFG, state: SDFGState):
         self._validate_common(sdfg, state, "TileMaskedOp")
+        out_conn = _get_output_connector_name(self)
 
         # Additional mask-specific validation
         m_node = c_node = None
@@ -80,7 +87,7 @@ class TileRuntimeMaskedOpLibraryNode(_TileOpBase):
             elif edge.dst_conn == "_b":
                 b_node = edge.src
         for edge in state.out_edges(self):
-            if edge.src_conn == "_c":
+            if edge.src_conn == out_conn:
                 c_node = edge.dst
 
         if m_node is None:
@@ -140,6 +147,145 @@ class ExpandTileRuntimeMaskedOpPure(ExpandTransformation):
     @staticmethod
     def expansion(node: TileRuntimeMaskedOpLibraryNode, state: SDFGState,
                   sdfg: SDFG) -> nodes.Tasklet:
+        out_conn = _get_output_connector_name(node)
+
+        if node.expr is not None:
+            # ── Multi-op expression mode with runtime mask ────────────────
+            in_descs = {}
+            out_desc = None
+            for edge in state.in_edges(node):
+                arr_name = edge.data.data
+                if edge.dst_conn is None or arr_name is None:
+                    continue
+                in_descs[edge.dst_conn] = sdfg.arrays[arr_name]
+            for edge in state.out_edges(node):
+                arr_name = edge.data.data
+                if edge.src_conn == out_conn and arr_name is not None:
+                    out_desc = sdfg.arrays[arr_name]
+            if out_desc is None:
+                raise ValueError(
+                    f"TileMaskedOp expansion: {out_conn} not connected for "
+                    f"node '{node.name}'."
+                )
+            if "_m" not in in_descs:
+                raise ValueError(
+                    f"TileMaskedOp expansion: _m must be connected for node "
+                    f"'{node.name}'."
+                )
+
+            expr_inputs = _expr_connectors(node.expr)
+            missing = [c for c in expr_inputs if c not in in_descs]
+            if missing:
+                raise ValueError(
+                    f"TileMaskedOp expansion: missing expr input connector(s) "
+                    f"{missing} for node '{node.name}'."
+                )
+
+            shape, ndim, use_scalar_form = _resolve_shape_and_scalar_form(node, out_desc)
+            m_desc = in_descs["_m"]
+            has_c_in = "_c_in" in in_descs
+            c_in_desc = in_descs.get("_c_in")
+
+            def _lv(conn: str) -> str:
+                return conn.lstrip("_")
+
+            val_subs = {sp.Symbol(conn): sp.Symbol(f"{_lv(conn)}_val")
+                        for conn in expr_inputs}
+            expr_cpp = symstr(node.expr.xreplace(val_subs), cpp_mode=True)
+
+            inputs: set[str] = {"_m", *expr_inputs}
+            if has_c_in:
+                inputs.add("_c_in")
+
+            if use_scalar_form:
+                val_reads = "".join(
+                    f"const auto {_lv(conn)}_val = {conn};\n" for conn in expr_inputs
+                )
+                if has_c_in:
+                    code = (
+                        f"if (_m) {{\n"
+                        f"{val_reads}"
+                        f"{out_conn} = {expr_cpp};\n"
+                        f"}} else {{ {out_conn} = _c_in; }}"
+                    )
+                else:
+                    code = (
+                        f"if (_m) {{\n"
+                        f"{val_reads}"
+                        f"{out_conn} = {expr_cpp};\n"
+                        f"}}"
+                    )
+            else:
+                shape_expr = ", ".join(symstr(s) for s in shape)
+                m_strides_expr = ", ".join(symstr(s) for s in m_desc.strides)
+                out_strides_expr = ", ".join(symstr(s) for s in out_desc.strides)
+
+                stride_decls = ""
+                index_decls = ""
+                index_updates = ""
+                val_decls = ""
+                for conn in expr_inputs:
+                    desc = in_descs[conn]
+                    key = _lv(conn)
+                    stride_str = ", ".join(symstr(s) for s in desc.strides)
+                    stride_decls += (
+                        f"const std::ptrdiff_t {key}_strides[ndim] = "
+                        f"{{{stride_str}}};\n"
+                    )
+                    index_decls += f"    std::size_t i{key} = 0;\n"
+                    index_updates += f"        i{key} += coord * {key}_strides[d];\n"
+                    val_decls += f"    const auto {key}_val = {conn}[i{key}];\n"
+
+                c_in_stride_decl = ""
+                c_in_index_decl = ""
+                c_in_index_update = ""
+                c_in_else = ""
+                if has_c_in and c_in_desc is not None:
+                    c_in_strides = ", ".join(symstr(s) for s in c_in_desc.strides)
+                    c_in_stride_decl = f"const std::ptrdiff_t c_in_strides[ndim] = {{{c_in_strides}}};"
+                    c_in_index_decl = "    std::size_t iin = 0;"
+                    c_in_index_update = "        iin += coord * c_in_strides[d];"
+                    c_in_else = f"else {{ {out_conn}[io] = _c_in[iin]; }}"
+
+                code = f"""
+constexpr int ndim = {ndim};
+const std::size_t shape[ndim] = {{{shape_expr}}};
+{stride_decls}const std::ptrdiff_t m_strides[ndim] = {{{m_strides_expr}}};
+const std::ptrdiff_t out_strides[ndim] = {{{out_strides_expr}}};
+{c_in_stride_decl}
+
+std::size_t n = 1;
+for (int d = 0; d < ndim; ++d) {{
+    n *= shape[d];
+}}
+for (std::size_t i = 0; i < n; ++i) {{
+    std::size_t rem = i;
+{index_decls}    std::size_t im = 0;
+    std::size_t io = 0;
+{c_in_index_decl}
+    for (int d = ndim - 1; d >= 0; --d) {{
+        const auto extent = shape[d];
+        const std::size_t coord = rem % extent;
+        rem /= extent;
+{index_updates}        im += coord * m_strides[d];
+        io += coord * out_strides[d];
+{c_in_index_update}
+    }}
+    if (_m[im]) {{
+{val_decls}        {out_conn}[io] = {expr_cpp};
+    }}
+    {c_in_else}
+}}
+"""
+
+            return nodes.Tasklet(
+                label=node.name + "_cutile",
+                inputs=inputs,
+                outputs={out_conn},
+                code=code,
+                language=dtypes.Language.CPP,
+            )
+
         op = node.op
         constant1 = node.constant1
         constant2 = node.constant2
@@ -173,9 +319,9 @@ class ExpandTileRuntimeMaskedOpPure(ExpandTransformation):
 
         if use_scalar_form:
             if has_c_in:
-                code = f"if (_m) {{ _c = {scalar_expr}; }} else {{ _c = _c_in; }}"
+                code = f"if (_m) {{ {out_conn} = {scalar_expr}; }} else {{ {out_conn} = _c_in; }}"
             else:
-                code = f"if (_m) {{ _c = {scalar_expr}; }}"
+                code = f"if (_m) {{ {out_conn} = {scalar_expr}; }}"
         else:
             shape_expr = ", ".join(symstr(s) for s in shape)
             m_strides_expr = ", ".join(symstr(s) for s in m_desc.strides)
@@ -194,7 +340,7 @@ class ExpandTileRuntimeMaskedOpPure(ExpandTransformation):
                 c_in_stride_decl = f"const std::ptrdiff_t c_in_strides[ndim] = {{{', '.join(symstr(s) for s in c_in_desc.strides)}}};"
                 c_in_index_decl =   "    std::size_t iin = 0;"
                 c_in_index_update = "        iin += coord * c_in_strides[d];"
-                c_in_else =         "else { _c[ic] = _c_in[iin]; }"
+                c_in_else =         f"else {{ {out_conn}[ic] = _c_in[iin]; }}"
 
             if not array_descs:
                 # Both operands are constants – only mask + output iteration
@@ -224,7 +370,7 @@ for (std::size_t i = 0; i < n; ++i) {{
 {c_in_index_update}
     }}
     if (_m[im]) {{
-        _c[ic] = _val;
+        {out_conn}[ic] = _val;
     }}
     {c_in_else}
 }}
@@ -256,7 +402,7 @@ for (std::size_t i = 0; i < n; ++i) {{
 {c_in_index_update}
     }}
     if (_m[im]) {{
-        _c[ic] = {indexed_expr};
+        {out_conn}[ic] = {indexed_expr};
     }}
     {c_in_else}
 }}
@@ -265,7 +411,7 @@ for (std::size_t i = 0; i < n; ++i) {{
         return nodes.Tasklet(
             label=node.name + "_cutile",
             inputs=inputs,
-            outputs={"_c"},
+            outputs={out_conn},
             code=code,
             language=dtypes.Language.CPP,
         )
@@ -293,7 +439,7 @@ for _op in _BINARY_OPS:
         mask=MaskType.RUNTIME,
         node_type=TileRuntimeMaskedOpLibraryNode,
         node_name=_MASKED_BINARY_DISPLAY_NAMES.get(_op, f"TileMaskedOp_{_op}"),
-        out="_c",
+        out="_out",
         rhs1="_a",
         rhs2="_b",
         mask_in="_m",
@@ -306,7 +452,7 @@ for _op in _BINARY_OPS:
         mask=MaskType.RUNTIME,
         node_type=TileRuntimeMaskedOpLibraryNode,
         node_name=_MASKED_CONST_DISPLAY_NAMES.get(_op, f"TileMaskedConstOp_{_op}"),
-        out="_c",
+        out="_out",
         rhs1="_a",
         rhs2="_b",
         mask_in="_m",
@@ -320,7 +466,7 @@ for _op in _UNARY_OPS:
         mask=MaskType.RUNTIME,
         node_type=TileRuntimeMaskedOpLibraryNode,
         node_name=_MASKED_UNARY_DISPLAY_NAMES.get(_op, f"TileMaskedUnaryOp_{_op}"),
-        out="_c",
+        out="_out",
         rhs1="_a",
         mask_in="_m",
         out_in="_c_in",

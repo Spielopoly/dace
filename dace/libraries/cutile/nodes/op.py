@@ -17,7 +17,7 @@ When neither ``constant2`` nor ``_b`` is present the node is unary.
 """
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import List, Optional, cast
 
 from dace import dtypes
 from dace.sdfg import SDFG, SDFGState
@@ -28,8 +28,10 @@ from dace.transformation.transformation import ExpandTransformation
 from ..op_registry import register_op, MaskType, TaskletType
 from ._base import (
     _TileOpBase,
+    _get_output_connector_name,
     _op_cpp_expr, _get_tile_descriptors, _resolve_shape_and_scalar_form,
     _build_stride_decls, _resolve_operands, _collect_array_descs,
+    _get_all_input_descs, _build_multi_op_code,
     _BINARY_OPS, _COMPARISON_OPS, _UNARY_OPS,
 )
 
@@ -46,7 +48,7 @@ class TileOpLibraryNode(_TileOpBase):
     ----------
     _a  (in, optional)  : left / first operand tile
     _b  (in, optional)  : right / second operand tile (binary only)
-    _c  (out)           : result tile
+    _out (out)          : result tile
     """
 
     implementations: dict = {}
@@ -56,9 +58,13 @@ class TileOpLibraryNode(_TileOpBase):
                  tile_shape: Optional[List[int]] = None,
                  constant1: Optional[str] = None,
                  constant2: Optional[str] = None,
+                 expr=None,
+                 out_connector: str = "_out",
                  **kwargs):
         super().__init__(name, op=op, tile_shape=tile_shape,
-                         constant1=constant1, constant2=constant2, **kwargs)
+                         constant1=constant1, constant2=constant2,
+                         expr=expr, out_connector=out_connector,
+                         **kwargs)
 
     def validate(self, sdfg: SDFG, state: SDFGState):
         self._validate_common(sdfg, state, "TileOp")
@@ -74,6 +80,22 @@ class ExpandTileOpPure(ExpandTransformation):
 
     @staticmethod
     def expansion(node: TileOpLibraryNode, state: SDFGState, sdfg: SDFG) -> nodes.Tasklet:
+        node = cast(TileOpLibraryNode, node)
+        out_conn = _get_output_connector_name(node)
+        if node.expr is not None:
+            # ── Multi-op expression mode ──────────────────────────────────
+            input_descs, c_desc = _get_all_input_descs(node, state, sdfg)
+            code = _build_multi_op_code(
+                node.expr, input_descs, c_desc, node.tile_shape, out_conn=out_conn)
+            return nodes.Tasklet(
+                label=node.name + "_cutile",
+                inputs=set(input_descs.keys()),
+                outputs={out_conn},
+                code=code,
+                language=dtypes.Language.CPP,
+            )
+
+        # ── Single-op mode ────────────────────────────────────────────────
         op = node.op
         constant1 = node.constant1
         constant2 = node.constant2
@@ -95,7 +117,7 @@ class ExpandTileOpPure(ExpandTransformation):
             constant1, constant2, is_binary)
 
         if use_scalar_form:
-            code = f"_c = {_op_cpp_expr(op, left_scalar, right_scalar)};"
+            code = f"{out_conn} = {_op_cpp_expr(op, left_scalar, right_scalar)};"
         else:
             shape_expr = ", ".join(symstr(s) for s in shape)
             c_strides_expr = ", ".join(symstr(s) for s in c_desc.strides)
@@ -127,7 +149,7 @@ for (std::size_t i = 0; i < n; ++i) {{
         rem /= extent;
         ic += coord * c_strides[d];
     }}
-    _c[ic] = _val;
+    {out_conn}[ic] = _val;
 }}
 """
             else:
@@ -150,14 +172,14 @@ for (std::size_t i = 0; i < n; ++i) {{
         rem /= extent;
 {index_updates}        ic += coord * c_strides[d];
     }}
-    _c[ic] = {expr};
+    {out_conn}[ic] = {expr};
 }}
 """
 
         return nodes.Tasklet(
             label=node.name + "_cutile",
             inputs=inputs,
-            outputs={"_c"},
+            outputs={out_conn},
             code=code,
             language=dtypes.Language.CPP,
         )
@@ -187,7 +209,7 @@ for _op in _BINARY_OPS:
         mask=MaskType.UNMASKED,
         node_type=TileOpLibraryNode,
         node_name=_BINARY_DISPLAY_NAMES.get(_op, f"TileOp_{_op}"),
-        out="_c",
+        out="_out",
         rhs1="_a",
         rhs2="_b",
     )
@@ -198,7 +220,7 @@ for _op in _BINARY_OPS:
         mask=MaskType.UNMASKED,
         node_type=TileOpLibraryNode,
         node_name=_CONST_BINARY_DISPLAY_NAMES.get(_op, f"TileConstOp_{_op}"),
-        out="_c",
+        out="_out",
         rhs1="_a",
         rhs2="_b",
     )
@@ -209,7 +231,7 @@ for _op in _BINARY_OPS:
         mask=MaskType.UNMASKED,
         node_type=TileOpLibraryNode,
         node_name=_SYMBOL_BINARY_DISPLAY_NAMES.get(_op, f"TileSymbolOp_{_op}"),
-        out="_c",
+        out="_out",
     )
 
 for _op in _UNARY_OPS:
@@ -220,7 +242,7 @@ for _op in _UNARY_OPS:
         mask=MaskType.UNMASKED,
         node_type=TileOpLibraryNode,
         node_name=_UNARY_DISPLAY_NAMES.get(_op, f"TileUnaryOp_{_op}"),
-        out="_c",
+        out="_out",
         rhs1="_a",
     )
     # Constant operand
@@ -230,7 +252,7 @@ for _op in _UNARY_OPS:
         mask=MaskType.UNMASKED,
         node_type=TileOpLibraryNode,
         node_name=_UNARY_DISPLAY_NAMES.get(_op, f"TileUnaryOp_{_op}") + "Const",
-        out="_c",
+        out="_out",
     )
 
 
@@ -260,7 +282,7 @@ for _op in _COMPARISON_OPS:
         mask=MaskType.UNMASKED,
         node_type=TileOpLibraryNode,
         node_name=_CMP_DISPLAY_NAMES[_op],
-        out="_c",
+        out="_out",
         rhs1="_a",
         rhs2="_b",
     )
@@ -271,7 +293,7 @@ for _op in _COMPARISON_OPS:
         mask=MaskType.UNMASKED,
         node_type=TileOpLibraryNode,
         node_name=_CMP_CONST_DISPLAY_NAMES[_op],
-        out="_c",
+        out="_out",
         rhs1="_a",
         rhs2="_b",
     )
@@ -282,5 +304,5 @@ for _op in _COMPARISON_OPS:
         mask=MaskType.UNMASKED,
         node_type=TileOpLibraryNode,
         node_name=_CMP_SYMBOL_DISPLAY_NAMES[_op],
-        out="_c",
+        out="_out",
     )

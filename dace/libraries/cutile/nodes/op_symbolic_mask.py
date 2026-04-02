@@ -27,6 +27,8 @@ from dace.transformation.transformation import ExpandTransformation
 from ..op_registry import TaskletType, MaskType, register_op
 from ._base import (
     _TileOpBase,
+    _expr_connectors,
+    _get_output_connector_name,
     _op_cpp_expr, _get_tile_descriptors, _resolve_shape_and_scalar_form,
     _build_stride_decls, _resolve_operands, _collect_array_descs,
     _BINARY_OPS, _UNARY_OPS,
@@ -50,7 +52,7 @@ class TileSymbolicMaskedOpLibraryNode(_TileOpBase):
     ----------
     _a  (in, optional)  : left / first operand tile
     _b  (in, optional)  : right / second operand tile (binary only)
-    _c  (out)           : result tile
+    _out (out)          : result tile
 
     The ``mask_condition`` property holds a SymPy boolean expression that
     references ``sp.Symbol('__m0')``, ``sp.Symbol('__m1')``, … for
@@ -80,10 +82,14 @@ class TileSymbolicMaskedOpLibraryNode(_TileOpBase):
                  tile_shape: Optional[List[int]] = None,
                  constant1: Optional[str] = None,
                  constant2: Optional[str] = None,
+                 expr=None,
+                 out_connector: str = "_out",
                  mask_condition: Optional[sp.Basic] = None,
                  **kwargs):
         super().__init__(name, op=op, tile_shape=tile_shape,
-                         constant1=constant1, constant2=constant2, **kwargs)
+                         constant1=constant1, constant2=constant2,
+                         expr=expr, out_connector=out_connector,
+                         **kwargs)
         self.mask_condition = mask_condition
 
     def validate(self, sdfg: SDFG, state: SDFGState):
@@ -101,6 +107,7 @@ class ExpandTileSymbolicMaskedOpPure(ExpandTransformation):
     @staticmethod
     def expansion(node: TileSymbolicMaskedOpLibraryNode, state: SDFGState,
                   sdfg: SDFG) -> nodes.Tasklet:
+        out_conn = _get_output_connector_name(node)
         op = node.op
         constant1 = node.constant1
         constant2 = node.constant2
@@ -114,6 +121,142 @@ class ExpandTileSymbolicMaskedOpPure(ExpandTransformation):
 
         a_desc, b_desc, c_desc, _, c_in_desc = _get_tile_descriptors(node, state, sdfg)
         has_c_in = c_in_desc is not None
+
+        if node.expr is not None:
+            # ── Multi-op expression mode with symbolic mask ───────────────
+            in_descs = {}
+            for edge in state.in_edges(node):
+                arr_name = edge.data.data
+                if edge.dst_conn is None or arr_name is None:
+                    continue
+                in_descs[edge.dst_conn] = sdfg.arrays[arr_name]
+
+            expr_inputs = _expr_connectors(node.expr)
+            missing = [c for c in expr_inputs if c not in in_descs]
+            if missing:
+                raise ValueError(
+                    f"TileSymbolicMaskedOp expansion: missing expr input "
+                    f"connector(s) {missing} for node '{node.name}'."
+                )
+
+            ref_desc = c_desc
+            shape, ndim, use_scalar_form = _resolve_shape_and_scalar_form(node, ref_desc)
+
+            def _lv(conn: str) -> str:
+                return conn.lstrip("_")
+
+            val_subs = {sp.Symbol(conn): sp.Symbol(f"{_lv(conn)}_val")
+                        for conn in expr_inputs}
+            expr_cpp = symstr(node.expr.xreplace(val_subs), cpp_mode=True)
+
+            inputs: set[str] = set(expr_inputs)
+            if has_c_in:
+                inputs.add("_c_in")
+
+            if use_scalar_form:
+                coord_decls = "\n".join(
+                    f"    constexpr std::ptrdiff_t __m{d} = 0;"
+                    for d in range(ndim)
+                )
+                val_reads = "".join(
+                    f"    const auto {_lv(conn)}_val = {conn};\n"
+                    for conn in expr_inputs
+                )
+                if has_c_in:
+                    code = f"""\
+{{
+{coord_decls}
+{val_reads}    if ({mask_condition}) {{
+        {out_conn} = {expr_cpp};
+    }} else {{
+        {out_conn} = _c_in;
+    }}
+}}
+"""
+                else:
+                    code = f"""\
+{{
+{coord_decls}
+{val_reads}    if ({mask_condition}) {{
+        {out_conn} = {expr_cpp};
+    }}
+}}
+"""
+            else:
+                shape_expr = ", ".join(symstr(s) for s in shape)
+                out_strides_expr = ", ".join(symstr(s) for s in c_desc.strides)
+
+                stride_decls = ""
+                index_decls = ""
+                index_updates = ""
+                val_decls = ""
+                for conn in expr_inputs:
+                    desc = in_descs[conn]
+                    key = _lv(conn)
+                    stride_str = ", ".join(symstr(s) for s in desc.strides)
+                    stride_decls += (
+                        f"const std::ptrdiff_t {key}_strides[ndim] = "
+                        f"{{{stride_str}}};\n"
+                    )
+                    index_decls += f"    std::size_t i{key} = 0;\n"
+                    index_updates += f"        i{key} += coord * {key}_strides[d];\n"
+                    val_decls += f"    const auto {key}_val = {conn}[i{key}];\n"
+
+                coord_aliases = "\n".join(
+                    f"    const std::ptrdiff_t __m{d} = (std::ptrdiff_t)__coords[{d}];"
+                    for d in range(ndim)
+                )
+
+                c_in_stride_decl = ""
+                c_in_index_decl = ""
+                c_in_index_update = ""
+                c_in_else = ""
+                if has_c_in and c_in_desc is not None:
+                    c_in_strides = ", ".join(symstr(s) for s in c_in_desc.strides)
+                    c_in_stride_decl = f"const std::ptrdiff_t c_in_strides[ndim] = {{{c_in_strides}}};"
+                    c_in_index_decl = "    std::size_t iin = 0;"
+                    c_in_index_update = "        iin += coord * c_in_strides[d];"
+                    c_in_else = f"else {{ {out_conn}[io] = _c_in[iin]; }}"
+
+                code = f"""\
+constexpr int ndim = {ndim};
+const std::size_t shape[ndim] = {{{shape_expr}}};
+{stride_decls}const std::ptrdiff_t out_strides[ndim] = {{{out_strides_expr}}};
+{c_in_stride_decl}
+
+std::size_t n = 1;
+for (int d = 0; d < ndim; ++d) {{
+    n *= shape[d];
+}}
+
+for (std::size_t i = 0; i < n; ++i) {{
+    std::size_t rem = i;
+{index_decls}    std::size_t io = 0;
+{c_in_index_decl}
+    std::size_t __coords[ndim];
+    for (int d = ndim - 1; d >= 0; --d) {{
+        const auto extent = shape[d];
+        const std::size_t coord = rem % extent;
+        rem /= extent;
+{index_updates}        io += coord * out_strides[d];
+{c_in_index_update}        __coords[d] = coord;
+    }}
+{coord_aliases}
+    if ({mask_condition}) {{
+{val_decls}        {out_conn}[io] = {expr_cpp};
+    }}
+    {c_in_else}
+}}
+"""
+
+            return nodes.Tasklet(
+                label=node.name + "_cutile",
+                inputs=inputs,
+                outputs={out_conn},
+                code=code,
+                language=dtypes.Language.CPP,
+            )
+
         is_binary = (constant2 is not None) or (b_desc is not None)
 
         ref_desc = a_desc or b_desc or c_desc
@@ -145,9 +288,9 @@ class ExpandTileSymbolicMaskedOpPure(ExpandTransformation):
 {{
 {coord_decls}
     if ({mask_condition}) {{
-        _c = {scalar_expr};
+        {out_conn} = {scalar_expr};
     }} else {{
-        _c = _c_in;
+        {out_conn} = _c_in;
     }}
 }}
 """
@@ -156,7 +299,7 @@ class ExpandTileSymbolicMaskedOpPure(ExpandTransformation):
 {{
 {coord_decls}
     if ({mask_condition}) {{
-        _c = {scalar_expr};
+        {out_conn} = {scalar_expr};
     }}
 }}
 """
@@ -183,7 +326,7 @@ class ExpandTileSymbolicMaskedOpPure(ExpandTransformation):
                 c_in_stride_decl = f"const std::ptrdiff_t c_in_strides[ndim] = {{{', '.join(symstr(s) for s in c_in_desc.strides)}}};"
                 c_in_index_decl =   "    std::size_t iin = 0;"
                 c_in_index_update = "        iin += coord * c_in_strides[d];"
-                c_in_else =         "else { _c[ic] = _c_in[iin]; }"
+                c_in_else =         f"else {{ {out_conn}[ic] = _c_in[iin]; }}"
 
             if not array_descs:
                 # Both operands are constants
@@ -213,7 +356,7 @@ for (std::size_t i = 0; i < n; ++i) {{
     }}
 {coord_aliases}
     if ({mask_condition}) {{
-        _c[ic] = _val;
+        {out_conn}[ic] = _val;
     }}
     {c_in_else}
 }}
@@ -244,7 +387,7 @@ for (std::size_t i = 0; i < n; ++i) {{
     }}
 {coord_aliases}
     if ({mask_condition}) {{
-        _c[ic] = {indexed_expr};
+        {out_conn}[ic] = {indexed_expr};
     }}
     {c_in_else}
 }}
@@ -253,7 +396,7 @@ for (std::size_t i = 0; i < n; ++i) {{
         return nodes.Tasklet(
             label=node.name + "_cutile",
             inputs=inputs,
-            outputs={"_c"},
+            outputs={out_conn},
             code=code,
             language=dtypes.Language.CPP,
         )
@@ -288,7 +431,7 @@ for _op in _BINARY_OPS:
         mask=MaskType.SYMBOLIC,
         node_type=TileSymbolicMaskedOpLibraryNode,
         node_name=_SYM_BINARY_DISPLAY_NAMES.get(_op, f"TileSymMaskedOp_{_op}"),
-        out="_c",
+        out="_out",
         rhs1="_a",
         rhs2="_b",
     )
@@ -299,7 +442,7 @@ for _op in _BINARY_OPS:
         mask=MaskType.SYMBOLIC,
         node_type=TileSymbolicMaskedOpLibraryNode,
         node_name=_SYM_CONST_DISPLAY_NAMES.get(_op, f"TileSymMaskedConstOp_{_op}"),
-        out="_c",
+        out="_out",
         rhs1="_a",
         rhs2="_b",
     )
@@ -310,7 +453,7 @@ for _op in _BINARY_OPS:
         mask=MaskType.SYMBOLIC,
         node_type=TileSymbolicMaskedOpLibraryNode,
         node_name=_SYM_SYMBOL_DISPLAY_NAMES.get(_op, f"TileSymMaskedSymOp_{_op}"),
-        out="_c",
+        out="_out",
     )
 
 for _op in _UNARY_OPS:
@@ -321,7 +464,7 @@ for _op in _UNARY_OPS:
         mask=MaskType.SYMBOLIC,
         node_type=TileSymbolicMaskedOpLibraryNode,
         node_name=_SYM_UNARY_DISPLAY_NAMES.get(_op, f"TileSymMaskedUnaryOp_{_op}"),
-        out="_c",
+        out="_out",
         rhs1="_a",
     )
     # Constant operand symbolic-masked unary
@@ -331,5 +474,5 @@ for _op in _UNARY_OPS:
         mask=MaskType.SYMBOLIC,
         node_type=TileSymbolicMaskedOpLibraryNode,
         node_name=_SYM_UNARY_DISPLAY_NAMES.get(_op, f"TileSymMaskedUnaryOp_{_op}") + "Const",
-        out="_c",
+        out="_out",
     )
