@@ -52,10 +52,7 @@ def _to_sympy_condition(
     All free symbols in the resulting expression must map to NSDFG array
     names. Returns ``None`` if parsing fails or unknown symbols appear.
     """
-    try:
-        expr = dace.symbolic.pystr_to_symbolic(cond_expr, simplify=False)
-    except Exception:
-        return None
+    expr = dace.symbolic.pystr_to_symbolic(cond_expr, simplify=False)
 
     if not isinstance(expr, sp.Basic):
         return None
