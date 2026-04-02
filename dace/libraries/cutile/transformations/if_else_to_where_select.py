@@ -24,7 +24,7 @@ from typing import Dict, List, Optional, Tuple
 
 import dace
 import sympy as sp
-from dace import Memlet, dtypes, subsets
+from dace import Memlet
 from dace.sdfg import SDFG, SDFGState, nodes, utils as sdutil
 from dace.sdfg.state import ConditionalBlock
 from dace.transformation import transformation as xf
@@ -33,6 +33,11 @@ from dace.libraries.cutile.nodes.if_else_op import TileIfElseOpLibraryNode
 from dace.libraries.cutile.op_registry import (
     match_tasklet_to_tile_library_node,
     MaskType,
+)
+from dace.libraries.cutile.transformations.utils import (
+    tile_subset_from_shape,
+    create_tile_transient,
+    is_canonical_inner_map,
 )
 from sympy.parsing.sympy_parser import parse_expr
 
@@ -142,9 +147,8 @@ class IfElseMapToTileWhere(xf.SingleStateTransformation):
             return False
 
         # Inner map must be canonical (0-based, unit stride)
-        for start, _, step in inner_entry.map.range:
-            if start != 0 or step != 1:
-                return False
+        if not is_canonical_inner_map(inner_entry.map):
+            return False
 
         # Analyze the NestedSDFG for the if-else pattern
         info = self._analyze_nsdfg(nsdfg.sdfg)
@@ -307,7 +311,7 @@ class IfElseMapToTileWhere(xf.SingleStateTransformation):
 
         # ── 2. Tile shape from inner map ─────────────────────────────
         tile_shape = tuple(inner_entry.map.range.size())
-        tile_subset = subsets.Range([(0, d - 1, 1) for d in tile_shape])
+        tile_subset = tile_subset_from_shape(tile_shape)
 
         # ── 3. Build NSDFG array → outer data mapping ───────────────
         # Maps nsdfg_internal_name → outer_data_name
@@ -335,16 +339,7 @@ class IfElseMapToTileWhere(xf.SingleStateTransformation):
                 continue
             if outer_name in outer_to_tile:
                 continue
-            data_desc = sdfg.arrays[outer_name]
-            trans_name = sdfg._find_new_name(outer_name + "_tile")
-            sdfg.add_transient(
-                trans_name,
-                shape=tile_shape,
-                dtype=data_desc.dtype,
-                storage=data_desc.storage,
-                lifetime=dtypes.AllocationLifetime.Scope,
-            )
-            trans_node = graph.add_access(trans_name)
+            trans_name, trans_node = create_tile_transient(sdfg, graph, outer_name, tile_shape)
             outer_to_tile[outer_name] = (trans_name, trans_node)
 
         # Map nsdfg_internal_name → tile_trans_name (inputs only)
@@ -510,15 +505,9 @@ class IfElseMapToTileWhere(xf.SingleStateTransformation):
             )
         output_outer_name = nsdfg_to_outer[output_nsdfg_array]
 
-        out_tile_name = sdfg._find_new_name(output_outer_name + "_out_tile")
-        sdfg.add_transient(
-            out_tile_name,
-            shape=tile_shape,
-            dtype=sdfg.arrays[output_outer_name].dtype,
-            storage=sdfg.arrays[output_outer_name].storage,
-            lifetime=dtypes.AllocationLifetime.Scope,
+        out_tile_name, out_tile_node = create_tile_transient(
+            sdfg, graph, output_outer_name, tile_shape, suffix="_out_tile"
         )
-        out_tile_node = graph.add_access(out_tile_name)
 
         graph.add_edge(compound_node, "_out", out_tile_node, None,
                        Memlet(data=out_tile_name, subset=tile_subset))

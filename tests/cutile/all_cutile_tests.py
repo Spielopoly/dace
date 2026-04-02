@@ -17,4 +17,7 @@ else:
     from cutile_frontend_test import *
     from cutile_if_else_op_test import *
     from cutile_ifelse_test import *
+    from cutile_masked_expr_test import *
+    from cutile_multi_op_test import *
     from cutile_test import *
+    

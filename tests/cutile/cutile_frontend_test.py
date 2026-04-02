@@ -631,7 +631,7 @@ def frontend_multiple_tasklets_program(
     C: dace.float64[10],
 ):
     """Multiple statements in a loop body, which become separate maps after preprocessing."""
-    for i in dace.map[0:10]:
+    for i in range(10):
         A[i] = B[i] + C[i]
         B[i] = A[i] * 2.0 + 1.0
         C[i] = A[i] - B[i]
@@ -650,15 +650,6 @@ def test_frontend_multiple_tasklets_pipeline_all_maps_tiled():
     pytest.skip("Skipped due to pre-existing MapFission issue with nested SDFGs")
     sdfg = frontend_multiple_tasklets_program.to_sdfg(simplify=True)
     
-    # Count maps before pipeline
-    maps_before = [
-        node
-        for state in sdfg.all_states()
-        for node in state.nodes()
-        if isinstance(node, nodes.MapEntry)
-    ]
-    maps_before_count = len(maps_before)
-    
     # Apply the pipeline with tiling
     count = apply_cutile_pipeline(
         sdfg,
@@ -667,26 +658,11 @@ def test_frontend_multiple_tasklets_pipeline_all_maps_tiled():
         tile_shape=(3, 3),
     )
     
-    # Should have applied transformations (at least the multiple maps should be tiled)
-    assert count >= 1, f"Expected at least 1 transformation, got {count}"
-    
-    # Count maps after pipeline - should be significantly more due to tiling
-    maps_after = [
-        node
-        for state in sdfg.all_states()
-        for node in state.nodes()
-        if isinstance(node, nodes.MapEntry)
-    ]
-    maps_after_count = len(maps_after)
-    
-    # With tiling, we should have more maps (outer + inner for each tiled map)
-    assert maps_after_count > maps_before_count, \
-        f"Expected more maps after tiling ({maps_before_count} before -> {maps_after_count} after)"
-    
     # Verify structure: should have library nodes for cuTile
     lib_nodes = _frontend_library_nodes(sdfg)
     # After transformation, should have some cuTile library nodes from the operations
     # (not necessarily TileOpLibraryNode due to the different operations, but at least nodes)
+    assert len(lib_nodes) >= 3, f"Expected 3 LibraryNodes in the transformed SDFG, got {len(lib_nodes)}"
     
     sdfg.expand_library_nodes()
     sdfg.validate()

@@ -44,6 +44,7 @@ from dace.symbolic import SymExpr, symstr
 from dace.transformation import transformation as xf
 
 from dace.libraries.cutile.op_registry import match_tasklet_to_tile_library_node, MaskType
+from dace.libraries.cutile.transformations.utils import tile_subset_from_shape, create_tile_transient, is_canonical_inner_map
 
 
 class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
@@ -235,11 +236,6 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
         assert isinstance(self._inner_entry.map.range, subsets.Range)
         return tuple(self._inner_entry.map.range.size())
 
-    @staticmethod
-    def _tile_subset_from_shape(tile_shape: tuple[sp.Basic | int, ...]) -> subsets.Range:
-        """Build a dense local tile range ``[0, extent-1]`` in every dimension."""
-        return subsets.Range([(0, d - 1, 1) for d in tile_shape])
-
     # ---- input/output slot mapping ------------------------------------------
 
     def _get_map_from_tasklet_input_to_libnode_inputs(self) -> dict[str, list[str]]:
@@ -305,28 +301,6 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
 
     # ---- transient creation -------------------------------------------------
 
-    def _create_and_add_tile_transient(self, data_name: str, tile_shape: tuple[sp.Basic | int, ...]) -> tuple[str, nodes.AccessNode]:
-        """
-        Create a scope-lifetime transient tile to stage an operand.
-
-        Scope lifetime ensures no state escapes outside this map rewrite.
-        The dtype and storage are inherited from the original array
-        descriptor *data_name*.
-
-        Returns ``(trans_name, trans_node)``.
-        """
-        data_desc = self._sdfg.arrays[data_name]
-        trans_name = self._sdfg._find_new_name(data_name + "_tile")
-        self._sdfg.add_transient(
-            trans_name,
-            shape=tile_shape,
-            dtype=data_desc.dtype,
-            storage=data_desc.storage,
-            lifetime=dtypes.AllocationLifetime.Scope,
-        )
-        trans_node = self._graph.add_access(trans_name)
-        return trans_name, trans_node
-
     # ---- memlet construction hooks ------------------------------------------
 
     def _build_memlet(self, map_edge: MultiConnectorEdge[Memlet], tasklet_edge: MultiConnectorEdge[Memlet]) -> Memlet:
@@ -378,7 +352,7 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
         Returns ``(trans_name, trans_read)``.
         """
         data_name = cast(str, outer_edge.data.data)
-        trans_name, trans_read = self._create_and_add_tile_transient(data_name, self._tile_shape)
+        trans_name, trans_read = create_tile_transient(self._sdfg, self._graph, data_name, self._tile_shape)
 
         # outer_entry -> transient (staging memlet preserves outer indexing).
         staging_memlet = self._build_input_staging_memlet(outer_edge, tasklet_edge)
@@ -415,7 +389,7 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
         Returns ``(trans_name, trans_write)``.
         """
         data_name = cast(str, inner_to_outer_edge.data.data)
-        trans_name, trans_write = self._create_and_add_tile_transient(data_name, self._tile_shape)
+        trans_name, trans_write = create_tile_transient(self._sdfg, self._graph, data_name, self._tile_shape)
 
         # Library writes full tile result into transient.
         self._graph.add_edge(self._library_node, lib_conn, trans_write, None,
@@ -508,7 +482,7 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
         # Derive the tile extents from the inner map.  In canonical mode this
         # is the concrete domain; in masked mode it is the bounding tile.
         self._tile_shape = self._calculate_tile_shape()
-        self._tile_subset = self._tile_subset_from_shape(self._tile_shape)
+        self._tile_subset = tile_subset_from_shape(self._tile_shape)
 
         # Instantiate the target library node selected by the operation
         # matcher.  Child hook may add extra connectors (mask, preload).
@@ -565,20 +539,6 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
         if isinstance(expr, dace.symbolic.SymExpr):
             return expr.expr
         return sp.sympify(expr)
-
-    @staticmethod
-    def _is_canonical_inner_map(inner_map: nodes.Map) -> bool:
-        """
-        Canonical inner map predicate used to select lowering strategy.
-
-        Canonical means: ``start == 0`` and ``step == 1`` in every dimension,
-        which implies the tile is fully dense and does not need a validity
-        mask.
-        """
-        for start, _, step in inner_map.range:
-            if start != 0 or step != 1:
-                return False
-        return True
 
     @staticmethod
     def _bounding_tile_shape(inner_map: nodes.Map) -> list[sp.Basic | int]:
@@ -759,7 +719,7 @@ class ScalarToTileMasked(_ScalarToTileBase):
             if step == 0:
                 return False
         # Only match non-canonical maps.
-        if self._is_canonical_inner_map(self._inner_entry.map):
+        if is_canonical_inner_map(self._inner_entry.map):
             return False
         return True
 

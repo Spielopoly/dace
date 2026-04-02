@@ -189,6 +189,11 @@ class StripMining(transformation.SingleStateTransformation):
             index += 1
         return candidate
 
+    def _register_new_dim_symbol(self, sdfg: SDFG, new_dim: str):
+        """Ensure newly-created tile dimensions are visible as SDFG symbols."""
+        if new_dim not in sdfg.symbols:
+            sdfg.add_symbol(new_dim, dtypes.int64)
+
     def _create_strided_range(self, sdfg: SDFG, state: SDFGState, map_entry: nodes.MapEntry):
         map_exit = state.exit_node(map_entry)
         dim_idx = self.dim_idx
@@ -205,6 +210,7 @@ class StripMining(transformation.SingleStateTransformation):
         target_dim = map_entry.map.params[dim_idx]
         td_from, td_to, td_step = map_entry.map.range[dim_idx]
         new_dim = self._find_new_dim(sdfg, state, map_entry, new_dim_prefix, target_dim)
+        self._register_new_dim_symbol(sdfg, new_dim)
         new_dim_range = (td_from, td_to, tile_size * td_step)
         new_map = nodes.Map(map_entry.map.label, [new_dim], subsets.Range([new_dim_range]))
 
@@ -241,6 +247,7 @@ class StripMining(transformation.SingleStateTransformation):
         td_from, td_to, td_step = map_entry.map.range[dim_idx]
         # Create new map. Replace by cloning map object?
         new_dim = self._find_new_dim(sdfg, graph, map_entry, new_dim_prefix, target_dim)
+        self._register_new_dim_symbol(sdfg, new_dim)
         nd_from = 0
         if tile_stride == 1:
             nd_to = td_to - td_from
@@ -317,6 +324,7 @@ class StripMining(transformation.SingleStateTransformation):
             raise NotImplementedError
 
         new_dim = self._find_new_dim(sdfg, state, map_entry, new_dim_prefix, target_dim)
+        self._register_new_dim_symbol(sdfg, new_dim)
         new_dim_range = (td_from, number_of_tiles - 1, 1)
         new_map = nodes.Map(map_entry.map.label, [new_dim], subsets.Range([new_dim_range]))
 
