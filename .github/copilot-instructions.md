@@ -51,7 +51,7 @@
 - All function parameters and return values should have type hints. Omit return type only when the function returns `None` or when the return type is obvious (e.g. `__init__`).
 - Prefer reusing existing DaCe utilities (e.g. `SDFGState.remove_memlet_path`, `sdfg.utils.*`, `subsets.*`) over reimplementing graph manipulation logic. Search the codebase before writing new utility code.
 - Keep functions small and single-responsibility. If a function does multiple logically distinct steps, split it.
-- Use descriptive variable and function names — avoid cryptic abbreviations or single-letter names outside tight loop indices.
+- Use descriptive variable and function names — avoid abbreviations or single-letter names outside tight loop indices.
 - Avoid `sp.simplify()` for equality/zero checks on symbolic expressions — it is expensive and unreliable. Prefer structural comparison (`==`, `!=`) or `.is_zero` where appropriate.
 - Flag and remove dead code, unused imports, and stale comments during any refactoring pass.
 
