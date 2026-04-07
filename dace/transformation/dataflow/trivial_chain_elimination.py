@@ -3,7 +3,7 @@
 
 import copy
 
-from dace import data, symbolic
+from dace import data, subsets, symbolic
 from dace.dtypes import AllocationLifetime, StorageType
 from dace.properties import make_properties
 from dace.sdfg import nodes
@@ -123,6 +123,19 @@ class TrivialChainElimination(transformation.SingleStateTransformation):
         out_subset_expr_exact = out_edge.data.subset.num_elements_exact()
         if (in_subset_expr != out_subset_expr and symbolic.inequal_symbols(in_subset_expr_exact, out_subset_expr_exact)):
             return False
+
+        # Reject if the in/out subsets have different strides (step sizes).
+        # Two subsets may have the same number of elements but incompatible
+        # strides (e.g. 0:14:1 vs 1:29:2 after MapFission on a strided loop).
+        in_sub = in_edge.data.subset
+        out_sub = out_edge.data.subset
+        if (isinstance(in_sub, subsets.Range) and isinstance(out_sub, subsets.Range)
+                and len(in_sub.ranges) == len(out_sub.ranges)):
+            for in_dim, out_dim in zip(in_sub.ranges, out_sub.ranges):
+                in_step = in_dim[2]
+                out_step = out_dim[2]
+                if in_step != out_step and symbolic.inequal_symbols(in_step, out_step):
+                    return False
 
         return True
 
