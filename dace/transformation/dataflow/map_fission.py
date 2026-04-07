@@ -13,6 +13,7 @@ from dace.sdfg.state import ConditionalBlock, LoopRegion
 from dace.symbolic import pystr_to_symbolic
 from dace.transformation import transformation, helpers
 from typing import List, Optional, Tuple
+import sympy
 
 
 @transformation.explicit_cf_compatible
@@ -141,8 +142,6 @@ class MapFission(transformation.SingleStateTransformation):
                         for e in graph.edges_by_connector(self.nested_sdfg, s):
                             if any(p in e.data.free_symbols for p in map_node.map.params):
                                 return False
-                    if any(p in cond.get_free_symbols() for p in map_node.map.params):
-                        return False
             helpers.nest_sdfg_control_flow(nsdfg_node.sdfg)
 
             subgraphs = list(nsdfg_node.sdfg.nodes())
@@ -307,9 +306,9 @@ class MapFission(transformation.SingleStateTransformation):
                 # Add extra nodes in component boundaries
                 for edge in edges:
                     anode = state.add_access(name)
-                    sbs = subsets.Range.from_string(','.join(outer_map.params))
-                    # Offset memlet by map range begin (to fit the transient)
-                    sbs.offset([r[0] for r in outer_map.range], True)
+                    sbs = subsets.Range([((pystr_to_symbolic(d) - r[0]) / r[2],
+                                          (pystr_to_symbolic(d) - r[0]) / r[2], 1)
+                                         for d, r in zip(outer_map.params, outer_map.range)])
                     state.add_edge(edge.src, edge.src_conn, anode, None,
                                    mm.Memlet.simple(name, sbs, num_accesses=outer_map.range.num_elements()))
                     state.add_edge(anode, None, edge.dst, edge.dst_conn,
@@ -462,7 +461,36 @@ class MapFission(transformation.SingleStateTransformation):
                                 # propagation will stop at the first AccessNode outside the Map scope. For example, see
                                 # `test.transformations.mapfission_test.MapFissionTest.test_array_copy_outside_scope`.
                                 if not (scope_dict[e.src] and scope_dict[e.dst]):
+                                    pre_ranges = list(e.data.subset.ranges)
                                     e.data = propagate_subset([e.data], desc, outer_map.params, outer_map.range)
+                                    # Fix strides: propagate_subset may produce step=1
+                                    # even when the map has step>1. For affine index
+                                    # expressions a*p + b, the correct step is |a|*map_step.
+                                    if any(r[2] != 1 for r in outer_map.range):
+                                        params_sym = [pystr_to_symbolic(p) for p in outer_map.params]
+                                        new_ranges = list(e.data.subset.ranges)
+                                        for dim_idx, orig_range in enumerate(pre_ranges):
+                                            if dim_idx >= len(new_ranges):
+                                                break
+                                            orb, ore, _ors = orig_range
+                                            _nrb, _nre, nrs = new_ranges[dim_idx]
+                                            if nrs != 1 or orb != ore:
+                                                continue
+                                            expr = pystr_to_symbolic(orb) if not hasattr(orb, 'free_symbols') else orb
+                                            for pidx, p in enumerate(params_sym):
+                                                if p not in expr.free_symbols:
+                                                    continue
+                                                wa = sympy.Wild('a', exclude=params_sym)
+                                                wb = sympy.Wild('b', exclude=params_sym)
+                                                match = expr.match(wa * p + wb)
+                                                if match is not None:
+                                                    coeff = match[wa]
+                                                    map_step = outer_map.range[pidx][2]
+                                                    corrected_step = abs(coeff) * map_step
+                                                    if corrected_step != 1:
+                                                        new_ranges[dim_idx] = (_nrb, _nre, corrected_step)
+                                                break
+                                        e.data.subset = subsets.Range(new_ranges)
 
                         # Only after offsetting memlets we can modify the
                         # overall offset
@@ -481,14 +509,15 @@ class MapFission(transformation.SingleStateTransformation):
                             # `test.transformations.mapfission_test.MapFissionTest.test_array_copy_outside_scope`.
                             if e.data.data == node.data:
                                 if e.data.subset:
-                                    e.data.subset = subsets.Range([(pystr_to_symbolic(d) - r[0],
-                                                                    pystr_to_symbolic(d) - r[0], 1)
+                                    e.data.subset = subsets.Range([((pystr_to_symbolic(d) - r[0]) / r[2],
+                                                                    (pystr_to_symbolic(d) - r[0]) / r[2], 1)
                                                                    for d, r in zip(outer_map.params, outer_map.range)] +
                                                                   e.data.subset.ranges)
                             else:
                                 if e.data.other_subset:
                                     e.data.other_subset = subsets.Range(
-                                        [(pystr_to_symbolic(d) - r[0], pystr_to_symbolic(d) - r[0], 1)
+                                        [((pystr_to_symbolic(d) - r[0]) / r[2],
+                                          (pystr_to_symbolic(d) - r[0]) / r[2], 1)
                                          for d, r in zip(outer_map.params, outer_map.range)] +
                                         e.data.other_subset.ranges)
 

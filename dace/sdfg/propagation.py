@@ -208,6 +208,9 @@ class AffineSMemlet(SeparableMemletPattern):
                 # Special case: i:i+stride for a begin:end:stride range
                 if node_rb == result_begin and bre + 1 == node_rs and step == 1:
                     pass
+                elif step is None or brb == bre:
+                    # Single affine index A[a*i+b] with strided map — handled in propagate()
+                    pass
                 else:
                     # Map ranges where the last index is not known
                     # exactly are not supported by this pattern.
@@ -252,6 +255,18 @@ class AffineSMemlet(SeparableMemletPattern):
 
         result_begin = rb.subs(self.param, node_rb).expand()
         result_end = re.subs(self.param, node_re).expand()
+
+        # Handle strided maps: for A[a*i+b] with map i: start:end:step,
+        # the propagated subset is A[a*start+b : a*last+b : |a|*step]
+        # where last = start + floor((end-start)/step)*step.
+        if node_rs != 1 and rt == 1 and rb == re:
+            actual_last = node_rb + sympy.floor((node_re - node_rb) / node_rs) * node_rs
+            result_begin = rb.subs(self.param, node_rb).expand()
+            result_end = re.subs(self.param, actual_last).expand()
+            if (self.multiplier < 0) == True:
+                result_begin, result_end = result_end, result_begin
+            result_skip = sympy.Abs(self.multiplier) * node_rs
+            return (simplify(result_begin), simplify(result_end), simplify(result_skip), 1)
 
         # Special case: multiplier < 0
         if (self.multiplier < 0) == True:

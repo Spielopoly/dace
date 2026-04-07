@@ -1844,17 +1844,22 @@ class RemoveSliceView(pm.SingleStateTransformation):
         state.remove_node(self.view)
 
     def _offset_subset(self, mapping: Dict[int, int], subset: subsets.Range, edge_subset: subsets.Range):
-        # Get offset and size from the space of the view to compose
-        old_subset = edge_subset.min_element()
-        old_size = edge_subset.size()
-
-        # Create a new subset in the space of the data container from the offsets and sizes
+        # Compose the view's source range with the edge's access range.
+        # For a view dimension with (view_start, view_end, view_stride) and
+        # an edge accessing (edge_start, edge_end, edge_stride), the composed
+        # range in data-container space is:
+        #   start  = view_start + view_stride * edge_start
+        #   end    = view_start + view_stride * edge_end
+        #   stride = view_stride * edge_stride
         new_subset: List[Tuple[int, int, int]] = subset.ndrange()
+        edge_ranges = edge_subset.ndrange()
         for vdim, adim in mapping.items():
             rb, re, rs = new_subset[adim]
-            rb += old_subset[vdim]
-            re = rb + old_size[vdim] - 1
-            new_subset[adim] = (rb, re, rs)
+            erb, ere, ers = edge_ranges[vdim]
+            new_rb = rb + rs * erb
+            new_re = rb + rs * ere
+            new_rs = rs * ers
+            new_subset[adim] = (new_rb, new_re, new_rs)
 
         return subsets.Range(new_subset)
 
