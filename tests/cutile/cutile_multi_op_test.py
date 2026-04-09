@@ -7,7 +7,7 @@ The convention used here is:
     - Note: ``_out`` is reserved for the output connector and must NOT be used
     as an expression input symbol.
 """
-from __future__ import annotations
+
 
 import numpy as np
 import pytest

@@ -11,7 +11,7 @@ reference ``__m0``, ``__m1``, … (SymPy Symbol objects) for per-dimension
 tile coordinates.  Conversion to C++ happens only at expansion time.
 When the condition is false for a given element, the output is not written.
 """
-from __future__ import annotations
+
 
 from typing import List, Optional
 

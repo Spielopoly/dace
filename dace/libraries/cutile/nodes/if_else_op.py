@@ -13,8 +13,6 @@ The expansion SDFG composes four inner library nodes:
 3. ``TileOpLibraryNode`` for the false branch expression
 4. ``TileWhereSelectLibraryNode`` for the final selection
 """
-from __future__ import annotations
-
 from typing import Dict, Optional, Tuple, cast
 
 import sympy as sp

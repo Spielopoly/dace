@@ -17,7 +17,7 @@ Both branches are executed unconditionally on full tiles inside the compound
 node's expansion SDFG.  A where-select picks the correct result per element
 based on the condition mask.
 """
-from __future__ import annotations
+
 
 import copy
 from typing import Dict, List, Optional, Tuple

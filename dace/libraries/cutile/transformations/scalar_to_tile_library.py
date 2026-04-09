@@ -28,7 +28,7 @@ Result (AFTER, non-canonical inner maps)::
                     + symbolic mask condition selects valid map points
                     (masked-out lanes are preserved via _c_in preload)
 """
-from __future__ import annotations
+
 
 import abc
 import copy

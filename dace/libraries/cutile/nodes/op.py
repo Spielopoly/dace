@@ -15,7 +15,7 @@ The ``op`` property selects the operation.
 ``constant1`` replaces the left/first operand, ``constant2`` the right/second.
 When neither ``constant2`` nor ``_b`` is present the node is unary.
 """
-from __future__ import annotations
+
 
 from typing import List, Optional, cast
 

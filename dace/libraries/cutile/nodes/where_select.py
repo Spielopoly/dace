@@ -12,7 +12,7 @@ from the NVIDIA cuTile library and is the tile-level analogue of
 All three input tiles must have the same shape, and the condition tile must
 be of boolean or integer type.
 """
-from __future__ import annotations
+
 
 from typing import List, Optional
 

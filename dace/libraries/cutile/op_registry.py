@@ -5,7 +5,6 @@ Maps tasklet code patterns to cuTile library node classes. To add a new
 operation, call ``register_op`` with the operation string, tasklet type,
 mask type, library node class, and connector mapping.
 """
-from __future__ import annotations
 from typing import Dict, Optional, Type
 from enum import Enum
 from dataclasses import dataclass

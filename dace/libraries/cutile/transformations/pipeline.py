@@ -13,7 +13,7 @@ composed with other DaCe passes::
     pipeline = CuTilePipeline(apply_map_tiling=True, tile_shape=(16, 16, 16))
     result = pipeline.apply_pass(sdfg, {})
 """
-from __future__ import annotations
+
 
 import os
 import time

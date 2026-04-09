@@ -14,7 +14,7 @@ Implements element-wise masked operations:
 When the mask is false, the output element is left untouched.
 ``constant1`` replaces the left/first operand, ``constant2`` the right/second.
 """
-from __future__ import annotations
+
 
 from typing import List, Optional
 

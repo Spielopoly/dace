@@ -1,5 +1,5 @@
 """Regression tests for expr support in masked cuTile op nodes."""
-from __future__ import annotations
+
 
 import numpy as np
 import pytest

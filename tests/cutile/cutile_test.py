@@ -4,7 +4,7 @@ Tests for the cuTile transformation pipeline.
 Tests scalar-to-library transformations that replace inner maps
 with scalar tasklets by cuTile library nodes.
 """
-from __future__ import annotations
+
 
 import dace
 import numpy as np
