@@ -603,6 +603,141 @@ def test_dependent_symbol():
     assert np.array_equal(val, ref)
 
 
+def test_strided_fission_step2():
+    """MapFission with step=2 must correctly size and index border transient arrays."""
+    sdfg = dace.SDFG('mapfission_strided_step2')
+    sdfg.add_array('A', [20], dace.float64)
+    sdfg.add_scalar('interim', dace.float64, transient=True)
+    state = sdfg.add_state()
+    me, mx = state.add_map('outer', dict(i='0:20:2'))
+
+    t1 = state.add_tasklet('addone', {'a'}, {'b'}, 'b = a + 1')
+    t2 = state.add_tasklet('addtwo', {'a'}, {'b'}, 'b = a + 2')
+
+    aread = state.add_read('A')
+    awrite = state.add_write('A')
+    state.add_memlet_path(aread, me, t1, dst_conn='a', memlet=dace.Memlet.simple('A', 'i'))
+    state.add_edge(t1, 'b', t2, 'a', dace.Memlet.simple('interim', '0'))
+    state.add_memlet_path(t2, mx, awrite, src_conn='b', memlet=dace.Memlet.simple('A', 'i'))
+
+    assert sdfg.apply_transformations(MapFission) > 0
+
+    dace.propagate_memlets_sdfg(sdfg)
+    sdfg.validate()
+
+    # Test: only even indices are touched, each gets +3
+    A = np.random.rand(20)
+    expected = A.copy()
+    expected[0:20:2] += 3
+    sdfg(A=A)
+    assert np.allclose(A, expected)
+
+
+def test_strided_fission_offset_and_step():
+    """MapFission with both offset and step must correctly normalize border transient indices."""
+    sdfg = dace.SDFG('mapfission_strided_offset_step')
+    sdfg.add_array('A', [30], dace.float64)
+    sdfg.add_scalar('interim', dace.float64, transient=True)
+    state = sdfg.add_state()
+    me, mx = state.add_map('outer', dict(i='10:30:3'))
+
+    t1 = state.add_tasklet('addone', {'a'}, {'b'}, 'b = a + 1')
+    t2 = state.add_tasklet('addtwo', {'a'}, {'b'}, 'b = a + 2')
+
+    aread = state.add_read('A')
+    awrite = state.add_write('A')
+    state.add_memlet_path(aread, me, t1, dst_conn='a', memlet=dace.Memlet.simple('A', 'i'))
+    state.add_edge(t1, 'b', t2, 'a', dace.Memlet.simple('interim', '0'))
+    state.add_memlet_path(t2, mx, awrite, src_conn='b', memlet=dace.Memlet.simple('A', 'i'))
+
+    assert sdfg.apply_transformations(MapFission) > 0
+
+    dace.propagate_memlets_sdfg(sdfg)
+    sdfg.validate()
+
+    # Test: indices 10, 13, 16, 19, 22, 25, 28 → 7 iterations, each +3
+    A = np.random.rand(30)
+    expected = A.copy()
+    for idx in range(10, 30, 3):
+        expected[idx] += 3
+    sdfg(A=A)
+    assert np.allclose(A, expected)
+
+
+def test_strided_fission_array_border():
+    """MapFission with step>1 and an array (not scalar) border transient."""
+    sdfg = dace.SDFG('mapfission_strided_array_border')
+    sdfg.add_array('A', [20], dace.float64)
+    sdfg.add_array('interim', [1], dace.float64, transient=True)
+    state = sdfg.add_state()
+    me, mx = state.add_map('outer', dict(i='0:20:2'))
+
+    t1 = state.add_tasklet('addone', {'a'}, {'b'}, 'b = a + 1')
+    interim = state.add_access('interim')
+    t2 = state.add_tasklet('addtwo', {'a'}, {'b'}, 'b = a + 2')
+
+    aread = state.add_read('A')
+    awrite = state.add_write('A')
+    state.add_memlet_path(aread, me, t1, dst_conn='a', memlet=dace.Memlet.simple('A', 'i'))
+    state.add_edge(t1, 'b', interim, None, dace.Memlet.simple('interim', '0'))
+    state.add_edge(interim, None, t2, 'a', dace.Memlet.simple('interim', '0'))
+    state.add_memlet_path(t2, mx, awrite, src_conn='b', memlet=dace.Memlet.simple('A', 'i'))
+
+    assert sdfg.apply_transformations(MapFission) > 0
+
+    dace.propagate_memlets_sdfg(sdfg)
+    sdfg.validate()
+
+    # Test: even indices get +3
+    A = np.random.rand(20)
+    expected = A.copy()
+    expected[0:20:2] += 3
+    sdfg(A=A)
+    assert np.allclose(A, expected)
+
+
+def test_strided_fission_two_outputs():
+    """MapFission with step>1 and two outputs sharing a border transient."""
+    sdfg = dace.SDFG('mapfission_strided_two_outputs')
+    sdfg.add_array('in1', [20], dace.float64)
+    sdfg.add_array('in2', [20], dace.float64)
+    sdfg.add_scalar('tmp', dace.float64, transient=True)
+    sdfg.add_array('out1', [20], dace.float64)
+    sdfg.add_array('out2', [20], dace.float64)
+    state = sdfg.add_state()
+    in1 = state.add_read('in1')
+    in2 = state.add_read('in2')
+    out1 = state.add_write('out1')
+    out2 = state.add_write('out2')
+    me, mx = state.add_map('outer', dict(i='0:20:4'))
+    t1 = state.add_tasklet('t1', {'i1'}, {'o1', 'o2'}, 'o1 = i1 * 2; o2 = i1 * 5')
+    t2 = state.add_tasklet('t2', {'i1', 'i2'}, {'o1'}, 'o1 = i1 * i2')
+    state.add_memlet_path(in1, me, t1, dst_conn='i1', memlet=dace.Memlet.simple('in1', 'i'))
+    state.add_memlet_path(in2, me, t2, dst_conn='i2', memlet=dace.Memlet.simple('in2', 'i'))
+    state.add_edge(t1, 'o1', t2, 'i1', dace.Memlet.simple('tmp', '0'))
+    state.add_memlet_path(t2, mx, out1, src_conn='o1', memlet=dace.Memlet.simple('out1', 'i'))
+    state.add_memlet_path(t1, mx, out2, src_conn='o2', memlet=dace.Memlet.simple('out2', 'i'))
+
+    assert sdfg.apply_transformations(MapFission) > 0
+
+    dace.propagate_memlets_sdfg(sdfg)
+    sdfg.validate()
+
+    # Test: indices 0, 4, 8, 12, 16 → 5 iterations
+    A = np.random.rand(20)
+    B = np.random.rand(20)
+    C = np.zeros(20)
+    D = np.zeros(20)
+    expected_C = np.zeros(20)
+    expected_D = np.zeros(20)
+    for idx in range(0, 20, 4):
+        expected_C[idx] = (A[idx] * 2) * B[idx]
+        expected_D[idx] = A[idx] * 5
+    sdfg(in1=A, in2=B, out1=C, out2=D)
+    assert np.allclose(C, expected_C)
+    assert np.allclose(D, expected_D)
+
+
 if __name__ == '__main__':
     test_subgraph()
     test_nested_sdfg()
@@ -618,3 +753,7 @@ if __name__ == '__main__':
     test_array_copy_outside_scope()
     test_single_data_multiple_connectors()
     test_dependent_symbol()
+    test_strided_fission_step2()
+    test_strided_fission_offset_and_step()
+    test_strided_fission_array_border()
+    test_strided_fission_two_outputs()

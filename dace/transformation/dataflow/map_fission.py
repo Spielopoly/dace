@@ -307,9 +307,9 @@ class MapFission(transformation.SingleStateTransformation):
                 # Add extra nodes in component boundaries
                 for edge in edges:
                     anode = state.add_access(name)
-                    sbs = subsets.Range.from_string(','.join(outer_map.params))
-                    # Offset memlet by map range begin (to fit the transient)
-                    sbs.offset([r[0] for r in outer_map.range], True)
+                    sbs = subsets.Range([((pystr_to_symbolic(d) - r[0]) / r[2],
+                                          (pystr_to_symbolic(d) - r[0]) / r[2], 1)
+                                         for d, r in zip(outer_map.params, outer_map.range)])
                     state.add_edge(edge.src, edge.src_conn, anode, None,
                                    mm.Memlet.simple(name, sbs, num_accesses=outer_map.range.num_elements()))
                     state.add_edge(anode, None, edge.dst, edge.dst_conn,
@@ -481,14 +481,14 @@ class MapFission(transformation.SingleStateTransformation):
                             # `test.transformations.mapfission_test.MapFissionTest.test_array_copy_outside_scope`.
                             if e.data.data == node.data:
                                 if e.data.subset:
-                                    e.data.subset = subsets.Range([(pystr_to_symbolic(d) - r[0],
-                                                                    pystr_to_symbolic(d) - r[0], 1)
+                                    e.data.subset = subsets.Range([((pystr_to_symbolic(d) - r[0]) / r[2],
+                                                                    (pystr_to_symbolic(d) - r[0]) / r[2], 1)
                                                                    for d, r in zip(outer_map.params, outer_map.range)] +
                                                                   e.data.subset.ranges)
                             else:
                                 if e.data.other_subset:
                                     e.data.other_subset = subsets.Range(
-                                        [(pystr_to_symbolic(d) - r[0], pystr_to_symbolic(d) - r[0], 1)
+                                        [((pystr_to_symbolic(d) - r[0]) / r[2], (pystr_to_symbolic(d) - r[0]) / r[2], 1)
                                          for d, r in zip(outer_map.params, outer_map.range)] +
                                         e.data.other_subset.ranges)
 

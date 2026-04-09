@@ -1894,13 +1894,39 @@ class CPUCodeGen(TargetCodeGenerator):
                         unroll_pragma += f" {node.map.unroll_factor}"
                     result.write(unroll_pragma, cfg, state_id, node)
 
-                result.write(
-                    "for (auto %s = %s; %s < %s; %s += %s) {\n" %
-                    (var, cpp.sym2cpp(begin), var, cpp.sym2cpp(end + 1), var, cpp.sym2cpp(skip)),
-                    cfg,
-                    state_id,
-                    node,
-                )
+                if (skip > 0) == True:
+                    result.write(
+                        "for (auto {v} = {b}; {v} < {e}; {v} += {s}) {{\n".format(
+                            v=var, b=cpp.sym2cpp(begin), e=cpp.sym2cpp(end + 1), s=cpp.sym2cpp(skip)),
+                        cfg, state_id, node)
+                elif (skip < 0) == True:
+                    result.write(
+                        "for (auto {v} = {b}; {v} > {e}; {v} += {s}) {{\n".format(
+                            v=var, b=cpp.sym2cpp(begin), e=cpp.sym2cpp(end - 1), s=cpp.sym2cpp(skip)),
+                        cfg, state_id, node)
+                else:
+                    # Unknown step sign at compile time — normalize to ascending loop
+                    # for OpenMP canonical form compatibility.
+                    niter = f'__dace_niter_{var}'
+                    idx = f'__dace_idx_{var}'
+                    skip_cpp = cpp.sym2cpp(skip)
+                    begin_cpp = cpp.sym2cpp(begin)
+                    end_p1_cpp = cpp.sym2cpp(end + 1)
+                    end_m1_cpp = cpp.sym2cpp(end - 1)
+                    result.write(
+                        f"auto {niter} = ({skip_cpp} > 0 "
+                        f"? ({end_p1_cpp} - {begin_cpp} + {skip_cpp} - 1) / {skip_cpp} "
+                        f": ({begin_cpp} - {end_m1_cpp} + (-{skip_cpp}) - 1) / (-{skip_cpp}));\n",
+                        cfg, state_id, node,
+                    )
+                    result.write(
+                        f"for (auto {idx} = 0; {idx} < {niter}; ++{idx}) {{\n",
+                        cfg, state_id, node,
+                    )
+                    result.write(
+                        f"auto {var} = {begin_cpp} + {idx} * ({skip_cpp});\n",
+                        cfg, state_id, node,
+                    )
 
         callsite_stream.write(inner_stream.getvalue())
 
