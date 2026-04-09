@@ -10,7 +10,7 @@ The pipeline is also available as a :class:`CuTilePipeline` Pass that can be
 composed with other DaCe passes::
 
     from dace.libraries.cutile.transformations.pipeline import CuTilePipeline
-    pipeline = CuTilePipeline(apply_map_tiling=True, tile_shape=(16, 16, 16))
+    pipeline = CuTilePipeline(apply_map_collapse_and_tiling=True, tile_shape=(16, 16, 16))
     result = pipeline.apply_pass(sdfg, {})
 """
 
@@ -31,7 +31,7 @@ from .scalar_to_tile_library import (
 from .if_else_to_where_select import (
     IfElseMapToTileWhere,
 )
-from dace.transformation.dataflow import MapTiling, TrivialTaskletElimination, TrivialChainElimination, MapFission, MapCollapse
+from dace.transformation.dataflow import MapTiling, TrivialTaskletElimination, MapFission, MapCollapse
 from dace.transformation.interstate.loop_lifting import LoopLifting
 from dace.transformation.interstate.loop_to_map import LoopToMap
 from dace.transformation.passes.split_tasklets import SplitTasklets
@@ -49,21 +49,25 @@ class CuTilePipeline(ppl.Pass):
 
     Pipeline stages:
 
-     1. **Simplify** – trivial tasklet/chain elimination and standard simplify.
-     2. **LoopLifting / LoopToMap** – convert state-machine loops into maps.
-     3. **SplitTasklets** – split multi-statement tasklets into single ops.
-     4. **MapFission** – fission maps into single-operation maps.
-     5. **Simplify** – clean up after preprocessing.
-     6. **MapTiling** – tile maps to the given tile shape (optional).
-     7. **Normalize conditional blocks** in NestedSDFGs.
-     8. **ScalarToTile rewriting** – replace scalar tasklets with cuTile
-        library nodes.
-     9. **Simplify** – final clean up.
+     1.  **Simplify** – trivial tasklet elimination and standard simplify.
+     2.  **LoopLifting / LoopToMap** – convert state-machine loops into maps.
+     3.  **MapCollapse** – collapse nested maps (optional, controlled by
+         ``apply_map_collapse_and_tiling``).
+     4.  **SplitTasklets** – split multi-statement tasklets into single ops.
+     5.  **MapFission** – fission maps into single-operation maps
+         (skipped when ConditionalBlocks are present).
+     6.  **Simplify** – clean up after preprocessing.
+     7.  **MapTiling** – tile maps to the given tile shape (optional,
+         controlled by ``apply_map_collapse_and_tiling``).
+     8.  **Normalize conditional blocks** in NestedSDFGs.
+     9.  **ScalarToTile rewriting** – replace scalar tasklets with cuTile
+         library nodes.
+     10. **Simplify** – final clean up.
     """
 
     CATEGORY: str = 'cuTile'
 
-    apply_map_collapse_and_tiling: bool = True
+    apply_map_collapse_and_tiling: bool = True  # Controls steps 3 (MapCollapse) and 7 (MapTiling)
     tile_shape: Tuple[int, ...] = (16, 16, 16)
     validate: bool = True
     validate_all: bool = True
@@ -79,8 +83,7 @@ class CuTilePipeline(ppl.Pass):
         return set()
 
     def _simplify(self, sdfg: SDFG) -> None:
-        """Trivial tasklet/chain elimination followed by standard simplification."""
-        # sdfg.apply_transformations_repeated([TrivialChainElimination])
+        """Trivial tasklet elimination followed by standard simplification."""
         sdfg.apply_transformations_repeated([TrivialTaskletElimination])
         sdfg.simplify()
 
@@ -246,7 +249,6 @@ def apply_cutile_pipeline(sdfg: SDFG, *,
                           validate: bool = True,
                           validate_all: bool = True,
                           apply_map_collapse_and_tiling: bool = True,
-                          apply_map_collapse: bool = True,
                           tile_shape: Tuple[int, ...] = (16, 16, 16),
                           debug_save_sdfg_steps: bool = False) -> int:
     """Apply the full cuTile transformation pipeline to an SDFG.
@@ -258,10 +260,9 @@ def apply_cutile_pipeline(sdfg: SDFG, *,
         sdfg: The SDFG to transform (modified in-place).
         validate: Validate the SDFG after the full pipeline.
         validate_all: Validate after every single transformation application.
-        apply_map_tiling: Whether to apply
-            :class:`~dace.transformation.dataflow.MapTiling`.
-        apply_map_collapse: Whether to apply
-            :class:`~dace.transformation.dataflow.MapCollapse`.
+        apply_map_collapse_and_tiling: Whether to apply
+            :class:`~dace.transformation.dataflow.MapCollapse` (step 3) and
+            :class:`~dace.transformation.dataflow.MapTiling` (step 7).
         tile_shape: Tile sizes for
             :class:`~dace.transformation.dataflow.MapTiling`.
         debug_save_sdfg_steps: When ``True``, save the SDFG to disk after
