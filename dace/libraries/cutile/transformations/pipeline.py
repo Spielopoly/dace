@@ -36,6 +36,7 @@ from dace.transformation.interstate.loop_lifting import LoopLifting
 from dace.transformation.interstate.loop_to_map import LoopToMap
 from dace.transformation.passes.split_tasklets import SplitTasklets
 from dace.transformation import pass_pipeline as ppl
+from .remove_intermediate_transient import RemoveIntermediateTransient
 
 
 # ---------------------------------------------------------------------------
@@ -86,6 +87,7 @@ class CuTilePipeline(ppl.Pass):
         """Trivial tasklet elimination followed by standard simplification."""
         sdfg.apply_transformations_repeated([TrivialTaskletElimination])
         sdfg.simplify()
+        sdfg.apply_transformations_repeated([RemoveIntermediateTransient])
 
     def apply_pass(self, sdfg: SDFG, pipeline_results: Dict[str, Any]):
         # Debug snapshot setup
