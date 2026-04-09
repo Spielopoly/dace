@@ -18,7 +18,7 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Set, Tuple, Type
+from typing import Any, Dict, Optional, Set, Tuple, Type, Union
 
 from .utils import duplicate_conditions_for_whole_sdfgs
 from dace.sdfg import SDFG
@@ -31,7 +31,7 @@ from .scalar_to_tile_library import (
 from .if_else_to_where_select import (
     IfElseMapToTileWhere,
 )
-from dace.transformation.dataflow import MapTiling, TrivialTaskletElimination, TrivialChainElimination, MapFission
+from dace.transformation.dataflow import MapTiling, TrivialTaskletElimination, TrivialChainElimination, MapFission, MapCollapse
 from dace.transformation.interstate.loop_lifting import LoopLifting
 from dace.transformation.interstate.loop_to_map import LoopToMap
 from dace.transformation.passes.split_tasklets import SplitTasklets
@@ -64,6 +64,7 @@ class CuTilePipeline(ppl.Pass):
     CATEGORY: str = 'cuTile'
 
     apply_map_tiling: bool = True
+    apply_map_collapse: bool = True
     tile_shape: Tuple[int, ...] = (16, 16, 16)
     validate: bool = True
     validate_all: bool = False
@@ -75,16 +76,16 @@ class CuTilePipeline(ppl.Pass):
     def should_reapply(self, modified: ppl.Modifies) -> bool:
         return False
 
-    def depends_on(self) -> Set[Type[ppl.Pass]]:
+    def depends_on(self) -> Set[Union[Type[ppl.Pass], ppl.Pass]]:
         return set()
 
     def _simplify(self, sdfg: SDFG) -> None:
         """Trivial tasklet/chain elimination followed by standard simplification."""
-        sdfg.apply_transformations_repeated([TrivialChainElimination])
+        # sdfg.apply_transformations_repeated([TrivialChainElimination])
         sdfg.apply_transformations_repeated([TrivialTaskletElimination])
         sdfg.simplify()
 
-    def apply_pass(self, sdfg: SDFG, pipeline_results: Dict[str, Any]) -> Optional[int]:
+    def apply_pass(self, sdfg: SDFG, pipeline_results: Dict[str, Any]):
         # Debug snapshot setup
         debug_step = -1
         debug_dirname: Optional[str] = None
@@ -94,7 +95,7 @@ class CuTilePipeline(ppl.Pass):
 
         def debug_save() -> None:
             nonlocal debug_step
-            if self.debug_save_sdfg_steps and debug_dirname is not None:
+            if self.debug_save_sdfg_steps:
                 debug_step += 1
                 sdfg.save(f"{debug_dirname}/step_{debug_step}.sdfg")
 
@@ -107,44 +108,48 @@ class CuTilePipeline(ppl.Pass):
 
         # Step 2: Loop canonicalization (LoopLifting + LoopToMap)
         count += sdfg.apply_transformations_repeated(
-            [LoopLifting], validate=False, validate_all=False,
-        )
-        count += sdfg.apply_transformations_repeated(
-            [LoopToMap], validate=False, validate_all=False,
+            [LoopLifting, LoopToMap], validate=self.validate_all, validate_all=self.validate_all,
         )
         debug_save()
+        
+        # Step 3: MapCollapse
+        if self.apply_map_collapse:
+            count += sdfg.apply_transformations_repeated(
+                [MapCollapse], validate=self.validate_all, validate_all=self.validate_all,
+            )
+        debug_save()
 
-        # Step 3: Split multi-statement tasklets
+        # Step 4: Split multi-statement tasklets
         SplitTasklets().apply_pass(sdfg, pipeline_results)
         debug_save()
 
-        # Step 4: Fission maps (skip if ConditionalBlocks present)
+        # Step 5: Fission maps (skip if ConditionalBlocks present)
         has_conditional = any(
             isinstance(cfr, ConditionalBlock)
             for cfr in sdfg.all_control_flow_regions(recursive=True)
         )
         if not has_conditional:
             count += sdfg.apply_transformations_repeated(
-                [MapFission], validate=False, validate_all=False,
+                [MapFission], validate=self.validate_all, validate_all=self.validate_all,
             )
         debug_save()
 
-        # Step 5: Clean up after preprocessing
+        # Step 6: Clean up after preprocessing
         self._simplify(sdfg)
         debug_save()
 
-        # Step 6: Map tiling (optional)
+        # Step 7: Map tiling (optional)
         if self.apply_map_tiling:
             count += _apply_map_tiling_to_all_maps(
                 sdfg, tile_shape=self.tile_shape, validate=self.validate_all,
             )
             debug_save()
 
-        # Step 7: Normalize conditional blocks in NestedSDFGs
+        # Step 8: Normalize conditional blocks in NestedSDFGs
         duplicate_conditions_for_whole_sdfgs(sdfg)
         debug_save()
 
-        # Step 8: ScalarToTile transformations
+        # Step 9: ScalarToTile transformations
         count += sdfg.apply_transformations_repeated(
             [ScalarToTileCanonical, ScalarToTileMasked, IfElseMapToTileWhere],
             validate=self.validate_all,
@@ -152,32 +157,20 @@ class CuTilePipeline(ppl.Pass):
         )
         debug_save()
 
-        # Step 9: Final clean up
+        # Step 10: Final clean up
         self._simplify(sdfg)
         debug_save()
 
         if self.validate or self.validate_all:
             sdfg.validate()
 
-        return count
+        pipeline_results['cutile_pipeline_count'] = count
+        return pipeline_results
 
 
 # ---------------------------------------------------------------------------
 # Module-level helpers
 # ---------------------------------------------------------------------------
-
-
-def _simplify(sdfg: SDFG) -> None:
-    """Apply trivial tasklet/chain elimination and standard simplification.
-
-    .. deprecated:: Use ``CuTilePipeline._simplify`` instead.
-    """
-    import warnings
-    warnings.warn("_simplify() is deprecated, use CuTilePipeline instead", DeprecationWarning, stacklevel=2)
-    sdfg.apply_transformations_repeated([TrivialChainElimination])
-    sdfg.apply_transformations_repeated([TrivialTaskletElimination])
-    sdfg.simplify()
-
 
 def _apply_map_tiling_to_all_maps(sdfg: SDFG,
                                    tile_shape: Tuple[int, ...],
@@ -254,6 +247,7 @@ def apply_cutile_pipeline(sdfg: SDFG, *,
                           validate: bool = True,
                           validate_all: bool = True,
                           apply_map_tiling: bool = True,
+                          apply_map_collapse: bool = True,
                           tile_shape: Tuple[int, ...] = (16, 16, 16),
                           debug_save_sdfg_steps: bool = False) -> int:
     """Apply the full cuTile transformation pipeline to an SDFG.
@@ -267,6 +261,8 @@ def apply_cutile_pipeline(sdfg: SDFG, *,
         validate_all: Validate after every single transformation application.
         apply_map_tiling: Whether to apply
             :class:`~dace.transformation.dataflow.MapTiling`.
+        apply_map_collapse: Whether to apply
+            :class:`~dace.transformation.dataflow.MapCollapse`.
         tile_shape: Tile sizes for
             :class:`~dace.transformation.dataflow.MapTiling`.
         debug_save_sdfg_steps: When ``True``, save the SDFG to disk after
@@ -277,10 +273,11 @@ def apply_cutile_pipeline(sdfg: SDFG, *,
     """
     pipeline = CuTilePipeline(
         apply_map_tiling=apply_map_tiling,
+        apply_map_collapse=apply_map_collapse,
         tile_shape=tile_shape,
         validate=validate,
         validate_all=validate_all,
         debug_save_sdfg_steps=debug_save_sdfg_steps,
     )
     result = pipeline.apply_pass(sdfg, {})
-    return result if result is not None else 0
+    return result['cutile_pipeline_count'] if result is not None else 0

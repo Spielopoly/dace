@@ -13,7 +13,7 @@ if __name__ == "__main__":
     test_files += glob.glob(os.path.join(current_dir, "*_test.py"))
     test_files = [file for file in test_files if file != file_name]
     
-    sys.exit(pytest.main(test_files + ["-q"]))
+    sys.exit(pytest.main(test_files + ["-q", "--tb=short"]))
 else:
     from cutile_frontend_test import *
     from cutile_if_else_op_test import *

@@ -19,7 +19,7 @@ from dace.libraries.cutile.transformations.if_else_to_where_select import (
     IfElseMapToTileWhere,
 )
 from dace.libraries.cutile.nodes.if_else_op import TileIfElseOpLibraryNode
-from dace.libraries.cutile.transformations.pipeline import apply_cutile_pipeline, _simplify
+from dace.libraries.cutile.transformations.pipeline import apply_cutile_pipeline
 
 
 # ---------------------------------------------------------------------------
