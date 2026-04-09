@@ -94,6 +94,15 @@ class RemoveIntermediateTransient(pm.SingleStateTransformation):
         if graph.out_degree(access_node) != 1:
             return False
 
+        # If a LibraryNode or NestedSDFG writes into the transient, the
+        # transient is an output buffer that must not be removed.  These
+        # nodes produce data that downstream transformations (e.g.
+        # IfElseMapToTileWhere) rely on finding in a dedicated AccessNode.
+        in_edge = graph.in_edges(access_node)[0]
+        if isinstance(in_edge.src,
+                      (nodes.LibraryNode, nodes.NestedSDFG)):
+            return False
+
         # No other access node in the SDFG may reference the same data
         occurrences = 0
         for state in sdfg.states():
@@ -122,7 +131,6 @@ class RemoveIntermediateTransient(pm.SingleStateTransformation):
             return False
 
         # Validate memlet composition for AccessNode predecessors with non-scalar intermediates
-        in_edge = graph.in_edges(access_node)[0]
         if isinstance(in_edge.src, nodes.AccessNode):
             in_other = in_edge.data.other_subset
             in_subset = in_edge.data.subset

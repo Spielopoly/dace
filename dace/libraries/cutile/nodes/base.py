@@ -153,7 +153,14 @@ def resolve_shape_and_scalar_form(
     return shape, ndim, use_scalar_form
 
 
-def build_stride_decls(array_descs: Dict[str, DataDesc]) -> Tuple[str, str, str]:
+def get_tile_strides(desc: DataDesc, ndim: int):
+    """Return the last *ndim* strides of *desc* (the tile-relevant ones)."""
+    if ndim <= 0:
+        return ()
+    return desc.strides[-ndim:]
+
+
+def build_stride_decls(array_descs: Dict[str, DataDesc], ndim: int) -> Tuple[str, str, str]:
     """Build C++ stride, index, and update declaration strings.
 
     Generates three code fragments used inside cuTile C++ expansion templates:
@@ -163,6 +170,8 @@ def build_stride_decls(array_descs: Dict[str, DataDesc]) -> Tuple[str, str, str]
     Args:
         array_descs: Mapping from short connector key (``"a"``, ``"b"``, …)
             to the corresponding array descriptor.
+        ndim: Number of tile dimensions.  Only the last *ndim* strides of
+            each descriptor are emitted.
 
     Returns:
         A 3-tuple ``(stride_decls, index_decls, index_updates)`` — each a
@@ -172,7 +181,8 @@ def build_stride_decls(array_descs: Dict[str, DataDesc]) -> Tuple[str, str, str]
     index_decls = ""
     index_updates = ""
     for key, desc in array_descs.items():
-        stride_decls += f"const std::ptrdiff_t {key}_strides[ndim] = {{{', '.join(symstr(s) for s in desc.strides)}}};\n"
+        strides = get_tile_strides(desc, ndim)
+        stride_decls += f"const std::ptrdiff_t {key}_strides[ndim] = {{{', '.join(symstr(s) for s in strides)}}};\n"
         index_decls += f"    std::size_t i{key} = 0;\n"
         index_updates += f"        i{key} += coord * {key}_strides[d];\n"
     return stride_decls, index_decls, index_updates
@@ -340,7 +350,7 @@ def build_multi_op_code(
         return f"{val_reads}{out_conn} = {cpp_expr_str};"
 
     shape_expr = ", ".join(symstr(s) for s in shape)
-    c_strides_expr = ", ".join(symstr(s) for s in c_desc.strides)
+    c_strides_expr = ", ".join(symstr(s) for s in get_tile_strides(c_desc, ndim))
     stride_decls = ""
     index_decls = ""
     index_updates = ""
@@ -348,7 +358,7 @@ def build_multi_op_code(
     for conn in connectors:
         desc = input_descs[conn]
         k = _lv(conn)
-        strides_str = ", ".join(symstr(s) for s in desc.strides)
+        strides_str = ", ".join(symstr(s) for s in get_tile_strides(desc, ndim))
         stride_decls += f"const std::ptrdiff_t {k}_strides[ndim] = {{{strides_str}}};\n"
         index_decls += f"    std::size_t i{k} = 0;\n"
         index_updates += f"        i{k} += coord * {k}_strides[d];\n"

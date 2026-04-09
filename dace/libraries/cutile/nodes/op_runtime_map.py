@@ -34,6 +34,7 @@ from .base import (
     get_output_connector_name,
     op_cpp_expr, get_tile_descriptors, resolve_shape_and_scalar_form,
     build_stride_decls, resolve_operands, collect_array_descs,
+    get_tile_strides,
     _BINARY_OPS, _UNARY_OPS, SUPPORTED_MASK_DTYPES,
 )
 
@@ -276,8 +277,8 @@ class ExpandTileRuntimeMaskedOpPure(ExpandTransformation):
                     )
             else:
                 shape_expr = ", ".join(symstr(s) for s in shape)
-                m_strides_expr = ", ".join(symstr(s) for s in m_desc.strides)
-                out_strides_expr = ", ".join(symstr(s) for s in out_desc.strides)
+                m_strides_expr = ", ".join(symstr(s) for s in get_tile_strides(m_desc, ndim))
+                out_strides_expr = ", ".join(symstr(s) for s in get_tile_strides(out_desc, ndim))
 
                 stride_decls = ""
                 index_decls = ""
@@ -286,7 +287,7 @@ class ExpandTileRuntimeMaskedOpPure(ExpandTransformation):
                 for conn in expr_inputs:
                     desc = in_descs[conn]
                     key = _lv(conn)
-                    stride_str = ", ".join(symstr(s) for s in desc.strides)
+                    stride_str = ", ".join(symstr(s) for s in get_tile_strides(desc, ndim))
                     stride_decls += (
                         f"const std::ptrdiff_t {key}_strides[ndim] = "
                         f"{{{stride_str}}};\n"
@@ -300,7 +301,7 @@ class ExpandTileRuntimeMaskedOpPure(ExpandTransformation):
                 c_in_index_update = ""
                 c_in_else = ""
                 if has_c_in and c_in_desc is not None:
-                    c_in_strides = ", ".join(symstr(s) for s in c_in_desc.strides)
+                    c_in_strides = ", ".join(symstr(s) for s in get_tile_strides(c_in_desc, ndim))
                     c_in_stride_decl = f"const std::ptrdiff_t c_in_strides[ndim] = {{{c_in_strides}}};"
                     c_in_index_decl = "    std::size_t iin = 0;"
                     c_in_index_update = "        iin += coord * c_in_strides[d];"
@@ -383,20 +384,20 @@ for (std::size_t i = 0; i < n; ++i) {{
                 code = f"if (_m) {{ {out_conn} = {scalar_expr}; }}"
         else:
             shape_expr = ", ".join(symstr(s) for s in shape)
-            m_strides_expr = ", ".join(symstr(s) for s in m_desc.strides)
-            c_strides_expr = ", ".join(symstr(s) for s in c_desc.strides)
+            m_strides_expr = ", ".join(symstr(s) for s in get_tile_strides(m_desc, ndim))
+            c_strides_expr = ", ".join(symstr(s) for s in get_tile_strides(c_desc, ndim))
 
             # Collect array descriptors for stride computation
             array_descs = collect_array_descs(a_desc, b_desc)
 
-            stride_decls, index_decls, index_updates = build_stride_decls(array_descs)
+            stride_decls, index_decls, index_updates = build_stride_decls(array_descs, ndim)
 
             c_in_stride_decl = ""
             c_in_index_decl = ""
             c_in_index_update = ""
             c_in_else = ""
             if has_c_in:
-                c_in_stride_decl = f"const std::ptrdiff_t c_in_strides[ndim] = {{{', '.join(symstr(s) for s in c_in_desc.strides)}}};"
+                c_in_stride_decl = f"const std::ptrdiff_t c_in_strides[ndim] = {{{', '.join(symstr(s) for s in get_tile_strides(c_in_desc, ndim))}}};"
                 c_in_index_decl =   "    std::size_t iin = 0;"
                 c_in_index_update = "        iin += coord * c_in_strides[d];"
                 c_in_else =         f"else {{ {out_conn}[ic] = _c_in[iin]; }}"

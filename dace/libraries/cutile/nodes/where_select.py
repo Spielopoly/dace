@@ -24,7 +24,7 @@ from dace.sdfg.validation import InvalidSDFGNodeError
 from dace.symbolic import symstr
 from dace.transformation.transformation import ExpandTransformation
 
-from .base import resolve_shape_and_scalar_form, TileNodeBase, SUPPORTED_MASK_DTYPES
+from .base import resolve_shape_and_scalar_form, TileNodeBase, SUPPORTED_MASK_DTYPES, get_tile_strides
 
 
 # ── Helper to read tile descriptors for where-select ─────────────────
@@ -216,10 +216,10 @@ class ExpandTileWhereSelectPure(ExpandTransformation):
             code = "_c = _cond ? _x : _y;"
         else:
             shape_expr = ", ".join(symstr(s) for s in shape)
-            cond_strides = ", ".join(symstr(s) for s in cond_desc.strides)
-            x_strides = ", ".join(symstr(s) for s in x_desc.strides)
-            y_strides = ", ".join(symstr(s) for s in y_desc.strides)
-            c_strides = ", ".join(symstr(s) for s in c_desc.strides)
+            cond_strides = ", ".join(symstr(s) for s in get_tile_strides(cond_desc, ndim))
+            x_strides = ", ".join(symstr(s) for s in get_tile_strides(x_desc, ndim))
+            y_strides = ", ".join(symstr(s) for s in get_tile_strides(y_desc, ndim))
+            c_strides = ", ".join(symstr(s) for s in get_tile_strides(c_desc, ndim))
 
             code = f"""
 constexpr int ndim = {ndim};

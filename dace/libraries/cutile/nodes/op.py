@@ -31,7 +31,7 @@ from .base import (
     get_output_connector_name,
     op_cpp_expr, get_tile_descriptors, resolve_shape_and_scalar_form,
     build_stride_decls, resolve_operands, collect_array_descs,
-    get_all_input_descs, build_multi_op_code,
+    get_all_input_descs, build_multi_op_code, get_tile_strides,
     _BINARY_OPS, _UNARY_OPS,
 )
 
@@ -159,12 +159,12 @@ class ExpandTileOpPure(ExpandTransformation):
             code = f"{out_conn} = {op_cpp_expr(op, left_scalar, right_scalar)};"
         else:
             shape_expr = ", ".join(symstr(s) for s in shape)
-            c_strides_expr = ", ".join(symstr(s) for s in c_desc.strides)
+            c_strides_expr = ", ".join(symstr(s) for s in get_tile_strides(c_desc, ndim))
 
             # Collect array descriptors that need stride computation
             array_descs = collect_array_descs(a_desc, b_desc)
 
-            stride_decls, index_decls, index_updates = build_stride_decls(array_descs)
+            stride_decls, index_decls, index_updates = build_stride_decls(array_descs, ndim)
 
             if not array_descs:
                 # Both operands are constants – fill output tile
