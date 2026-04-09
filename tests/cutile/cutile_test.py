@@ -216,7 +216,7 @@ def test_scalar_to_tile_add():
     """Transform tiled scalar add → TileAdd library node."""
     sdfg = build_tiled_scalar_add_sdfg()
 
-    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_tiling=False)
+    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_collapse_and_tiling=False)
     assert count == 1, f"Expected 1 transformation, got {count}"
 
     state = sdfg.states()[0]
@@ -252,7 +252,7 @@ def test_scalar_to_tile_add_same_input_operand():
     """Regression: c = a + a must wire one input tile to both library inputs."""
     sdfg = build_tiled_scalar_add_same_input_sdfg()
 
-    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_tiling=False)
+    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_collapse_and_tiling=False)
     assert count == 1, f"Expected 1 transformation, got {count}"
 
     state = sdfg.states()[0]
@@ -348,17 +348,17 @@ def test_pipeline_idempotent():
     """Running the pipeline twice should not change a transformed SDFG."""
     sdfg = build_tiled_scalar_add_sdfg()
 
-    count1 = apply_cutile_pipeline(sdfg, validate=True, apply_map_tiling=False)
+    count1 = apply_cutile_pipeline(sdfg, validate=True, apply_map_collapse_and_tiling=False)
     assert count1 == 1
 
-    count2 = apply_cutile_pipeline(sdfg, validate=True, apply_map_tiling=False)
+    count2 = apply_cutile_pipeline(sdfg, validate=True, apply_map_collapse_and_tiling=False)
     assert count2 == 0, "Pipeline should be idempotent"
 
 
 def test_structure_matches_expected():
     """Verify the transformed SDFG has the expected node/edge structure."""
     sdfg = build_tiled_scalar_add_sdfg()
-    apply_cutile_pipeline(sdfg, validate=True, apply_map_tiling=False)
+    apply_cutile_pipeline(sdfg, validate=True, apply_map_collapse_and_tiling=False)
 
     state = sdfg.states()[0]
     outer_entry = None
@@ -442,7 +442,7 @@ def test_pipeline_runtime_numeric_correctness_float64():
         dtype=dace.float64,
     )
 
-    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_tiling=False)
+    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_collapse_and_tiling=False)
     assert count == 1
     sdfg.expand_library_nodes()
     sdfg.validate()
@@ -466,7 +466,7 @@ def test_pipeline_runtime_numeric_correctness_float32():
         dtype=dace.float32,
     )
 
-    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_tiling=False)
+    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_collapse_and_tiling=False)
     assert count == 1
     sdfg.expand_library_nodes()
     sdfg.validate()
@@ -490,7 +490,7 @@ def test_pipeline_runtime_numeric_correctness_same_input_float64():
         dtype=dace.float64,
     )
 
-    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_tiling=False)
+    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_collapse_and_tiling=False)
     assert count == 1
     sdfg.expand_library_nodes()
     sdfg.validate()
@@ -513,7 +513,7 @@ def test_pipeline_runtime_numeric_correctness_same_input_float32():
         dtype=dace.float32,
     )
 
-    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_tiling=False)
+    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_collapse_and_tiling=False)
     assert count == 1
     sdfg.expand_library_nodes()
     sdfg.validate()
@@ -902,7 +902,7 @@ def test_scalar_to_tile_subtract():
     """Transform tiled scalar subtract → TileSubtractLibraryNode."""
     sdfg = build_tiled_scalar_subtract_sdfg()
 
-    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_tiling=False)
+    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_collapse_and_tiling=False)
     assert count == 1, f"Expected 1 transformation, got {count}"
 
     state = sdfg.states()[0]
@@ -932,17 +932,17 @@ def test_subtract_pipeline_idempotent():
     """Running the pipeline twice on a subtract SDFG should be idempotent."""
     sdfg = build_tiled_scalar_subtract_sdfg()
 
-    count1 = apply_cutile_pipeline(sdfg, validate=True, apply_map_tiling=False)
+    count1 = apply_cutile_pipeline(sdfg, validate=True, apply_map_collapse_and_tiling=False)
     assert count1 == 1
 
-    count2 = apply_cutile_pipeline(sdfg, validate=True, apply_map_tiling=False)
+    count2 = apply_cutile_pipeline(sdfg, validate=True, apply_map_collapse_and_tiling=False)
     assert count2 == 0, "Pipeline should be idempotent for subtract"
 
 
 def test_subtract_structure_matches_expected():
     """Transformed subtract SDFG has the expected node/edge structure."""
     sdfg = build_tiled_scalar_subtract_sdfg()
-    apply_cutile_pipeline(sdfg, validate=True, apply_map_tiling=False)
+    apply_cutile_pipeline(sdfg, validate=True, apply_map_collapse_and_tiling=False)
 
     state = sdfg.states()[0]
     outer_entry = outer_exit = lib_node = None
@@ -1024,7 +1024,7 @@ def test_pipeline_runtime_subtraction_float64():
         dtype=dace.float64,
     )
 
-    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_tiling=False)
+    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_collapse_and_tiling=False)
     assert count == 1
     sdfg.expand_library_nodes()
     sdfg.validate()
@@ -1048,7 +1048,7 @@ def test_pipeline_runtime_subtraction_float32():
         dtype=dace.float32,
     )
 
-    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_tiling=False)
+    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_collapse_and_tiling=False)
     assert count == 1
     sdfg.expand_library_nodes()
     sdfg.validate()
@@ -1389,7 +1389,7 @@ def test_subtract_pipeline_various_tile_sizes():
             tile_shape=tile_shape,
             dtype=dace.float64,
         )
-        count = apply_cutile_pipeline(sdfg, validate=True, apply_map_tiling=False)
+        count = apply_cutile_pipeline(sdfg, validate=True, apply_map_collapse_and_tiling=False)
         assert count == 1, f"Expected 1 for {outer_shape=} {tile_shape=}, got {count}"
         sdfg.expand_library_nodes()
         sdfg.validate()
@@ -1418,7 +1418,7 @@ def test_add_pipeline_various_tile_sizes():
             tile_shape=tile_shape,
             dtype=dace.float64,
         )
-        count = apply_cutile_pipeline(sdfg, validate=True, apply_map_tiling=False)
+        count = apply_cutile_pipeline(sdfg, validate=True, apply_map_collapse_and_tiling=False)
         assert count == 1
         sdfg.expand_library_nodes()
         sdfg.validate()
@@ -1549,7 +1549,7 @@ def test_noncanonical_add_transforms_to_masked_node_and_contiguous_memlets():
         dtype=dace.float64,
     )
 
-    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_tiling=False)
+    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_collapse_and_tiling=False)
     assert count == 1
 
     state = sdfg.states()[0]
@@ -1571,7 +1571,7 @@ def test_noncanonical_add_runtime_numeric_correctness():
         dtype=dace.float64,
     )
 
-    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_tiling=False)
+    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_collapse_and_tiling=False)
     assert count == 1
     sdfg.expand_library_nodes()
     sdfg.validate()
@@ -1597,7 +1597,7 @@ def test_noncanonical_subtract_runtime_numeric_correctness_negative_step():
         dtype=dace.float64,
     )
 
-    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_tiling=False)
+    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_collapse_and_tiling=False)
     assert count == 1
 
     state = sdfg.states()[0]
@@ -1632,7 +1632,7 @@ def test_noncanonical_symbolic_unknown_sign_step_runtime():
         step_symbol="S",
     )
 
-    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_tiling=False)
+    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_collapse_and_tiling=False)
     assert count == 1
     sdfg.expand_library_nodes()
     sdfg.validate()
@@ -1915,7 +1915,7 @@ def test_pipeline_multiply_transforms_correctly():
                           src_conn="c", memlet=Memlet("C[i, j, ii, jj]"))
     sdfg.validate()
 
-    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_tiling=False)
+    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_collapse_and_tiling=False)
     assert count == 1
 
     state = sdfg.states()[0]
@@ -2042,7 +2042,7 @@ def test_pipeline_unary_negate_transforms_correctly():
                           src_conn="c", memlet=Memlet("C[i, j, ii, jj]"))
     sdfg.validate()
 
-    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_tiling=False)
+    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_collapse_and_tiling=False)
     assert count == 1
 
     state = sdfg.states()[0]
@@ -2237,7 +2237,7 @@ def test_pipeline_const_add_right_transforms_correctly():
                           src_conn="c", memlet=Memlet("C[i, j, ii, jj]"))
     sdfg.validate()
 
-    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_tiling=False)
+    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_collapse_and_tiling=False)
     assert count == 1
 
     state = sdfg.states()[0]
@@ -2286,7 +2286,7 @@ def test_pipeline_const_left_multiply_transforms_correctly():
                           src_conn="c", memlet=Memlet("C[i, j, ii, jj]"))
     sdfg.validate()
 
-    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_tiling=False)
+    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_collapse_and_tiling=False)
     assert count == 1
 
     state = sdfg.states()[0]
@@ -2663,7 +2663,7 @@ def test_pipeline_multiple_independent_maps_tiling():
     assert len(map_entries_before) == 2, f"Expected 2 maps before tiling, got {len(map_entries_before)}"
     
     # Apply the pipeline with tiling
-    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_tiling=True, tile_shape=(2, 2))
+    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_collapse_and_tiling=True, tile_shape=(2, 2))
     
     # The transformation count should indicate that both maps were tiled.
     # Each MapTiling creates additional strip-mining operations, so count >= 2

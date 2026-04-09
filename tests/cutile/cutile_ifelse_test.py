@@ -426,14 +426,14 @@ class TestIfElsePipeline:
 
     def test_pipeline_applies_if_else(self):
         sdfg = if_else_add_constant.to_sdfg()
-        apply_cutile_pipeline(sdfg, apply_map_tiling=True)
+        apply_cutile_pipeline(sdfg, apply_map_collapse_and_tiling=True)
 
         ws = _collect_lib_nodes(sdfg, TileIfElseOpLibraryNode)
         assert len(ws) >= 1, "Pipeline should produce at least one TileIfElseOpLibraryNode"
 
     def test_pipeline_numeric_correctness(self):
         sdfg = if_else_add_constant.to_sdfg()
-        apply_cutile_pipeline(sdfg, apply_map_tiling=True)
+        apply_cutile_pipeline(sdfg, apply_map_collapse_and_tiling=True)
         sdfg.expand_library_nodes()
         compiled = sdfg.compile()
 

@@ -63,11 +63,10 @@ class CuTilePipeline(ppl.Pass):
 
     CATEGORY: str = 'cuTile'
 
-    apply_map_tiling: bool = True
-    apply_map_collapse: bool = True
+    apply_map_collapse_and_tiling: bool = True
     tile_shape: Tuple[int, ...] = (16, 16, 16)
     validate: bool = True
-    validate_all: bool = False
+    validate_all: bool = True
     debug_save_sdfg_steps: bool = False
 
     def modifies(self) -> ppl.Modifies:
@@ -113,7 +112,7 @@ class CuTilePipeline(ppl.Pass):
         debug_save()
         
         # Step 3: MapCollapse
-        if self.apply_map_collapse:
+        if self.apply_map_collapse_and_tiling:
             count += sdfg.apply_transformations_repeated(
                 [MapCollapse], validate=self.validate_all, validate_all=self.validate_all,
             )
@@ -139,11 +138,11 @@ class CuTilePipeline(ppl.Pass):
         debug_save()
 
         # Step 7: Map tiling (optional)
-        if self.apply_map_tiling:
+        if self.apply_map_collapse_and_tiling:
             count += _apply_map_tiling_to_all_maps(
                 sdfg, tile_shape=self.tile_shape, validate=self.validate_all,
             )
-            debug_save()
+        debug_save()
 
         # Step 8: Normalize conditional blocks in NestedSDFGs
         duplicate_conditions_for_whole_sdfgs(sdfg)
@@ -246,7 +245,7 @@ def _apply_map_tiling_to_all_maps(sdfg: SDFG,
 def apply_cutile_pipeline(sdfg: SDFG, *,
                           validate: bool = True,
                           validate_all: bool = True,
-                          apply_map_tiling: bool = True,
+                          apply_map_collapse_and_tiling: bool = True,
                           apply_map_collapse: bool = True,
                           tile_shape: Tuple[int, ...] = (16, 16, 16),
                           debug_save_sdfg_steps: bool = False) -> int:
@@ -272,8 +271,7 @@ def apply_cutile_pipeline(sdfg: SDFG, *,
         Total number of transformations applied.
     """
     pipeline = CuTilePipeline(
-        apply_map_tiling=apply_map_tiling,
-        apply_map_collapse=apply_map_collapse,
+        apply_map_collapse_and_tiling=apply_map_collapse_and_tiling,
         tile_shape=tile_shape,
         validate=validate,
         validate_all=validate_all,

@@ -137,7 +137,7 @@ def test_frontend_vadd_pipeline_structure_and_runtime():
     count = apply_cutile_pipeline(
         sdfg,
         validate=True,
-        apply_map_tiling=True,
+        apply_map_collapse_and_tiling=True,
         tile_shape=(6, 5),
     )
     assert count >= 1, f"Expected at least 1 transformation, got {count}"
@@ -182,7 +182,7 @@ def test_frontend_symbolic_vadd_pipeline_structure_and_runtime():
     count = apply_cutile_pipeline(
         sdfg,
         validate=True,
-        apply_map_tiling=True,
+        apply_map_collapse_and_tiling=True,
         tile_shape=(4, 3),
     )
     assert count >= 1, f"Expected at least 1 transformation, but got {count}"
@@ -220,7 +220,7 @@ def test_frontend_vselfadd_pipeline_structure_and_runtime():
     count = apply_cutile_pipeline(
         sdfg,
         validate=True,
-        apply_map_tiling=True,
+        apply_map_collapse_and_tiling=True,
         tile_shape=(6, 5),
     )
     assert count >= 1, f"Expected at least 1 transformation, got {count}"
@@ -247,7 +247,7 @@ def test_frontend_noncanonical_strided_add_pipeline_structure_and_runtime():
     count = apply_cutile_pipeline(
         sdfg,
         validate=True,
-        apply_map_tiling=False,
+        apply_map_collapse_and_tiling=False,
     )
     assert count == 0
 
@@ -287,7 +287,7 @@ def test_frontend_large_prime_strided_add_with_nonmultiple_tile_shape(tile_shape
     count = apply_cutile_pipeline(
         sdfg,
         validate=True,
-        apply_map_tiling=True,
+        apply_map_collapse_and_tiling=True,
         tile_shape=tile_shape,
     )
     assert count >= 2
@@ -319,7 +319,7 @@ def test_frontend_large_prime_strided_add_with_nondivisible_ranges(tile_shape):
     count = apply_cutile_pipeline(
         sdfg,
         validate=True,
-        apply_map_tiling=True,
+        apply_map_collapse_and_tiling=True,
         tile_shape=tile_shape,
     )
     assert count >= 2
@@ -431,7 +431,7 @@ def test_frontend_negate_pipeline_structure_and_runtime():
     count = apply_cutile_pipeline(
         sdfg,
         validate=True,
-        apply_map_tiling=True,
+        apply_map_collapse_and_tiling=True,
         tile_shape=(6, 5),
     )
     assert count >= 1
@@ -456,7 +456,7 @@ def test_frontend_abs_pipeline_structure_and_runtime():
     count = apply_cutile_pipeline(
         sdfg,
         validate=True,
-        apply_map_tiling=True,
+        apply_map_collapse_and_tiling=True,
         tile_shape=(6, 5),
     )
     assert count >= 1
@@ -481,7 +481,7 @@ def test_frontend_cos_pipeline_structure_and_runtime():
     count = apply_cutile_pipeline(
         sdfg,
         validate=True,
-        apply_map_tiling=True,
+        apply_map_collapse_and_tiling=True,
         tile_shape=(6, 5),
     )
     assert count >= 1
@@ -506,7 +506,7 @@ def test_frontend_a_minus_const_pipeline_structure_and_runtime():
     count = apply_cutile_pipeline(
         sdfg,
         validate=True,
-        apply_map_tiling=True,
+        apply_map_collapse_and_tiling=True,
         tile_shape=(6, 5),
     )
     assert count >= 1
@@ -531,7 +531,7 @@ def test_frontend_const_minus_a_pipeline_structure_and_runtime():
     count = apply_cutile_pipeline(
         sdfg,
         validate=True,
-        apply_map_tiling=True,
+        apply_map_collapse_and_tiling=True,
         tile_shape=(6, 5),
     )
     assert count >= 1
@@ -556,7 +556,7 @@ def test_frontend_a_times_const_pipeline_structure_and_runtime():
     count = apply_cutile_pipeline(
         sdfg,
         validate=True,
-        apply_map_tiling=True,
+        apply_map_collapse_and_tiling=True,
         tile_shape=(6, 5),
     )
     assert count >= 1
@@ -581,7 +581,7 @@ def test_frontend_const_const_pipeline_runtime():
     count = apply_cutile_pipeline(
         sdfg,
         validate=True,
-        apply_map_tiling=True,
+        apply_map_collapse_and_tiling=True,
         tile_shape=(6, 5),
     )
     assert count >= 1
@@ -631,7 +631,7 @@ def test_frontend_multi_vadd_pipeline_all_maps_tiled():
     count = apply_cutile_pipeline(
         sdfg,
         validate=True,
-        apply_map_tiling=True,
+        apply_map_collapse_and_tiling=True,
         tile_shape=(3, 3),
     )
     
@@ -690,7 +690,7 @@ def test_frontend_multiple_tasklets_pipeline_all_maps_tiled():
     count = apply_cutile_pipeline(
         sdfg,
         validate=True,
-        apply_map_tiling=True,
+        apply_map_collapse_and_tiling=True,
         tile_shape=(3, 3),
     )
     
@@ -918,7 +918,7 @@ def frontend_forloop_ifelse_masked_symbolic(
 def test_frontend_forloop_selfwrite_unmasked_numeric_structure_and_runtime():
     sdfg = frontend_forloop_selfwrite_unmasked_numeric.to_sdfg(simplify=True)
     count = apply_cutile_pipeline(
-        sdfg, validate=True, apply_map_tiling=True, tile_shape=(6, 5)
+        sdfg, validate=True, apply_map_collapse_and_tiling=True, tile_shape=(6, 5)
     )
     assert count >= 1
     _assert_unmasked_tileop_min(sdfg, 1)
@@ -943,7 +943,7 @@ def test_frontend_forloop_selfwrite_unmasked_numeric_structure_and_runtime():
 def test_frontend_forloop_selfwrite_masked_numeric_structure_and_runtime():
     sdfg = frontend_forloop_selfwrite_masked_numeric.to_sdfg(simplify=True)
     count = apply_cutile_pipeline(
-        sdfg, validate=True, apply_map_tiling=True, tile_shape=(7, 6)
+        sdfg, validate=True, apply_map_collapse_and_tiling=True, tile_shape=(7, 6)
     )
     assert count >= 1
     _assert_masked_or_tileop_min(sdfg, 1)
@@ -965,7 +965,7 @@ def test_frontend_forloop_selfwrite_masked_numeric_structure_and_runtime():
 def test_frontend_forloop_selfwrite_unmasked_symbolic_structure_and_runtime():
     sdfg = frontend_forloop_selfwrite_unmasked_symbolic.to_sdfg(simplify=True)
     count = apply_cutile_pipeline(
-        sdfg, validate=True, apply_map_tiling=True, tile_shape=(4, 3)
+        sdfg, validate=True, apply_map_collapse_and_tiling=True, tile_shape=(4, 3)
     )
     assert count >= 1
     _assert_unmasked_tileop_min(sdfg, 1)
@@ -992,7 +992,7 @@ def test_frontend_forloop_selfwrite_unmasked_symbolic_structure_and_runtime():
 def test_frontend_forloop_selfwrite_masked_symbolic_structure_and_runtime():
     sdfg = frontend_forloop_selfwrite_masked_symbolic.to_sdfg(simplify=True)
     count = apply_cutile_pipeline(
-        sdfg, validate=True, apply_map_tiling=True, tile_shape=(5, 4)
+        sdfg, validate=True, apply_map_collapse_and_tiling=True, tile_shape=(5, 4)
     )
     assert count >= 1
     _assert_masked_or_tileop_min(sdfg, 1)
@@ -1016,7 +1016,7 @@ def test_frontend_forloop_selfwrite_masked_symbolic_structure_and_runtime():
 def test_frontend_forloop_multistep_unmasked_numeric_structure_and_runtime():
     sdfg = frontend_forloop_multistep_unmasked_numeric.to_sdfg(simplify=True)
     count = apply_cutile_pipeline(
-        sdfg, validate=True, apply_map_tiling=True, tile_shape=(6, 5)
+        sdfg, validate=True, apply_map_collapse_and_tiling=True, tile_shape=(6, 5)
     )
     assert count >= 1
     _assert_unmasked_tileop_min(sdfg, 2)
@@ -1045,7 +1045,7 @@ def test_frontend_forloop_multistep_unmasked_numeric_structure_and_runtime():
 def test_frontend_forloop_multistep_masked_numeric_structure_and_runtime():
     sdfg = frontend_forloop_multistep_masked_numeric.to_sdfg(simplify=True)
     count = apply_cutile_pipeline(
-        sdfg, validate=True, apply_map_tiling=True, tile_shape=(7, 6)
+        sdfg, validate=True, apply_map_collapse_and_tiling=True, tile_shape=(7, 6)
     )
     assert count >= 1
     _assert_masked_or_tileop_min(sdfg, 2)
@@ -1076,7 +1076,7 @@ def test_frontend_forloop_multistep_masked_numeric_structure_and_runtime():
 def test_frontend_forloop_multistep_unmasked_symbolic_structure_and_runtime():
     sdfg = frontend_forloop_multistep_unmasked_symbolic.to_sdfg(simplify=True)
     count = apply_cutile_pipeline(
-        sdfg, validate=True, apply_map_tiling=True, tile_shape=(4, 3)
+        sdfg, validate=True, apply_map_collapse_and_tiling=True, tile_shape=(4, 3)
     )
     assert count >= 1
     _assert_unmasked_tileop_min(sdfg, 2)
@@ -1107,7 +1107,7 @@ def test_frontend_forloop_multistep_unmasked_symbolic_structure_and_runtime():
 def test_frontend_forloop_multistep_masked_symbolic_structure_and_runtime():
     sdfg = frontend_forloop_multistep_masked_symbolic.to_sdfg(simplify=True)
     count = apply_cutile_pipeline(
-        sdfg, validate=True, apply_map_tiling=True, tile_shape=(5, 4)
+        sdfg, validate=True, apply_map_collapse_and_tiling=True, tile_shape=(5, 4)
     )
     assert count >= 1
     _assert_masked_or_tileop_min(sdfg, 2)
@@ -1144,7 +1144,7 @@ def test_frontend_forloop_multistep_masked_symbolic_structure_and_runtime():
 def test_frontend_forloop_ifelse_unmasked_numeric_structure_and_runtime():
     sdfg = frontend_forloop_ifelse_unmasked_numeric.to_sdfg(simplify=True)
     count = apply_cutile_pipeline(
-        sdfg, validate=True, apply_map_tiling=True, tile_shape=(6, 5)
+        sdfg, validate=True, apply_map_collapse_and_tiling=True, tile_shape=(6, 5)
     )
     assert count >= 1
     _assert_ifelse_node_min(sdfg, 1)
@@ -1171,7 +1171,7 @@ def test_frontend_forloop_ifelse_unmasked_numeric_structure_and_runtime():
 def test_frontend_forloop_ifelse_masked_numeric_structure_and_runtime():
     sdfg = frontend_forloop_ifelse_masked_numeric.to_sdfg(simplify=True)
     count = apply_cutile_pipeline(
-        sdfg, validate=True, apply_map_tiling=True, tile_shape=(7, 6)
+        sdfg, validate=True, apply_map_collapse_and_tiling=True, tile_shape=(7, 6)
     )
     assert count >= 1
     _assert_ifelse_node_min(sdfg, 1)
@@ -1205,7 +1205,7 @@ def test_frontend_forloop_ifelse_masked_numeric_structure_and_runtime():
 def test_frontend_forloop_ifelse_unmasked_symbolic_structure_and_runtime():
     sdfg = frontend_forloop_ifelse_unmasked_symbolic.to_sdfg(simplify=True)
     count = apply_cutile_pipeline(
-        sdfg, validate=True, apply_map_tiling=True, tile_shape=(4, 3)
+        sdfg, validate=True, apply_map_collapse_and_tiling=True, tile_shape=(4, 3)
     )
     assert count >= 1
     _assert_ifelse_node_min(sdfg, 1)
@@ -1234,7 +1234,7 @@ def test_frontend_forloop_ifelse_unmasked_symbolic_structure_and_runtime():
 def test_frontend_forloop_ifelse_masked_symbolic_structure_and_runtime():
     sdfg = frontend_forloop_ifelse_masked_symbolic.to_sdfg(simplify=True)
     count = apply_cutile_pipeline(
-        sdfg, validate=True, apply_map_tiling=True, tile_shape=(5, 4)
+        sdfg, validate=True, apply_map_collapse_and_tiling=True, tile_shape=(5, 4)
     )
     assert count >= 1
     _assert_ifelse_node_min(sdfg, 1)
@@ -1384,7 +1384,7 @@ def frontend_1d_ifelse_masked_symbolic(
 
 def test_frontend_1d_selfwrite_unmasked_numeric_structure_and_runtime():
     sdfg = frontend_1d_selfwrite_unmasked_numeric.to_sdfg(simplify=True)
-    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_tiling=True, tile_shape=(6,))
+    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_collapse_and_tiling=True, tile_shape=(6,))
     assert count >= 1
     _assert_unmasked_tileop_min(sdfg, 1)
     sdfg.expand_library_nodes()
@@ -1401,7 +1401,7 @@ def test_frontend_1d_selfwrite_unmasked_numeric_structure_and_runtime():
 def test_frontend_1d_selfwrite_masked_numeric_structure_and_runtime():
     # Structure: verify pipeline produces masked library nodes
     sdfg = frontend_1d_selfwrite_masked_numeric.to_sdfg(simplify=True)
-    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_tiling=True, tile_shape=(6,))
+    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_collapse_and_tiling=True, tile_shape=(6,))
     assert count >= 1
     _assert_masked_or_tileop_min(sdfg, 1)
 
@@ -1420,7 +1420,7 @@ def test_frontend_1d_selfwrite_masked_numeric_structure_and_runtime():
 
 def test_frontend_1d_selfwrite_unmasked_symbolic_structure_and_runtime():
     sdfg = frontend_1d_selfwrite_unmasked_symbolic.to_sdfg(simplify=True)
-    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_tiling=True, tile_shape=(6,))
+    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_collapse_and_tiling=True, tile_shape=(6,))
     assert count >= 1
     _assert_unmasked_tileop_min(sdfg, 1)
     sdfg.expand_library_nodes()
@@ -1438,7 +1438,7 @@ def test_frontend_1d_selfwrite_unmasked_symbolic_structure_and_runtime():
 def test_frontend_1d_selfwrite_masked_symbolic_structure_and_runtime():
     # Structure: verify pipeline produces masked library nodes
     sdfg = frontend_1d_selfwrite_masked_symbolic.to_sdfg(simplify=True)
-    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_tiling=True, tile_shape=(6,))
+    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_collapse_and_tiling=True, tile_shape=(6,))
     assert count >= 1
     _assert_masked_or_tileop_min(sdfg, 1)
 
@@ -1458,7 +1458,7 @@ def test_frontend_1d_selfwrite_masked_symbolic_structure_and_runtime():
 
 def test_frontend_1d_multistep_unmasked_numeric_structure_and_runtime():
     sdfg = frontend_1d_multistep_unmasked_numeric.to_sdfg(simplify=True)
-    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_tiling=True, tile_shape=(6,))
+    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_collapse_and_tiling=True, tile_shape=(6,))
     assert count >= 1
     _assert_unmasked_tileop_min(sdfg, 2)
     sdfg.expand_library_nodes()
@@ -1479,7 +1479,7 @@ def test_frontend_1d_multistep_unmasked_numeric_structure_and_runtime():
 def test_frontend_1d_multistep_masked_numeric_structure_and_runtime():
     # Structure: verify pipeline produces masked library nodes
     sdfg = frontend_1d_multistep_masked_numeric.to_sdfg(simplify=True)
-    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_tiling=True, tile_shape=(6,))
+    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_collapse_and_tiling=True, tile_shape=(6,))
     assert count >= 1
     _assert_masked_or_tileop_min(sdfg, 1)
 
@@ -1503,7 +1503,7 @@ def test_frontend_1d_multistep_masked_numeric_structure_and_runtime():
 
 def test_frontend_1d_multistep_unmasked_symbolic_structure_and_runtime():
     sdfg = frontend_1d_multistep_unmasked_symbolic.to_sdfg(simplify=True)
-    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_tiling=True, tile_shape=(6,))
+    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_collapse_and_tiling=True, tile_shape=(6,))
     assert count >= 1
     _assert_unmasked_tileop_min(sdfg, 2)
     sdfg.expand_library_nodes()
@@ -1528,7 +1528,7 @@ def test_frontend_1d_multistep_masked_symbolic_structure_and_runtime():
     # with missing symbols on nested SDFGs; verify structure when possible.
     sdfg = frontend_1d_multistep_masked_symbolic.to_sdfg(simplify=True)
     try:
-        count = apply_cutile_pipeline(sdfg, validate=False, validate_all=False, apply_map_tiling=True, tile_shape=(6,))
+        count = apply_cutile_pipeline(sdfg, validate=False, validate_all=False, apply_map_collapse_and_tiling=True, tile_shape=(6,))
         assert count >= 1
         _assert_masked_or_tileop_min(sdfg, 1)
     except Exception:
@@ -1555,7 +1555,7 @@ def test_frontend_1d_multistep_masked_symbolic_structure_and_runtime():
 
 def test_frontend_1d_ifelse_unmasked_numeric_structure_and_runtime():
     sdfg = frontend_1d_ifelse_unmasked_numeric.to_sdfg(simplify=True)
-    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_tiling=True, tile_shape=(6,))
+    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_collapse_and_tiling=True, tile_shape=(6,))
     assert count >= 1
     lib_nodes = _frontend_library_nodes(sdfg)
     if any(isinstance(n, TileIfElseOpLibraryNode) for n in lib_nodes):
@@ -1575,7 +1575,7 @@ def test_frontend_1d_ifelse_unmasked_numeric_structure_and_runtime():
 
 def test_frontend_1d_ifelse_masked_numeric_structure_and_runtime():
     sdfg = frontend_1d_ifelse_masked_numeric.to_sdfg(simplify=True)
-    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_tiling=True, tile_shape=(6,))
+    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_collapse_and_tiling=True, tile_shape=(6,))
     assert count >= 1
     lib_nodes = _frontend_library_nodes(sdfg)
     if lib_nodes:
@@ -1598,7 +1598,7 @@ def test_frontend_1d_ifelse_masked_numeric_structure_and_runtime():
 
 def test_frontend_1d_ifelse_unmasked_symbolic_structure_and_runtime():
     sdfg = frontend_1d_ifelse_unmasked_symbolic.to_sdfg(simplify=True)
-    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_tiling=True, tile_shape=(6,))
+    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_collapse_and_tiling=True, tile_shape=(6,))
     assert count >= 1
     lib_nodes = _frontend_library_nodes(sdfg)
     if any(isinstance(n, TileIfElseOpLibraryNode) for n in lib_nodes):
@@ -1619,7 +1619,7 @@ def test_frontend_1d_ifelse_unmasked_symbolic_structure_and_runtime():
 
 def test_frontend_1d_ifelse_masked_symbolic_structure_and_runtime():
     sdfg = frontend_1d_ifelse_masked_symbolic.to_sdfg(simplify=True)
-    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_tiling=True, tile_shape=(6,))
+    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_collapse_and_tiling=True, tile_shape=(6,))
     assert count >= 1
     lib_nodes = _frontend_library_nodes(sdfg)
     if lib_nodes:
