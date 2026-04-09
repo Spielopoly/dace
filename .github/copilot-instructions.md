@@ -69,3 +69,6 @@
 - **Pipeline** (`pipeline.py`): `apply_cutile_pipeline()` runs `TrivialTaskletElimination` + `ScalarToTileCanonical` + `ScalarToTileMasked`.
 - **Tests**: `tests/cutile/cutile_test.py` and `tests/cutile/cutile_frontend_test.py`, `tests/cutile/cutile_if_else_op_test.py`, `tests/cutile/cutile_if_else_test.py`. Run all after any cuTile changes:
   - `/venv/main/bin/python -m pytest tests/cutile/cutile_test.py tests/cutile/cutile_frontend_test.py tests/cutile/cutile_if_else_op_test.py tests/cutile/cutile_if_else_test.py -x -q`
+
+# Known Issues
+- Cannot use `from __future__ import annotations` because it messes up type hints from dace. But the python version is new enough that it doesn't matter and we can use type hints anyway. Just don't add the future import to any files.
