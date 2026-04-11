@@ -258,7 +258,12 @@ class AffineSMemlet(SeparableMemletPattern):
             result_begin, result_end = result_end, result_begin
 
         # Special case: i:i+stride for a begin:end:stride range
-        if (node_rb == result_begin and (re - rb + 1) == node_rs and rs == 1 and rt == 1):
+        # Only valid when multiplier is 1 (identity mapping); with multiplier != 1,
+        # e.g. A[2*i], the normal propagation correctly computes the stride.
+        # NOTE: This guard depends on can_be_applied() rejecting node_rs != 1
+        # for non-identity patterns. If that rejection is relaxed in the future,
+        # this shortcut must also be updated to avoid silently losing stride info.
+        if (self.multiplier == 1 and node_rb == result_begin and (re - rb + 1) == node_rs and rs == 1 and rt == 1):
             return (node_rb, node_re, 1, 1)
 
         # Experimental
@@ -513,6 +518,44 @@ class GenericSMemlet(SeparableMemletPattern):
 
         result_skip = 1
         result_tile = 1
+
+        # For scalar or degenerate-range (begin == end) access with an affine
+        # pattern, compute stride: A[a*p + b] with map step s → skip = |a| * s.
+        # This handles both strided maps (s > 1) and multiplied index access
+        # (|a| > 1) or both.
+        stride_expr = None
+        if not isinstance(dim_exprs, tuple) and symbolic.issymbolic(dim_exprs):
+            stride_expr = dim_exprs
+        elif isinstance(dim_exprs, tuple):
+            _rb = symbolic.pystr_to_symbolic(dim_exprs[0])
+            _re = symbolic.pystr_to_symbolic(dim_exprs[1])
+            if _rb == _re:
+                stride_expr = _rb
+
+        if stride_expr is not None and symbolic.issymbolic(stride_expr):
+            expr_syms = stride_expr.free_symbols
+            a = sympy.Wild('a', exclude=self.params)
+            b = sympy.Wild('b', exclude=self.params)
+            # Find parameters with affine access; compute stride if exactly one matches
+            affine_params = []
+            for idx, node_r in enumerate(node_range):
+                if self.params[idx] not in expr_syms:
+                    continue
+                node_rs = node_r[2]
+                if (node_rs < 0) == True:
+                    node_rs = -node_rs
+                matches = stride_expr.match(a * self.params[idx] + b)
+                if matches is not None:
+                    multiplier = matches[a]
+                    if (multiplier < 0) == True:
+                        multiplier = -multiplier
+                    candidate_skip = multiplier * node_rs
+                    affine_params.append((idx, candidate_skip))
+            # Limitation: stride inference only works for single-parameter affine access.
+            # Multi-parameter expressions like A[2*i + 3*j] fall back to stride=1
+            # (safe overapproximation). Extending to multi-param requires per-dimension analysis.
+            if len(affine_params) == 1:
+                result_skip = affine_params[0][1]
 
         return (result_begin, result_end, result_skip, result_tile)
 
@@ -1468,12 +1511,29 @@ def propagate_subset(memlets: List[Memlet],
     # Argument handling
     if defined_variables is None:
         # Default defined variables is "everything but params"
+        # Use sympy's free_symbols (via _freesyms) to reliably find symbols
+        # in function applications like int_floor(), which Range.free_symbols
+        # (backed by symbolic.symlist) may miss.
         defined_variables = set()
-        defined_variables |= rng.free_symbols
+        for dim in rng:
+            for d in dim:
+                defined_variables |= _freesyms(d)
         for memlet in memlets:
-            defined_variables |= memlet.free_symbols
-        defined_variables -= set(params)
-        defined_variables = set(symbolic.pystr_to_symbolic(p) for p in defined_variables)
+            if memlet.subset is not None:
+                for dim in memlet.subset:
+                    for d in dim:
+                        defined_variables |= _freesyms(d)
+            if memlet.other_subset is not None:
+                for dim in memlet.other_subset:
+                    for d in dim:
+                        defined_variables |= _freesyms(d)
+        # Convert params to sympy symbols and subtract by name to handle
+        # type mismatches between sympy.Symbol and dace.symbol.
+        param_names = set(str(p) for p in params)
+        defined_variables = set(
+            symbolic.pystr_to_symbolic(s) for s in defined_variables
+            if str(s) not in param_names
+        )
 
     # Propagate subset
     variable_context = [defined_variables, [symbolic.pystr_to_symbolic(p) for p in params]]

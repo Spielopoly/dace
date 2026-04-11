@@ -145,6 +145,15 @@ class MapFission(transformation.SingleStateTransformation):
                         return False
             helpers.nest_sdfg_control_flow(nsdfg_node.sdfg)
 
+            # After nesting control flow, check if any interstate edges
+            # reference map parameters. These edges live at the SDFG level
+            # (outside any map scope), so the parameters would become
+            # undefined after fission removes the outer map.
+            map_params = set(map_node.map.params)
+            for e in nsdfg_node.sdfg.edges():
+                if e.data.free_symbols & map_params:
+                    return False
+
             subgraphs = list(nsdfg_node.sdfg.nodes())
 
         # Test subgraphs
@@ -462,7 +471,9 @@ class MapFission(transformation.SingleStateTransformation):
                                 # propagation will stop at the first AccessNode outside the Map scope. For example, see
                                 # `test.transformations.mapfission_test.MapFissionTest.test_array_copy_outside_scope`.
                                 if not (scope_dict[e.src] and scope_dict[e.dst]):
-                                    e.data = propagate_subset([e.data], desc, outer_map.params, outer_map.range)
+                                    use_dst = (e.data._is_data_src is not None and not e.data._is_data_src)
+                                    e.data = propagate_subset([e.data], desc, outer_map.params, outer_map.range,
+                                                              use_dst=use_dst)
 
                         # Only after offsetting memlets we can modify the
                         # overall offset
@@ -519,6 +530,9 @@ class MapFission(transformation.SingleStateTransformation):
         # Remove outer map
         graph.remove_nodes_from([map_entry, map_exit])
 
-        # NOTE: It is better to manually call memlet propagation here to ensure that all subsets are properly updated.
-        # This can solve issues when, e.g., applying MapFission through `SDFG.apply_transformations_repeated`.
-        propagate_memlets_state(sdfg, graph)
+        # Only propagate for expr_index == 0 (subgraph case).
+        # For expr_index == 1 (NestedSDFG case), memlets are already correctly
+        # set above. Recursive propagation would corrupt inner NSDFG boundary
+        # edges via unsqueeze_memlet.
+        if self.expr_index == 0:
+            propagate_memlets_state(sdfg, graph)
