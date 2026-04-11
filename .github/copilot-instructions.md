@@ -26,6 +26,7 @@
 - Recommended contributor setup:
   - `/venv/main/bin/pip install -e ".[testing,linting]"`
   - `pre-commit install`
+- **CRITICAL: Always use the `-B` flag** when running Python tests (`/venv/main/bin/python -B -m pytest ...`). Without `-B`, stale `.pyc` bytecache can mask errors (e.g., TypeError from changed function signatures). This has caused hours of debugging in the past.
 - Default test workflow:
   - `/venv/main/bin/python -m pytest tests -m "not gpu and not long"`
 - Run focused tests for touched areas (examples):
@@ -33,6 +34,10 @@
   - `/venv/main/bin/python -m pytest tests/sdfg -m "not gpu"`
 - GPU-only changes should also run:
   - `/venv/main/bin/python -m pytest tests -m "gpu" --timeout=300`
+- cuTile library changes:
+  - `/venv/main/bin/python -B tests/cutile/all_cutile_tests.py` (runs full cuTile suite)
+  - `/venv/main/bin/python -B -m pytest tests/cutile/cutile_test.py -x` (core unit tests)
+  - `/venv/main/bin/python -B -m pytest tests/cutile/cutile_frontend_test.py -x` (pipeline integration tests)
 - For unknown reason you cannot import the dace module in interactive python sessions, so create a temporary test script that imports the module and run it with `/venv/main/bin/python` if you need to quickly test something interactively.
 
 ## Conventions
@@ -65,9 +70,37 @@
 - **Transformation architecture**: `_ScalarToTileBase` (template method base) with two concrete child classes:
   - `ScalarToTileCanonical` — 0-based, unit-stride inner maps → unmasked tile library nodes
   - `ScalarToTileMasked` — non-canonical inner maps → runtime-masked tile library nodes with preload
+- **IfElseMapToTileWhere** (`if_else_to_where_select.py`): Converts if-else patterns inside maps to `TileIfElseOpLibraryNode` select operations. Key internals:
+  - `_get_branch_output_array()` chain-walks AccessNodes from tasklet to final sink (uses `visited` set to avoid cycles)
+  - `_fix_staging_memlets` adjusts memlets for staging arrays — note: do not add dimensionality filtering to `_needs_fix()` (previously caused SIGABRT by skipping 1D arrays)
 - **PatternNode bug**: `PatternNode.__get__` resolves nodes by integer index in the state's node list. Adding/removing graph nodes shifts indices, causing descriptors to return wrong nodes. Always capture actual node object references at the start of `apply()` (before any graph modifications) and use those throughout. Never use PatternNode descriptors (`self.outer_map_entry` etc.) after modifying the graph.
-- **Pipeline** (`pipeline.py`): `apply_cutile_pipeline()` runs `TrivialTaskletElimination` + `ScalarToTileCanonical` + `ScalarToTileMasked`.
+- **Pipeline** (`pipeline.py`): `CuTilePipeline` is a 10-step transformation pipeline:
+  1. **Simplify** — trivial tasklet elimination + standard simplify
+  2. **LoopToMap** — convert state-machine loops into maps
+  3. **MapCollapse** — collapse nested maps (optional)
+  3b. **MapTiling + IfElseMapToTileWhere** — tile maps containing ConditionalBlock NestedSDFGs
+  4. **SplitTasklets** — split multi-statement tasklets into single ops
+  5. **MapFission + MapCollapse** — fission maps into single-op maps; merge directly-nested 1D maps
+  6. **Simplify** — clean up after preprocessing
+  7. **MapTiling** — tile maps to given tile shape (optional)
+  8. **Normalize ConditionalBlock** — normalize conditional blocks in NestedSDFGs
+  8b. **IfElseMapToTileWhere** — handle patterns not caught in step 3b
+  9. **ScalarToTile** — replace scalar tasklets with cuTile library nodes (`ScalarToTileCanonical`, `ScalarToTileMasked`)
+  10. **Simplify** — final cleanup
 - **Tests**: `tests/cutile/*.py` Run all tests after any cuTile changes to check for regressions.
+
+## Memlet Propagation (`dace/sdfg/propagation.py`)
+- The propagation pattern dispatch chain is: `AffineSMemlet` → `ModuloSMemlet` → `ConstantSMemlet` → `GenericSMemlet`. Each pattern's `can_be_applied()` filters what it handles; rejected cases fall through.
+- **AffineSMemlet stride shortcut**: The `i:i+stride` shortcut (returns stride=1) is only valid when `multiplier == 1`. For non-identity access like `A[2*i]`, removing this guard silently loses stride information.
+- **GenericSMemlet stride**: Computes `skip = |multiplier| * map_stride` for single-parameter affine access. Multi-parameter expressions (e.g., `A[2*i + 3*j]`) fall back to `stride=1` (safe overapproximation).
+- **`propagate_subset` defined_variables**: Uses `_freesyms()` (not `symlist()`) to detect symbols in ranges — this correctly handles symbols nested inside `int_floor()`, `ceiling()`, etc.
+
+## MapFission (`dace/transformation/dataflow/map_fission.py`)
+- In `can_be_applied()`, use `nsdfg.sdfg.edges()` (top-level only) to check for map parameter references in interstate edges. Do NOT use `all_interstate_edges()` — it recurses into nested control flow regions (e.g., `LoopRegion`, `ConditionalBlock`) and causes false rejections when inner loops reuse map parameter names.
+- When calling `propagate_subset` for write-back edges (`_is_data_src is False`), pass `use_dst=True` to get correct direction.
+- Only call `propagate_memlets_state` for `expr_index == 0` to avoid corrupting inner NSDFG edges.
 
 # Known Issues
 - Cannot use `from __future__ import annotations` because it messes up type hints from dace. But the python version is new enough that it doesn't matter and we can use type hints anyway. Just don't add the future import to any files.
+- **SIGABRT in compiled code cannot be caught by pytest `xfail`** — use `@pytest.mark.skip(reason="...")` instead. This affects symbolic masked strided patterns that crash at the code generation level.
+- **Per-test `@pytest.mark.filterwarnings`** is preferred over blanket `pytest.ini` warning filters for traceability. Use when warnings are expected for specific test configurations (e.g., `validate_subsets` with symbolic ranges).
