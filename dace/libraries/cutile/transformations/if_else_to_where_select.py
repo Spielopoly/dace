@@ -19,6 +19,7 @@ based on the condition mask.
 """
 
 
+import ast as _ast
 import copy
 from typing import Dict, List, Optional, Tuple
 
@@ -103,7 +104,157 @@ def _build_sympy_expr(
     return parse_expr(f"({left}) {op} ({right})")
 
 
-# ── Transformation ───────────────────────────────────────────────────
+def _extract_base_array_name(expr_str: str) -> Optional[str]:
+    """Extract the base array name from an array subscript like ``B[i, j]``."""
+    try:
+        tree = _ast.parse(expr_str.strip(), mode='eval')
+        if isinstance(tree.body, _ast.Subscript) and isinstance(tree.body.value, _ast.Name):
+            return tree.body.value.id
+    except Exception:
+        pass
+    return None
+
+
+def _tasklet_code_to_sympy(code_str: str, input_mapping: Dict[str, sp.Basic]) -> Optional[sp.Basic]:
+    """Convert a simple assignment tasklet to a SymPy expression.
+
+    Handles patterns like ``__out = __in1 * 3`` by replacing connector
+    names with the SymPy expressions from *input_mapping*.  Also handles
+    ``dace.float64(…)`` and similar typed-constant wrappers.
+    """
+    try:
+        tree = _ast.parse(code_str.strip())
+        if len(tree.body) != 1 or not isinstance(tree.body[0], _ast.Assign):
+            return None
+        rhs_str = _ast.unparse(tree.body[0].value)
+        for conn, resolved in input_mapping.items():
+            rhs_str = rhs_str.replace(conn, f'({resolved})')
+        # Strip dace type wrappers: dace.float64(3) → 3
+        import re
+        rhs_str = re.sub(r'dace\.\w+\(([^)]+)\)', r'\1', rhs_str)
+        return dace.symbolic.pystr_to_symbolic(rhs_str, simplify=False)
+    except Exception:
+        return None
+
+
+def _resolve_symbol(
+    inner_sdfg: SDFG,
+    sym_name: str,
+    ise_assignments: Dict[str, str],
+    wired_inputs: set,
+    visited: frozenset,
+) -> Optional[sp.Basic]:
+    """Resolve *sym_name* to a SymPy expression over wired input arrays.
+
+    Handles wired inputs (identity), interstate-edge symbol assignments
+    (e.g. ``B[i, j]`` → ``B``), and single-tasklet transient arrays.
+    """
+    if sym_name in visited:
+        return None
+    visited = visited | {sym_name}
+
+    # Already a wired input → identity
+    if sym_name in wired_inputs:
+        return sp.Symbol(sym_name)
+
+    # Interstate-edge symbol → extract base array name
+    if sym_name in ise_assignments:
+        base = _extract_base_array_name(ise_assignments[sym_name])
+        if base is not None:
+            return _resolve_symbol(inner_sdfg, base, ise_assignments, wired_inputs, visited)
+        return None
+
+    # Transient array → trace through its writing tasklet or copy edge
+    if sym_name in inner_sdfg.arrays and inner_sdfg.arrays[sym_name].transient:
+        for state in inner_sdfg.all_states():
+            for nd in state.nodes():
+                if not isinstance(nd, nodes.AccessNode) or nd.data != sym_name:
+                    continue
+                for in_edge in state.in_edges(nd):
+                    if isinstance(in_edge.src, nodes.Tasklet):
+                        tasklet = in_edge.src
+                        inp_map: Dict[str, sp.Basic] = {}
+                        for t_edge in state.in_edges(tasklet):
+                            if isinstance(t_edge.src, nodes.AccessNode) and t_edge.dst_conn:
+                                r = _resolve_symbol(inner_sdfg, t_edge.src.data,
+                                                    ise_assignments, wired_inputs, visited)
+                                if r is None:
+                                    return None
+                                inp_map[t_edge.dst_conn] = r
+                        result = _tasklet_code_to_sympy(tasklet.code.as_string, inp_map)
+                        if result is not None:
+                            return result
+                    elif isinstance(in_edge.src, nodes.AccessNode):
+                        # Direct copy: trace through to the source
+                        return _resolve_symbol(inner_sdfg, in_edge.src.data,
+                                               ise_assignments, wired_inputs, visited)
+        return None
+
+    return None
+
+
+def _resolve_condition_to_wired_inputs(
+    inner_sdfg: SDFG,
+    cond_expr: str,
+    wired_inputs: set,
+) -> Optional[sp.Basic]:
+    """Resolve a condition expression to reference only wired input arrays.
+
+    Traces interstate-edge symbol assignments and transient array
+    computations backward through the data flow so that the returned
+    SymPy expression contains only symbols that are wired NSDFG inputs.
+
+    Returns ``None`` if resolution fails.
+    """
+    ise_assignments: Dict[str, str] = {}
+    for e in inner_sdfg.all_interstate_edges():
+        ise_assignments.update(e.data.assignments)
+
+    parsed = dace.symbolic.pystr_to_symbolic(cond_expr, simplify=False)
+    if not isinstance(parsed, sp.Basic):
+        return None
+
+    for sym in list(parsed.free_symbols):
+        sym_name = str(sym)
+        resolved = _resolve_symbol(inner_sdfg, sym_name, ise_assignments,
+                                   wired_inputs, frozenset())
+        if resolved is None:
+            return None
+        if resolved is not sym:
+            parsed = parsed.subs(sym, resolved)
+
+    # Verify all remaining symbols are wired inputs
+    remaining = {str(s) for s in parsed.free_symbols}
+    if not remaining.issubset(wired_inputs):
+        return None
+    return parsed
+
+
+def _extend_nsdfg_to_outer_with_transients(
+    inner_sdfg: SDFG,
+    nsdfg_to_outer: Dict[str, str],
+) -> Dict[str, str]:
+    """Extend *nsdfg_to_outer* to include internal transients that can be
+    traced back to wired inputs through simple data movement.
+
+    Walks all dataflow edges in every state of *inner_sdfg* and propagates
+    the mapping whenever an unknown transient is written from a known array
+    via a direct ``AccessNode → AccessNode`` edge (copy / slice / index).
+    """
+    resolved: Dict[str, str] = dict(nsdfg_to_outer)
+    all_states = list(inner_sdfg.all_states())
+    changed = True
+    while changed:
+        changed = False
+        for state in all_states:
+            for edge in state.edges():
+                if (isinstance(edge.src, nodes.AccessNode)
+                        and isinstance(edge.dst, nodes.AccessNode)):
+                    if edge.src.data in resolved and edge.dst.data not in resolved:
+                        resolved[edge.dst.data] = resolved[edge.src.data]
+                        changed = True
+    return resolved
+
 
 class IfElseMapToTileWhere(xf.SingleStateTransformation):
     """
@@ -199,44 +350,59 @@ class IfElseMapToTileWhere(xf.SingleStateTransformation):
 
         _, cond_expr, true_branch_state, false_branch_state = analysis_result
 
-        nsdfg_arrays = set(nsdfg.sdfg.arrays.keys())
-        condition_expression = _to_sympy_condition(cond_expr, nsdfg_arrays)
-        if condition_expression is None:
-            return False
-        condition_symbol_names = [
-            str(free_symbol) for free_symbol in condition_expression.free_symbols
-        ]
-        if any(symbol_name not in nsdfg.in_connectors
-               for symbol_name in condition_symbol_names):
-            return False
-
         # Each condition symbol must be both declared and wired from outer scope.
         wired_inputs = {
             input_edge.dst_conn
             for input_edge in graph.in_edges(nsdfg)
             if input_edge.dst_conn is not None and input_edge.data.data is not None
         }
-        if any(symbol_name not in wired_inputs
-               for symbol_name in condition_symbol_names):
-            return False
 
-        # Each branch must have exactly one tasklet with one output
+        nsdfg_arrays = set(nsdfg.sdfg.arrays.keys())
+        condition_expression = _to_sympy_condition(cond_expr, nsdfg_arrays)
+        if condition_expression is not None:
+            # Direct condition: all symbols must be wired input arrays
+            cond_syms = [str(s) for s in condition_expression.free_symbols]
+            if any(s not in nsdfg.in_connectors for s in cond_syms):
+                condition_expression = None
+            elif any(s not in wired_inputs for s in cond_syms):
+                condition_expression = None
+
+        if condition_expression is None:
+            # Fallback: resolve intermediates back to wired inputs
+            condition_expression = _resolve_condition_to_wired_inputs(
+                nsdfg.sdfg, cond_expr, wired_inputs)
+            if condition_expression is None:
+                return False
+
+        # Each branch must have exactly one tasklet with one output,
+        # OR be a direct copy (0 tasklets, AccessNode chain).
         for branch_state in (true_branch_state, false_branch_state):
             tasklets = [node for node in branch_state.nodes()
                         if isinstance(node, nodes.Tasklet)]
-            if len(tasklets) != 1:
-                return False
-            tasklet_node = tasklets[0]
-            if len(tasklet_node.out_connectors) != 1:
-                return False
-            # Classify using the NSDFG's internal state (promote
-            # scalar types since these are element-wise ops inside a
-            # NestedSDFG that will be lifted to tile-level).
-            tasklet_match = match_tasklet_to_tile_library_node(
-                branch_state, tasklet_node, MaskType.UNMASKED,
-                promote_scalars=True)
-            if tasklet_match is None:
-                return False
+            if len(tasklets) == 0:
+                # Copy branch: check for AccessNode → AccessNode chain
+                if self._get_copy_branch_input(branch_state) is None:
+                    return False
+            elif len(tasklets) == 1:
+                tasklet_node = tasklets[0]
+                if len(tasklet_node.out_connectors) != 1:
+                    return False
+                tasklet_match = match_tasklet_to_tile_library_node(
+                    branch_state, tasklet_node, MaskType.UNMASKED,
+                    promote_scalars=True)
+                if tasklet_match is None:
+                    return False
+            else:
+                # Multi-tasklet chain (e.g., from SplitTasklets): check that
+                # exactly one tasklet connects to the output and the chain
+                # can be resolved to a SymPy expression over wired inputs.
+                output_tasklet = self._find_output_tasklet(branch_state)
+                if output_tasklet is None:
+                    return False
+                chain_expr = self._resolve_chain_expression(
+                    branch_state, output_tasklet, nsdfg.sdfg, wired_inputs)
+                if chain_expr is None:
+                    return False
 
         # Both branches must write to the same output connector
         true_branch_output = self._get_branch_output_array(true_branch_state)
@@ -249,6 +415,61 @@ class IfElseMapToTileWhere(xf.SingleStateTransformation):
         # The output must be an NSDFG output connector
         if true_branch_output not in nsdfg.out_connectors:
             return False
+
+        # All branch operand arrays must have outer NSDFG connector mappings.
+        # Internal transients (e.g. frontend-generated intermediates) lack
+        # outer connectors and would cause a ValueError in apply().
+        nsdfg_to_outer: Dict[str, str] = {}
+        for e in graph.in_edges(nsdfg):
+            if e.dst_conn and e.data.data:
+                nsdfg_to_outer[e.dst_conn] = e.data.data
+        for e in graph.out_edges(nsdfg):
+            if e.src_conn and e.data.data:
+                nsdfg_to_outer[e.src_conn] = e.data.data
+
+        # Collect all NSDFG array names needed by condition + branches.
+        needed_nsdfg_names: set = set()
+        # Condition symbols
+        cond_syms = {str(s) for s in condition_expression.free_symbols}
+        needed_nsdfg_names.update(cond_syms)
+        # Branch operand arrays
+        for branch_state in (true_branch_state, false_branch_state):
+            tasklets = [n for n in branch_state.nodes()
+                        if isinstance(n, nodes.Tasklet)]
+            if len(tasklets) == 0:
+                copy_input = self._get_copy_branch_input(branch_state)
+                if copy_input is not None:
+                    needed_nsdfg_names.add(copy_input)
+            elif len(tasklets) == 1:
+                tasklet_node = tasklets[0]
+                tasklet_match = match_tasklet_to_tile_library_node(
+                    branch_state, tasklet_node, MaskType.UNMASKED,
+                    promote_scalars=True)
+                if tasklet_match is not None:
+                    tc = tasklet_match.tasklet_classification
+                    input_mapping = self._get_tasklet_input_mapping(
+                        branch_state, tasklet_node)
+                    if tc.rhs1 is not None and tc.constant1 is None:
+                        arr = input_mapping.get(tc.rhs1)
+                        if arr is not None:
+                            needed_nsdfg_names.add(arr)
+                    if tc.rhs2 is not None and tc.constant2 is None:
+                        arr = input_mapping.get(tc.rhs2)
+                        if arr is not None:
+                            needed_nsdfg_names.add(arr)
+            else:
+                # Multi-tasklet chain: collect needed arrays from resolved expr
+                output_tasklet = self._find_output_tasklet(branch_state)
+                if output_tasklet is not None:
+                    chain_expr = self._resolve_chain_expression(
+                        branch_state, output_tasklet, nsdfg.sdfg, wired_inputs)
+                    if chain_expr is not None:
+                        for sym in chain_expr.free_symbols:
+                            needed_nsdfg_names.add(str(sym))
+
+        for name in needed_nsdfg_names:
+            if name not in nsdfg_to_outer:
+                return False
 
         return True
 
@@ -318,23 +539,58 @@ class IfElseMapToTileWhere(xf.SingleStateTransformation):
 
     @staticmethod
     def _get_branch_output_array(state: SDFGState) -> Optional[str]:
-        """Get the data name written by the single tasklet in a branch state.
+        """Get the data name written by the branch.
 
-        Args:
-            state: The branch :class:`~dace.sdfg.SDFGState` containing
-                exactly one :class:`~dace.sdfg.nodes.Tasklet`.
+        For tasklet branches, follows ``Tasklet → AccessNode → … → AccessNode``
+        hops.  For copy branches (no tasklet), finds the sink AccessNode.
 
         Returns:
-            The ``data`` name of the access node written by the tasklet,
-            or ``None`` if the pattern is not matched.
+            The ``data`` name of the final access node, or ``None``.
         """
         tasklets = [node for node in state.nodes() if isinstance(node, nodes.Tasklet)]
-        if len(tasklets) != 1:
+        if len(tasklets) == 1:
+            current = tasklets[0]
+            visited: set = set()
+            while True:
+                out_edges = state.out_edges(current)
+                access_successors = [e.dst for e in out_edges if isinstance(e.dst, nodes.AccessNode) and e.dst not in visited]
+                if not access_successors:
+                    break
+                visited.add(current)
+                current = access_successors[0]
+            if isinstance(current, nodes.AccessNode):
+                return current.data
             return None
-        tasklet_node = tasklets[0]
-        for output_edge in state.out_edges(tasklet_node):
-            if isinstance(output_edge.dst, nodes.AccessNode):
-                return output_edge.dst.data
+        elif len(tasklets) == 0:
+            # Copy branch: find the sink AccessNode
+            access_nodes = [n for n in state.nodes()
+                            if isinstance(n, nodes.AccessNode)]
+            sinks = [n for n in access_nodes if state.out_degree(n) == 0]
+            if len(sinks) == 1:
+                return sinks[0].data
+            return None
+        else:
+            # Multi-tasklet chain: find the sink AccessNode
+            sinks = [n for n in state.nodes()
+                     if isinstance(n, nodes.AccessNode) and state.out_degree(n) == 0]
+            if len(sinks) == 1:
+                return sinks[0].data
+            return None
+
+    @staticmethod
+    def _get_copy_branch_input(state: SDFGState) -> Optional[str]:
+        """Get the source array name for a copy-only branch (no tasklets).
+
+        A copy branch has an ``AccessNode → … → AccessNode`` chain with
+        no tasklets.  Returns the first (source) AccessNode's data name,
+        or ``None`` if the pattern is not matched.
+        """
+        sources = state.source_nodes()
+        if not sources:
+            return None
+        for src in sources:
+            if isinstance(src, nodes.AccessNode):
+                return src.data
         return None
 
     @staticmethod
@@ -358,6 +614,153 @@ class IfElseMapToTileWhere(xf.SingleStateTransformation):
             elif input_edge.dst_conn is not None and input_edge.data.data is not None:
                 input_mapping[input_edge.dst_conn] = input_edge.data.data
         return input_mapping
+
+    @staticmethod
+    def _find_output_tasklet(state: SDFGState) -> Optional[nodes.Tasklet]:
+        """Find the tasklet that writes to the final (sink) AccessNode."""
+        sinks = [n for n in state.nodes()
+                 if isinstance(n, nodes.AccessNode) and state.out_degree(n) == 0]
+        if len(sinks) != 1:
+            return None
+        sink = sinks[0]
+        # Check direct edges to sink
+        for edge in state.in_edges(sink):
+            if isinstance(edge.src, nodes.Tasklet):
+                return edge.src
+        # Check one level of indirection (Tasklet → AccessNode → sink)
+        for edge in state.in_edges(sink):
+            if isinstance(edge.src, nodes.AccessNode):
+                for inner_edge in state.in_edges(edge.src):
+                    if isinstance(inner_edge.src, nodes.Tasklet):
+                        return inner_edge.src
+        return None
+
+    @staticmethod
+    def _resolve_chain_expression(
+        state: SDFGState,
+        output_tasklet: nodes.Tasklet,
+        inner_sdfg: SDFG,
+        wired_inputs: set,
+    ) -> Optional[sp.Basic]:
+        """Resolve a multi-tasklet chain to a SymPy expression over wired inputs.
+
+        Used for branches where SplitTasklets has broken a single tasklet
+        into a chain (e.g., constant generator -> operation).
+        """
+        ise_assignments: Dict[str, str] = {}
+        for e in inner_sdfg.all_interstate_edges():
+            ise_assignments.update(e.data.assignments)
+
+        input_mapping: Dict[str, sp.Basic] = {}
+        for edge in state.in_edges(output_tasklet):
+            if not isinstance(edge.src, nodes.AccessNode) or edge.dst_conn is None:
+                continue
+            arr_name = edge.src.data
+            resolved = _resolve_symbol(
+                inner_sdfg, arr_name, ise_assignments, wired_inputs, frozenset())
+            if resolved is None:
+                return None
+            input_mapping[edge.dst_conn] = resolved
+        return _tasklet_code_to_sympy(output_tasklet.code.as_string, input_mapping)
+
+    @staticmethod
+    def _fix_staging_memlets(
+        graph: SDFGState,
+        sdfg: SDFG,
+        compound_node: nodes.LibraryNode,
+        out_tile_node: nodes.AccessNode,
+        nsdfg_sym_mapping: Dict[str, object],
+        inner_map_params: List[str],
+        inner_map_ranges: list,
+        tile_shape: tuple,
+    ) -> None:
+        """Reconstruct staging memlets when they are bounding boxes.
+
+        After map collapse + tiling, memlets may be propagated to full-array
+        bounding boxes (e.g., ``A[0:24, 0:20]``).  When the tile transient
+        is smaller, these cause buffer overflows.  This method reconstructs
+        correct per-tile subsets using the NSDFG's symbol_mapping.
+        """
+        from dace.subsets import Range as SubsetRange
+        tile_volume = 1
+        for s in tile_shape:
+            tile_volume *= int(s) if isinstance(s, (int, sp.Integer)) else s
+
+        # Filter out identity mappings (dimension params like FM → FM)
+        # to keep only actual index variables (i → i + tile_i, j → j + ...).
+        nsdfg_syms = sorted(
+            k for k, v in nsdfg_sym_mapping.items()
+            if str(k) != str(v)
+        )
+
+        def _to_sympy_val(val):
+            if isinstance(val, sp.Basic):
+                return val
+            if hasattr(val, 'expr'):
+                return val.expr
+            return sp.sympify(val)
+
+        def _compute_per_tile_subset(arr):
+            ndim = len(arr.shape)
+            if len(nsdfg_syms) != ndim:
+                return None
+            ranges = []
+            for d, sym_name in enumerate(nsdfg_syms):
+                expr = dace.symbolic.pystr_to_symbolic(
+                    str(nsdfg_sym_mapping[sym_name]))
+                inner_found = False
+                for p_idx, p_name in enumerate(inner_map_params):
+                    actual_sym = next(
+                        (s for s in expr.free_symbols if str(s) == p_name),
+                        None)
+                    if actual_sym is not None:
+                        inner_found = True
+                        r_start = _to_sympy_val(inner_map_ranges[p_idx][0])
+                        r_end = _to_sympy_val(inner_map_ranges[p_idx][1])
+                        start_val = expr.subs(actual_sym, r_start)
+                        end_val = expr.subs(actual_sym, r_end)
+                        # Clamp end to array bound — the inner map range
+                        # may not account for outer tile offsets, so the
+                        # computed end can exceed the dimension size.
+                        dim_bound = sp.sympify(arr.shape[d]) - 1
+                        end_val = sp.Min(end_val, dim_bound)
+                        ranges.append((start_val, end_val, 1))
+                        break
+                if not inner_found:
+                    ranges.append((expr, expr, 1))
+            return SubsetRange(ranges)
+
+        def _needs_fix(memlet, arr):
+            """Check if a staging memlet is a bounding box (too large)."""
+            try:
+                vol = memlet.subset.num_elements()
+                return vol != tile_volume
+            except TypeError:
+                return True
+
+        # Fix input staging: MapEntry → tile_transient
+        for in_edge in graph.in_edges(compound_node):
+            tile_node = in_edge.src
+            if not isinstance(tile_node, nodes.AccessNode):
+                continue
+            if not sdfg.arrays.get(tile_node.data, type('', (), {'transient': False})).transient:
+                continue
+            for se in graph.in_edges(tile_node):
+                if isinstance(se.src, nodes.MapEntry):
+                    arr = sdfg.arrays.get(se.data.data)
+                    if arr and _needs_fix(se.data, arr):
+                        ns = _compute_per_tile_subset(arr)
+                        if ns is not None:
+                            se.data = Memlet(data=se.data.data, subset=ns)
+
+        # Fix output staging: out_tile → MapExit
+        for se in graph.out_edges(out_tile_node):
+            if isinstance(se.dst, nodes.MapExit):
+                arr = sdfg.arrays.get(se.data.data)
+                if arr and _needs_fix(se.data, arr):
+                    ns = _compute_per_tile_subset(arr)
+                    if ns is not None:
+                        se.data = Memlet(data=se.data.data, subset=ns)
 
     # ── apply ────────────────────────────────────────────────────────
 
@@ -386,6 +789,12 @@ class IfElseMapToTileWhere(xf.SingleStateTransformation):
         inner_exit: nodes.MapExit = self.inner_map_exit
         outer_exit: nodes.MapExit = self.outer_map_exit
         inner_sdfg = nsdfg.sdfg
+
+        # Capture NSDFG symbol_mapping and inner map info for staging
+        # memlet reconstruction (needed when memlets are bounding boxes).
+        nsdfg_sym_mapping = dict(nsdfg.symbol_mapping)
+        inner_map_params = list(inner_entry.map.params)
+        inner_map_ranges = list(inner_entry.map.range.ranges)
 
         # ── 1. Analyze NestedSDFG ────────────────────────────────────
         analysis_result = self._analyze_nsdfg(inner_sdfg)
@@ -458,29 +867,58 @@ class IfElseMapToTileWhere(xf.SingleStateTransformation):
                     break
 
         # ── 6. Convert condition and classify branch tasklets ───────
+        wired_inputs = {
+            input_edge.dst_conn
+            for input_edge in graph.in_edges(nsdfg)
+            if input_edge.dst_conn is not None and input_edge.data.data is not None
+        }
         nsdfg_arrays = set(inner_sdfg.arrays.keys())
         condition_expression = _to_sympy_condition(cond_expr, nsdfg_arrays)
+        if condition_expression is not None:
+            cond_syms = [str(s) for s in condition_expression.free_symbols]
+            if (any(s not in nsdfg.in_connectors for s in cond_syms)
+                    or any(s not in wired_inputs for s in cond_syms)):
+                condition_expression = None
+        if condition_expression is None:
+            condition_expression = _resolve_condition_to_wired_inputs(
+                inner_sdfg, cond_expr, wired_inputs)
         assert condition_expression is not None, f"Unsupported condition: {cond_expr}"
         condition_symbol_names = sorted(
             str(free_symbol) for free_symbol in condition_expression.free_symbols
         )
-        for symbol_name in condition_symbol_names:
-            assert symbol_name in nsdfg.in_connectors, (
-                "Condition may only reference NestedSDFG inputs; "
-                f"got symbol '{symbol_name}' in '{cond_expr}'"
-            )
 
-        # Classify both branch tasklets
+        # Classify both branch tasklets (or detect copy/chain branches)
         branch_matches: Dict[str, Tuple[TaskletLibraryNodeMatch, nodes.Tasklet]] = {}   # "true"/"false" → (match, tasklet)
+        copy_branches: Dict[str, str] = {}  # branch_name → nsdfg input array name
+        chain_branches: Dict[str, sp.Basic] = {}  # branch_name → resolved SymPy expr over NSDFG array names
         for branch_name, branch_state in [("true", true_branch_state), ("false", false_branch_state)]:
             tasklets = [node for node in branch_state.nodes()
                         if isinstance(node, nodes.Tasklet)]
-            assert len(tasklets) == 1
-            tasklet_match = match_tasklet_to_tile_library_node(
-                branch_state, tasklets[0], MaskType.UNMASKED,
-                promote_scalars=True)
-            assert tasklet_match is not None
-            branch_matches[branch_name] = (tasklet_match, tasklets[0])
+            if len(tasklets) == 1:
+                tasklet_match = match_tasklet_to_tile_library_node(
+                    branch_state, tasklets[0], MaskType.UNMASKED,
+                    promote_scalars=True)
+                assert tasklet_match is not None
+                branch_matches[branch_name] = (tasklet_match, tasklets[0])
+            elif len(tasklets) == 0:
+                # Copy branch: AccessNode → AccessNode chain (identity)
+                copy_input = self._get_copy_branch_input(branch_state)
+                assert copy_input is not None, (
+                    f"IfElseMapToTileWhere: {branch_name} branch has no "
+                    f"tasklets and no valid copy chain")
+                copy_branches[branch_name] = copy_input
+            else:
+                # Multi-tasklet chain (e.g., from SplitTasklets)
+                output_tasklet = self._find_output_tasklet(branch_state)
+                assert output_tasklet is not None, (
+                    f"IfElseMapToTileWhere: {branch_name} branch has "
+                    f"{len(tasklets)} tasklets but no output tasklet found")
+                chain_expr = self._resolve_chain_expression(
+                    branch_state, output_tasklet, inner_sdfg, wired_inputs)
+                assert chain_expr is not None, (
+                    f"IfElseMapToTileWhere: {branch_name} branch chain "
+                    f"could not be resolved to a SymPy expression")
+                chain_branches[branch_name] = chain_expr
 
         # ── 7. Build SymPy expressions for branches ─────────────────
         # Collect NSDFG arrays used by branch operands.
@@ -489,6 +927,17 @@ class IfElseMapToTileWhere(xf.SingleStateTransformation):
         branch_operand_arrays: Dict[str, Dict[str, str]] = {}
 
         for branch_name, branch_state in [("true", true_branch_state), ("false", false_branch_state)]:
+            if branch_name in copy_branches:
+                # Copy branch: the only operand is the input array
+                copy_arr = copy_branches[branch_name]
+                needed_nsdfg_names.add(copy_arr)
+                branch_operand_arrays[branch_name] = {"rhs1": copy_arr}
+                continue
+            if branch_name in chain_branches:
+                # Multi-tasklet chain: collect needed arrays from resolved expr
+                for sym in chain_branches[branch_name].free_symbols:
+                    needed_nsdfg_names.add(str(sym))
+                continue
             tasklet_classification = branch_matches[branch_name][0].tasklet_classification
             tasklet_node = branch_matches[branch_name][1]
             input_mapping = self._get_tasklet_input_mapping(branch_state, tasklet_node)
@@ -527,6 +976,20 @@ class IfElseMapToTileWhere(xf.SingleStateTransformation):
         # Build a SymPy expression for each branch.
         branch_exprs: Dict[str, sp.Basic] = {}
         for branch_name in ("true", "false"):
+            if branch_name in copy_branches:
+                # Copy branch: identity expression (output = input)
+                operand_arrays = branch_operand_arrays[branch_name]
+                branch_exprs[branch_name] = _nsdfg_to_conn_sym(
+                    operand_arrays["rhs1"])
+                continue
+            if branch_name in chain_branches:
+                # Multi-tasklet chain: remap NSDFG array names to connector symbols
+                chain_expr = chain_branches[branch_name]
+                subs = {}
+                for sym in chain_expr.free_symbols:
+                    subs[sym] = _nsdfg_to_conn_sym(str(sym))
+                branch_exprs[branch_name] = chain_expr.xreplace(subs)
+                continue
             tasklet_classification = branch_matches[branch_name][0].tasklet_classification
             operand_arrays = branch_operand_arrays[branch_name]
             # Left / first operand
@@ -630,3 +1093,13 @@ class IfElseMapToTileWhere(xf.SingleStateTransformation):
         graph.remove_node(nsdfg)
         graph.remove_node(inner_entry)
         graph.remove_node(inner_exit)
+
+        # ── 11. Fix staging memlets for bounding-box cases ───────────
+        # When memlets are propagated bounding boxes (e.g., A[0:24, 0:20]
+        # for a 6-element tile), reconstruct correct per-tile subsets
+        # using the NSDFG's symbol_mapping and inner map range.
+        self._fix_staging_memlets(
+            graph, sdfg, compound_node, out_tile_node,
+            nsdfg_sym_mapping, inner_map_params, inner_map_ranges,
+            tile_shape,
+        )

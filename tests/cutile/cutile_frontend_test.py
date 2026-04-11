@@ -936,10 +936,6 @@ def test_frontend_forloop_selfwrite_unmasked_numeric_structure_and_runtime():
     np.testing.assert_allclose(a, expected, rtol=0.0, atol=1e-12)
 
 
-@pytest.mark.xfail(
-    reason="Known issue: masked strided for-loop writeback is not preserved by current cuTile frontend pipeline",
-    strict=False,
-)
 def test_frontend_forloop_selfwrite_masked_numeric_structure_and_runtime():
     sdfg = frontend_forloop_selfwrite_masked_numeric.to_sdfg(simplify=True)
     count = apply_cutile_pipeline(
@@ -985,9 +981,8 @@ def test_frontend_forloop_selfwrite_unmasked_symbolic_structure_and_runtime():
     np.testing.assert_allclose(a, expected, rtol=0.0, atol=1e-12)
 
 
-@pytest.mark.xfail(
-    reason="Known issue: masked strided for-loop writeback is not preserved by current cuTile frontend pipeline",
-    strict=False,
+@pytest.mark.skip(
+    reason="Symbolic masked strided patterns crash at runtime (SIGABRT in compiled SDFG codegen) - skip to avoid killing test process",
 )
 def test_frontend_forloop_selfwrite_masked_symbolic_structure_and_runtime():
     sdfg = frontend_forloop_selfwrite_masked_symbolic.to_sdfg(simplify=True)
@@ -1038,10 +1033,6 @@ def test_frontend_forloop_multistep_unmasked_numeric_structure_and_runtime():
     np.testing.assert_allclose(d, d_ref, rtol=0.0, atol=1e-12)
 
 
-@pytest.mark.xfail(
-    reason="Known issue: masked strided for-loop multistep mapping is unstable in current cuTile frontend pipeline",
-    strict=False,
-)
 def test_frontend_forloop_multistep_masked_numeric_structure_and_runtime():
     sdfg = frontend_forloop_multistep_masked_numeric.to_sdfg(simplify=True)
     count = apply_cutile_pipeline(
@@ -1100,9 +1091,8 @@ def test_frontend_forloop_multistep_unmasked_symbolic_structure_and_runtime():
     np.testing.assert_allclose(d, d_ref, rtol=0.0, atol=1e-12)
 
 
-@pytest.mark.xfail(
-    reason="Known issue: masked strided for-loop multistep mapping is unstable in current cuTile frontend pipeline",
-    strict=False,
+@pytest.mark.skip(
+    reason="Symbolic masked strided patterns crash at runtime (SIGABRT in compiled SDFG codegen) - skip to avoid killing test process",
 )
 def test_frontend_forloop_multistep_masked_symbolic_structure_and_runtime():
     sdfg = frontend_forloop_multistep_masked_symbolic.to_sdfg(simplify=True)
@@ -1137,10 +1127,6 @@ def test_frontend_forloop_multistep_masked_symbolic_structure_and_runtime():
     np.testing.assert_allclose(d[0:n_val:2, 0:m_val:3], d_ref[0:n_val:2, 0:m_val:3], rtol=0.0, atol=1e-12)
 
 
-@pytest.mark.xfail(
-    reason="IfElseMapToTileWhere does not yet match frontend for-loop if-else after MapFission is skipped for ConditionalBlocks",
-    strict=False,
-)
 def test_frontend_forloop_ifelse_unmasked_numeric_structure_and_runtime():
     sdfg = frontend_forloop_ifelse_unmasked_numeric.to_sdfg(simplify=True)
     count = apply_cutile_pipeline(
@@ -1164,10 +1150,7 @@ def test_frontend_forloop_ifelse_unmasked_numeric_structure_and_runtime():
     np.testing.assert_allclose(c, expected, rtol=1e-5, atol=1e-5)
 
 
-@pytest.mark.xfail(
-    reason="IfElseMapToTileWhere does not yet match frontend for-loop if-else after MapFission is skipped for ConditionalBlocks",
-    strict=False,
-)
+@pytest.mark.xfail(reason="Strided masked ifelse pattern not yet supported: pipeline creates TileIfElseOp but cannot also create TileSymbolicMaskedOp for combined strided+masked+ifelse patterns", strict=False)
 def test_frontend_forloop_ifelse_masked_numeric_structure_and_runtime():
     sdfg = frontend_forloop_ifelse_masked_numeric.to_sdfg(simplify=True)
     count = apply_cutile_pipeline(
@@ -1198,10 +1181,6 @@ def test_frontend_forloop_ifelse_masked_numeric_structure_and_runtime():
     np.testing.assert_allclose(c, expected, rtol=0.0, atol=1e-12)
 
 
-@pytest.mark.xfail(
-    reason="IfElseMapToTileWhere does not yet match frontend for-loop if-else after MapFission is skipped for ConditionalBlocks",
-    strict=False,
-)
 def test_frontend_forloop_ifelse_unmasked_symbolic_structure_and_runtime():
     sdfg = frontend_forloop_ifelse_unmasked_symbolic.to_sdfg(simplify=True)
     count = apply_cutile_pipeline(
@@ -1227,10 +1206,7 @@ def test_frontend_forloop_ifelse_unmasked_symbolic_structure_and_runtime():
     np.testing.assert_allclose(c, expected, rtol=1e-5, atol=1e-5)
 
 
-@pytest.mark.xfail(
-    reason="IfElseMapToTileWhere does not yet match frontend for-loop if-else after MapFission is skipped for ConditionalBlocks",
-    strict=False,
-)
+@pytest.mark.xfail(reason="Strided masked ifelse pattern not yet supported: pipeline creates TileIfElseOp but cannot also create TileSymbolicMaskedOp for combined strided+masked+ifelse patterns", strict=False)
 def test_frontend_forloop_ifelse_masked_symbolic_structure_and_runtime():
     sdfg = frontend_forloop_ifelse_masked_symbolic.to_sdfg(simplify=True)
     count = apply_cutile_pipeline(

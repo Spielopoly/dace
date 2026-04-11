@@ -39,6 +39,7 @@ from dace.transformation import pass_pipeline as ppl
 from .remove_intermediate_transient import RemoveIntermediateTransient
 
 
+
 # ---------------------------------------------------------------------------
 # CuTilePipeline — the main pipeline Pass
 # ---------------------------------------------------------------------------
@@ -55,8 +56,8 @@ class CuTilePipeline(ppl.Pass):
      3.  **MapCollapse** – collapse nested maps (optional, controlled by
          ``apply_map_collapse_and_tiling``).
      4.  **SplitTasklets** – split multi-statement tasklets into single ops.
-     5.  **MapFission** – fission maps into single-operation maps
-         (skipped when ConditionalBlocks are present).
+     5.  **MapFission** – fission maps into single-operation maps,
+         followed by **MapCollapse** to merge directly-nested 1-D maps.
      6.  **Simplify** – clean up after preprocessing.
      7.  **MapTiling** – tile maps to the given tile shape (optional,
          controlled by ``apply_map_collapse_and_tiling``).
@@ -115,7 +116,7 @@ class CuTilePipeline(ppl.Pass):
             [LoopLifting, LoopToMap], validate=self.validate_all, validate_all=self.validate_all,
         )
         debug_save()
-        
+
         # Step 3: MapCollapse
         if self.apply_map_collapse_and_tiling:
             count += sdfg.apply_transformations_repeated(
@@ -123,18 +124,37 @@ class CuTilePipeline(ppl.Pass):
             )
         debug_save()
 
+        # Step 3b: Early handling of ConditionalBlock maps.
+        # Tile maps containing ConditionalBlock NestedSDFGs and convert
+        # them to TileIfElseOpLibraryNode BEFORE SplitTasklets breaks
+        # multi-statement tasklets inside the branches.
+        if self.apply_map_collapse_and_tiling:
+            count += _apply_map_tiling_to_all_maps(
+                sdfg, tile_shape=self.tile_shape, validate=self.validate_all,
+                only_conditional_block_maps=True,
+            )
+            duplicate_conditions_for_whole_sdfgs(sdfg)
+            count += sdfg.apply_transformations_repeated(
+                [IfElseMapToTileWhere],
+                validate=self.validate_all,
+                validate_all=self.validate_all,
+            )
+        debug_save()
+
         # Step 4: Split multi-statement tasklets
         SplitTasklets().apply_pass(sdfg, pipeline_results)
         debug_save()
 
-        # Step 5: Fission maps (skip if ConditionalBlocks present)
-        has_conditional = any(
-            isinstance(cfr, ConditionalBlock)
-            for cfr in sdfg.all_control_flow_regions(recursive=True)
+        # Step 5: Fission maps
+        count += sdfg.apply_transformations_repeated(
+            [MapFission], validate=self.validate_all, validate_all=self.validate_all,
         )
-        if not has_conditional:
+        # MapFission may produce directly-nested 1-D maps (e.g. fission of
+        # an outer loop that contained an inner loop map).  Collapse them so
+        # that the subsequent tiling step sees a single multi-dimensional map.
+        if self.apply_map_collapse_and_tiling:
             count += sdfg.apply_transformations_repeated(
-                [MapFission], validate=self.validate_all, validate_all=self.validate_all,
+                [MapCollapse], validate=self.validate_all, validate_all=self.validate_all,
             )
         debug_save()
 
@@ -153,9 +173,18 @@ class CuTilePipeline(ppl.Pass):
         duplicate_conditions_for_whole_sdfgs(sdfg)
         debug_save()
 
+        # Step 8b: Apply IfElseMapToTileWhere for patterns that weren't
+        # handled in Step 3b (e.g. frontend patterns that needed MapFission first).
+        count += sdfg.apply_transformations_repeated(
+            [IfElseMapToTileWhere],
+            validate=self.validate_all,
+            validate_all=self.validate_all,
+        )
+        debug_save()
+
         # Step 9: ScalarToTile transformations
         count += sdfg.apply_transformations_repeated(
-            [ScalarToTileCanonical, ScalarToTileMasked, IfElseMapToTileWhere],
+            [ScalarToTileCanonical, ScalarToTileMasked],
             validate=self.validate_all,
             validate_all=self.validate_all,
         )
@@ -178,7 +207,8 @@ class CuTilePipeline(ppl.Pass):
 
 def _apply_map_tiling_to_all_maps(sdfg: SDFG,
                                    tile_shape: Tuple[int, ...],
-                                   validate: bool = False) -> int:
+                                   validate: bool = False,
+                                   only_conditional_block_maps: bool = False) -> int:
     """Apply MapTiling to all MapEntry nodes in the SDFG.
 
     Collects all MapEntry nodes before tiling begins, then applies MapTiling
@@ -207,7 +237,8 @@ def _apply_map_tiling_to_all_maps(sdfg: SDFG,
             if isinstance(node, sdfg_nodes.MapEntry):
                 map_entries_to_tile.append((state, node))
             elif isinstance(node, sdfg_nodes.NestedSDFG):
-                count += _apply_map_tiling_to_all_maps(node.sdfg, tile_shape, validate)
+                count += _apply_map_tiling_to_all_maps(node.sdfg, tile_shape, validate,
+                                                       only_conditional_block_maps)
 
     # Apply MapTiling to each original MapEntry exactly once
     options = {
@@ -221,6 +252,21 @@ def _apply_map_tiling_to_all_maps(sdfg: SDFG,
         # (it may have been removed or transformed by previous tiling)
         if map_entry not in state.nodes():
             continue
+
+        # If only tiling maps that contain ConditionalBlock NestedSDFGs, skip others
+        if only_conditional_block_maps:
+            scope_nodes = state.scope_subgraph(map_entry).nodes()
+            has_conditional = False
+            for sn in scope_nodes:
+                if isinstance(sn, sdfg_nodes.NestedSDFG):
+                    for cfr in sn.sdfg.all_control_flow_regions():
+                        if isinstance(cfr, ConditionalBlock):
+                            has_conditional = True
+                            break
+                if has_conditional:
+                    break
+            if not has_conditional:
+                continue
 
         # Verify the node is still a valid MapEntry before attempting
         if not isinstance(map_entry, sdfg_nodes.MapEntry):
