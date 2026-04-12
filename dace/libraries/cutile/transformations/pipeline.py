@@ -48,23 +48,6 @@ from .remove_intermediate_transient import RemoveIntermediateTransient
 @dataclass(unsafe_hash=True)
 class CuTilePipeline(ppl.Pass):
     """Full cuTile transformation pipeline as a DaCe :class:`~dace.transformation.pass_pipeline.Pass`.
-
-    Pipeline stages:
-
-     1.  **Simplify** – trivial tasklet elimination and standard simplify.
-     2.  **LoopLifting / LoopToMap** – convert state-machine loops into maps.
-     3.  **MapCollapse** – collapse nested maps (optional, controlled by
-         ``apply_map_collapse_and_tiling``).
-     4.  **SplitTasklets** – split multi-statement tasklets into single ops.
-     5.  **MapFission** – fission maps into single-operation maps,
-         followed by **MapCollapse** to merge directly-nested 1-D maps.
-     6.  **Simplify** – clean up after preprocessing.
-     7.  **MapTiling** – tile maps to the given tile shape (optional,
-         controlled by ``apply_map_collapse_and_tiling``).
-     8.  **Normalize conditional blocks** in NestedSDFGs.
-     9.  **ScalarToTile rewriting** – replace scalar tasklets with cuTile
-         library nodes.
-     10. **Simplify** – final clean up.
     """
 
     CATEGORY: str = 'cuTile'
@@ -124,7 +107,7 @@ class CuTilePipeline(ppl.Pass):
             )
         debug_save()
 
-        # Step 3b: Early handling of ConditionalBlock maps.
+        # Step 4: Early handling of ConditionalBlock maps.
         # Tile maps containing ConditionalBlock NestedSDFGs and convert
         # them to TileIfElseOpLibraryNode BEFORE SplitTasklets breaks
         # multi-statement tasklets inside the branches.
@@ -141,14 +124,17 @@ class CuTilePipeline(ppl.Pass):
             )
         debug_save()
 
-        # Step 4: Split multi-statement tasklets
+        # Step 5: Split multi-statement tasklets
         SplitTasklets().apply_pass(sdfg, pipeline_results)
         debug_save()
 
-        # Step 5: Fission maps
+        # Step 6: Fission maps
         count += sdfg.apply_transformations_repeated(
             [MapFission], validate=self.validate_all, validate_all=self.validate_all,
         )
+        debug_save()
+        
+        # Step 7
         # MapFission may produce directly-nested 1-D maps (e.g. fission of
         # an outer loop that contained an inner loop map).  Collapse them so
         # that the subsequent tiling step sees a single multi-dimensional map.
@@ -158,22 +144,22 @@ class CuTilePipeline(ppl.Pass):
             )
         debug_save()
 
-        # Step 6: Clean up after preprocessing
+        # Step 8: Clean up after preprocessing
         self._simplify(sdfg)
         debug_save()
 
-        # Step 7: Map tiling (optional)
+        # Step 9: Map tiling (optional)
         if self.apply_map_collapse_and_tiling:
             count += _apply_map_tiling_to_all_maps(
                 sdfg, tile_shape=self.tile_shape, validate=self.validate_all,
             )
         debug_save()
 
-        # Step 8: Normalize conditional blocks in NestedSDFGs
+        # Step 10: Normalize conditional blocks in NestedSDFGs
         duplicate_conditions_for_whole_sdfgs(sdfg)
         debug_save()
 
-        # Step 8b: Apply IfElseMapToTileWhere for patterns that weren't
+        # Step 11: Apply IfElseMapToTileWhere for patterns that weren't
         # handled in Step 3b (e.g. frontend patterns that needed MapFission first).
         count += sdfg.apply_transformations_repeated(
             [IfElseMapToTileWhere],
@@ -182,7 +168,7 @@ class CuTilePipeline(ppl.Pass):
         )
         debug_save()
 
-        # Step 9: ScalarToTile transformations
+        # Step 12: ScalarToTile transformations
         count += sdfg.apply_transformations_repeated(
             [ScalarToTileCanonical, ScalarToTileMasked],
             validate=self.validate_all,
@@ -190,7 +176,7 @@ class CuTilePipeline(ppl.Pass):
         )
         debug_save()
 
-        # Step 10: Final clean up
+        # Step 13: Final clean up
         self._simplify(sdfg)
         debug_save()
 
