@@ -672,18 +672,13 @@ def frontend_multiple_tasklets_program(
         B[i] = A[i] * 2.0 + 1.0
         C[i] = A[i] - B[i]
 
-
 def test_frontend_multiple_tasklets_pipeline_all_maps_tiled():
     """Regression test: pipeline tiles ALL maps from multiple tasklets, not just the first.
     
     This test verifies the fix for the MapTiling issue where only the first map
     was tiled when multiple independent maps were created by SplitTasklets and
     MapFission. The fix ensures that all original maps are tiled exactly once.
-    
-    NOTE: This test is skipped due to a pre-existing issue with MapFission on nested SDFGs
-    that is unrelated to the MapTiling fix.
     """
-    pytest.skip("Skipped due to pre-existing MapFission issue with nested SDFGs")
     sdfg = frontend_multiple_tasklets_program.to_sdfg(simplify=True)
     
     # Apply the pipeline with tiling
@@ -982,7 +977,7 @@ def test_frontend_forloop_selfwrite_unmasked_symbolic_structure_and_runtime():
 
 
 @pytest.mark.skip(
-    reason="Symbolic masked strided patterns crash at runtime (SIGABRT in compiled SDFG codegen) - skip to avoid killing test process",
+    reason="Skip symbolic masked strided patterns crash at runtime (SIGABRT in compiled SDFG codegen) - skip to avoid killing test process",
 )
 def test_frontend_forloop_selfwrite_masked_symbolic_structure_and_runtime():
     sdfg = frontend_forloop_selfwrite_masked_symbolic.to_sdfg(simplify=True)
@@ -1097,7 +1092,7 @@ def test_frontend_forloop_multistep_unmasked_symbolic_structure_and_runtime():
 def test_frontend_forloop_multistep_masked_symbolic_structure_and_runtime():
     sdfg = frontend_forloop_multistep_masked_symbolic.to_sdfg(simplify=True)
     count = apply_cutile_pipeline(
-        sdfg, validate=True, apply_map_collapse_and_tiling=True, tile_shape=(5, 4)
+        sdfg, validate=True, apply_map_collapse_and_tiling=True, tile_shape=(5, 4), validate_all=True
     )
     assert count >= 1
     _assert_masked_or_tileop_min(sdfg, 2)
