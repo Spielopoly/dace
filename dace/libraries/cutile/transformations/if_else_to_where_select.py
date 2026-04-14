@@ -40,6 +40,9 @@ from dace.libraries.cutile.transformations.utils import (
     tile_subset_from_shape,
     create_tile_transient,
     is_canonical_inner_map,
+    primary_memlet_subset,
+    with_primary_subset,
+    memlet_with_primary_subset,
 )
 from sympy.parsing.sympy_parser import parse_expr
 
@@ -733,7 +736,10 @@ class IfElseMapToTileWhere(xf.SingleStateTransformation):
         def _needs_fix(memlet, arr):
             """Check if a staging memlet is a bounding box (too large)."""
             try:
-                vol = memlet.subset.num_elements()
+                subset = primary_memlet_subset(memlet)
+                if subset is None:
+                    return True
+                vol = subset.num_elements()
                 return vol != tile_volume
             except TypeError:
                 return True
@@ -751,7 +757,7 @@ class IfElseMapToTileWhere(xf.SingleStateTransformation):
                     if arr and _needs_fix(se.data, arr):
                         ns = _compute_per_tile_subset(arr)
                         if ns is not None:
-                            se.data = Memlet(data=se.data.data, subset=ns)
+                            se.data = with_primary_subset(se.data, ns)
 
         # Fix output staging: out_tile → MapExit
         for se in graph.out_edges(out_tile_node):
@@ -760,7 +766,7 @@ class IfElseMapToTileWhere(xf.SingleStateTransformation):
                 if arr and _needs_fix(se.data, arr):
                     ns = _compute_per_tile_subset(arr)
                     if ns is not None:
-                        se.data = Memlet(data=se.data.data, subset=ns)
+                        se.data = with_primary_subset(se.data, ns)
 
     # ── apply ────────────────────────────────────────────────────────
 
@@ -1043,7 +1049,9 @@ class IfElseMapToTileWhere(xf.SingleStateTransformation):
         for outer_name, conn_name in outer_to_conn.items():
             tile_name, tile_node = outer_to_tile[outer_name]
             graph.add_edge(tile_node, None, compound_node, conn_name,
-                           Memlet(data=tile_name, subset=tile_subset))
+                           memlet_with_primary_subset(tile_name,
+                                                      tile_subset,
+                                                      data_on_src=True))
 
         # ── 9. Connect output to outer exit ──────────────────────────
         output_nsdfg_array = self._get_branch_output_array(true_branch_state)
@@ -1059,7 +1067,9 @@ class IfElseMapToTileWhere(xf.SingleStateTransformation):
         )
 
         graph.add_edge(compound_node, "_out", out_tile_node, None,
-                       Memlet(data=out_tile_name, subset=tile_subset))
+                       memlet_with_primary_subset(out_tile_name,
+                                                  tile_subset,
+                                                  data_on_src=False))
 
         # Find the original nsdfg → inner_exit → outer_exit edge
         # and reuse its memlet for the output store

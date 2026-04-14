@@ -125,6 +125,8 @@ class RemoveIntermediateTransient(pm.SingleStateTransformation):
         out_edge = graph.edges_between(access_node, map_exit)[0]
         if out_edge.data.data is None:
             return False
+        if out_edge.data.dst_subset is None:
+            return False
 
         # out_edge must reference an outer array, not the intermediate itself
         if out_edge.data.data == access_node.data:
@@ -132,15 +134,17 @@ class RemoveIntermediateTransient(pm.SingleStateTransformation):
 
         # Validate memlet composition for AccessNode predecessors with non-scalar intermediates
         if isinstance(in_edge.src, nodes.AccessNode):
-            in_other = in_edge.data.other_subset
-            in_subset = in_edge.data.subset
-            out_other = out_edge.data.other_subset
-            if in_other is not None and in_subset is not None and out_other is not None:
+            in_edge.data.try_initialize(sdfg, graph, in_edge)
+            out_edge.data.try_initialize(sdfg, graph, out_edge)
+            in_src = in_edge.data.src_subset
+            in_dst = in_edge.data.dst_subset
+            out_src = out_edge.data.src_subset
+            if in_src is not None and in_dst is not None and out_src is not None:
                 try:
                     import copy as _copy
-                    relative = _copy.deepcopy(out_other)
-                    relative.offset(in_subset, negative=True)
-                    in_other.compose(relative)
+                    relative = _copy.deepcopy(out_src)
+                    relative.offset(in_dst, negative=True)
+                    in_src.compose(relative)
                 except (ValueError, TypeError, NotImplementedError):
                     return False
 
@@ -155,26 +159,44 @@ class RemoveIntermediateTransient(pm.SingleStateTransformation):
 
         # Build the new memlet that bypasses the intermediate access node.
         # out_edge.data.data is the outer array name (e.g., 'c')
-        # out_edge.data.subset is the subset of that array (e.g., 'i')
-        # out_edge.data.other_subset references the intermediate (being removed)
+        # out_edge.data.dst_subset targets that array (e.g., 'i')
+        # out_edge.data.src_subset references the intermediate (being removed)
+        in_edge.data.try_initialize(sdfg, graph, in_edge)
+        out_edge.data.try_initialize(sdfg, graph, out_edge)
         out_data = out_edge.data.data
-        out_subset = (copy.deepcopy(out_edge.data.subset)
-                      if out_edge.data.subset is not None else None)
+        out_dst_subset = (copy.deepcopy(out_edge.data.dst_subset)
+                          if out_edge.data.dst_subset is not None else None)
+        if out_dst_subset is None:
+            raise ValueError(
+                "RemoveIntermediateTransient cannot construct bypass memlet: "
+                "missing destination subset on outgoing edge."
+            )
 
-        # Determine the source-side subset (other_subset in the new memlet)
-        new_other_subset = None
+        # Determine the source-side subset for the new memlet
+        new_src_subset = None
         if isinstance(in_edge.src, nodes.AccessNode):
             # Predecessor is an AccessNode: compose subsets through intermediate
-            in_other = in_edge.data.other_subset
-            in_subset = in_edge.data.subset
-            out_other = out_edge.data.other_subset
+            in_src = in_edge.data.src_subset
+            in_dst = in_edge.data.dst_subset
+            out_src = out_edge.data.src_subset
 
-            if in_other is not None and in_subset is not None and out_other is not None:
-                relative = copy.deepcopy(out_other)
-                relative.offset(in_subset, negative=True)
-                new_other_subset = in_other.compose(relative)
-            elif in_other is not None:
-                new_other_subset = copy.deepcopy(in_other)
+            if in_src is not None and in_dst is not None and out_src is not None:
+                try:
+                    relative = copy.deepcopy(out_src)
+                    relative.offset(in_dst, negative=True)
+                    new_src_subset = in_src.compose(relative)
+                except (ValueError, TypeError, NotImplementedError) as exc:
+                    raise ValueError(
+                        "RemoveIntermediateTransient failed to compose bypass memlet subsets; "
+                        "incoming and outgoing subsets are incompatible for intermediate removal."
+                    ) from exc
+            elif in_src is not None:
+                new_src_subset = copy.deepcopy(in_src)
+            else:
+                raise ValueError(
+                    "RemoveIntermediateTransient cannot construct bypass memlet: "
+                    "missing source subset on incoming access edge."
+                )
 
         # Merge WCR from both edges
         wcr = out_edge.data.wcr
@@ -186,12 +208,14 @@ class RemoveIntermediateTransient(pm.SingleStateTransformation):
 
         # Construct new memlet
         new_memlet = mm.Memlet(data=out_data,
-                               subset=out_subset,
-                               other_subset=new_other_subset,
-                               volume=out_edge.data.volume,
-                               dynamic=out_edge.data.dynamic,
-                               wcr=wcr,
-                               wcr_nonatomic=wcr_nonatomic)
+                       volume=out_edge.data.volume,
+                       dynamic=out_edge.data.dynamic,
+                       wcr=wcr,
+                       wcr_nonatomic=wcr_nonatomic)
+        # Bypass edge always writes to the outer array, so data is on destination side.
+        new_memlet._is_data_src = False
+        new_memlet.src_subset = new_src_subset
+        new_memlet.dst_subset = out_dst_subset
 
         # Add new edge bypassing the access node
         graph.add_edge(in_edge.src, in_edge.src_conn,

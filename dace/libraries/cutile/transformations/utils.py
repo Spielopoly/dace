@@ -1,7 +1,11 @@
 
 
+import copy
+from typing import Optional
+
 import dace
 from dace import subsets, dtypes
+from dace.memlet import Memlet
 from dace.sdfg.state import ConditionalBlock, SDFGState
 from dace.sdfg.construction_utils import duplicate_condition_across_top_level_nodes
 from dace.sdfg import nodes
@@ -102,3 +106,48 @@ def is_canonical_inner_map(inner_map: nodes.Map) -> bool:
         if r_begin != 0 or r_stride != 1:
             return False
     return True
+
+
+def primary_memlet_subset(memlet: Memlet) -> Optional[subsets.Subset]:
+    """Return the memlet subset field through src/dst-oriented accessors."""
+    if memlet._is_data_src is False:
+        return memlet.dst_subset
+    return memlet.src_subset
+
+
+def with_primary_subset(memlet: Memlet, new_subset: subsets.Subset) -> Memlet:
+    """Clone *memlet* and replace the direction-dependent primary subset.
+
+    If the orientation is unresolved (``_is_data_src is None``), both
+    ``src_subset`` and ``dst_subset`` are set to deep copies of
+    ``new_subset``. This keeps the cloned memlet fully initialized and valid
+    regardless of which side is later interpreted as primary.
+    """
+    updated = copy.deepcopy(memlet)
+    if updated._is_data_src is False:
+        updated.dst_subset = new_subset
+    elif updated._is_data_src is True:
+        updated.src_subset = new_subset
+    else:
+        # Orientation unresolved: initialize both sides to avoid half-initialized memlets.
+        updated.src_subset = copy.deepcopy(new_subset)
+        updated.dst_subset = copy.deepcopy(new_subset)
+    return updated
+
+
+def memlet_with_primary_subset(data_name: str,
+                               primary_subset: subsets.Subset,
+                               *,
+                               data_on_src: Optional[bool] = None) -> Memlet:
+    """Construct a memlet with explicit directional semantics."""
+    memlet = Memlet(data=data_name)
+    if data_on_src is True:
+        memlet._is_data_src = True
+        memlet.src_subset = primary_subset
+    elif data_on_src is False:
+        memlet._is_data_src = False
+        memlet.dst_subset = primary_subset
+    else:
+        memlet.src_subset = copy.deepcopy(primary_subset)
+        memlet.dst_subset = copy.deepcopy(primary_subset)
+    return memlet

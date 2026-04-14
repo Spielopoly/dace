@@ -1528,14 +1528,15 @@ def _assert_no_strided_outer_memlets(state: dace.SDFGState):
     for edge in state.edges():
         if edge.data.data not in {"A", "B", "C"}:
             continue
-        if not isinstance(edge.data.subset, dace.subsets.Range):
+        subset = edge.data.dst_subset if edge.data._is_data_src is False else edge.data.src_subset
+        if not isinstance(subset, dace.subsets.Range):
             continue
         if not (
             isinstance(edge.src, (nodes.MapEntry, nodes.MapExit))
             or isinstance(edge.dst, (nodes.MapEntry, nodes.MapExit))
         ):
             continue
-        for _, _, step in edge.data.subset:
+        for _, _, step in subset:
             assert step == 1, f"Found strided outer memlet: {edge.data}"
 
 

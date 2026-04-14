@@ -39,7 +39,7 @@ def _make_scalar_intermediate_sdfg():
     state.add_edge(tasklet, '__out', c_tmp, None, dace.Memlet('c_tmp[0]'))
     mx.add_in_connector('IN_c')
     state.add_edge(c_tmp, None, mx, 'IN_c',
-                   dace.Memlet(data='c', subset='i', other_subset='0'))
+                   dace.Memlet('[0] -> c[i]'))
     state.add_memlet_path(mx, c_write,
                           memlet=dace.Memlet('c[i]'), src_conn='OUT_c')
 
@@ -82,8 +82,7 @@ def _make_2d_tiled_sdfg():
                    dace.Memlet('c_slice[0]'))
     imx.add_in_connector('IN_c')
     state.add_edge(c_slice, None, imx, 'IN_c',
-                   dace.Memlet(data='c', subset='i+tile_i, j+tile_j',
-                               other_subset='0'))
+                   dace.Memlet('[0] -> c[i+tile_i, j+tile_j]'))
     state.add_memlet_path(
         imx, omx, c_write,
         memlet=dace.Memlet(
@@ -187,7 +186,7 @@ def test_does_not_apply_multi_use():
     state1.add_edge(tasklet, '__out', c_tmp, None, dace.Memlet('c_tmp[0]'))
     mx.add_in_connector('IN_c')
     state1.add_edge(c_tmp, None, mx, 'IN_c',
-                    dace.Memlet(data='c', subset='i', other_subset='0'))
+                    dace.Memlet('[0] -> c[i]'))
     state1.add_memlet_path(mx, c_write,
                            memlet=dace.Memlet('c[i]'), src_conn='OUT_c')
 
@@ -234,7 +233,7 @@ def test_does_not_apply_multi_in_degree():
 
     mx.add_in_connector('IN_c')
     state.add_edge(c_tmp, None, mx, 'IN_c',
-                   dace.Memlet(data='c', subset='i', other_subset='0'))
+                   dace.Memlet('[0] -> c[i]'))
     state.add_memlet_path(mx, c_write,
                           memlet=dace.Memlet('c[i]'), src_conn='OUT_c')
 
@@ -272,9 +271,9 @@ def test_does_not_apply_multi_out_degree():
     mx.add_out_connector('OUT_c')
     mx.add_out_connector('OUT_c2')
     state.add_edge(c_tmp, None, mx, 'IN_c',
-                   dace.Memlet(data='c', subset='i', other_subset='0'))
+                   dace.Memlet('[0] -> c[i]'))
     state.add_edge(c_tmp, None, mx, 'IN_c2',
-                   dace.Memlet(data='c', subset='i', other_subset='0'))
+                   dace.Memlet('[0] -> c[i]'))
     state.add_edge(mx, 'OUT_c', c_write, None, dace.Memlet('c[i]'))
     state.add_edge(mx, 'OUT_c2', c_write, None, dace.Memlet('c[i]'))
 
@@ -321,7 +320,7 @@ def test_wcr_preserved():
                    dace.Memlet('c_tmp[0]'))
     mx.add_in_connector('IN_c')
     state.add_edge(c_tmp, None, mx, 'IN_c',
-                   dace.Memlet(data='c', subset='i', other_subset='0',
+                   dace.Memlet('[0] -> c[i]',
                                wcr='lambda a, b: a + b'))
     state.add_memlet_path(mx, c_write,
                           memlet=dace.Memlet('c[i]',
@@ -358,10 +357,10 @@ def test_accessnode_predecessor():
 
     state.add_memlet_path(a_read, me, a_inner, memlet=dace.Memlet('a[i]'))
     state.add_edge(a_inner, None, c_tmp, None,
-                   dace.Memlet(data='c_tmp', subset='0', other_subset='i'))
+                   dace.Memlet('[i] -> c_tmp[0]'))
     mx.add_in_connector('IN_c')
     state.add_edge(c_tmp, None, mx, 'IN_c',
-                   dace.Memlet(data='c', subset='i', other_subset='0'))
+                   dace.Memlet('[0] -> c[i]'))
     state.add_memlet_path(mx, c_write,
                           memlet=dace.Memlet('c[i]'), src_conn='OUT_c')
 

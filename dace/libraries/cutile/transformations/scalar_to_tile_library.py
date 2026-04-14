@@ -44,7 +44,14 @@ from dace.symbolic import SymExpr, symstr
 from dace.transformation import transformation as xf
 
 from dace.libraries.cutile.op_registry import match_tasklet_to_tile_library_node, MaskType
-from dace.libraries.cutile.transformations.utils import tile_subset_from_shape, create_tile_transient, is_canonical_inner_map
+from dace.libraries.cutile.transformations.utils import (
+    tile_subset_from_shape,
+    create_tile_transient,
+    is_canonical_inner_map,
+    primary_memlet_subset,
+    with_primary_subset,
+    memlet_with_primary_subset,
+)
 
 
 class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
@@ -177,9 +184,10 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
         element position inside the tile; non-scalar memlets violate that model.
         """
         for edge in self._get_all_edges_of_node(tasklet):
-            if not isinstance(edge.data.subset, subsets.Range):
+            edge_subset = primary_memlet_subset(edge.data)
+            if not isinstance(edge_subset, subsets.Range):
                 return False
-            for rng in edge.data.subset:
+            for rng in edge_subset:
                 start, end, step = rng
                 if start != end:
                     return False
@@ -383,7 +391,9 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
         # The library node consumes the full tile domain.
         for lib_conn in lib_conns:
             self._graph.add_edge(trans_read, None, self._library_node, lib_conn,
-                                 Memlet(data=trans_name, subset=self._tile_subset))
+                                 memlet_with_primary_subset(trans_name,
+                                                            self._tile_subset,
+                                                            data_on_src=True))
 
         return trans_name, trans_read
 
@@ -414,7 +424,9 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
 
         # Library writes full tile result into transient.
         self._graph.add_edge(self._library_node, lib_conn, trans_write, None,
-                             Memlet(data=trans_name, subset=self._tile_subset))
+                             memlet_with_primary_subset(trans_name,
+                                                        self._tile_subset,
+                                                        data_on_src=False))
 
         # transient -> outer_exit (store memlet preserves outer indexing).
         store_memlet = self._build_output_store_memlet(inner_to_outer_edge, tasklet_out_edge)
@@ -838,10 +850,12 @@ class ScalarToTileMasked(_ScalarToTileBase):
         Returns:
             A :class:`~dace.Memlet` with a contiguous outer subset.
         """
-        data_name = cast(str, map_edge.data.data)
+        tasklet_subset = primary_memlet_subset(tasklet_edge.data)
+        if tasklet_subset is None:
+            raise ValueError("ScalarToTileMasked expects tasklet memlets to define a subset")
         load_subset = self._build_contiguous_outer_subset(
-            tasklet_edge.data.subset, self._inner_entry.map)
-        return Memlet(data=data_name, subset=load_subset)
+            tasklet_subset, self._inner_entry.map)
+        return with_primary_subset(map_edge.data, load_subset)
 
     def _configure_library_node(self) -> None:
         """Configure the library node and set the symbolic mask condition.
@@ -894,8 +908,11 @@ class ScalarToTileMasked(_ScalarToTileBase):
 
         # 3. Build the outer subset for reading current values (same range
         #    the store memlet will use).
+        tasklet_subset = primary_memlet_subset(tasklet_out_edge.data)
+        if tasklet_subset is None:
+            raise ValueError("ScalarToTileMasked expects output tasklet memlets to define a subset")
         outer_subset = self._build_contiguous_outer_subset(
-            tasklet_out_edge.data.subset, self._inner_entry.map)
+            tasklet_subset, self._inner_entry.map)
 
         # 4. Add a new input connector pair on outer_entry.
         conn_base = self._outer_entry.next_connector("preload")
@@ -906,13 +923,18 @@ class ScalarToTileMasked(_ScalarToTileBase):
 
         # 5. Wire: output_array_read -> outer_entry
         ext_read = self._graph.add_access(data_name)
+        preload_memlet = memlet_with_primary_subset(data_name,
+                                outer_subset,
+                                data_on_src=True)
         self._graph.add_edge(ext_read, None, self._outer_entry, in_conn,
-                             Memlet(data=data_name, subset=outer_subset))
+                     preload_memlet)
 
         # 6. Wire: outer_entry -> preload_transient
         self._graph.add_edge(self._outer_entry, out_conn, preload_node, None,
-                             Memlet(data=data_name, subset=outer_subset))
+                     copy.deepcopy(preload_memlet))
 
         # 7. Wire: preload_transient -> library_node._c_in
         self._graph.add_edge(preload_node, None, self._library_node, "_c_in",
-                             Memlet(data=preload_name, subset=self._tile_subset))
+                     memlet_with_primary_subset(preload_name,
+                                                self._tile_subset,
+                                                data_on_src=True))
