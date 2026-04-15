@@ -354,8 +354,7 @@ class TestSpecialBlocks:
         assert 'break' in result
 
     def test_continue_block(self):
-        """A trailing continue is stripped by _clean_loop_body (it's redundant).
-        Verify the continue block is generated when it's NOT at the tail."""
+        """Verify the continue block is generated when it's not at the tail."""
         sdfg = SDFG('test_continue')
         loop = LoopRegion('loop', condition_expr='True', sdfg=sdfg)
         sdfg.add_node(loop, is_start_block=True)

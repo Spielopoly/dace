@@ -12,6 +12,7 @@ from dace.cli import progress
 from dace.codegen.py import control_flow as py_cflow
 from dace.codegen import dispatcher as disp
 from dace.codegen.prettycode import CodeIOStream
+from dace.codegen.py.prettycode import PythonCodeIOStream
 from dace.codegen.target import TargetCodeGenerator
 from dace.sdfg.type_inference import infer_expr_type
 from dace.sdfg import SDFG, SDFGState, nodes
@@ -37,8 +38,8 @@ class DaCePythonCodeGenerator(object):
     def __init__(self, sdfg: SDFG):
         self._dispatcher = disp.TargetDispatcher(self)
         self._dispatcher.register_state_dispatcher(self)
-        self._initcode = CodeIOStream()
-        self._exitcode = CodeIOStream()
+        self._initcode = PythonCodeIOStream()
+        self._exitcode = PythonCodeIOStream()
         self.statestruct: List[str] = []
         self.environments: List[Any] = []
         self.targets: Set[TargetCodeGenerator] = set()
@@ -301,7 +302,7 @@ class {mangle_dace_state_struct_name(sdfg)}:
 
         # Create closure + function for state dispatcher
         def dispatch_state(state: SDFGState) -> str:
-            stream = CodeIOStream()
+            stream = PythonCodeIOStream()
             self._dispatcher.dispatch_state(state, global_stream, stream)
             opbar.next()
             states_generated.add(state)  # For sanity check
@@ -684,8 +685,8 @@ class {mangle_dace_state_struct_name(sdfg)}:
         if len(cfg_id) == 0 and sdfg.cfg_id != 0:
             cfg_id = '_%d' % sdfg.cfg_id
 
-        global_stream = CodeIOStream()
-        callsite_stream = CodeIOStream()
+        global_stream = PythonCodeIOStream()
+        callsite_stream = PythonCodeIOStream()
 
         is_top_level = sdfg.parent is None
 
@@ -771,11 +772,11 @@ class {mangle_dace_state_struct_name(sdfg)}:
             # dependent environments
             self.environments = dace.library.get_environments_and_dependencies(self._dispatcher.used_environments)
 
-            header_global_stream = CodeIOStream()
-            self.generate_header(sdfg, header_global_stream, CodeIOStream())
+            header_global_stream = PythonCodeIOStream()
+            self.generate_header(sdfg, header_global_stream, PythonCodeIOStream())
 
-            self.generate_footer(sdfg, CodeIOStream(), CodeIOStream())
-            self.generate_external_memory_management(sdfg, CodeIOStream())
+            self.generate_footer(sdfg, PythonCodeIOStream(), PythonCodeIOStream())
+            self.generate_external_memory_management(sdfg, PythonCodeIOStream())
 
             # Merge global streams
             header_global_stream.write(global_stream.getvalue())

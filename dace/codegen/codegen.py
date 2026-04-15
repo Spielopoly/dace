@@ -225,8 +225,15 @@ def generate_code(sdfg: SDFG, validate=True) -> List[CodeObject]:
 
 
     if sdfg.backend == dtypes.BackendLanguage.Python:
-        # For now we just skip target instantiation or other bullshit below
-        # TODO: Target instantiation
+        from dace.codegen.py.python_codegen import PythonCodeGen
+        py_target = PythonCodeGen(frame, sdfg)
+
+        # Query codegen targets and preprocess
+        frame.targets.add(py_target)
+        py_target.preprocess(sdfg)
+        
+        # TODO: Add other targets
+
         (global_code, frame_code, used_targets, used_environments) = frame.generate_code(sdfg, None)
         target_objects = [
             CodeObject(sdfg.name,
