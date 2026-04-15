@@ -259,11 +259,6 @@ class {mangle_dace_state_struct_name(sdfg)}:
 
         callsite_stream.write('\n')
 
-        # Invoke all instrumentation providers
-        for instr in self._dispatcher.instrumentation.values():
-            if instr is not None:
-                instr.on_state_begin(sdfg, cfg, state, callsite_stream, global_stream)
-
         #####################
         # Create dataflow graph for state's children.
 
@@ -298,11 +293,6 @@ class {mangle_dace_state_struct_name(sdfg)}:
         if generate_state_footer:
             # Emit internal transient array deallocation
             self.deallocate_arrays_in_scope(sdfg, state.parent_graph, state, global_stream, callsite_stream)
-
-            # Invoke all instrumentation providers
-            for instr in self._dispatcher.instrumentation.values():
-                if instr is not None:
-                    instr.on_state_end(sdfg, cfg, state, callsite_stream, global_stream)
 
     def generate_states(self, sdfg: SDFG, global_stream: CodeIOStream, callsite_stream: CodeIOStream) -> Set[SDFGState]:
         states_generated = set()
@@ -706,11 +696,6 @@ class {mangle_dace_state_struct_name(sdfg)}:
         # Generate code
         ###########################
 
-        # Invoke all instrumentation providers
-        for instr in self._dispatcher.instrumentation.values():
-            if instr is not None:
-                instr.on_sdfg_begin(sdfg, callsite_stream, global_stream, self)
-
         # Allocate outer-level transients
         self.allocate_arrays_in_scope(sdfg, sdfg, sdfg, global_stream, callsite_stream)
 
@@ -760,6 +745,7 @@ class {mangle_dace_state_struct_name(sdfg)}:
             if not is_top_level and isvarName in sdfg.parent_nsdfg_node.symbol_mapping:
                 continue
             # No emit needed: Python variables are created on assignment.
+            # TODO: Check that this is true for all cases, and that no "undefined variable" errors can occur.
 
         #######################################################################
         # Generate actual program body
