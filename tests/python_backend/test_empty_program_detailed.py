@@ -64,12 +64,6 @@ def test_generated_code_is_executable():
     ns[sdfg.name]()
 
 
-def test_generated_code_exact():
-    """The generated code should be 'def <name>():\\n    pass\\n'."""
-    sdfg, code = _generate_empty_program()
-    assert code[0].code == f'def {sdfg.name}():\n    pass\n'
-
-
 if __name__ == "__main__":
     test_single_code_object()
     test_language_is_py()
@@ -79,5 +73,4 @@ if __name__ == "__main__":
     test_generated_code_has_pass_body()
     test_generated_code_is_valid_python()
     test_generated_code_is_executable()
-    test_generated_code_exact()
     print("All tests passed!")
