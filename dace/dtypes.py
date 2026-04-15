@@ -132,6 +132,10 @@ class Language(ExtensibleAttributeEnum):
     SystemVerilog = auto()
     MLIR = auto()
 
+class BackendLanguage(ExtensibleAttributeEnum):
+    """ Available programming languages for code generation. """
+    CPP = auto()
+    Python = auto()
 
 @undefined_safe_enum
 class InstrumentationType(ExtensibleAttributeEnum):

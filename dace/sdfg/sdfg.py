@@ -465,6 +465,10 @@ class SDFG(ControlFlowRegion):
                               desc="Measure execution statistics with given method",
                               default=dtypes.InstrumentationType.No_Instrumentation)
 
+    backend = EnumProperty(dtype=dtypes.BackendLanguage,
+                           desc="Target backend language for code generation",
+                           default=dtypes.BackendLanguage.CPP)
+
     global_code = DictProperty(str, CodeBlock, desc="Code generated in a global scope on the output files.")
     init_code = DictProperty(str, CodeBlock, desc="Code generated in the `__dace_init` function.")
     exit_code = DictProperty(str, CodeBlock, desc="Code generated in the `__dace_exit` function.")

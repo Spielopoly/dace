@@ -9,6 +9,7 @@ from dace import data
 from dace import config
 from dace.sdfg import SDFG
 from dace.codegen.targets import framecode
+from dace.codegen.targets.py import framecode as pyframecode
 from dace.codegen.codeobject import CodeObject
 from dace.codegen import exceptions as exc
 from dace.config import Config
@@ -209,7 +210,12 @@ def generate_code(sdfg: SDFG, validate=True) -> List[CodeObject]:
     infer_types.infer_connector_types(sdfg)
     infer_types.set_default_schedule_and_storage_types(sdfg, None)
 
-    frame = framecode.DaCeCodeGenerator(sdfg)
+    if sdfg.backend == dtypes.BackendLanguage.CPP:
+        frame = framecode.DaCeCodeGenerator(sdfg)
+    elif sdfg.backend == dtypes.BackendLanguage.Python:
+        frame = pyframecode.DaCePythonCodeGenerator(sdfg)
+    else:
+        raise exc.CodegenError(f"Unsupported backend language '{sdfg.backend}' for SDFG '{sdfg.name}'")
 
     # Test for undefined symbols in SDFG arguments
     if "?" in frame.arglist.keys():
