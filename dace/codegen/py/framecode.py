@@ -9,24 +9,12 @@ import numpy as np
 
 import dace
 from dace import config, data, dtypes
-from dace.cli import progress
-from dace.codegen import control_flow as cflow
-from dace.codegen import dispatcher as disp
 from dace.codegen.prettycode import CodeIOStream
 from dace.codegen.target import TargetCodeGenerator
-from dace.sdfg.type_inference import infer_expr_type
+from dace.codegen import dispatcher as disp
 from dace.sdfg import SDFG, SDFGState, nodes
-from dace.sdfg import scope as sdscope
-from dace.sdfg import utils
-from dace.sdfg.analysis import cfg as cfg_analysis
 from dace.sdfg.state import ControlFlowBlock, ControlFlowRegion, LoopRegion
 from dace.transformation.passes.analysis import StateReachability, loop_analysis
-
-
-def _get_or_eval_sdfg_first_arg(func, sdfg):
-    if callable(func):
-        return func(sdfg)
-    return func
 
 
 class DaCePythonCodeGenerator(object):
@@ -35,17 +23,8 @@ class DaCePythonCodeGenerator(object):
         individual states based on the target. """
 
     def __init__(self, sdfg: SDFG):
-        self._dispatcher = disp.TargetDispatcher(self)
-        self._dispatcher.register_state_dispatcher(self)
-        self._initcode = CodeIOStream()
-        self._exitcode = CodeIOStream()
-        self.statestruct: List[str] = []
-        self.environments: List[Any] = []
-        self.targets: Set[TargetCodeGenerator] = set()
-        self.to_allocate: DefaultDict[Union[SDFG, SDFGState, nodes.EntryNode],
-                                      List[Tuple[SDFG, Optional[SDFGState], Optional[nodes.AccessNode], bool, bool,
-                                                 bool]]] = collections.defaultdict(list)
-        self.where_allocated: Dict[Tuple[SDFG, str], SDFG] = {}
+        
+        
         self.fsyms: Dict[int, Set[str]] = {}
         self._symbols_and_constants: Dict[int, Set[str]] = {}
         fsyms = self.free_symbols(sdfg)
@@ -96,7 +75,7 @@ class DaCePythonCodeGenerator(object):
 
     @property
     def dispatcher(self):
-        return self._dispatcher
+        raise NotImplementedError()
 
     ##################################################################
     # Code generation
@@ -131,6 +110,7 @@ class DaCePythonCodeGenerator(object):
             :param global_stream: Stream to write to (global).
             :param callsite_stream: Stream to write to (at call site).
         """
+        raise NotImplementedError()
 
     def generate_footer(self, sdfg: SDFG, global_stream: CodeIOStream, callsite_stream: CodeIOStream):
         """ Generate the footer of the frame-code. Code exists in a separate
@@ -204,4 +184,17 @@ class DaCePythonCodeGenerator(object):
                      code, and a set of targets that have been used in the
                      generation of this SDFG.
         """
-        raise NotImplementedError()
+        # TODO: implement target-specific code gen
+        
+        assert schedule is None, "Scheduling of nested SDFGs is not yet supported in frame code generation."
+        
+        global_code = ""
+        local_code = ""
+        used_targets = set()
+        used_environments = set()
+        
+        # TODO: code generation
+        
+        
+        
+        return global_code, local_code, used_targets, used_environments

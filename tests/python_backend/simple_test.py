@@ -10,7 +10,10 @@ def test_empty_program():
     sdfg.backend = dace.dtypes.BackendLanguage.Python
     code = sdfg.generate_code()
     
-    return
+    return code
 
 if __name__ == "__main__":
-    test_empty_program()
+    code = test_empty_program()
+    for c in code:
+        print(f"Code Object: {c.name}, Language: {c.language}, Title: {c.title}")
+        print(c.code)
