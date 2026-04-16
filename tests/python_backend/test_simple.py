@@ -11,7 +11,7 @@ def test_simple_program():
     
     sdfg = simple_program.to_sdfg(simplify=False)
     sdfg.backend = dace.dtypes.BackendLanguage.Python
-    with set_temporary('compiler', 'codegen_lineinfo', value=True):
+    with set_temporary('compiler', 'codegen_lineinfo', value=False):
         code = sdfg.generate_code()
     
     return code

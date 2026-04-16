@@ -11,9 +11,7 @@ from dace.properties import CodeBlock
 from dace.sdfg import SDFG, InterstateEdge
 from dace.sdfg.state import (ControlFlowRegion, LoopRegion, ConditionalBlock, BreakBlock, ContinueBlock, ReturnBlock,
                               SDFGState)
-from dace.codegen.py.control_flow import (control_flow_region_to_code, _unparse_py_expr, _unparse_codeblock,
-                                           _generate_interstate_assignments, _loop_region_to_code,
-                                           _conditional_block_to_code, _indent)
+from dace.codegen.py.control_flow import (control_flow_region_to_code, _unparse_py_expr, _unparse_codeblock)
 
 
 # ---------------------------------------------------------------------------

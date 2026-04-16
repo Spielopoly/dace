@@ -34,7 +34,6 @@ def _unparse_py_expr(code_ast, sdfg: SDFG) -> str:
     if isinstance(code_ast, list):
         # CodeBlock.code is a list of AST statements; unparse each and join.
         return '; '.join(_unparse_py_expr(node, sdfg) for node in code_ast)
-    # For AST nodes, use the DaCe-aware unparser that handles subscripts etc.
     return astutils.unparse(code_ast)
 
 
@@ -44,8 +43,9 @@ def _unparse_codeblock(cb: Optional[CodeBlock], sdfg: SDFG) -> str:
         return ''
     if cb.language == dtypes.Language.Python:
         return _unparse_py_expr(cb.code, sdfg)
-    # Fallback for non-Python code blocks
-    return cb.as_string
+    if cb.code:
+        raise NotImplementedError(f'CodeBlock with language {cb.language} cannot be unparsed to Python')
+    return ''
 
 
 # ---------------------------------------------------------------------------

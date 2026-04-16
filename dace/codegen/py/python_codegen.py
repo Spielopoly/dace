@@ -165,7 +165,7 @@ class PythonCodeGen(TargetCodeGenerator):
             callsite_stream.write(f"for {param} in range({start}, {end} + 1, {step}):", cfg, state_id, entry_node)
 
         # Generate loop body with stream-managed indentation
-        if isinstance(callsite_stream, PythonCodeIOStream):
+        if isinstance(callsite_stream, PythonCodeIOStream) and isinstance(function_stream, PythonCodeIOStream):
             with callsite_stream.indented():
                 pos_before = callsite_stream.tell()
                 self._dispatcher.dispatch_subgraph(sdfg, cfg, dfg_scope, state_id, function_stream, callsite_stream,
