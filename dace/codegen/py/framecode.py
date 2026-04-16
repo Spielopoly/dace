@@ -11,7 +11,6 @@ from dace import data, dtypes
 from dace.cli import progress
 from dace.codegen.py import control_flow as py_cflow
 from dace.codegen import dispatcher as disp
-from dace.codegen.prettycode import PythonCodeIOStream
 from dace.codegen.py.prettycode import PythonCodeIOStream
 from dace.codegen.target import TargetCodeGenerator
 from dace.sdfg.type_inference import infer_expr_type
@@ -258,7 +257,7 @@ class {mangle_dace_state_struct_name(sdfg)}:
         # Emit internal transient array allocation
         self.allocate_arrays_in_scope(sdfg, cfg, state, global_stream, callsite_stream)
 
-        callsite_stream.write('\n')
+        callsite_stream.write('\n', cfg=cfg, state_id=sid)
 
         #####################
         # Create dataflow graph for state's children.
@@ -787,13 +786,13 @@ class {mangle_dace_state_struct_name(sdfg)}:
             body = callsite_stream.getvalue().strip()
 
             func_code = PythonCodeIOStream()
-            func_code.write(f'def {sdfg.name}({params}):\n')
+            func_code.write(f'def {sdfg.name}({params}):\n', cfg=sdfg)
             if body:
                 with func_code.indented():
                     func_code.write(body)
             else:
                 with func_code.indented():
-                    func_code.write('pass\n')
+                    func_code.write('pass\n', cfg=sdfg)
 
             generated_code = func_code.getvalue()
         else:

@@ -2462,19 +2462,55 @@ class SDFG(ControlFlowRegion):
         dll = cs.ReloadableDLL(binary_filename, self.name)
         return dll.is_loaded()
 
-    def compile(self, output_file=None, validate=True, return_program_handle=True) -> 'CompiledSDFG':
+    def compile(self, output_file=None, validate=True, return_program_handle=True) -> 'Union[CompiledSDFG, Any, None]':
         """ Compiles a runnable binary from this SDFG.
 
+            For the C++ backend, compiles a shared library and returns a
+            :class:`~dace.codegen.compiled_sdfg.CompiledSDFG`.
+            For the Python backend, no binary is produced; instead the
+            generated Python source is executed directly and a
+            :class:`~dace.codegen.py.compiled_sdfg.PythonCompiledSDFG` is
+            returned.
+
             :param output_file: If not None, copies the output library file to
-                                the specified path.
+                                the specified path (C++ backend) or writes the
+                                generated Python source to the path (Python
+                                backend).
             :param validate: If True, validates the SDFG prior to generating
                              code.
-            :param return_program_handle: If False, does not load the generated library.
-            :return: A callable CompiledSDFG object, or None if ``return_program_handle=False``.
+            :param return_program_handle: If False, does not load the generated
+                                         library / compiled object.
+            :return: A callable CompiledSDFG or PythonCompiledSDFG object, or
+                     None if ``return_program_handle=False``.
         """
 
         # Importing these outside creates an import loop
         from dace.codegen import codegen, compiler
+
+        # Python backend: generate code and return a PythonCompiledSDFG directly
+        if self.backend == dtypes.BackendLanguage.Python:
+            from dace.codegen.py.compiled_sdfg import compile_python_sdfg
+            sdfg = copy.deepcopy(self)
+
+            try:
+                sdfg.fill_scope_connectors()
+                program_objects = codegen.generate_code(sdfg, validate=validate)
+            except Exception:
+                fpath = os.path.join('_dacegraphs', 'failing.sdfgz')
+                self.save(fpath, compress=True)
+                print(f'Failing SDFG saved for inspection in {os.path.abspath(fpath)}')
+                raise
+
+            if output_file is not None:
+                import pathlib
+                p = pathlib.Path(output_file)
+                if p.is_dir():
+                    p = p / f'{sdfg.name}.py'
+                p.write_text(program_objects[0].code)
+
+            if return_program_handle:
+                return compile_python_sdfg(sdfg, program_objects)
+            return None
 
         # Compute build folder path before running codegen
         build_folder = self.build_folder

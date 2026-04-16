@@ -64,7 +64,7 @@ def _write_interstate_assignments(edge: Edge[InterstateEdge], sdfg: SDFG,
         return False
     for variable, value in edge.data.assignments.items():
         val_str = _unparse_py_expr(value, sdfg)
-        stream.write(f'{variable} = {val_str}')
+        stream.write(f'{variable} = {val_str}', cfg=sdfg, state_id=edge.src.block_id)
     return True
 
 
@@ -86,41 +86,41 @@ def _write_loop_region(region: LoopRegion, dispatch_state: Callable[[SDFGState],
         init = _unparse_codeblock(region.init_statement, sdfg)
         update = _unparse_codeblock(region.update_statement, sdfg)
 
-        stream.write(init)
+        stream.write(init, cfg=sdfg, state_id=region.block_id)
 
         if region.inverted:
-            stream.write('while True:')
+            stream.write('while True:', cfg=sdfg, state_id=region.block_id)
             with stream.indented():
                 _write_control_flow_region(region, dispatch_state, codegen, symbols, stream)
                 if region.update_before_condition:
-                    stream.write(update)
-                    stream.write(f'if not ({cond}):')
+                    stream.write(update, cfg=sdfg, state_id=region.block_id)
+                    stream.write(f'if not ({cond}):', cfg=sdfg, state_id=region.block_id)
                     with stream.indented():
-                        stream.write('break')
+                        stream.write('break', cfg=sdfg, state_id=region.block_id)
                 else:
-                    stream.write(f'if not ({cond}):')
+                    stream.write(f'if not ({cond}):', cfg=sdfg, state_id=region.block_id)
                     with stream.indented():
-                        stream.write('break')
-                    stream.write(update)
+                        stream.write('break', cfg=sdfg, state_id=region.block_id)
+                    stream.write(update, cfg=sdfg, state_id=region.block_id)
         else:
-            stream.write(f'while {cond}:')
+            stream.write(f'while {cond}:', cfg=sdfg, state_id=region.block_id)
             with stream.indented():
                 _write_control_flow_region(region, dispatch_state, codegen, symbols, stream)
-                stream.write(update)
+                stream.write(update, cfg=sdfg, state_id=region.block_id)
     else:
         if region.inverted:
-            stream.write('while True:')
+            stream.write('while True:', cfg=sdfg, state_id=region.block_id)
             with stream.indented():
                 _write_control_flow_region(region, dispatch_state, codegen, symbols, stream)
-                stream.write(f'if not ({cond}):')
+                stream.write(f'if not ({cond}):', cfg=sdfg, state_id=region.block_id)
                 with stream.indented():
-                    stream.write('break')
+                    stream.write('break', cfg=sdfg, state_id=region.block_id)
         else:
-            stream.write(f'while {cond}:')
+            stream.write(f'while {cond}:', cfg=sdfg, state_id=region.block_id)
             pos_before = stream.tell()
             with stream.indented():
                 if not _write_control_flow_region(region, dispatch_state, codegen, symbols, stream):
-                    stream.write('pass')
+                    stream.write('pass', cfg=sdfg, state_id=region.block_id)
 
 
 def _write_conditional_block(region: ConditionalBlock, dispatch_state: Callable[[SDFGState], str],
@@ -133,17 +133,17 @@ def _write_conditional_block(region: ConditionalBlock, dispatch_state: Callable[
         if cond is not None:
             cond_str = _unparse_py_expr(cond.code, sdfg)
             if i == 0:
-                stream.write(f'if {cond_str}:')
+                stream.write(f'if {cond_str}:', cfg=sdfg, state_id=region.block_id)
             else:
-                stream.write(f'elif {cond_str}:')
+                stream.write(f'elif {cond_str}:', cfg=sdfg, state_id=region.block_id)
         else:
             if i < len(region.branches) - 1 or i == 0:
                 raise RuntimeError('Missing branch condition for non-final conditional branch')
-            stream.write('else:')
+            stream.write('else:', cfg=sdfg, state_id=region.block_id)
         pos_before = stream.tell()
         with stream.indented():
             if not _write_control_flow_region(body_region, dispatch_state, codegen, symbols, stream):
-                stream.write('pass')
+                stream.write('pass', cfg=sdfg, state_id=region.block_id)
 
 
 # ---------------------------------------------------------------------------
@@ -155,9 +155,16 @@ def _state_label(node: ControlFlowBlock) -> str:
     return re.sub(r'\s+', '_', node.label)
 
 
-def _write_state_machine(region: AbstractControlFlowRegion, dispatch_state: Callable[[SDFGState], str],
-                         codegen: 'DaCePythonCodeGenerator', symbols: Dict[str, dtypes.typeclass],
-                         stream: PythonCodeIOStream) -> None:
+def _write_state_machine(region: AbstractControlFlowRegion,
+                         dispatch_state: Callable[[SDFGState], str],
+                         codegen: 'DaCePythonCodeGenerator',
+                         symbols: Dict[str, dtypes.typeclass],
+                         stream: PythonCodeIOStream,
+                         start: Optional[ControlFlowBlock] = None,
+                         stop: Optional[ControlFlowBlock] = None,
+                         generate_children_of: Optional[ControlFlowBlock] = None,
+                         ptree: Optional[Dict[ControlFlowBlock, ControlFlowBlock]] = None,
+                         visited: Optional[Set[ControlFlowBlock]] = None) -> None:
     """
     Writes a while loop with state-variable dispatch for
     unstructured control flow that cannot be expressed with structured
@@ -165,12 +172,12 @@ def _write_state_machine(region: AbstractControlFlowRegion, dispatch_state: Call
     """
     sdfg = region.sdfg
 
-    start_label = _state_label(region.start_block)
+    start_label = _state_label(region.start_block if start is None else start)
     exit_label = f'__exit_{region.cfg_id}'
     current_state_label = f'__state_{region.cfg_id}'
 
-    stream.write(f'{current_state_label} = {start_label!r}')
-    stream.write(f'while {current_state_label} != {exit_label!r}:')
+    stream.write(f'{current_state_label} = {start_label!r}', cfg=sdfg)
+    stream.write(f'while {current_state_label} != {exit_label!r}:', cfg=sdfg)
 
     with stream.indented():
         first = True
@@ -178,7 +185,7 @@ def _write_state_machine(region: AbstractControlFlowRegion, dispatch_state: Call
             label = _state_label(node)
             kw = 'if' if first else 'elif'
             first = False
-            stream.write(f'{kw} {current_state_label} == {label!r}:')
+            stream.write(f'{kw} {current_state_label} == {label!r}:', cfg=sdfg, state_id=node.block_id)
 
             with stream.indented():
                 # Dispatch the block itself
@@ -188,21 +195,21 @@ def _write_state_machine(region: AbstractControlFlowRegion, dispatch_state: Call
                 out_edges = region.out_edges(node)
                 if len(out_edges) == 0:
                     # If no outgoing edges, this is the last block and we can exit the region.
-                    stream.write(f'{current_state_label} = {exit_label!r}')
+                    stream.write(f'{current_state_label} = {exit_label!r}', cfg=sdfg, state_id=node.block_id)
                 elif len(out_edges) == 1:
                     e = out_edges[0]
                     if not e.data.is_unconditional():
                         cond_str = _unparse_py_expr(e.data.condition.code[0], sdfg)
-                        stream.write(f'if {cond_str}:')
+                        stream.write(f'if {cond_str}:', cfg=sdfg, state_id=node.block_id)
                         with stream.indented():
                             _write_interstate_assignments(e, sdfg, stream)
-                            stream.write(f'{current_state_label} = {_state_label(e.dst)!r}')
-                        stream.write('else:')
+                            stream.write(f'{current_state_label} = {_state_label(e.dst)!r}', cfg=sdfg, state_id=node.block_id)
+                        stream.write('else:', cfg=sdfg, state_id=node.block_id)
                         with stream.indented():
-                            stream.write(f'{current_state_label} = {exit_label!r}')
+                            stream.write(f'{current_state_label} = {exit_label!r}', cfg=sdfg, state_id=node.block_id)
                     else:
                         _write_interstate_assignments(e, sdfg, stream)
-                        stream.write(f'{current_state_label} = {_state_label(e.dst)!r}')
+                        stream.write(f'{current_state_label} = {_state_label(e.dst)!r}', cfg=sdfg, state_id=node.block_id)
                 else:
                     # Multiple outgoing edges (branching)
                     unconditional_edge = None
@@ -219,29 +226,29 @@ def _write_state_machine(region: AbstractControlFlowRegion, dispatch_state: Call
                         cond_str = _unparse_py_expr(e.data.condition.code[0], sdfg)
                         kw2 = 'if' if edge_first else 'elif'
                         edge_first = False
-                        stream.write(f'{kw2} {cond_str}:')
+                        stream.write(f'{kw2} {cond_str}:', cfg=sdfg, state_id=node.block_id)
                         with stream.indented():
                             _write_interstate_assignments(e, sdfg, stream)
-                            stream.write(f'{current_state_label} = {_state_label(e.dst)!r}')
+                            stream.write(f'{current_state_label} = {_state_label(e.dst)!r}', cfg=sdfg, state_id=node.block_id)
 
                     if unconditional_edge is not None:
                         if edge_first:
                             _write_interstate_assignments(unconditional_edge, sdfg, stream)
                             stream.write(
-                                f'{current_state_label} = {_state_label(unconditional_edge.dst)!r}')
+                                f'{current_state_label} = {_state_label(unconditional_edge.dst)!r}', cfg=sdfg, state_id=node.block_id)
                         else:
-                            stream.write('else:')
+                            stream.write('else:', cfg=sdfg, state_id=node.block_id)
                             with stream.indented():
                                 _write_interstate_assignments(unconditional_edge, sdfg, stream)
                                 stream.write(
-                                    f'{current_state_label} = {_state_label(unconditional_edge.dst)!r}')
+                                    f'{current_state_label} = {_state_label(unconditional_edge.dst)!r}', cfg=sdfg, state_id=node.block_id)
                     else:
                         if not edge_first:
-                            stream.write('else:')
+                            stream.write('else:', cfg=sdfg, state_id=node.block_id)
                             with stream.indented():
-                                stream.write(f'{current_state_label} = {exit_label!r}')
+                                stream.write(f'{current_state_label} = {exit_label!r}', cfg=sdfg, state_id=node.block_id)
                         else:
-                            stream.write(f'{current_state_label} = {exit_label!r}')
+                            stream.write(f'{current_state_label} = {exit_label!r}', cfg=sdfg, state_id=node.block_id)
 
 
 def _write_dispatch_block(node: ControlFlowBlock, dispatch_state: Callable[[SDFGState], str],
@@ -253,11 +260,11 @@ def _write_dispatch_block(node: ControlFlowBlock, dispatch_state: Callable[[SDFG
         if code and code.strip():
             stream.write(code)
     elif isinstance(node, BreakBlock):
-        stream.write('break')
+        stream.write('break', cfg=node.sdfg, state_id=node.block_id)
     elif isinstance(node, ContinueBlock):
-        stream.write('continue')
+        stream.write('continue', cfg=node.sdfg, state_id=node.block_id)
     elif isinstance(node, ReturnBlock):
-        stream.write('return')
+        stream.write('return', cfg=node.sdfg, state_id=node.block_id)
     elif isinstance(node, LoopRegion):
         _write_loop_region(node, dispatch_state, codegen, symbols, stream)
     elif isinstance(node, ConditionalBlock):
@@ -324,12 +331,12 @@ def _write_structured_region(region: AbstractControlFlowRegion, dispatch_state: 
             e = out_edges[0]
             if not e.data.is_unconditional():
                 cond_str = _unparse_py_expr(e.data.condition.code[0], sdfg)
-                stream.write(f'if {cond_str}:')
+                stream.write(f'if {cond_str}:', cfg=sdfg, state_id=node.block_id)
                 pos_before = stream.tell()
                 with stream.indented():
                     if not _write_interstate_assignments(e, sdfg, stream):
                         # If no assignments were written, we still need a statement in the body.
-                        stream.write('pass')
+                        stream.write('pass', cfg=sdfg, state_id=node.block_id)
             else:
                 _write_interstate_assignments(e, sdfg, stream)
             stack.append(e.dst)
@@ -350,24 +357,24 @@ def _write_structured_region(region: AbstractControlFlowRegion, dispatch_state: 
                 cond_str = _unparse_py_expr(e.data.condition.code[0], sdfg)
                 kw = 'if' if edge_first else 'elif'
                 edge_first = False
-                stream.write(f'{kw} {cond_str}:')
+                stream.write(f'{kw} {cond_str}:', cfg=sdfg, state_id=node.block_id)
                 pos_before = stream.tell()
                 with stream.indented():
                     if not _write_interstate_assignments(e, sdfg, stream):
                         # If no assignments were written, we still need a statement in the body.
-                        stream.write('pass')
+                        stream.write('pass', cfg=sdfg, state_id=node.block_id)
                 stack.append(e.dst)
 
             if unconditional_edge is not None:
                 if edge_first:
                     _write_interstate_assignments(unconditional_edge, sdfg, stream)
                 else:
-                    stream.write('else:')
+                    stream.write('else:', cfg=sdfg, state_id=node.block_id)
                     pos_before = stream.tell()
                     with stream.indented():
                         _write_interstate_assignments(unconditional_edge, sdfg, stream)
                         if stream.tell() == pos_before:
-                            stream.write('pass')
+                            stream.write('pass', cfg=sdfg, state_id=node.block_id)
                 stack.append(unconditional_edge.dst)
 
 

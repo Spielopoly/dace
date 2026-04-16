@@ -3,15 +3,13 @@ from dace.config import set_temporary
 
 def test_simple_program():
     @dace.program
-    def simple_program(x: dace.float64):
-        if x > 0:
-            return x
-        else:
-            return -x
+    def simple_program(x: dace.float64[3], y: dace.float64[3]):
+        for i in range(3):
+            y[i] = x[i] * 2.0
     
-    sdfg = simple_program.to_sdfg(simplify=False)
+    sdfg = simple_program.to_sdfg(simplify=True)
     sdfg.backend = dace.dtypes.BackendLanguage.Python
-    with set_temporary('compiler', 'codegen_lineinfo', value=False):
+    with set_temporary('compiler', 'codegen_lineinfo', value=True):
         code = sdfg.generate_code()
     
     return code

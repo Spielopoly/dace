@@ -1,2 +1,3 @@
-from .python_codegen import PythonCodeGen
+from .python_target import PythonCodeGen
 from .framecode import DaCePythonCodeGenerator
+from .compiled_sdfg import PythonCompiledSDFG
