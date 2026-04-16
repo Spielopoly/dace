@@ -11,7 +11,7 @@ from dace import data, dtypes
 from dace.cli import progress
 from dace.codegen.py import control_flow as py_cflow
 from dace.codegen import dispatcher as disp
-from dace.codegen.prettycode import CodeIOStream
+from dace.codegen.prettycode import PythonCodeIOStream
 from dace.codegen.py.prettycode import PythonCodeIOStream
 from dace.codegen.target import TargetCodeGenerator
 from dace.sdfg.type_inference import infer_expr_type
@@ -111,7 +111,7 @@ class DaCePythonCodeGenerator(object):
         """
         pass
 
-    def generate_constants(self, sdfg: SDFG, callsite_stream: CodeIOStream):
+    def generate_constants(self, sdfg: SDFG, callsite_stream: PythonCodeIOStream):
         # Write constants
         for cstname, (csttype, cstval) in sdfg.constants_prop.items():
             if isinstance(csttype, data.Array):
@@ -125,7 +125,7 @@ class DaCePythonCodeGenerator(object):
             else:
                 callsite_stream.write(f"{cstname} = {cstval}\n", sdfg)
 
-    def generate_fileheader(self, sdfg: SDFG, global_stream: CodeIOStream, backend: str = 'frame'):
+    def generate_fileheader(self, sdfg: SDFG, global_stream: PythonCodeIOStream, backend: str = 'frame'):
         """ Generate a header in every output file that includes custom types
             and constants.
 
@@ -206,7 +206,7 @@ class {mangle_dace_state_struct_name(sdfg)}:
             if backend in sd.global_code:
                 global_stream.write(codeblock_to_python(sd.global_code[backend]), sd)
 
-    def generate_header(self, sdfg: SDFG, global_stream: CodeIOStream, callsite_stream: CodeIOStream):
+    def generate_header(self, sdfg: SDFG, global_stream: PythonCodeIOStream, callsite_stream: PythonCodeIOStream):
         """ Generate the header of the frame-code. Code exists in a separate
             function for overriding purposes.
 
@@ -223,7 +223,7 @@ class {mangle_dace_state_struct_name(sdfg)}:
 
         self.generate_fileheader(sdfg, global_stream, 'frame')
 
-    def generate_footer(self, sdfg: SDFG, global_stream: CodeIOStream, callsite_stream: CodeIOStream):
+    def generate_footer(self, sdfg: SDFG, global_stream: PythonCodeIOStream, callsite_stream: PythonCodeIOStream):
         """ Generate the footer of the frame-code. Code exists in a separate
             function for overriding purposes.
 
@@ -234,7 +234,7 @@ class {mangle_dace_state_struct_name(sdfg)}:
         # Python backend: function wrapping is handled in generate_code().
         pass
 
-    def generate_external_memory_management(self, sdfg: SDFG, callsite_stream: CodeIOStream):
+    def generate_external_memory_management(self, sdfg: SDFG, callsite_stream: PythonCodeIOStream):
         """
         External memory management is not yet supported in the Python backend.
         """
@@ -250,8 +250,8 @@ class {mangle_dace_state_struct_name(sdfg)}:
                        sdfg: SDFG,
                        cfg: ControlFlowRegion,
                        state: SDFGState,
-                       global_stream: CodeIOStream,
-                       callsite_stream: CodeIOStream,
+                       global_stream: PythonCodeIOStream,
+                       callsite_stream: PythonCodeIOStream,
                        generate_state_footer: bool = True):
         sid = state.block_id
 
@@ -295,7 +295,7 @@ class {mangle_dace_state_struct_name(sdfg)}:
             # Emit internal transient array deallocation
             self.deallocate_arrays_in_scope(sdfg, state.parent_graph, state, global_stream, callsite_stream)
 
-    def generate_states(self, sdfg: SDFG, global_stream: CodeIOStream, callsite_stream: CodeIOStream) -> Set[SDFGState]:
+    def generate_states(self, sdfg: SDFG, global_stream: PythonCodeIOStream, callsite_stream: PythonCodeIOStream) -> Set[SDFGState]:
         states_generated = set()
 
         opbar = progress.OptionalProgressBar(len(sdfg.states()), title=f'Generating code (SDFG {sdfg.cfg_id})')
@@ -308,7 +308,7 @@ class {mangle_dace_state_struct_name(sdfg)}:
             states_generated.add(state)  # For sanity check
             return stream.getvalue()
 
-        callsite_stream.write(py_cflow.control_flow_region_to_code(sdfg, dispatch_state, self, sdfg.symbols), sdfg)
+        py_cflow.control_flow_region_to_code(sdfg, dispatch_state, self, sdfg.symbols, callsite_stream)
 
         opbar.done()
 
@@ -621,7 +621,7 @@ class {mangle_dace_state_struct_name(sdfg)}:
 
     def allocate_arrays_in_scope(self, sdfg: SDFG, cfg: ControlFlowRegion, scope: Union[nodes.EntryNode, SDFGState,
                                                                                         SDFG],
-                                 function_stream: CodeIOStream, callsite_stream: CodeIOStream) -> None:
+                                 function_stream: PythonCodeIOStream, callsite_stream: PythonCodeIOStream) -> None:
         """ Dispatches allocation of all arrays in the given scope. """
         if len(self.to_allocate[scope]) == 0:
             return
@@ -644,7 +644,7 @@ class {mangle_dace_state_struct_name(sdfg)}:
 
     def deallocate_arrays_in_scope(self, sdfg: SDFG, cfg: ControlFlowRegion, scope: Union[nodes.EntryNode, SDFGState,
                                                                                           SDFG],
-                                   function_stream: CodeIOStream, callsite_stream: CodeIOStream):
+                                   function_stream: PythonCodeIOStream, callsite_stream: PythonCodeIOStream):
         """ Dispatches deallocation of all arrays in the given scope. """
         if len(self.to_allocate[scope]) == 0:
             return
@@ -786,13 +786,16 @@ class {mangle_dace_state_struct_name(sdfg)}:
             params = ', '.join(self.arglist.keys())
             body = callsite_stream.getvalue().strip()
 
-            func_code = f'def {sdfg.name}({params}):\n'
+            func_code = PythonCodeIOStream()
+            func_code.write(f'def {sdfg.name}({params}):\n')
             if body:
-                func_code += textwrap.indent(body, '    ') + '\n'
+                with func_code.indented():
+                    func_code.write(body)
             else:
-                func_code += '    pass\n'
+                with func_code.indented():
+                    func_code.write('pass\n')
 
-            generated_code = func_code
+            generated_code = func_code.getvalue()
         else:
             generated_header = global_stream.getvalue()
             generated_code = callsite_stream.getvalue()

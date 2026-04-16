@@ -59,6 +59,7 @@ def _write_interstate_assignments(edge: Edge[InterstateEdge], sdfg: SDFG,
 
     :return: True if any assignments were written.
     """
+    # TODO: C++ backend generates gotos and conditions. Check if we need to do anything else here.
     if not edge.data.assignments:
         return False
     for variable, value in edge.data.assignments.items():
@@ -78,7 +79,10 @@ def _write_loop_region(region: LoopRegion, dispatch_state: Callable[[SDFGState],
     sdfg = region.sdfg
     cond = _unparse_codeblock(region.loop_condition, sdfg)
 
+    # TODO: Check that doing a seperation here makes sense, and what happens if
+    # only some of the components are present?
     if region.update_statement and region.init_statement and region.loop_variable:
+        # This is a C-style for loop
         init = _unparse_codeblock(region.init_statement, sdfg)
         update = _unparse_codeblock(region.update_statement, sdfg)
 
@@ -115,8 +119,7 @@ def _write_loop_region(region: LoopRegion, dispatch_state: Callable[[SDFGState],
             stream.write(f'while {cond}:')
             pos_before = stream.tell()
             with stream.indented():
-                _write_control_flow_region(region, dispatch_state, codegen, symbols, stream)
-                if stream.tell() == pos_before:
+                if not _write_control_flow_region(region, dispatch_state, codegen, symbols, stream):
                     stream.write('pass')
 
 
@@ -139,8 +142,7 @@ def _write_conditional_block(region: ConditionalBlock, dispatch_state: Callable[
             stream.write('else:')
         pos_before = stream.tell()
         with stream.indented():
-            _write_control_flow_region(body_region, dispatch_state, codegen, symbols, stream)
-            if stream.tell() == pos_before:
+            if not _write_control_flow_region(body_region, dispatch_state, codegen, symbols, stream):
                 stream.write('pass')
 
 
@@ -157,7 +159,7 @@ def _write_state_machine(region: AbstractControlFlowRegion, dispatch_state: Call
                          codegen: 'DaCePythonCodeGenerator', symbols: Dict[str, dtypes.typeclass],
                          stream: PythonCodeIOStream) -> None:
     """
-    Writes a ``while True`` + state-variable dispatch loop for
+    Writes a while loop with state-variable dispatch for
     unstructured control flow that cannot be expressed with structured
     Python constructs.
     """
@@ -165,9 +167,10 @@ def _write_state_machine(region: AbstractControlFlowRegion, dispatch_state: Call
 
     start_label = _state_label(region.start_block)
     exit_label = f'__exit_{region.cfg_id}'
+    current_state_label = f'__state_{region.cfg_id}'
 
-    stream.write(f'__state_{region.cfg_id} = {start_label!r}')
-    stream.write('while True:')
+    stream.write(f'{current_state_label} = {start_label!r}')
+    stream.write(f'while {current_state_label} != {exit_label!r}:')
 
     with stream.indented():
         first = True
@@ -175,7 +178,7 @@ def _write_state_machine(region: AbstractControlFlowRegion, dispatch_state: Call
             label = _state_label(node)
             kw = 'if' if first else 'elif'
             first = False
-            stream.write(f'{kw} __state_{region.cfg_id} == {label!r}:')
+            stream.write(f'{kw} {current_state_label} == {label!r}:')
 
             with stream.indented():
                 # Dispatch the block itself
@@ -184,34 +187,22 @@ def _write_state_machine(region: AbstractControlFlowRegion, dispatch_state: Call
                 # Generate outgoing edge transitions
                 out_edges = region.out_edges(node)
                 if len(out_edges) == 0:
-                    stream.write(f'__state_{region.cfg_id} = {exit_label!r}')
+                    # If no outgoing edges, this is the last block and we can exit the region.
+                    stream.write(f'{current_state_label} = {exit_label!r}')
                 elif len(out_edges) == 1:
                     e = out_edges[0]
-                    has_assigns = bool(e.data.assignments)
-                    if has_assigns:
-                        if not e.data.is_unconditional():
-                            cond_str = _unparse_py_expr(e.data.condition.code[0], sdfg)
-                            stream.write(f'if {cond_str}:')
-                            with stream.indented():
-                                _write_interstate_assignments(e, sdfg, stream)
-                                stream.write(f'__state_{region.cfg_id} = {_state_label(e.dst)!r}')
-                            stream.write('else:')
-                            with stream.indented():
-                                stream.write(f'__state_{region.cfg_id} = {exit_label!r}')
-                        else:
+                    if not e.data.is_unconditional():
+                        cond_str = _unparse_py_expr(e.data.condition.code[0], sdfg)
+                        stream.write(f'if {cond_str}:')
+                        with stream.indented():
                             _write_interstate_assignments(e, sdfg, stream)
-                            stream.write(f'__state_{region.cfg_id} = {_state_label(e.dst)!r}')
+                            stream.write(f'{current_state_label} = {_state_label(e.dst)!r}')
+                        stream.write('else:')
+                        with stream.indented():
+                            stream.write(f'{current_state_label} = {exit_label!r}')
                     else:
-                        if not e.data.is_unconditional():
-                            cond_str = _unparse_py_expr(e.data.condition.code[0], sdfg)
-                            stream.write(f'if {cond_str}:')
-                            with stream.indented():
-                                stream.write(f'__state_{region.cfg_id} = {_state_label(e.dst)!r}')
-                            stream.write('else:')
-                            with stream.indented():
-                                stream.write(f'__state_{region.cfg_id} = {exit_label!r}')
-                        else:
-                            stream.write(f'__state_{region.cfg_id} = {_state_label(e.dst)!r}')
+                        _write_interstate_assignments(e, sdfg, stream)
+                        stream.write(f'{current_state_label} = {_state_label(e.dst)!r}')
                 else:
                     # Multiple outgoing edges (branching)
                     unconditional_edge = None
@@ -231,32 +222,26 @@ def _write_state_machine(region: AbstractControlFlowRegion, dispatch_state: Call
                         stream.write(f'{kw2} {cond_str}:')
                         with stream.indented():
                             _write_interstate_assignments(e, sdfg, stream)
-                            stream.write(f'__state_{region.cfg_id} = {_state_label(e.dst)!r}')
+                            stream.write(f'{current_state_label} = {_state_label(e.dst)!r}')
 
                     if unconditional_edge is not None:
                         if edge_first:
                             _write_interstate_assignments(unconditional_edge, sdfg, stream)
                             stream.write(
-                                f'__state_{region.cfg_id} = {_state_label(unconditional_edge.dst)!r}')
+                                f'{current_state_label} = {_state_label(unconditional_edge.dst)!r}')
                         else:
                             stream.write('else:')
                             with stream.indented():
                                 _write_interstate_assignments(unconditional_edge, sdfg, stream)
                                 stream.write(
-                                    f'__state_{region.cfg_id} = {_state_label(unconditional_edge.dst)!r}')
+                                    f'{current_state_label} = {_state_label(unconditional_edge.dst)!r}')
                     else:
                         if not edge_first:
                             stream.write('else:')
                             with stream.indented():
-                                stream.write(f'__state_{region.cfg_id} = {exit_label!r}')
+                                stream.write(f'{current_state_label} = {exit_label!r}')
                         else:
-                            stream.write(f'__state_{region.cfg_id} = {exit_label!r}')
-
-        # Exit case
-        kw_exit = 'elif' if not first else 'if'
-        stream.write(f'{kw_exit} __state_{region.cfg_id} == {exit_label!r}:')
-        with stream.indented():
-            stream.write('break')
+                            stream.write(f'{current_state_label} = {exit_label!r}')
 
 
 def _write_dispatch_block(node: ControlFlowBlock, dispatch_state: Callable[[SDFGState], str],
@@ -287,13 +272,13 @@ def _write_dispatch_block(node: ControlFlowBlock, dispatch_state: Callable[[SDFG
 # Structured (reducible) control flow path
 # ---------------------------------------------------------------------------
 
-def _child_of(node: ControlFlowBlock, parent: ControlFlowBlock,
-              ptree: Dict[ControlFlowBlock, ControlFlowBlock]) -> bool:
+def _is_child_of(node: ControlFlowBlock, parent: ControlFlowBlock,
+              parent_tree: Dict[ControlFlowBlock, ControlFlowBlock]) -> bool:
     curnode = node
     while curnode is not None:
         if curnode is parent:
             return True
-        curnode = ptree.get(curnode)
+        curnode = parent_tree.get(curnode)
     return False
 
 
@@ -321,7 +306,7 @@ def _write_structured_region(region: AbstractControlFlowRegion, dispatch_state: 
     stack = [start]
     while stack:
         node = stack.pop()
-        if generate_children_of is not None and not _child_of(node, generate_children_of, ptree):
+        if generate_children_of is not None and not _is_child_of(node, generate_children_of, ptree):
             continue
         if node in visited or node is stop:
             continue
@@ -333,6 +318,7 @@ def _write_structured_region(region: AbstractControlFlowRegion, dispatch_state: 
         # Handle outgoing edges
         out_edges = region.out_edges(node)
         if len(out_edges) == 0:
+            # TODO: C++ backend generates goto here. Check what we should do in Python
             pass
         elif len(out_edges) == 1:
             e = out_edges[0]
@@ -341,14 +327,15 @@ def _write_structured_region(region: AbstractControlFlowRegion, dispatch_state: 
                 stream.write(f'if {cond_str}:')
                 pos_before = stream.tell()
                 with stream.indented():
-                    _write_interstate_assignments(e, sdfg, stream)
-                    if stream.tell() == pos_before:
+                    if not _write_interstate_assignments(e, sdfg, stream):
+                        # If no assignments were written, we still need a statement in the body.
                         stream.write('pass')
             else:
                 _write_interstate_assignments(e, sdfg, stream)
             stack.append(e.dst)
         else:
             # Multiple outgoing edges — generate if/elif/else chain
+            # TODO: C++ backend generates gotos and conditions. Check if we need to do anything else here.
             unconditional_edge = None
             edge_first = True
             for e in out_edges:
@@ -366,8 +353,8 @@ def _write_structured_region(region: AbstractControlFlowRegion, dispatch_state: 
                 stream.write(f'{kw} {cond_str}:')
                 pos_before = stream.tell()
                 with stream.indented():
-                    _write_interstate_assignments(e, sdfg, stream)
-                    if stream.tell() == pos_before:
+                    if not _write_interstate_assignments(e, sdfg, stream):
+                        # If no assignments were written, we still need a statement in the body.
                         stream.write('pass')
                 stack.append(e.dst)
 
@@ -403,7 +390,9 @@ def _write_control_flow_region(region: AbstractControlFlowRegion,
                             or isinstance(region, UnstructuredControlFlow))
 
     if contains_irreducible:
-        _write_state_machine(region, dispatch_state, codegen, symbols, stream)
+        _write_state_machine(region, dispatch_state, codegen, symbols, stream,
+                                 start=start, stop=stop, generate_children_of=generate_children_of,
+                                 ptree=ptree, visited=visited)
     else:
         _write_structured_region(region, dispatch_state, codegen, symbols, stream,
                                  start=start, stop=stop, generate_children_of=generate_children_of,
@@ -418,12 +407,13 @@ def control_flow_region_to_code(region: AbstractControlFlowRegion,
                                 dispatch_state: Callable[[SDFGState], str],
                                 codegen: 'DaCePythonCodeGenerator',
                                 symbols: Dict[str, dtypes.typeclass],
+                                stream: PythonCodeIOStream,
                                 start: Optional[ControlFlowBlock] = None,
                                 stop: Optional[ControlFlowBlock] = None,
                                 generate_children_of: Optional[ControlFlowBlock] = None,
-                                ptree: Optional[Dict[ControlFlowBlock, ControlFlowBlock]] = None,
+                                parent_tree: Optional[Dict[ControlFlowBlock, ControlFlowBlock]] = None,
                                 visited: Optional[Set[ControlFlowBlock]] = None,
-                                indent: int = 0) -> str:
+                                ) -> None:
     """
     Converts a control flow region to Python code with the correct control
     flow expressions.
@@ -441,9 +431,8 @@ def control_flow_region_to_code(region: AbstractControlFlowRegion,
     :param indent:               Current indentation in number of spaces.
     :return:                     Python code string.
     """
-    stream = PythonCodeIOStream(base_indentation=indent // 4)
+    assert isinstance(stream, PythonCodeIOStream)
     _write_control_flow_region(region, dispatch_state, codegen, symbols, stream,
                                start=start, stop=stop, generate_children_of=generate_children_of,
-                               ptree=ptree, visited=visited)
-    return stream.getvalue()
-
+                               ptree=parent_tree, visited=visited)
+    

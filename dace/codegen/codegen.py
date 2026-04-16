@@ -225,7 +225,7 @@ def generate_code(sdfg: SDFG, validate=True) -> List[CodeObject]:
 
 
     if sdfg.backend == dtypes.BackendLanguage.Python:
-        from dace.codegen.py.python_codegen import PythonCodeGen
+        from dace.codegen.py.python_target import PythonCodeGen
         py_target = PythonCodeGen(frame, sdfg)
 
         # Query codegen targets and preprocess

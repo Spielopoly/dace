@@ -21,6 +21,15 @@ class PythonCodeIOStream(io.StringIO):
 
     Indentation is managed explicitly via :meth:`indent`, :meth:`dedent`, and
     the :meth:`indented` context manager.
+    
+    Example usage:
+    >>> stream = PythonCodeIOStream()
+    >>> stream.write('def foo():')
+    >>> with stream.indented():
+    ...     stream.write('print("Hello, world!")')
+    >>> print(stream.getvalue())
+    def foo():
+        print("Hello, world!")
     """
 
     def __init__(self, base_indentation: int = 0):
