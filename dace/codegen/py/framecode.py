@@ -1,7 +1,6 @@
 # Copyright 2019-2026 ETH Zurich and the DaCe authors. All rights reserved.
 import collections
 import copy
-import textwrap
 from typing import Any, DefaultDict, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
@@ -192,12 +191,10 @@ class DaCePythonCodeGenerator(object):
         #########################################################
         # Write state struct (only if there are fields)
         if self.statestruct:
-            structstr = '\n    '.join(self.statestruct)
-            global_stream.write(f'''
-class {mangle_dace_state_struct_name(sdfg)}:
-    {structstr}
-
-''', sdfg)
+            structstr = '\n'.join(self.statestruct)
+            global_stream.write(f'class {mangle_dace_state_struct_name(sdfg)}:', sdfg)
+            with global_stream.indent():
+                global_stream.write(structstr, sdfg)
 
         for sd in sdfg.all_sdfgs_recursive():
             if None in sd.global_code:
@@ -335,6 +332,8 @@ class {mangle_dace_state_struct_name(sdfg)}:
 
     def _can_allocate(self, sdfg: SDFG, state: SDFGState, desc: data.Data, scope: Union[nodes.EntryNode, SDFGState,
                                                                                         SDFG]) -> bool:
+        # TODO: Check if whatever this does is actually correct
+        # for python
         schedule = self._get_schedule(scope)
         # if not dtypes.can_allocate(desc.storage, schedule):
         #     return False
@@ -357,6 +356,9 @@ class {mangle_dace_state_struct_name(sdfg)}:
 
         :param top_sdfg: The top-level SDFG to determine for.
         """
+        # TODO: I don't believe this is correct for the python backend
+        # Python only has one way to scope things and that is with functions
+        
         # Gather shared transients, free symbols, and first/last appearance
         shared_transients = {}
         fsyms = {}
@@ -425,6 +427,7 @@ class {mangle_dace_state_struct_name(sdfg)}:
                 if first_node_instance is None:
                     continue
 
+                # TODO: as_arg can return c-style definitions that may break python code
                 definition = desc.as_arg(name=f'__{sdfg.cfg_id}_{name}')
 
                 if top_storage != dtypes.StorageType.CPU_ThreadLocal:  # If thread-local, skip struct entry
@@ -441,7 +444,7 @@ class {mangle_dace_state_struct_name(sdfg)}:
                 # If unused, skip
                 if first_node_instance is None:
                     continue
-
+                # TODO: as_arg can return c-style definitions that may break python code
                 definition = desc.as_arg(name=f'__{sdfg.cfg_id}_{name}')
                 self.statestruct.append(definition)
 
@@ -622,11 +625,9 @@ class {mangle_dace_state_struct_name(sdfg)}:
                                                                                         SDFG],
                                  function_stream: PythonCodeIOStream, callsite_stream: PythonCodeIOStream) -> None:
         """ Dispatches allocation of all arrays in the given scope. """
+        # TODO: Check what we should actually do for python
         if len(self.to_allocate[scope]) == 0:
             return
-        for instr in self._dispatcher.instrumentation.values():
-            if instr is not None:
-                instr.on_allocation_begin(sdfg, scope, callsite_stream)
         for tsdfg, state, node, declare, allocate, _ in self.to_allocate[scope]:
             if state is not None:
                 state_id = state.block_id
@@ -645,11 +646,9 @@ class {mangle_dace_state_struct_name(sdfg)}:
                                                                                           SDFG],
                                    function_stream: PythonCodeIOStream, callsite_stream: PythonCodeIOStream):
         """ Dispatches deallocation of all arrays in the given scope. """
+        # TODO: Check what we should actually do for python
         if len(self.to_allocate[scope]) == 0:
             return
-        for instr in self._dispatcher.instrumentation.values():
-            if instr is not None:
-                instr.on_deallocation_begin(sdfg, scope, callsite_stream)
         for tsdfg, state, node, _, _, deallocate in self.to_allocate[scope]:
             if not deallocate:
                 continue
@@ -662,9 +661,6 @@ class {mangle_dace_state_struct_name(sdfg)}:
 
             self._dispatcher.dispatch_deallocate(tsdfg, state.parent_graph, state, state_id, node, desc,
                                                  function_stream, callsite_stream)
-        for instr in self._dispatcher.instrumentation.values():
-            if instr is not None:
-                instr.on_deallocation_end(sdfg, scope, callsite_stream)
 
     def generate_code(self,
                       sdfg: SDFG,
@@ -681,6 +677,11 @@ class {mangle_dace_state_struct_name(sdfg)}:
                      code, and a set of targets that have been used in the
                      generation of this SDFG.
         """
+        # TODO: This is not yet fully correct for a python implementation
+        # Also quite a bit of code was removed compared to C++ 
+        # version, so we should check that all necessary steps 
+        # are still present and correct for python.
+        
         if len(cfg_id) == 0 and sdfg.cfg_id != 0:
             cfg_id = '_%d' % sdfg.cfg_id
 
@@ -691,18 +692,21 @@ class {mangle_dace_state_struct_name(sdfg)}:
 
         # Analyze allocation lifetime of SDFG and all nested SDFGs
         if is_top_level:
+            # TODO: Check if this is actually needed for python
             self.determine_allocation_lifetime(sdfg)
 
         # Generate code
         ###########################
 
         # Allocate outer-level transients
+        # TODO: Check if this is correct for python
         self.allocate_arrays_in_scope(sdfg, sdfg, sdfg, global_stream, callsite_stream)
 
         # Define constants as top-level-allocated
+        # TODO: Check if this is correct for python
         for cname, (ctype, _) in sdfg.constants_prop.items():
             if isinstance(ctype, data.Array):
-                self.dispatcher.defined_vars.add(cname, disp.DefinedType.Pointer, ctype.dtype.ctype)
+                self.dispatcher.defined_vars.add(cname, disp.DefinedType.Pointer, ctype.dtype.ctype) # TODO: Pointer is almost definitely not correct for python
             else:
                 self.dispatcher.defined_vars.add(cname, disp.DefinedType.Scalar, ctype.dtype.ctype)
 
@@ -808,6 +812,7 @@ def _get_dominator_and_postdominator(sdfg: SDFG, accesses: List[Tuple[SDFGState,
     Gets the closest common dominator and post-dominator for a list of states.
     Used for determining allocation of data used in branched states.
     """
+    # TODO: Find out what this does and if it's correct for python
     alldoms: Dict[ControlFlowBlock, Set[ControlFlowBlock]] = collections.defaultdict(lambda: set())
     allpostdoms: Dict[ControlFlowBlock, Set[ControlFlowBlock]] = collections.defaultdict(lambda: set())
     idom: Dict[ControlFlowRegion, Dict[ControlFlowBlock, ControlFlowBlock]] = {}

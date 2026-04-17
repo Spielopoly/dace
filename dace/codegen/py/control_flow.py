@@ -117,7 +117,6 @@ def _write_loop_region(region: LoopRegion, dispatch_state: Callable[[SDFGState],
                     stream.write('break', cfg=sdfg, state_id=region.block_id)
         else:
             stream.write(f'while {cond}:', cfg=sdfg, state_id=region.block_id)
-            pos_before = stream.tell()
             with stream.indented():
                 if not _write_control_flow_region(region, dispatch_state, codegen, symbols, stream):
                     stream.write('pass', cfg=sdfg, state_id=region.block_id)
