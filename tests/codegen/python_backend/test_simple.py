@@ -22,7 +22,8 @@ def test_simple_program():
         
         x = np.random.rand(3, 7)
         y = np.random.rand(3, 7)
-        result = sdfg(x=x, y=y)
+        ret = np.zeros((3, 7), dtype=np.float64)
+        result = sdfg(x=x, y=y, __return=ret)
     
     return code
 

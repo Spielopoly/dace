@@ -438,6 +438,7 @@ def test_map_elementwise_add_xfail():
     b = np.arange(4, dtype=np.float64)
     c = np.zeros(4, dtype=np.float64)
     _run_sdfg(sdfg, A=a, B=b, C=c)
+    np.testing.assert_allclose(c, a + b)
 
 
 @pytest.mark.xfail(strict=True, reason='Python backend reduction or WCR code generation currently fails for end-to-end execution.')
@@ -485,6 +486,7 @@ def test_transient_array_intermediate_xfail():
     a = np.arange(n, dtype=np.float64)
     b = np.zeros(n, dtype=np.float64)
     _run_sdfg(sdfg, A=a, B=b, N=n)
+    np.testing.assert_allclose(b, a)
 
 
 @pytest.mark.xfail(strict=True, reason='Python backend has no code generator for NestedSDFG nodes.')
@@ -509,6 +511,7 @@ def test_nested_sdfg_xfail():
     a = np.array([3.0], dtype=np.float64)
     b = np.zeros(1, dtype=np.float64)
     _run_sdfg(outer, A=a, B=b)
+    np.testing.assert_allclose(b, np.array([4.0], dtype=np.float64))
 
 
 @pytest.mark.xfail(strict=True, reason='Python backend rebinds scalar outputs locally and does not write them back to the caller.')
@@ -541,3 +544,4 @@ def test_global_code_xfail():
 
     a = np.zeros(1, dtype=np.int64)
     _run_sdfg(sdfg, A=a)
+    np.testing.assert_array_equal(a, np.array([9], dtype=np.int64))
