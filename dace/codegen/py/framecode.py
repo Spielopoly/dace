@@ -193,7 +193,7 @@ class DaCePythonCodeGenerator(object):
         if self.statestruct:
             structstr = '\n'.join(self.statestruct)
             global_stream.write(f'class {mangle_dace_state_struct_name(sdfg)}:', sdfg)
-            with global_stream.indent():
+            with global_stream.indented():
                 global_stream.write(structstr, sdfg)
 
         for sd in sdfg.all_sdfgs_recursive():

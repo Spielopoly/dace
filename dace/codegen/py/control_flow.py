@@ -429,13 +429,12 @@ def control_flow_region_to_code(region: AbstractControlFlowRegion,
                                  single SDFG state and returns it as a string.
     :param codegen:              The Python code generator object.
     :param symbols:              A dictionary of symbol names and their types.
+    :param stream:               The output stream to write generated code into.
     :param start:                Optional start block override.
     :param stop:                 Optional stop block (exclusive).
     :param generate_children_of: If set, only generate children of this block.
-    :param ptree:                Pre-computed parent tree (or None).
+    :param parent_tree:          Pre-computed parent tree (or None).
     :param visited:              Set of already-visited blocks.
-    :param indent:               Current indentation in number of spaces.
-    :return:                     Python code string.
     """
     assert isinstance(stream, PythonCodeIOStream)
     _write_control_flow_region(region, dispatch_state, codegen, symbols, stream,
