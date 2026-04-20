@@ -134,10 +134,5 @@ def test_output_file(tmp_path):
 
 
 if __name__ == "__main__":
-    test_empty_program_compiles_and_runs()
-    test_compile_returns_python_compiled_sdfg()
-    test_compiled_sdfg_has_sdfg_property()
-    test_compiled_sdfg_has_code_property()
-    test_program_with_array_args()
-    test_program_with_positional_args()
-    print("All tests passed!")
+    import pytest
+    pytest.main([__file__, '-q'])

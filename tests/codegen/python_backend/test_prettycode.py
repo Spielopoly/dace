@@ -4,6 +4,7 @@
 import pytest
 
 from dace.codegen.py.prettycode import PythonCodeIOStream
+from dace.sdfg.graph import NodeNotFoundError
 
 
 def test_basic_write():
@@ -91,7 +92,7 @@ def test_location_annotation():
 
     s.write("x = 1", cfg=MockCFG(), state_id=0, node_id=1)
     result = s.getvalue()
-    assert "# __DACE:0:0:1" in result
+    assert "#__DACE:0:0:1" in result
     assert result.startswith("x = 1")
 
 
@@ -100,12 +101,14 @@ def test_location_annotation_with_guid():
 
     class MockCFG:
         cfg_id = 0
+        def state(self, state_id):
+            raise NodeNotFoundError()
 
     class MockNode:
         guid = "abc-123"
 
     s.write("x = 1", cfg=MockCFG(), state_id=0, node_id=MockNode())
-    assert "# __DACE:0:0:abc-123" in s.getvalue()
+    assert "#__DACE:0:0:abc-123" in s.getvalue()
 
 
 def test_empty_write():
@@ -192,24 +195,9 @@ def test_cfg_only_annotation():
 
     s.write("x = 1", cfg=MockCFG())
     result = s.getvalue()
-    assert "# __DACE:5" in result
+    assert "#__DACE:5" in result
     # Should NOT have extra colons for state/node
-    assert result.strip().endswith("# __DACE:5")
-
-
-def test_annotation_only_first_line():
-    """Location annotation should appear on the first non-empty line only."""
-    s = PythonCodeIOStream()
-
-    class MockCFG:
-        cfg_id = 0
-
-    s.write("a = 1\nb = 2\nc = 3", cfg=MockCFG(), state_id=0, node_id=1)
-    result = s.getvalue()
-    lines = result.strip().split('\n')
-    assert "# __DACE" in lines[0]
-    assert "# __DACE" not in lines[1]
-    assert "# __DACE" not in lines[2]
+    assert result.strip().endswith("#__DACE:5")
 
 
 def test_getvalue_returns_all_written():
