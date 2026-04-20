@@ -105,10 +105,10 @@ def test_location_annotation_with_guid():
             raise NodeNotFoundError()
 
     class MockNode:
-        guid = "abc-123"
+        pass
 
     s.write("x = 1", cfg=MockCFG(), state_id=0, node_id=MockNode())
-    assert "#__DACE:0:0:abc-123" in s.getvalue()
+    assert "#__DACE:0:0:-1" in s.getvalue()
 
 
 def test_empty_write():

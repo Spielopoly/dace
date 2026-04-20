@@ -45,9 +45,6 @@ class PythonCompiledSDFG:
     def __call__(self, *args, **kwargs):
         return self._func(*args, **kwargs)
 
-    def __del__(self):
-        pass
-
 
 def compile_python_sdfg(sdfg, code_objects: 'list[CodeObject]') -> PythonCompiledSDFG:
     """

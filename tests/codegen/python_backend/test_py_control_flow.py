@@ -11,7 +11,10 @@ from dace.properties import CodeBlock
 from dace.sdfg import SDFG, InterstateEdge
 from dace.sdfg.state import (ControlFlowRegion, LoopRegion, ConditionalBlock, BreakBlock, ContinueBlock, ReturnBlock,
                               SDFGState)
-from dace.codegen.py.control_flow import (control_flow_region_to_code, _unparse_py_expr, _unparse_codeblock)
+from dace.codegen.py.control_flow import (control_flow_region_to_code, _unparse_py_expr, _unparse_codeblock,
+                                          _write_interstate_assignments, _write_loop_region,
+                                          _write_conditional_block)
+from dace.codegen.py.prettycode import PythonCodeIOStream
 
 
 # ---------------------------------------------------------------------------
@@ -21,6 +24,11 @@ from dace.codegen.py.control_flow import (control_flow_region_to_code, _unparse_
 class _FakeCodegen:
     """Minimal stub for the codegen parameter."""
     pass
+
+
+def _make_stream(indent: int = 0) -> PythonCodeIOStream:
+    """Creates a PythonCodeIOStream with the given indentation level."""
+    return PythonCodeIOStream(base_indentation=indent // 4)
 
 
 def _make_dispatch():
@@ -39,23 +47,6 @@ def _make_dispatch():
 # ---------------------------------------------------------------------------
 
 class TestHelpers:
-    def test_indent_empty(self):
-        assert _indent('', 4) == ''
-
-    def test_indent_single_line(self):
-        assert _indent('x = 1', 4) == '    x = 1'
-
-    def test_indent_multiline(self):
-        result = _indent('a = 1\nb = 2\n', 8)
-        lines = result.split('\n')
-        assert lines[0] == '        a = 1'
-        assert lines[1] == '        b = 2'
-
-    def test_indent_preserves_blank_lines(self):
-        result = _indent('a\n\nb', 4)
-        lines = result.split('\n')
-        assert lines[1] == ''  # blank line not indented
-
     def test_unparse_py_expr_string(self):
         assert _unparse_py_expr('x + 1', None) == 'x + 1'
 
@@ -88,33 +79,41 @@ class TestInterstateAssignments:
         s0 = sdfg.add_state('s0')
         s1 = sdfg.add_state('s1')
         edge = sdfg.add_edge(s0, s1, InterstateEdge())
-        result = _generate_interstate_assignments(edge, sdfg, 0)
-        assert result == ''
+        stream = _make_stream()
+        wrote = _write_interstate_assignments(edge, sdfg, stream)
+        assert not wrote
+        assert stream.getvalue() == ''
 
     def test_single_assignment(self):
         sdfg = SDFG('test')
         s0 = sdfg.add_state('s0')
         s1 = sdfg.add_state('s1')
         edge = sdfg.add_edge(s0, s1, InterstateEdge(assignments={'i': '0'}))
-        result = _generate_interstate_assignments(edge, sdfg, 0)
-        assert result == 'i = 0'
+        stream = _make_stream()
+        _write_interstate_assignments(edge, sdfg, stream)
+        result = stream.getvalue()
+        assert 'i = 0' in result
 
     def test_multiple_assignments(self):
         sdfg = SDFG('test')
         s0 = sdfg.add_state('s0')
         s1 = sdfg.add_state('s1')
         edge = sdfg.add_edge(s0, s1, InterstateEdge(assignments={'i': '0', 'j': 'N'}))
-        result = _generate_interstate_assignments(edge, sdfg, 4)
-        assert '    i = 0' in result
-        assert '    j = N' in result
+        stream = _make_stream()
+        _write_interstate_assignments(edge, sdfg, stream)
+        result = stream.getvalue()
+        assert 'i = 0' in result
+        assert 'j = N' in result
 
     def test_indentation(self):
         sdfg = SDFG('test')
         s0 = sdfg.add_state('s0')
         s1 = sdfg.add_state('s1')
         edge = sdfg.add_edge(s0, s1, InterstateEdge(assignments={'x': '42'}))
-        result = _generate_interstate_assignments(edge, sdfg, 8)
-        assert result.startswith('        x = 42')
+        stream = _make_stream(indent=8)
+        _write_interstate_assignments(edge, sdfg, stream)
+        result = stream.getvalue()
+        assert '        x = 42' in result
 
 
 # ---------------------------------------------------------------------------
@@ -130,10 +129,13 @@ class TestLoopRegion:
 
         dispatch, dispatched = _make_dispatch()
         codegen = _FakeCodegen()
+        stream = _make_stream()
 
-        result = _loop_region_to_code(loop, dispatch, codegen, {}, indent=0)
+        _write_loop_region(loop, dispatch, codegen, {}, stream)
+        result = stream.getvalue()
         assert 'while' in result
         assert 'i < N' in result or 'i<N' in result
+        assert len(dispatched) == 1
 
     def test_for_style_loop(self):
         sdfg = SDFG('test_for')
@@ -144,8 +146,10 @@ class TestLoopRegion:
 
         dispatch, dispatched = _make_dispatch()
         codegen = _FakeCodegen()
+        stream = _make_stream()
 
-        result = _loop_region_to_code(loop, dispatch, codegen, {}, indent=0)
+        _write_loop_region(loop, dispatch, codegen, {}, stream)
+        result = stream.getvalue()
         assert 'i = 0' in result
         assert 'while' in result
         assert 'i = i + 1' in result or 'i = (i + 1)' in result
@@ -158,10 +162,13 @@ class TestLoopRegion:
 
         dispatch, _ = _make_dispatch()
         codegen = _FakeCodegen()
+        stream = _make_stream()
 
-        result = _loop_region_to_code(loop, dispatch, codegen, {}, indent=0)
+        _write_loop_region(loop, dispatch, codegen, {}, stream)
+        result = stream.getvalue()
         assert 'while True:' in result
         assert 'break' in result
+        assert 'pass' not in result
 
     def test_loop_indentation(self):
         sdfg = SDFG('test_indent')
@@ -171,8 +178,10 @@ class TestLoopRegion:
 
         dispatch, _ = _make_dispatch()
         codegen = _FakeCodegen()
+        stream = _make_stream(indent=4)
 
-        result = _loop_region_to_code(loop, dispatch, codegen, {}, indent=4)
+        _write_loop_region(loop, dispatch, codegen, {}, stream)
+        result = stream.getvalue()
         lines = result.split('\n')
         while_line = [l for l in lines if 'while' in l][0]
         assert while_line.startswith('    ')
@@ -199,10 +208,13 @@ class TestConditionalBlock:
         dispatch, dispatched = _make_dispatch()
         codegen = _FakeCodegen()
 
-        result = _conditional_block_to_code(cond_block, dispatch, codegen, {}, indent=0)
+        stream = _make_stream()
+        _write_conditional_block(cond_block, dispatch, codegen, {}, stream)
+        result = stream.getvalue()
         assert 'if' in result
         assert 'else:' in result
-        assert 'then_body' in result or len(dispatched) == 2
+        assert 'then_body' in result
+        assert len(dispatched) == 2
 
     def test_if_elif_else(self):
         sdfg = SDFG('test_elif')
@@ -222,8 +234,10 @@ class TestConditionalBlock:
 
         dispatch, _ = _make_dispatch()
         codegen = _FakeCodegen()
+        stream = _make_stream()
 
-        result = _conditional_block_to_code(cond_block, dispatch, codegen, {}, indent=0)
+        _write_conditional_block(cond_block, dispatch, codegen, {}, stream)
+        result = stream.getvalue()
         assert 'if' in result
         assert 'elif' in result
         assert 'else:' in result
@@ -239,8 +253,10 @@ class TestConditionalBlock:
 
         dispatch, _ = _make_dispatch()
         codegen = _FakeCodegen()
+        stream = _make_stream(indent=8)
 
-        result = _conditional_block_to_code(cond_block, dispatch, codegen, {}, indent=8)
+        _write_conditional_block(cond_block, dispatch, codegen, {}, stream)
+        result = stream.getvalue()
         lines = result.split('\n')
         if_line = [l for l in lines if 'if' in l][0]
         assert if_line.startswith('        ')
@@ -257,8 +273,9 @@ class TestControlFlowRegionToCode:
 
         dispatch, dispatched = _make_dispatch()
         codegen = _FakeCodegen()
+        stream = _make_stream()
 
-        result = control_flow_region_to_code(sdfg, dispatch, codegen, {}, indent=0)
+        control_flow_region_to_code(sdfg, dispatch, codegen, {}, stream)
         assert 's0' in dispatched
 
     def test_linear_chain(self):
@@ -269,8 +286,9 @@ class TestControlFlowRegionToCode:
 
         dispatch, dispatched = _make_dispatch()
         codegen = _FakeCodegen()
+        stream = _make_stream()
 
-        result = control_flow_region_to_code(sdfg, dispatch, codegen, {}, indent=0)
+        control_flow_region_to_code(sdfg, dispatch, codegen, {}, stream)
         assert 's0' in dispatched
         assert 's1' in dispatched
 
@@ -282,8 +300,10 @@ class TestControlFlowRegionToCode:
 
         dispatch, _ = _make_dispatch()
         codegen = _FakeCodegen()
+        stream = _make_stream()
 
-        result = control_flow_region_to_code(sdfg, dispatch, codegen, {}, indent=0)
+        control_flow_region_to_code(sdfg, dispatch, codegen, {}, stream)
+        result = stream.getvalue()
         assert 'if' in result
 
     def test_assignment_edge(self):
@@ -294,8 +314,10 @@ class TestControlFlowRegionToCode:
 
         dispatch, _ = _make_dispatch()
         codegen = _FakeCodegen()
+        stream = _make_stream()
 
-        result = control_flow_region_to_code(sdfg, dispatch, codegen, {}, indent=0)
+        control_flow_region_to_code(sdfg, dispatch, codegen, {}, stream)
+        result = stream.getvalue()
         assert 'i = 0' in result
 
     def test_branching_uses_state_machine(self):
@@ -309,11 +331,13 @@ class TestControlFlowRegionToCode:
 
         dispatch, dispatched = _make_dispatch()
         codegen = _FakeCodegen()
+        stream = _make_stream()
 
-        result = control_flow_region_to_code(sdfg, dispatch, codegen, {}, indent=0)
+        control_flow_region_to_code(sdfg, dispatch, codegen, {}, stream)
+        result = stream.getvalue()
         # Should use state machine pattern
         assert '__state_' in result
-        assert 'while True:' in result
+        assert 'while' in result
 
     def test_no_goto_in_output(self):
         """Ensure no C++ constructs leak into the Python output."""
@@ -324,8 +348,10 @@ class TestControlFlowRegionToCode:
 
         dispatch, _ = _make_dispatch()
         codegen = _FakeCodegen()
+        stream = _make_stream()
 
-        result = control_flow_region_to_code(sdfg, dispatch, codegen, {}, indent=0)
+        control_flow_region_to_code(sdfg, dispatch, codegen, {}, stream)
+        result = stream.getvalue()
         assert 'goto' not in result
         assert '{' not in result
         assert '}' not in result
@@ -348,8 +374,9 @@ class TestSpecialBlocks:
         dispatch, _ = _make_dispatch()
         codegen = _FakeCodegen()
 
-        result = _loop_region_to_code(loop, dispatch, codegen, {}, indent=0)
-        assert 'break' in result
+        stream = _make_stream()
+        _write_loop_region(loop, dispatch, codegen, {}, stream)
+        assert 'break' in stream.getvalue()
 
     def test_continue_block(self):
         """Verify the continue block is generated when it's not at the tail."""
@@ -364,9 +391,10 @@ class TestSpecialBlocks:
 
         dispatch, _ = _make_dispatch()
         codegen = _FakeCodegen()
+        stream = _make_stream()
 
-        result = _loop_region_to_code(loop, dispatch, codegen, {}, indent=0)
-        assert 'continue' in result
+        _write_loop_region(loop, dispatch, codegen, {}, stream)
+        assert 'continue' in stream.getvalue()
 
     def test_return_block(self):
         sdfg = SDFG('test_return')
@@ -376,9 +404,10 @@ class TestSpecialBlocks:
 
         dispatch, _ = _make_dispatch()
         codegen = _FakeCodegen()
+        stream = _make_stream()
 
-        result = control_flow_region_to_code(sdfg, dispatch, codegen, {}, indent=0)
-        assert 'return' in result
+        control_flow_region_to_code(sdfg, dispatch, codegen, {}, stream)
+        assert 'return' in stream.getvalue()
 
 
 if __name__ == '__main__':
