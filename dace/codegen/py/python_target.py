@@ -33,7 +33,7 @@ class PythonCodeGen(TargetCodeGenerator):
     language = "python"
 
     def get_includes(self) -> dict[str, list[str]]:
-        return {'frame': ['numpy']}
+        return {'frame': ['numpy', 'from dataclasses import dataclass']}
 
     def __init__(self, frame_codegen: 'DaCePythonCodeGenerator', sdfg: SDFG):
         self._frame = frame_codegen

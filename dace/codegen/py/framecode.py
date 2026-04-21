@@ -144,15 +144,11 @@ class DaCePythonCodeGenerator(object):
         # Write constants
         for cstname, (csttype, cstval) in sdfg.constants_prop.items():
             if isinstance(csttype, data.Array):
-                const_str = cstname + " = ["
-                it = np.nditer(cstval, order='C')
-                for i in range(cstval.size - 1):
-                    const_str += str(it[0]) + ", "
-                    it.iternext()
-                const_str += str(it[0]) + "]\n"
+                # TODO: Multidimensional arrays
+                const_str = cstname + " = [" + ', '.join(str(it[0]) for it in np.nditer(cstval, order='C')) + "]"
                 callsite_stream.write(const_str, sdfg)
             else:
-                callsite_stream.write(f"{cstname} = {cstval}\n", sdfg)
+                callsite_stream.write(f"{cstname} = {cstval}", sdfg)
 
     def generate_fileheader(self, sdfg: SDFG, global_stream: PythonCodeIOStream, backend: str = 'frame'):
         """ Generate a header in every output file that includes custom types
@@ -218,11 +214,11 @@ class DaCePythonCodeGenerator(object):
             elif isinstance(dtype, dtypes.struct):
                 for field in dtype.fields.values():
                     wrote_something = _emit_definitions(field, wrote_something)
-            if hasattr(dtype, 'emit_definition'):
+            if hasattr(dtype, 'emit_python_definition'):
                 if not wrote_something:
                     global_stream.write("", sdfg)
                 if dtype not in emitted:
-                    global_stream.write(dtype.emit_definition(), sdfg)
+                    dtype.emit_python_definition(global_stream, sdfg)
                     wrote_something = True
                     emitted.add(dtype)
             return wrote_something

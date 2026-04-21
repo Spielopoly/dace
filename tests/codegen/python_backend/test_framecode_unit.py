@@ -1338,8 +1338,9 @@ class TestAdditionalFramecodeBranches:
         stream = PythonCodeIOStream()
         codegen.generate_fileheader(sdfg, stream, backend='frame')
         code = stream.getvalue()
-        assert "struct TmpStruct" in code
-        assert code.count("struct TmpStruct") == 1
+        assert "class TmpStruct" in code
+        assert code.count("class TmpStruct") == 1
+        assert "    a: 'numpy.int32'" in code
 
     def test_get_schedule_nested_in_parent_scope(self):
         """Nested SDFG inside a map inherits schedule from parent scope."""

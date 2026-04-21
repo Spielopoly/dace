@@ -16,6 +16,9 @@ from enum import auto, Enum
 from dace.attr_enum import ExtensibleAttributeEnum
 from dace.registry import undefined_safe_enum
 
+if TYPE_CHECKING:
+    from dace.codegen.py.prettycode import PythonCodeIOStream
+    from dace.sdfg.state import ControlFlowRegion
 
 @undefined_safe_enum
 class DeviceType(ExtensibleAttributeEnum):
@@ -797,6 +800,15 @@ class struct(typeclass):
             typ='\n'.join(["    %s %s;" % (t.ctype, tname) for tname, t in self._data.items()]),
         )
 
+    def emit_python_definition(self, code_stream: 'PythonCodeIOStream', cfg: 'ControlFlowRegion | None'=None, state_id: int | None=None, node_id: int | None=None):
+        class_definition = f"@dataclass\nclass {self.name}:"
+        code_stream.write(class_definition, cfg, state_id, node_id)
+        with code_stream.indented():
+            for tname, t in self._data.items():
+                type_annotation = f"{t.type!r}"
+                if "<class " in type_annotation:
+                    type_annotation = type_annotation.replace("<class ", "").replace(">", "")
+                code_stream.write(f"{tname}: {type_annotation}", cfg, state_id, node_id)
 
 class pyobject(opaque):
     """

@@ -61,7 +61,7 @@ class PythonCodeIOStream(io.StringIO):
         finally:
             self.dedent(levels)
 
-    def write(self, contents, cfg: ControlFlowRegion = None, state_id: int = None, node_id=None) -> None:
+    def write(self, contents, cfg: 'ControlFlowRegion | None' = None, state_id: int | None = None, node_id: int | None = None) -> int:
         """Write *contents* with proper Python indentation and optional location annotations.
 
         Each non-empty line is prefixed with the current indentation.  Empty
@@ -69,8 +69,8 @@ class PythonCodeIOStream(io.StringIO):
         multi-line *contents* is preserved.  Location annotations use Python
         comment syntax (``# __DACE:…``).
         """
-        if contents is None or (isinstance(contents, str) and len(contents) == 0):
-            return
+        if contents is None or (isinstance(contents, str) and contents == '' or contents == '\n'):
+            return super().write('\n')
 
         contents = str(contents)
 
@@ -106,9 +106,12 @@ class PythonCodeIOStream(io.StringIO):
             caller = inspect.getframeinfo(inspect.stack()[1][0], context=0)
             location_identifier += f'  #__CODEGEN {caller.filename}:{caller.lineno}'
 
+        count = 0
         for line in lines:
             if line.strip():
                 out_line = prefix + line + location_identifier
-                super().write(out_line + '\n')
+                count += super().write(out_line + '\n')
             else:
-                super().write('\n')
+                count += super().write('\n')
+
+        return count
