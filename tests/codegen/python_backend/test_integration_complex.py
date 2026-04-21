@@ -460,7 +460,10 @@ def test_vector_norm_reduction_xfail():
     _run_sdfg(sdfg, A=a, out=out)
 
 
-@pytest.mark.xfail(strict=True, reason='Python backend does not execute SDFG-level global Python code in the generated runtime namespace.')
+@pytest.mark.xfail(
+    strict=True,
+    reason='Python backend still treats names assigned in SDFG-level global_code as free symbols during argument collection.',
+)
 def test_global_code_constant_xfail():
     sdfg = _new_sdfg('global_code_constant')
     sdfg.add_array('A', [1], dace.int64)
@@ -488,8 +491,7 @@ def test_init_code_semantics_xfail():
     _run_sdfg(sdfg, A=a)
 
 
-@pytest.mark.xfail(strict=True, reason='Transient array allocation uses numpy.zeros(...) in generated code without importing numpy.')
-def test_transient_array_pipeline_xfail():
+def test_transient_array_pipeline():
     n_symbol = dace.symbol('N')
     sdfg = _new_sdfg('transient_array_pipeline')
     sdfg.add_symbol('N', dace.int64)
@@ -503,7 +505,11 @@ def test_transient_array_pipeline_xfail():
     state1.add_edge(state1.add_read('A'), None, state1.add_access('tmp'), None, dace.Memlet('A[0:N] -> [0:N]'))
     state2.add_edge(state2.add_read('tmp'), None, state2.add_write('B'), None, dace.Memlet('tmp[0:N] -> [0:N]'))
 
+    code = sdfg.generate_code()[0].code
+    assert 'import numpy' in code
+
     n = 5
     a = np.arange(n, dtype=np.float64)
     b = np.zeros(n, dtype=np.float64)
     _run_sdfg(sdfg, A=a, B=b, N=n)
+    np.testing.assert_allclose(b, a)

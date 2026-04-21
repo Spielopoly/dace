@@ -57,10 +57,10 @@ def _generate_code_for(sdfg: SDFG):
 class TestCodeblockToPython:
 
     def test_codeblock_python_language(self):
-        """Python CodeBlock → returns cb.code."""
+        """Python CodeBlock → returns Python source text."""
         cb = CodeBlock("x = 42")
         result = codeblock_to_python(cb)
-        assert result is cb.code
+        assert result == "x = 42"
 
     def test_codeblock_non_python_as_string(self):
         """Non-Python with code → ValueError."""
@@ -298,7 +298,6 @@ class TestGenerateFileheader:
         code = stream.getvalue()
         assert "cstdlib" not in code
 
-    @pytest.mark.xfail(reason="Bug in framecode.py: global_stream.indent() used instead of indented()")
     def test_fileheader_state_struct(self):
         """State struct class generated when fields exist."""
         sdfg = _make_sdfg("struct_test")
@@ -336,10 +335,8 @@ class TestGenerateFileheader:
         stream = PythonCodeIOStream()
         codegen.generate_fileheader(sdfg, stream, backend='frame')
         code = stream.getvalue()
-        # codeblock_to_python returns the AST list; the stream receives the
-        # string representation (which may be repr of AST objects).
-        # Just verify that something was written for global code.
-        assert len(code.strip()) > 0
+        assert "GLOBAL_VAR = 99" in code
+        assert "Assign(" not in code
 
     def test_fileheader_global_code_backend_key(self):
         """Global code with backend key is written."""
@@ -351,8 +348,8 @@ class TestGenerateFileheader:
         stream = PythonCodeIOStream()
         codegen.generate_fileheader(sdfg, stream, backend='frame')
         code = stream.getvalue()
-        # Verify something was written for global code
-        assert len(code.strip()) > 0
+        assert "FRAME_VAR = 123" in code
+        assert "Assign(" not in code
 
     def test_fileheader_target_includes(self):
         """Target includes written as 'import X'."""
@@ -370,6 +367,50 @@ class TestGenerateFileheader:
         codegen.generate_fileheader(sdfg, stream, backend='frame')
         code = stream.getvalue()
         assert "import json" in code
+
+    def test_fileheader_verbatim_import_headers(self):
+        """Raw import statements are emitted verbatim."""
+        sdfg = _make_sdfg("raw_headers")
+        codegen = DaCePythonCodeGenerator(sdfg)
+
+        class FakeEnv:
+            headers = {"frame": ["import numpy as np", "from math import sin"]}
+            state_fields = []
+
+        codegen.environments = [FakeEnv()]
+        stream = PythonCodeIOStream()
+        codegen.generate_fileheader(sdfg, stream, backend='frame')
+        code = stream.getvalue()
+        assert "import numpy as np" in code
+        assert "from math import sin" in code
+
+    def test_fileheader_deduplicates_imports_across_sources(self):
+        """Imports are deduplicated across target, environment, and Python global code."""
+        sdfg = _make_sdfg("dedupe_headers")
+        codegen = DaCePythonCodeGenerator(sdfg)
+
+        class FakeEnv:
+            headers = {"frame": ["import numpy as np", "from math import sin"]}
+            state_fields = []
+
+        class FakeTarget:
+            def get_includes(self):
+                return {"frame": ["numpy", "from math import sin", "import json"]}
+
+        codegen.environments = [FakeEnv()]
+        codegen._dispatcher._used_targets.add(FakeTarget())
+        sdfg.global_code['python'] = CodeBlock("import numpy as np\nHEADER_SENTINEL = 1")
+
+        stream = PythonCodeIOStream()
+        codegen.generate_fileheader(sdfg, stream, backend='frame')
+        code = stream.getvalue()
+        code_lines = code.splitlines()
+
+        assert sum(line.startswith("import numpy") and " as np" not in line for line in code_lines) == 1
+        assert sum(line.startswith("import numpy as np") for line in code_lines) == 1
+        assert sum(line.startswith("from math import sin") for line in code_lines) == 1
+        assert sum(line.startswith("import json") for line in code_lines) == 1
+        assert "HEADER_SENTINEL = 1" in code
 
 
 # ===========================================================================

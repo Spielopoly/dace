@@ -467,8 +467,7 @@ def test_sum_reduction_xfail():
     _run_sdfg(sdfg, A=a, out=out)
 
 
-@pytest.mark.xfail(strict=True, reason='Python backend allocates transient arrays with numpy.zeros(...) but the generated function lacks import numpy.')
-def test_transient_array_intermediate_xfail():
+def test_transient_array_intermediate():
     n_symbol = dace.symbol('N')
     sdfg = _new_sdfg('transient_array_pipeline')
     sdfg.add_symbol('N', dace.int64)
@@ -481,6 +480,9 @@ def test_transient_array_intermediate_xfail():
     sdfg.add_edge(state1, state2, InterstateEdge())
     state1.add_edge(state1.add_read('A'), None, state1.add_access('tmp'), None, dace.Memlet('A[0:N] -> [0:N]'))
     state2.add_edge(state2.add_read('tmp'), None, state2.add_write('B'), None, dace.Memlet('tmp[0:N] -> [0:N]'))
+
+    code = sdfg.generate_code()[0].code
+    assert 'import numpy' in code
 
     n = 5
     a = np.arange(n, dtype=np.float64)
@@ -532,7 +534,10 @@ def test_scalar_descriptor_output_xfail():
     np.testing.assert_allclose(out, np.array([6.5], dtype=np.float64))
 
 
-@pytest.mark.xfail(strict=True, reason='Python backend does not execute SDFG-level global Python code in the generated runtime namespace.')
+@pytest.mark.xfail(
+    strict=True,
+    reason='Python backend still treats names assigned in SDFG-level global_code as free symbols during argument collection.',
+)
 def test_global_code_xfail():
     sdfg = _new_sdfg('global_code')
     sdfg.add_array('A', [1], dace.int64)

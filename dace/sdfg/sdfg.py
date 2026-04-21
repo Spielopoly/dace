@@ -43,6 +43,7 @@ if TYPE_CHECKING:
     from dace.codegen.instrumentation.data.data_report import InstrumentedDataReport
     from dace.codegen.compiled_sdfg import CompiledSDFG
     from dace.sdfg.analysis.schedule_tree.treenodes import ScheduleTreeScope
+    from dace.codegen.py.compiled_sdfg import PythonCompiledSDFG
 
 
 class NestedDict(dict):
@@ -2462,7 +2463,7 @@ class SDFG(ControlFlowRegion):
         dll = cs.ReloadableDLL(binary_filename, self.name)
         return dll.is_loaded()
 
-    def compile(self, output_file=None, validate=True, return_program_handle=True) -> 'Union[CompiledSDFG, Any, None]':
+    def compile(self, output_file=None, validate=True, return_program_handle=True) -> 'Union[CompiledSDFG, PythonCompiledSDFG, Any, None]':
         """ Compiles a runnable binary from this SDFG.
 
             For the C++ backend, compiles a shared library and returns a

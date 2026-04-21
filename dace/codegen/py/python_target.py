@@ -32,6 +32,9 @@ class PythonCodeGen(TargetCodeGenerator):
     target_name = "python"
     language = "python"
 
+    def get_includes(self) -> dict[str, list[str]]:
+        return {'frame': ['numpy']}
+
     def __init__(self, frame_codegen: 'DaCePythonCodeGenerator', sdfg: SDFG):
         self._frame = frame_codegen
         self._dispatcher: TargetDispatcher = frame_codegen.dispatcher

@@ -311,11 +311,6 @@ class TestArrayManagementCorrectness:
         csdfg(x=x, y=y)
         assert y[0] == 23.0
 
-    @pytest.mark.xfail(
-        reason="allocate_array generates numpy.zeros() but numpy is not imported in generated code namespace",
-        raises=NameError,
-        strict=True,
-    )
     def test_transient_array_correctness(self):
         """Transient array as intermediate: compile and verify."""
         N = 8
@@ -335,11 +330,6 @@ class TestArrayManagementCorrectness:
         csdfg(A=A, B=B)
         np.testing.assert_array_equal(B, A)
 
-    @pytest.mark.xfail(
-        reason="allocate_array generates numpy.zeros() but numpy is not imported in generated code namespace",
-        raises=NameError,
-        strict=True,
-    )
     def test_2d_transient_array_correctness(self):
         """2D transient array: compile and verify."""
         R, C = 3, 4
@@ -359,11 +349,6 @@ class TestArrayManagementCorrectness:
         csdfg(A=A, B=B)
         np.testing.assert_array_equal(B, A)
 
-    @pytest.mark.xfail(
-        reason="allocate_array generates numpy.zeros() but numpy is not imported in generated code namespace",
-        raises=NameError,
-        strict=True,
-    )
     def test_int32_transient_correctness(self):
         """int32 transient array: compile and verify dtype preserved."""
         N = 6
@@ -415,11 +400,6 @@ class TestArrayManagementCorrectness:
         csdfg(A=A, B=B)
         np.testing.assert_allclose(B, A * 2 + 1)
 
-    @pytest.mark.xfail(
-        reason="allocate_array generates numpy.zeros() but numpy is not imported in generated code namespace",
-        raises=NameError,
-        strict=True,
-    )
     def test_multi_state_copy_correctness(self):
         """Multi-state with copies: S1 copies A->tmp, S2 copies tmp->B."""
         N = 5

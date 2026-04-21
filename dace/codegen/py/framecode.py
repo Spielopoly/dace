@@ -1,4 +1,5 @@
 # Copyright 2019-2026 ETH Zurich and the DaCe authors. All rights reserved.
+import ast
 import collections
 import copy
 from typing import Any, DefaultDict, Dict, List, Optional, Set, Tuple, Union
@@ -12,6 +13,7 @@ from dace.codegen.py import control_flow as py_cflow
 from dace.codegen import dispatcher as disp
 from dace.codegen.py.prettycode import PythonCodeIOStream
 from dace.codegen.target import TargetCodeGenerator
+from dace.frontend.python import astutils
 from dace.sdfg.type_inference import infer_expr_type
 from dace.sdfg import SDFG, SDFGState, nodes
 from dace.sdfg import scope as sdscope
@@ -21,13 +23,42 @@ from dace.sdfg.state import ControlFlowBlock, ControlFlowRegion, LoopRegion
 from dace.transformation.passes.analysis import StateReachability, loop_analysis
 from dace.properties import CodeBlock
 
+
 def codeblock_to_python(cb: CodeBlock):
     if cb.language == dtypes.Language.Python:
-        return cb.code
+        return cb.as_string or ""
     if cb.as_string:
         raise ValueError(f"CodeBlock language {cb.language} cannot be converted to Python.")
     # ignore empty code blocks
     return ""
+
+
+def _normalize_python_import(import_entry: str) -> Optional[str]:
+    import_entry = import_entry.strip()
+    if not import_entry:
+        return None
+    if import_entry.startswith('import ') or import_entry.startswith('from '):
+        return import_entry
+    return f'import {import_entry}'
+
+
+def _split_codeblock_imports(cb: CodeBlock) -> Tuple[List[str], str]:
+    if cb.language != dtypes.Language.Python:
+        return [], codeblock_to_python(cb)
+
+    statements = cb.code if isinstance(cb.code, list) else ast.parse(cb.as_string).body
+    import_statements: List[str] = []
+    remaining_statements: List[ast.AST] = []
+    for stmt in statements:
+        if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+            import_statements.append(astutils.unparse(stmt))
+        else:
+            remaining_statements.append(stmt)
+
+    remaining_code = astutils.unparse(remaining_statements) if remaining_statements else ""
+    return import_statements, remaining_code
+
+
 class DaCePythonCodeGenerator(object):
     """ DaCe code generator class that writes the generated code for SDFG
         state machines, and uses a dispatcher to generate code for
@@ -134,13 +165,32 @@ class DaCePythonCodeGenerator(object):
         # TODO: mangle_dace_state_struct_name should be moved to a shared utility module
         #       instead of importing from the C++ target.
         from dace.codegen.targets.cpp import mangle_dace_state_struct_name  # Avoid circular import
+
+        emitted_imports: Set[str] = set()
+
+        def _write_imports(imports: List[str], import_sdfg: SDFG) -> None:
+            lines: List[str] = []
+            for import_entry in imports:
+                normalized = _normalize_python_import(import_entry)
+                if normalized is None or normalized in emitted_imports:
+                    continue
+                emitted_imports.add(normalized)
+                lines.append(normalized)
+            if lines:
+                global_stream.write('\n'.join(lines), import_sdfg)
+
+        def _write_global_code(codeblock: CodeBlock, code_sdfg: SDFG) -> None:
+            import_statements, remaining_code = _split_codeblock_imports(codeblock)
+            _write_imports(import_statements, code_sdfg)
+            if remaining_code:
+                global_stream.write(remaining_code, code_sdfg)
         
         #########################################################
         # Target-based includes
         for target in self._dispatcher.used_targets:
             headers = target.get_includes()
             if backend in headers:
-                global_stream.write("\n".join("import " + h for h in headers[backend]), sdfg)
+                _write_imports(headers[backend], sdfg)
 
         # Environment-based includes
         for env in self.environments:
@@ -150,7 +200,7 @@ class DaCePythonCodeGenerator(object):
                 else:
                     headers = env.headers
                 if backend in headers:
-                    global_stream.write("\n".join("import " + h for h in headers[backend]), sdfg)
+                    _write_imports(headers[backend], sdfg)
 
         #########################################################
         # Custom types
@@ -198,9 +248,11 @@ class DaCePythonCodeGenerator(object):
 
         for sd in sdfg.all_sdfgs_recursive():
             if None in sd.global_code:
-                global_stream.write(codeblock_to_python(sd.global_code[None]), sd)
+                _write_global_code(sd.global_code[None], sd)
+            if 'python' in sd.global_code:
+                _write_global_code(sd.global_code['python'], sd)
             if backend in sd.global_code:
-                global_stream.write(codeblock_to_python(sd.global_code[backend]), sd)
+                _write_global_code(sd.global_code[backend], sd)
 
     def generate_header(self, sdfg: SDFG, global_stream: PythonCodeIOStream, callsite_stream: PythonCodeIOStream):
         """ Generate the header of the frame-code. Code exists in a separate
