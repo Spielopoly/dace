@@ -6,6 +6,7 @@
 - For new Python functions, add type hints and keep imports explicit (no `import *`).
 - Run formatting and checks before finalizing changes:
   - `pre-commit run --all-files`
+- Use spaces for indentation (4 spaces per level), NEVER tabs.
 
 ## Architecture
 - DaCe is organized around the SDFG IR and transformation pipeline.
