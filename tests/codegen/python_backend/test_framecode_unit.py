@@ -1,6 +1,7 @@
 # Copyright 2019-2026 ETH Zurich and the DaCe authors. All rights reserved.
 """Unit tests for dace/codegen/py/framecode.py — DaCePythonCodeGenerator and helpers."""
 
+import ast
 import collections
 import copy
 from types import SimpleNamespace
@@ -14,6 +15,7 @@ from dace.codegen.py.framecode import DaCePythonCodeGenerator, codeblock_to_pyth
 from dace.codegen.py.prettycode import PythonCodeIOStream
 from dace.properties import CodeBlock
 from dace.sdfg import SDFG, nodes
+from dace.sdfg.validation import InvalidSDFGEdgeError
 from dace.sdfg.state import ControlFlowRegion, LoopRegion, SDFGState
 
 
@@ -47,6 +49,11 @@ def _make_sdfg_with_tasklet(name: str = "tasklet_sdfg") -> SDFG:
 def _generate_code_for(sdfg: SDFG):
     """Run full code generation on the SDFG and return the code objects."""
     return sdfg.generate_code()
+
+
+def _combined_generated_code(sdfg: SDFG) -> str:
+    """Join all generated Python code objects into a single module string."""
+    return '\n'.join(obj.code for obj in _generate_code_for(sdfg) if getattr(obj, 'code', None))
 
 
 # ===========================================================================
@@ -920,7 +927,6 @@ class TestGenerateCode:
         assert "def loop_sdfg" in code
         assert "while" in code or "for" in code or "i" in code
 
-    @pytest.mark.xfail(reason="Python backend: no code generator for node type NestedSDFG")
     def test_generate_code_cfg_id_nonzero(self):
         """cfg_id formatting for non-zero SDFG (via nested SDFG)."""
         outer = dace.SDFG("outer_cfg")
@@ -929,6 +935,7 @@ class TestGenerateCode:
         outer.add_array("B", [1], dace.float64)
 
         inner = dace.SDFG("inner_cfg")
+        inner.backend = dace.dtypes.BackendLanguage.Python
         inner.add_array("X", [1], dace.float64)
         inner.add_array("Y", [1], dace.float64)
 
@@ -1975,6 +1982,7 @@ class TestCoverageBoostV2:
         outer.add_array("B", [1], dace.float64)
 
         inner = dace.SDFG("inner_ntl")
+        inner.backend = dace.dtypes.BackendLanguage.Python
         inner.add_array("X", [1], dace.float64)
         inner.add_array("Y", [1], dace.float64)
         ist = inner.add_state("is")
@@ -2008,6 +2016,108 @@ class TestCoverageBoostV2:
         header, code, targets, envs = result
         assert isinstance(header, str)
         assert isinstance(code, str)
+
+    def test_generate_code_nested_emits_helper_function_and_call(self):
+        """Nested SDFGs lower to a helper function plus a call from the outer function."""
+        outer = dace.SDFG("outer_helper")
+        outer.backend = dace.dtypes.BackendLanguage.Python
+        outer.add_array("A", [1], dace.float64)
+        outer.add_array("B", [1], dace.float64)
+
+        inner = dace.SDFG("inner_helper")
+        inner.backend = dace.dtypes.BackendLanguage.Python
+        inner.add_array("X", [1], dace.float64)
+        inner.add_array("Y", [1], dace.float64)
+        istate = inner.add_state("is", is_start_block=True)
+        tasklet = istate.add_tasklet("inc", {"inp"}, {"out"}, "out = inp + 2.0")
+        istate.add_edge(istate.add_read("X"), None, tasklet, "inp", dace.Memlet("X[0]"))
+        istate.add_edge(tasklet, "out", istate.add_write("Y"), None, dace.Memlet("Y[0]"))
+
+        ostate = outer.add_state("os", is_start_block=True)
+        nested = ostate.add_nested_sdfg(inner, {"X"}, {"Y"})
+        ostate.add_edge(ostate.add_read("A"), None, nested, "X", dace.Memlet("A[0]"))
+        ostate.add_edge(nested, "Y", ostate.add_write("B"), None, dace.Memlet("B[0]"))
+
+        module = ast.parse(_combined_generated_code(outer))
+        functions = [node for node in ast.walk(module) if isinstance(node, ast.FunctionDef)]
+        outer_def = next(node for node in functions if node.name == outer.name)
+        helper_names = {node.name for node in functions if node.name != outer.name}
+
+        assert helper_names
+        helper_calls = [
+            node for node in ast.walk(outer_def)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in helper_names
+        ]
+        assert helper_calls
+
+    def test_generate_code_nested_passes_views_and_symbols_directly(self):
+        """Nested helper calls preserve direct array slices and symbol mappings."""
+        n_symbol = dace.symbol("N")
+        m_symbol = dace.symbol("M")
+
+        outer = dace.SDFG("outer_view_args")
+        outer.backend = dace.dtypes.BackendLanguage.Python
+        outer.add_symbol("N", dace.int64)
+        outer.add_array("A", [n_symbol], dace.float64)
+        outer.add_array("B", [n_symbol], dace.float64)
+
+        inner = dace.SDFG("inner_view_args")
+        inner.backend = dace.dtypes.BackendLanguage.Python
+        inner.add_symbol("M", dace.int64)
+        inner.add_array("X", [m_symbol], dace.float64)
+        inner.add_array("Y", [m_symbol], dace.float64)
+        istate = inner.add_state("is", is_start_block=True)
+        istate.add_edge(istate.add_read("X"), None, istate.add_write("Y"), None, dace.Memlet("X[0:M] -> [0:M]"))
+
+        ostate = outer.add_state("os", is_start_block=True)
+        nested = ostate.add_nested_sdfg(inner, {"X"}, {"Y"}, symbol_mapping={"M": "N - 2"})
+        ostate.add_edge(ostate.add_read("A"), None, nested, "X", dace.Memlet("A[1:N-1] -> [0:N-2]"))
+        ostate.add_edge(nested, "Y", ostate.add_write("B"), None, dace.Memlet("B[1:N-1] -> [0:N-2]"))
+
+        module = ast.parse(_combined_generated_code(outer))
+        functions = [node for node in ast.walk(module) if isinstance(node, ast.FunctionDef)]
+        outer_def = next(node for node in functions if node.name == outer.name)
+        helper_defs = {node.name: node for node in functions if node.name != outer.name}
+        helper_call = next(
+            node for node in ast.walk(outer_def)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in helper_defs
+        )
+        assert isinstance(helper_call.func, ast.Name)
+        helper_def = helper_defs[helper_call.func.id]
+
+        expected_arg_order = list(inner.arglist(scalars_only=False, free_symbols=inner.free_symbols).keys())
+        actual_arg_order = [arg.arg for arg in helper_def.args.args]
+        passed_args = dict(zip(actual_arg_order, helper_call.args))
+
+        assert actual_arg_order == expected_arg_order
+        assert ast.dump(passed_args["X"], include_attributes=False) == ast.dump(
+            ast.parse("A[1:N-1]", mode="eval").body, include_attributes=False)
+        assert ast.dump(passed_args["Y"], include_attributes=False) == ast.dump(
+            ast.parse("B[1:N-1]", mode="eval").body, include_attributes=False)
+        assert ast.dump(passed_args["M"], include_attributes=False) == ast.dump(
+            ast.parse("N-2", mode="eval").body, include_attributes=False)
+
+    def test_generate_code_nested_other_subset_validation_uses_connector_descriptor(self):
+        """Invalid other_subset on a NestedSDFG connector raises a structural validation error."""
+        outer = dace.SDFG("outer_other_subset_invalid")
+        outer.backend = dace.dtypes.BackendLanguage.Python
+        outer.add_array("A", [2, 2], dace.float64)
+        outer.add_array("B", [2, 2], dace.float64)
+
+        inner = dace.SDFG("inner_other_subset_invalid")
+        inner.backend = dace.dtypes.BackendLanguage.Python
+        inner.add_array("X", [2, 2], dace.float64)
+        inner.add_array("Y", [2, 2], dace.float64)
+        istate = inner.add_state("is", is_start_block=True)
+        istate.add_edge(istate.add_read("X"), None, istate.add_write("Y"), None, dace.Memlet("X[0:2, 0:2] -> [0:2, 0:2]"))
+
+        ostate = outer.add_state("os", is_start_block=True)
+        nested = ostate.add_nested_sdfg(inner, {"X"}, {"Y"})
+        ostate.add_edge(ostate.add_read("A"), None, nested, "X", dace.Memlet(data="A", subset="0:2, 0:2", other_subset="0:2"))
+        ostate.add_edge(nested, "Y", ostate.add_write("B"), None, dace.Memlet("B[0:2, 0:2] -> [0:2, 0:2]"))
+
+        with pytest.raises(InvalidSDFGEdgeError, match="Memlet other_subset does not match node dimension"):
+            outer.validate()
 
     # ------------------------------------------------------------------
     # Line 709: Array constant in generate_code defined_vars

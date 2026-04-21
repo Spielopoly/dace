@@ -6,10 +6,12 @@ and memory copies. Registers with the dispatcher as the node, map, array, and co
 handler for CPU storage types and sequential schedules.
 """
 import ast
+import copy
 import itertools
 from typing import TYPE_CHECKING
 
-from dace import data, dtypes
+from dace import data, dtypes, subsets, symbolic
+from dace.config import Config
 from dace.codegen.py.prettycode import PythonCodeIOStream
 from dace.codegen.target import TargetCodeGenerator
 from dace.codegen.dispatcher import TargetDispatcher
@@ -53,6 +55,224 @@ class PythonCodeGen(TargetCodeGenerator):
         # Register copy dispatchers for all CPU storage pairs
         for src_storage, dst_storage in itertools.product(cpu_storage, cpu_storage):
             dispatcher.register_copy_dispatcher(src_storage, dst_storage, None, self)
+
+        self._generated_nested_sdfg: dict[object, object] = {}
+
+    def _python_read_expr(self, name: str, desc: data.Data, subset) -> str:
+        if isinstance(desc, data.Scalar) or subset is None:
+            return name
+        return f"{name}[{subset}]"
+
+    def _python_write_target(self, name: str, desc: data.Data, subset) -> str:
+        if isinstance(desc, data.Scalar):
+            return name
+        if subset is None:
+            return f"{name}[...]"
+        return f"{name}[{subset}]"
+
+    def _is_python_view(self, desc: data.Data, subset) -> bool:
+        if isinstance(desc, data.Scalar):
+            return False
+        if subset is None:
+            return True
+        if isinstance(subset, subsets.SubsetUnion):
+            return False
+        return subset.data_dims() > 0
+
+    def _nested_temp_name(self, cfg: ControlFlowRegion, state_id: int, dfg: StateSubgraphView, node: nodes.NestedSDFG,
+                          connector: str) -> str:
+        return f"__dace_nested_{cfg.cfg_id}_{state_id}_{dfg.node_id(node)}_{connector}"
+
+    def _allocate_nested_temp(self, name: str, desc: data.Data, stream: PythonCodeIOStream, cfg: ControlFlowRegion,
+                              state_id: int, node: nodes.NestedSDFG) -> None:
+        if isinstance(desc, data.Scalar):
+            stream.write(f"{name} = numpy.{desc.dtype.to_string()}(0)", cfg, state_id, node)
+            return
+        if isinstance(desc, data.Array):
+            shape = ", ".join(symbolic.symstr(s) for s in desc.shape)
+            stream.write(f"{name} = numpy.zeros(({shape},), dtype=numpy.{desc.dtype.to_string()})", cfg, state_id,
+                         node)
+            return
+        raise NotImplementedError(f"Python backend: cannot create temporary for {type(desc).__name__}")
+
+    def _same_outer_access(self, in_edge: MultiConnectorEdge[Memlet], out_edge: MultiConnectorEdge[Memlet]) -> bool:
+        if in_edge.data.data != out_edge.data.data:
+            return False
+        src_subset = '' if in_edge.data.src_subset is None else str(in_edge.data.src_subset)
+        dst_subset = '' if out_edge.data.dst_subset is None else str(out_edge.data.dst_subset)
+        return src_subset == dst_subset
+
+    def _is_single_value_array(self, desc: data.Data) -> bool:
+        if not isinstance(desc, data.Array):
+            return False
+        return all((dim == 1) == True for dim in desc.shape)
+
+    def _temp_init_target(self, name: str, desc: data.Data, subset) -> str:
+        if isinstance(desc, data.Array) and subset is None and self._is_single_value_array(desc):
+            return f"{name}.flat[0]"
+        return self._python_write_target(name, desc, subset)
+
+    def _temp_result_expr(self, name: str, desc: data.Data, subset, scalarize: bool) -> str:
+        if isinstance(desc, data.Array) and subset is None and scalarize and self._is_single_value_array(desc):
+            return f"{name}.flat[0]"
+        return self._python_read_expr(name, desc, subset)
+
+    def _nested_symbol_replacements(self, node: nodes.NestedSDFG) -> dict[object, object]:
+        replacements: dict[object, object] = {}
+        for name, value in node.symbol_mapping.items():
+            replacements[symbolic.pystr_to_symbolic(name)] = symbolic.pystr_to_symbolic(value)
+        return replacements
+
+    def _mapped_rebased_connector_subset(self, desc: data.Data, node: nodes.NestedSDFG):
+        if not hasattr(desc, 'shape'):
+            return None
+
+        replacements = self._nested_symbol_replacements(node)
+        ranges = []
+        for extent in desc.shape:
+            mapped_extent = symbolic.pystr_to_symbolic(extent)
+            if replacements and symbolic.issymbolic(mapped_extent):
+                mapped_extent = mapped_extent.subs(replacements)
+            ranges.append((0, mapped_extent - 1, 1))
+        return subsets.Range(ranges)
+
+    def _is_rebased_full_connector_view(self, desc: data.Data, node: nodes.NestedSDFG, subset) -> bool:
+        if subset is None:
+            return True
+        if isinstance(subset, subsets.SubsetUnion):
+            return False
+
+        expected_subset = self._mapped_rebased_connector_subset(desc, node)
+        if expected_subset is None:
+            return False
+
+        actual_subset = copy.deepcopy(subset)
+        try:
+            return expected_subset.covers_precise(actual_subset) and actual_subset.covers_precise(expected_subset)
+        except (AttributeError, TypeError, ValueError):
+            return False
+
+    def _build_nested_data_binding(self, sdfg: SDFG, cfg: ControlFlowRegion, dfg: StateSubgraphView, state_id: int,
+                                   node: nodes.NestedSDFG, connector: str,
+                                   in_edge: MultiConnectorEdge[Memlet] | None,
+                                   out_edge: MultiConnectorEdge[Memlet] | None) -> tuple[str, list[str], list[str]]:
+        inner_desc = node.sdfg.arrays[connector]
+        prelude: list[str] = []
+        postlude: list[str] = []
+
+        if in_edge is not None:
+            outer_src_desc = sdfg.arrays[in_edge.data.data]
+            input_expr = self._python_read_expr(in_edge.data.data, outer_src_desc, in_edge.data.src_subset)
+            input_is_direct = self._is_python_view(outer_src_desc, in_edge.data.src_subset)
+            input_is_safe_view = isinstance(inner_desc, data.Array) and self._is_rebased_full_connector_view(
+                inner_desc, node, in_edge.data.dst_subset)
+        else:
+            outer_src_desc = None
+            input_expr = None
+            input_is_direct = False
+            input_is_safe_view = False
+
+        if out_edge is not None:
+            outer_dst_desc = sdfg.arrays[out_edge.data.data]
+            output_expr = self._python_read_expr(out_edge.data.data, outer_dst_desc, out_edge.data.dst_subset)
+            output_target = self._python_write_target(out_edge.data.data, outer_dst_desc, out_edge.data.dst_subset)
+            output_is_direct = self._is_python_view(outer_dst_desc, out_edge.data.dst_subset)
+            output_is_safe_view = isinstance(inner_desc, data.Array) and self._is_rebased_full_connector_view(
+                inner_desc, node, out_edge.data.src_subset)
+        else:
+            outer_dst_desc = None
+            output_expr = None
+            output_target = None
+            output_is_direct = False
+            output_is_safe_view = False
+
+        if in_edge is not None and out_edge is not None:
+            if (isinstance(inner_desc, data.Array) and input_is_direct and output_is_direct
+                    and input_is_safe_view and output_is_safe_view and self._same_outer_access(in_edge, out_edge)):
+                return input_expr, prelude, postlude
+
+            temp_name = self._nested_temp_name(cfg, state_id, dfg, node, connector)
+            temp_stream = PythonCodeIOStream()
+            self._allocate_nested_temp(temp_name, inner_desc, temp_stream, cfg, state_id, node)
+            prelude.extend(line for line in temp_stream.getvalue().splitlines() if line.strip())
+            init_target = self._temp_init_target(temp_name, inner_desc, in_edge.data.dst_subset)
+            prelude.append(f"{init_target} = {input_expr}")
+            result_expr = self._temp_result_expr(temp_name, inner_desc, out_edge.data.src_subset,
+                                                 scalarize=not output_is_direct)
+            postlude.append(f"{output_target} = {result_expr}")
+            return temp_name, prelude, postlude
+
+        if in_edge is not None:
+            if isinstance(inner_desc, data.Scalar) or (input_is_direct and input_is_safe_view):
+                return input_expr, prelude, postlude
+
+            temp_name = self._nested_temp_name(cfg, state_id, dfg, node, connector)
+            temp_stream = PythonCodeIOStream()
+            self._allocate_nested_temp(temp_name, inner_desc, temp_stream, cfg, state_id, node)
+            prelude.extend(line for line in temp_stream.getvalue().splitlines() if line.strip())
+            init_target = self._temp_init_target(temp_name, inner_desc, in_edge.data.dst_subset)
+            prelude.append(f"{init_target} = {input_expr}")
+            return temp_name, prelude, postlude
+
+        if out_edge is not None:
+            if isinstance(inner_desc, data.Array) and output_is_direct and output_is_safe_view:
+                return output_expr, prelude, postlude
+
+            temp_name = self._nested_temp_name(cfg, state_id, dfg, node, connector)
+            temp_stream = PythonCodeIOStream()
+            self._allocate_nested_temp(temp_name, inner_desc, temp_stream, cfg, state_id, node)
+            prelude.extend(line for line in temp_stream.getvalue().splitlines() if line.strip())
+            result_expr = self._temp_result_expr(temp_name, inner_desc, out_edge.data.src_subset,
+                                                 scalarize=not output_is_direct)
+            postlude.append(f"{output_target} = {result_expr}")
+            return temp_name, prelude, postlude
+
+        raise KeyError(f"Connector {connector} is not connected on NestedSDFG {node.label}")
+
+    def _nested_sdfg_label(self, cfg: ControlFlowRegion, state_id: int, dfg: StateSubgraphView,
+                           node: nodes.NestedSDFG) -> tuple[str, bool]:
+        unique_functions_conf = Config.get('compiler', 'unique_functions')
+
+        if unique_functions_conf is True:
+            unique_functions_conf = 'hash'
+        elif unique_functions_conf is False:
+            unique_functions_conf = 'none'
+
+        if unique_functions_conf == 'hash':
+            unique_functions = True
+            unique_functions_hash = True
+        elif unique_functions_conf == 'unique_name':
+            unique_functions = True
+            unique_functions_hash = False
+        elif unique_functions_conf == 'none':
+            unique_functions = False
+            unique_functions_hash = False
+        else:
+            raise ValueError(f"Unknown unique_functions configuration: {unique_functions_conf}")
+
+        if unique_functions and not unique_functions_hash and node.unique_name:
+            sdfg_label = node.unique_name
+        else:
+            sdfg_label = f"{node.sdfg.name}_{cfg.cfg_id}_{state_id}_{dfg.node_id(node)}"
+
+        code_already_generated = False
+        if unique_functions:
+            sdfg_hash = node.sdfg.hash_sdfg()
+            if unique_functions_hash:
+                if sdfg_hash in self._generated_nested_sdfg:
+                    code_already_generated = True
+                    sdfg_label = self._generated_nested_sdfg[sdfg_hash]
+                else:
+                    self._generated_nested_sdfg[sdfg_hash] = sdfg_label
+            else:
+                if sdfg_label in self._generated_nested_sdfg:
+                    code_already_generated = True
+                    if sdfg_hash != self._generated_nested_sdfg[sdfg_label]:
+                        raise ValueError(f"Different Nested SDFGs have the same unique name: {sdfg_label}")
+                else:
+                    self._generated_nested_sdfg[sdfg_label] = sdfg_hash
+
+        return sdfg_label, code_already_generated
 
     # =========================================================================
     # Node dispatch
@@ -153,6 +373,79 @@ class PythonCodeGen(TargetCodeGenerator):
                 callsite_stream.write(f"{memlet.data} = {connector}", cfg, state_id, node)
             else:
                 callsite_stream.write(f"{memlet.data}[{memlet.subset}] = {connector}", cfg, state_id, node)
+
+    def _generate_NestedSDFG(self, sdfg: SDFG, cfg: ControlFlowRegion, dfg: StateSubgraphView, state_id: int,
+                             node: nodes.NestedSDFG, function_stream: PythonCodeIOStream,
+                             callsite_stream: PythonCodeIOStream) -> None:
+        state = cfg.nodes()[state_id]
+        sdfg_label, code_already_generated = self._nested_sdfg_label(cfg, state_id, dfg, node)
+
+        in_edges = {
+            edge.dst_conn: edge
+            for edge in sorted(state.in_edges(node), key=lambda edge: edge.dst_conn or '')
+            if edge.dst_conn is not None and edge.data.data is not None
+        }
+        out_edges = {
+            edge.src_conn: edge
+            for edge in sorted(state.out_edges(node), key=lambda edge: edge.src_conn or '')
+            if edge.src_conn is not None and edge.data.data is not None
+        }
+
+        fsyms = self._frame.free_symbols(node.sdfg)
+        arglist = node.sdfg.arglist(scalars_only=False, free_symbols=fsyms)
+        used_symbols = node.sdfg.used_symbols(all_symbols=False, keep_defined_in_mapping=True)
+
+        signature_args: list[str] = []
+        call_args: list[str] = []
+        prelude: list[str] = []
+        postlude: list[str] = []
+        returned_scalars: list[str] = []
+
+        for arg_name in arglist.keys():
+            if arg_name in in_edges or arg_name in out_edges:
+                arg_expr, arg_prelude, arg_postlude = self._build_nested_data_binding(sdfg, cfg, dfg, state_id, node,
+                                                                                      arg_name, in_edges.get(arg_name),
+                                                                                      out_edges.get(arg_name))
+                signature_args.append(arg_name)
+                call_args.append(arg_expr)
+                prelude.extend(arg_prelude)
+                postlude.extend(arg_postlude)
+                if arg_name in out_edges and isinstance(node.sdfg.arrays[arg_name], data.Scalar):
+                    returned_scalars.append(arg_expr)
+            elif arg_name in node.symbol_mapping and arg_name in used_symbols and arg_name not in sdfg.constants:
+                signature_args.append(arg_name)
+                call_args.append(symbolic.symstr(node.symbol_mapping[arg_name]))
+
+        for stmt in prelude:
+            callsite_stream.write(stmt, cfg, state_id, node)
+
+        if not code_already_generated:
+            global_code, local_code, _, used_environments = self._frame.generate_code(node.sdfg, None, sdfg_label)
+            self._dispatcher._used_environments |= used_environments
+
+            function_stream.write(global_code)
+            function_stream.write(f"def {sdfg_label}({', '.join(signature_args)}):", cfg, state_id, node)
+            with function_stream.indented():
+                self._frame.generate_constants(node.sdfg, function_stream)
+                if local_code.strip():
+                    function_stream.write(local_code)
+                if returned_scalars:
+                    function_stream.write(f"return {', '.join(name for name in signature_args if name in out_edges and isinstance(node.sdfg.arrays[name], data.Scalar))}", cfg, state_id, node)
+                elif not local_code.strip():
+                    function_stream.write('pass', cfg, state_id, node)
+            function_stream.write('', cfg, state_id, node)
+
+        call_expr = f"{sdfg_label}({', '.join(call_args)})"
+        if returned_scalars:
+            if len(returned_scalars) == 1:
+                callsite_stream.write(f"{returned_scalars[0]} = {call_expr}", cfg, state_id, node)
+            else:
+                callsite_stream.write(f"{', '.join(returned_scalars)} = {call_expr}", cfg, state_id, node)
+        else:
+            callsite_stream.write(call_expr, cfg, state_id, node)
+
+        for stmt in postlude:
+            callsite_stream.write(stmt, cfg, state_id, node)
 
     # =========================================================================
     # Scope (map) generation

@@ -398,6 +398,16 @@ def _is_scalar(edge: 'gr.MultiConnectorEdge[Memlet]', memlet_path: List['gr.Mult
     return True
 
 
+def _resolve_memlet_path_endpoint_descriptor(sdfg: 'dace.sdfg.SDFG', node, connector):
+    from dace.sdfg import nodes as nd
+
+    if isinstance(node, nd.AccessNode):
+        return sdfg.arrays[node.data]
+    if isinstance(node, nd.NestedSDFG) and node.sdfg is not None and connector is not None:
+        return node.sdfg.arrays.get(connector)
+    return None
+
+
 def validate_state(state: 'dace.sdfg.SDFGState',
                    state_id: int = None,
                    sdfg: 'dace.sdfg.SDFG' = None,
@@ -776,8 +786,6 @@ def validate_state(state: 'dace.sdfg.SDFGState',
         if e.data.data is not None and e.data.allow_oob == False:
             subset_node = (dst_node
                            if isinstance(dst_node, nd.AccessNode) and e.data.data == dst_node.data else src_node)
-            other_subset_node = (dst_node
-                                 if isinstance(dst_node, nd.AccessNode) and e.data.data != dst_node.data else src_node)
 
             if isinstance(subset_node, nd.AccessNode):
                 arr = sdfg.arrays[e.data.data]
@@ -802,8 +810,11 @@ def validate_state(state: 'dace.sdfg.SDFGState',
                         raise InvalidSDFGEdgeError("Memlet subset out-of-bounds", sdfg, state_id, eid)
 
             # Test other_subset as well
-            if e.data.other_subset is not None and isinstance(other_subset_node, nd.AccessNode):
-                arr = sdfg.arrays[other_subset_node.data]
+            other_subset_node = dst_node if subset_node is src_node else src_node
+            other_subset_desc = _resolve_memlet_path_endpoint_descriptor(
+                sdfg, other_subset_node, path[-1].dst_conn if subset_node is src_node else path[0].src_conn)
+            if e.data.other_subset is not None and other_subset_desc is not None:
+                arr = other_subset_desc
                 # Dimensionality
                 if e.data.other_subset.dims() != len(arr.shape):
                     raise InvalidSDFGEdgeError(
@@ -882,24 +893,30 @@ def validate_state(state: 'dace.sdfg.SDFGState',
 
         # Verify that source and destination subsets contain the same
         # number of elements
-        if not e.data.allow_oob and e.data.other_subset is not None and not (
-            (isinstance(src_node, nd.AccessNode) and isinstance(sdfg.arrays[src_node.data], dt.Stream)) or
-            (isinstance(dst_node, nd.AccessNode) and isinstance(sdfg.arrays[dst_node.data], dt.Stream))):
-            src_expr = (e.data.src_subset.num_elements() * sdfg.arrays[src_node.data].veclen)
-            dst_expr = (e.data.dst_subset.num_elements() * sdfg.arrays[dst_node.data].veclen)
-            if symbolic.inequal_symbols(src_expr, dst_expr):
-                error = InvalidSDFGEdgeError('Dimensionality mismatch between src/dst subsets', sdfg, state_id, eid)
-                # NOTE: Make an exception for Views and reference sets
-                from dace.sdfg import utils
-                if (isinstance(sdfg.arrays[src_node.data], dt.View) and utils.get_view_edge(state, src_node) is e):
-                    warnings.warn(error.message)
-                    continue
-                if (isinstance(sdfg.arrays[dst_node.data], dt.View) and utils.get_view_edge(state, dst_node) is e):
-                    warnings.warn(error.message)
-                    continue
-                if e.dst_conn == 'set':
-                    continue
-                raise error
+        if not e.data.allow_oob and e.data.other_subset is not None:
+            src_desc = _resolve_memlet_path_endpoint_descriptor(sdfg, src_node, path[0].src_conn)
+            dst_desc = _resolve_memlet_path_endpoint_descriptor(sdfg, dst_node, path[-1].dst_conn)
+
+            if src_desc is not None and dst_desc is not None and not (
+                    isinstance(src_desc, dt.Stream) or isinstance(dst_desc, dt.Stream)):
+                src_expr = (e.data.src_subset.num_elements() * src_desc.veclen)
+                dst_expr = (e.data.dst_subset.num_elements() * dst_desc.veclen)
+                if symbolic.inequal_symbols(src_expr, dst_expr):
+                    error = InvalidSDFGEdgeError('Dimensionality mismatch between src/dst subsets', sdfg, state_id,
+                                                 eid)
+                    # NOTE: Make an exception for Views and reference sets
+                    from dace.sdfg import utils
+                    if isinstance(src_node, nd.AccessNode) and isinstance(src_desc, dt.View):
+                        if utils.get_view_edge(state, src_node) is e:
+                            warnings.warn(error.message)
+                            continue
+                    if isinstance(dst_node, nd.AccessNode) and isinstance(dst_desc, dt.View):
+                        if utils.get_view_edge(state, dst_node) is e:
+                            warnings.warn(error.message)
+                            continue
+                    if e.dst_conn == 'set':
+                        continue
+                    raise error
 
     if Config.get_bool('experimental.check_race_conditions'):
         node_labels = []

@@ -18,6 +18,11 @@
   - Library nodes and environments: [dace/libraries](../dace/libraries)
 - Prefer following existing local patterns in the touched submodule rather than introducing new cross-cutting abstractions.
 
+## Python Backend
+- Python NestedSDFG lowering lives in [dace/codegen/py/python_target.py](../dace/codegen/py/python_target.py); reuse the existing recursive helper-function generation path instead of introducing a separate lowering pipeline.
+- For Python NestedSDFG connectors, pass arrays and slices directly only when the connector mapping resolves to a zero-based full view after symbol substitution. Reindexed, offset, scalar, or elementwise memlets must go through a temporary plus copy-back to preserve semantics.
+- Targeted regression coverage for this area lives in [tests/codegen/python_backend/test_framecode_unit.py](../tests/codegen/python_backend/test_framecode_unit.py), [tests/codegen/python_backend/test_integration_complex.py](../tests/codegen/python_backend/test_integration_complex.py), [tests/codegen/python_backend/test_integration_numpy.py](../tests/codegen/python_backend/test_integration_numpy.py), and [tests/codegen/python_backend/test_node_generation.py](../tests/codegen/python_backend/test_node_generation.py).
+
 ## Build and Test
 - **IMPORTANT: Never create a new Python environment. Always reuse `/venv/main`.**
 - Use the workspace virtual environment for Python commands in terminals:

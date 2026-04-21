@@ -145,7 +145,7 @@ class DaCePythonCodeGenerator(object):
         for cstname, (csttype, cstval) in sdfg.constants_prop.items():
             if isinstance(csttype, data.Array):
                 # TODO: Multidimensional arrays
-                const_str = cstname + " = [" + ', '.join(str(it[0]) for it in np.nditer(cstval, order='C')) + "]"
+                const_str = cstname + " = [" + ', '.join(str(it.item()) for it in np.nditer(cstval, order='C')) + "]"
                 callsite_stream.write(const_str, sdfg)
             else:
                 callsite_stream.write(f"{cstname} = {cstval}", sdfg)

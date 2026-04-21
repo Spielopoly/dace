@@ -491,13 +491,13 @@ def test_transient_array_intermediate():
     np.testing.assert_allclose(b, a)
 
 
-@pytest.mark.xfail(strict=True, reason='Python backend has no code generator for NestedSDFG nodes.')
-def test_nested_sdfg_xfail():
+def test_nested_sdfg_simple():
     outer = _new_sdfg('outer_nested')
     outer.add_array('A', [1], dace.float64)
     outer.add_array('B', [1], dace.float64)
 
     inner = SDFG('inner_nested')
+    inner.backend = BackendLanguage.Python
     inner.add_array('X', [1], dace.float64)
     inner.add_array('Y', [1], dace.float64)
     inner_state = inner.add_state(is_start_block=True)
@@ -514,6 +514,34 @@ def test_nested_sdfg_xfail():
     b = np.zeros(1, dtype=np.float64)
     _run_sdfg(outer, A=a, B=b)
     np.testing.assert_allclose(b, np.array([4.0], dtype=np.float64))
+
+
+def test_nested_sdfg_scalar_memlet_copy_back():
+    outer = _new_sdfg('outer_nested_scalar')
+    outer.add_array('A', [4], dace.int64)
+    outer.add_array('B', [4], dace.int64)
+
+    inner = SDFG('inner_nested_scalar')
+    inner.backend = BackendLanguage.Python
+    inner.add_scalar('X', dace.int64)
+    inner.add_scalar('Y', dace.int64)
+    inner_state = inner.add_state(is_start_block=True)
+    tasklet = inner_state.add_tasklet('scale', {'inp'}, {'out'}, 'out = inp * 3 + 1')
+    inner_state.add_edge(inner_state.add_read('X'), None, tasklet, 'inp', dace.Memlet('X'))
+    inner_state.add_edge(tasklet, 'out', inner_state.add_write('Y'), None, dace.Memlet('Y'))
+
+    state = outer.add_state(is_start_block=True)
+    nested = state.add_nested_sdfg(inner, {'X'}, {'Y'})
+    state.add_edge(state.add_read('A'), None, nested, 'X', dace.Memlet('A[2]'))
+    state.add_edge(nested, 'Y', state.add_write('B'), None, dace.Memlet('B[1]'))
+
+    a = np.array([4, -2, 7, 5], dtype=np.int64)
+    b = np.zeros(4, dtype=np.int64)
+    _run_sdfg(outer, A=a, B=b)
+
+    expected = np.zeros(4, dtype=np.int64)
+    expected[1] = a[2] * 3 + 1
+    np.testing.assert_array_equal(b, expected)
 
 
 @pytest.mark.xfail(strict=True, reason='Python backend rebinds scalar outputs locally and does not write them back to the caller.')

@@ -346,13 +346,13 @@ def test_loop_region_zero_iterations():
     np.testing.assert_array_equal(a, np.zeros(0, dtype=np.int64))
 
 
-@pytest.mark.xfail(strict=True, reason='Python backend has no code generator for NestedSDFG nodes.')
-def test_nested_sdfg_simple_xfail():
+def test_nested_sdfg_simple():
     outer = _new_sdfg('outer_nested_simple')
     outer.add_array('A', [1], dace.float64)
     outer.add_array('B', [1], dace.float64)
 
     inner = SDFG('inner_nested_simple')
+    inner.backend = BackendLanguage.Python
     inner.add_array('X', [1], dace.float64)
     inner.add_array('Y', [1], dace.float64)
     inner_state = inner.add_state(is_start_block=True)
@@ -368,10 +368,10 @@ def test_nested_sdfg_simple_xfail():
     a = np.array([2.0], dtype=np.float64)
     b = np.zeros(1, dtype=np.float64)
     _run_sdfg(outer, A=a, B=b)
+    np.testing.assert_allclose(b, np.array([3.0], dtype=np.float64))
 
 
-@pytest.mark.xfail(strict=True, reason='Python backend has no code generator for NestedSDFG nodes, including symbol-mapped nested graphs.')
-def test_nested_sdfg_with_symbols_xfail():
+def test_nested_sdfg_with_symbols():
     n_symbol = dace.symbol('N')
     outer = _new_sdfg('outer_nested_symbols')
     outer.add_symbol('N', dace.int64)
@@ -379,6 +379,7 @@ def test_nested_sdfg_with_symbols_xfail():
     outer.add_array('B', [n_symbol], dace.float64)
 
     inner = SDFG('inner_nested_symbols')
+    inner.backend = BackendLanguage.Python
     inner.add_symbol('N', dace.int64)
     inner.add_array('X', [n_symbol], dace.float64)
     inner.add_array('Y', [n_symbol], dace.float64)
@@ -394,6 +395,65 @@ def test_nested_sdfg_with_symbols_xfail():
     a = np.arange(n, dtype=np.float64)
     b = np.zeros(n, dtype=np.float64)
     _run_sdfg(outer, A=a, B=b, N=n)
+    np.testing.assert_allclose(b, a)
+
+
+def test_nested_sdfg_slice_view_symbol_mapping():
+    n_symbol = dace.symbol('N')
+    m_symbol = dace.symbol('M')
+    outer = _new_sdfg('outer_nested_slice_view')
+    outer.add_symbol('N', dace.int64)
+    outer.add_array('A', [n_symbol], dace.float64)
+    outer.add_array('B', [n_symbol], dace.float64)
+
+    inner = SDFG('inner_nested_slice_view')
+    inner.backend = BackendLanguage.Python
+    inner.add_symbol('M', dace.int64)
+    inner.add_array('X', [m_symbol], dace.float64)
+    inner.add_array('Y', [m_symbol], dace.float64)
+    inner_state = inner.add_state(is_start_block=True)
+    inner_state.add_edge(inner_state.add_read('X'), None, inner_state.add_write('Y'), None, dace.Memlet('X[0:M] -> [0:M]'))
+
+    state = outer.add_state(is_start_block=True)
+    nested = state.add_nested_sdfg(inner, {'X'}, {'Y'}, symbol_mapping={'M': 'N - 2'})
+    state.add_edge(state.add_read('A'), None, nested, 'X', dace.Memlet('A[1:N-1] -> [0:N-2]'))
+    state.add_edge(nested, 'Y', state.add_write('B'), None, dace.Memlet('B[1:N-1] -> [0:N-2]'))
+
+    n = 6
+    a = np.linspace(-1.5, 2.5, n)
+    b = np.zeros(n, dtype=np.float64)
+    _run_sdfg(outer, A=a, B=b, N=n)
+
+    expected = np.zeros(n, dtype=np.float64)
+    expected[1:-1] = a[1:-1]
+    np.testing.assert_allclose(b, expected)
+
+
+def test_nested_sdfg_inout_reindexing_uses_temp_mapping():
+    outer = _new_sdfg('outer_nested_inout_reindex')
+    outer.add_array('A', [3], dace.int64)
+    outer.add_array('B', [3], dace.int64)
+
+    inner = SDFG('inner_nested_inout_reindex')
+    inner.backend = BackendLanguage.Python
+    inner.add_array('X', [4], dace.int64)
+    inner.add_array('Y', [4], dace.int64)
+    inner_state = inner.add_state(is_start_block=True)
+    for index in range(1, 4):
+        tasklet = inner_state.add_tasklet(f'shift_{index}', {'inp'}, {'out'}, 'out = inp + 100')
+        inner_state.add_edge(inner_state.add_read('X'), None, tasklet, 'inp', dace.Memlet(f'X[{index}]'))
+        inner_state.add_edge(tasklet, 'out', inner_state.add_write('Y'), None, dace.Memlet(f'Y[{index}]'))
+
+    state = outer.add_state(is_start_block=True)
+    nested = state.add_nested_sdfg(inner, {'X'}, {'Y'})
+    state.add_edge(state.add_read('A'), None, nested, 'X', dace.Memlet('A[0:3] -> [1:4]'))
+    state.add_edge(nested, 'Y', state.add_write('B'), None, dace.Memlet('B[0:3] -> [1:4]'))
+
+    a = np.array([10, 20, 30], dtype=np.int64)
+    b = np.zeros(3, dtype=np.int64)
+    _run_sdfg(outer, A=a, B=b)
+
+    np.testing.assert_array_equal(b, np.array([110, 120, 130], dtype=np.int64))
 
 
 @pytest.mark.xfail(strict=True, reason='Mapped computations inside Python-backend control flow still fail because MapExit dispatch is unsupported.')
