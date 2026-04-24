@@ -420,7 +420,6 @@ def test_complex_fixed_index_computation():
     np.testing.assert_allclose(b, expected)
 
 
-@pytest.mark.xfail(strict=True, reason='Python backend dispatches MapExit nodes and raises NotImplementedError for mapped computations.')
 def test_map_elementwise_add_xfail():
     sdfg = _new_sdfg('map_elementwise')
     sdfg.add_array('A', [4], dace.float64)
@@ -441,30 +440,52 @@ def test_map_elementwise_add_xfail():
     np.testing.assert_allclose(c, a + b)
 
 
-@pytest.mark.xfail(strict=True, reason='Python backend reduction or WCR code generation currently fails for end-to-end execution.')
-def test_sum_reduction_xfail():
+def test_sum_reduction():
     sdfg = _new_sdfg('reduction_sum')
     sdfg.add_array('A', [4], dace.float64)
     sdfg.add_array('out', [1], dace.float64)
 
     state = sdfg.add_state(is_start_block=True)
-    init = state.add_tasklet('init', {}, {'out'}, 'out = 0.0')
-    state.add_edge(init, 'out', state.add_write('out'), None, dace.Memlet('out[0]'))
+    init = state.add_tasklet('init', {}, {'result'}, 'result = 0.0')
+    state.add_edge(init, 'result', state.add_write('out'), None, dace.Memlet('out[0]'))
 
     map_entry, map_exit = state.add_map('m', {'i': '0:4'}, schedule=ScheduleType.Sequential)
-    tasklet = state.add_tasklet('accumulate', {'inp'}, {'out'}, 'out = inp')
+    tasklet = state.add_tasklet('accumulate', {'inp'}, {'result'}, 'result = inp')
     state.add_memlet_path(state.add_read('A'), map_entry, tasklet, dst_conn='inp', memlet=dace.Memlet('A[i]'))
     state.add_memlet_path(
         tasklet,
         map_exit,
         state.add_write('out'),
-        src_conn='out',
+        src_conn='result',
         memlet=dace.Memlet('out[0]', wcr='lambda x, y: x + y'),
     )
 
     a = np.arange(4, dtype=np.float64)
     out = np.zeros(1, dtype=np.float64)
     _run_sdfg(sdfg, A=a, out=out)
+    np.testing.assert_allclose(out, np.array([6.0], dtype=np.float64))
+
+
+def test_scalar_descriptor_wcr_writeback():
+    sdfg = _new_sdfg('scalar_wcr_writeback')
+    sdfg.add_array('A', [4], dace.float64)
+    sdfg.add_scalar('out', dace.float64)
+
+    state = sdfg.add_state(is_start_block=True)
+    init = state.add_tasklet('init', {}, {'result'}, 'result = 0.0')
+    state.add_edge(init, 'result', state.add_write('out'), None, dace.Memlet('out'))
+
+    a_read = state.add_read('A')
+    out_write = state.add_write('out')
+    for index in range(4):
+        tasklet = state.add_tasklet(f'accumulate_{index}', {'inp'}, {'result'}, 'result = inp')
+        state.add_edge(a_read, None, tasklet, 'inp', dace.Memlet(f'A[{index}]'))
+        state.add_edge(tasklet, 'result', out_write, None, dace.Memlet('out', wcr='lambda x, y: x + y'))
+
+    a = np.arange(4, dtype=np.float64)
+    out = np.zeros(1, dtype=np.float64)
+    _run_sdfg(sdfg, A=a, out=out)
+    np.testing.assert_allclose(out, np.array([6.0], dtype=np.float64))
 
 
 def test_transient_array_intermediate():
@@ -491,8 +512,7 @@ def test_transient_array_intermediate():
     np.testing.assert_allclose(b, a)
 
 
-@pytest.mark.xfail(strict=True, reason='Python backend has no code generator for NestedSDFG nodes.')
-def test_nested_sdfg_xfail():
+def test_nested_sdfg():
     outer = _new_sdfg('outer_nested')
     outer.add_array('A', [1], dace.float64)
     outer.add_array('B', [1], dace.float64)
@@ -516,8 +536,7 @@ def test_nested_sdfg_xfail():
     np.testing.assert_allclose(b, np.array([4.0], dtype=np.float64))
 
 
-@pytest.mark.xfail(strict=True, reason='Python backend rebinds scalar outputs locally and does not write them back to the caller.')
-def test_scalar_descriptor_output_xfail():
+def test_scalar_descriptor_output():
     sdfg = _new_sdfg('scalar_output')
     sdfg.add_scalar('lhs', dace.float64)
     sdfg.add_scalar('rhs', dace.float64)
@@ -534,11 +553,7 @@ def test_scalar_descriptor_output_xfail():
     np.testing.assert_allclose(out, np.array([6.5], dtype=np.float64))
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason='Python backend still treats names assigned in SDFG-level global_code as free symbols during argument collection.',
-)
-def test_global_code_xfail():
+def test_global_code():
     sdfg = _new_sdfg('global_code')
     sdfg.add_array('A', [1], dace.int64)
     sdfg.global_code[None] = CodeBlock('GLOBAL_SENTINEL = 9')

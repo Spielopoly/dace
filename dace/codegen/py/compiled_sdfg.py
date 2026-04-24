@@ -21,6 +21,8 @@ class PythonCompiledSDFG:
         from dace.sdfg import SDFG
         self._sdfg: SDFG = sdfg
         self._code: str = code
+        self._initialized = False
+        self._finalized = False
 
         # Execute the generated code in an isolated namespace
         self._namespace: Dict[str, Any] = {}
@@ -33,6 +35,8 @@ class PythonCompiledSDFG:
                 f"Generated Python code does not define function '{func_name}'"
             )
         self._func = self._namespace[func_name]
+        self._init = self._namespace.get(f'__dace_init_{func_name}')
+        self._exit = self._namespace.get(f'__dace_exit_{func_name}')
 
     @property
     def sdfg(self):
@@ -42,8 +46,31 @@ class PythonCompiledSDFG:
     def code(self) -> str:
         return self._code
 
+    def initialize(self, *args, **kwargs):
+        if self._initialized:
+            return
+        if self._init is not None:
+            self._init(*args, **kwargs)
+        self._initialized = True
+        self._finalized = False
+
+    def finalize(self):
+        if self._finalized:
+            return
+        if self._exit is not None:
+            self._exit()
+        self._initialized = False
+        self._finalized = True
+
     def __call__(self, *args, **kwargs):
+        self.initialize(*args, **kwargs)
         return self._func(*args, **kwargs)
+
+    def __del__(self):
+        try:
+            self.finalize()
+        except Exception:
+            pass
 
 
 def compile_python_sdfg(sdfg, code_objects: 'list[CodeObject]') -> PythonCompiledSDFG:

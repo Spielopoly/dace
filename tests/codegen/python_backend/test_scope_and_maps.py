@@ -3,12 +3,6 @@
 
 Covers generate_scope for single/multi-param maps, stepped maps,
 symbolic bounds, nested maps, and end-to-end correctness.
-
-NOTE: All tests in this file are expected to fail (xfail) because
-python_target.py's generate_scope calls dispatch_subgraph with
-skip_entry_node=True but NOT skip_exit_node=True, so MapExit gets
-dispatched to generate_node which has no _generate_MapExit handler.
-The C++ backend (cpu.py) handles this by having a _generate_MapExit method.
 """
 import pytest
 import numpy as np
@@ -19,11 +13,8 @@ from dace.dtypes import ScheduleType
 from dace.sdfg import SDFG
 from dace.memlet import Memlet
 
-_MAP_XFAIL = pytest.mark.xfail(
-    reason="MapExit not handled by PythonCodeGen.generate_node (missing _generate_MapExit)",
-    raises=NotImplementedError,
-    strict=True,
-)
+def _MAP_XFAIL(func):
+    return func
 
 
 def _make_python_sdfg(name: str) -> SDFG:
@@ -302,6 +293,33 @@ class TestMapCorrectness:
         B = np.zeros(N_val, dtype=np.float64)
         csdfg(A=A, B=B, N=N_val)
         np.testing.assert_allclose(B, A + 1)
+
+    @_MAP_XFAIL
+    def test_map_symbolic_negative_step_runtime(self):
+        """A symbolic map step can be negative at runtime and still iterates correctly."""
+        sdfg = _make_python_sdfg('test_symbolic_negative_step_runtime')
+        sdfg.add_symbol('START', dace.int64)
+        sdfg.add_symbol('STOP', dace.int64)
+        sdfg.add_symbol('STEP', dace.int64)
+        sdfg.add_array('A', [6], dace.float64)
+        sdfg.add_array('B', [6], dace.float64)
+        state = sdfg.add_state('s')
+        map_entry, map_exit = state.add_map('m', {'i': 'START:STOP:STEP'}, schedule=ScheduleType.Sequential)
+        tasklet = state.add_tasklet('copy', {'inp'}, {'out'}, 'out = inp')
+        state.add_memlet_path(state.add_read('A'), map_entry, tasklet, dst_conn='inp', memlet=Memlet(data='A', subset='i'))
+        state.add_memlet_path(tasklet, map_exit, state.add_write('B'), src_conn='out', memlet=Memlet(data='B', subset='i'))
+
+        generated_code = sdfg.generate_code()[0].code
+        assert 'if (STEP) > 0 else' in generated_code
+
+        compiled_sdfg = sdfg.compile()
+        a = np.arange(6, dtype=np.float64)
+        b = np.zeros(6, dtype=np.float64)
+        compiled_sdfg(A=a, B=b, START=5, STOP=-1, STEP=-2)
+
+        expected = np.zeros(6, dtype=np.float64)
+        expected[[5, 3, 1]] = a[[5, 3, 1]]
+        np.testing.assert_allclose(b, expected)
 
     @_MAP_XFAIL
     def test_map_square_elements(self):

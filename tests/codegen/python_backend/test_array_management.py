@@ -13,11 +13,8 @@ from dace.dtypes import ScheduleType
 from dace.sdfg import SDFG, nodes
 from dace.memlet import Memlet
 
-_MAP_XFAIL = pytest.mark.xfail(
-    reason="MapExit not handled by PythonCodeGen.generate_node (missing _generate_MapExit)",
-    raises=NotImplementedError,
-    strict=True,
-)
+def _MAP_XFAIL(func):
+    return func
 
 
 def _make_python_sdfg(name: str) -> SDFG:
@@ -123,7 +120,7 @@ class TestAllocateArray:
         s_node = state.add_access('S')
         r = state.add_read('x')
         state.add_edge(r, None, s_node, None, Memlet(data='x'))
-        with pytest.raises(NotImplementedError, match="cannot allocate"):
+        with pytest.raises(NotImplementedError, match="Stream descriptors"):
             sdfg.generate_code()
 
 
@@ -169,7 +166,7 @@ class TestCopyMemory:
         wy = state.add_write('y')
         state.add_edge(rx, None, wy, None, Memlet(data='x'))
         code = sdfg.generate_code()[0].code
-        assert 'y = x' in code
+        assert 'y[...] = x' in code
 
     def test_copy_array_element_to_scalar(self):
         """Array element to scalar -> 'y = A[3]'."""
@@ -194,7 +191,7 @@ class TestCopyMemory:
         state.add_edge(a, None, b, None, Memlet(data='A', subset='0:10'))
         code = sdfg.generate_code()[0].code
         assert 'A[0:10]' in code
-        assert 'B =' in code or 'B=' in code
+        assert 'numpy.copyto(B, A[0:10])' in code
 
 
 # =============================================================================

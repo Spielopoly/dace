@@ -1,6 +1,7 @@
 # Copyright 2019-2024 ETH Zurich and the DaCe authors. All rights reserved.
 """ Inline multi-state SDFGs. """
 
+import ast
 from copy import deepcopy as dc
 import itertools
 from typing import Dict, List
@@ -10,11 +11,29 @@ from dace.sdfg import nodes
 from dace.sdfg.graph import MultiConnectorEdge
 from dace.sdfg import InterstateEdge, SDFG, SDFGState
 from dace.sdfg import utils as sdutil, infer_types
-from dace.sdfg.replace import replace_datadesc_names, replace_properties_dict
+from dace.sdfg.replace import replace_datadesc_names, replace_in_runtime_codeblock, replace_properties_dict
 from dace.transformation import transformation, helpers
 from dace.properties import make_properties
 from dace import data
 from dace.sdfg.state import LoopRegion, ReturnBlock, StateSubgraphView
+
+
+def _append_runtime_codeblocks(parent_sdfg: SDFG, nested_sdfg: SDFG, replacements: Dict[str, str]) -> None:
+    """Copy nested runtime code into the parent SDFG after applying name replacements."""
+    runtime_code_sources = (
+        (nested_sdfg.global_code, parent_sdfg.append_global_code),
+        (nested_sdfg.init_code, parent_sdfg.append_init_code),
+        (nested_sdfg.exit_code, parent_sdfg.append_exit_code),
+    )
+
+    for codeblocks, append_code in runtime_code_sources:
+        for location, codeblock in codeblocks.items():
+            copied_codeblock = dc(codeblock)
+            if replacements:
+                if copied_codeblock.language == dtypes.Language.Python and isinstance(copied_codeblock.code, str):
+                    copied_codeblock.code = ast.parse(copied_codeblock.as_string).body
+                replace_in_runtime_codeblock(copied_codeblock, replacements)
+            append_code(copied_codeblock.as_string, location, language=copied_codeblock.language)
 
 
 @make_properties
@@ -147,14 +166,6 @@ class InlineMultistateSDFG(transformation.SingleStateTransformation):
         #######################################################
         # Collect and update top-level SDFG metadata
 
-        # Global/init/exit code
-        for loc, code in nsdfg.global_code.items():
-            sdfg.append_global_code(code.code, loc)
-        for loc, code in nsdfg.init_code.items():
-            sdfg.append_init_code(code.code, loc)
-        for loc, code in nsdfg.exit_code.items():
-            sdfg.append_exit_code(code.code, loc)
-
         # Callbacks and other types
         sdfg._callback_mapping.update(nsdfg.callback_mapping)
 
@@ -273,6 +284,7 @@ class InlineMultistateSDFG(transformation.SingleStateTransformation):
         repldict.update({k: v.data.data for k, v in itertools.chain(inputs.items(), outputs.items())})
 
         symbolic.safe_replace(repldict, lambda m: replace_datadesc_names(nsdfg, m), value_as_string=True)
+        _append_runtime_codeblocks(sdfg, nsdfg, repldict)
 
         # Make unique names for all control-flow blocks
         node_names = set(cfr.label for cfr in sdfg.all_control_flow_blocks(recursive=True))

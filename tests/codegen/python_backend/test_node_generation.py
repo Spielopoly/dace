@@ -13,15 +13,8 @@ from dace.codegen.py.python_target import PythonCodeGen
 from dace.dtypes import ScheduleType, Language
 from dace.sdfg import nodes, SDFG, NodeNotExpandedError
 from dace.memlet import Memlet
-
-# All map tests fail because python_target.py's generate_scope calls
-# dispatch_subgraph(skip_entry_node=True) but does NOT skip the exit node,
-# so MapExit gets dispatched to generate_node which has no handler for it.
-_MAP_XFAIL = pytest.mark.xfail(
-    reason="MapExit not handled by PythonCodeGen.generate_node (missing _generate_MapExit)",
-    raises=NotImplementedError,
-    strict=True,
-)
+def _MAP_XFAIL(func):
+    return func
 
 
 def _make_python_sdfg(name: str) -> SDFG:
@@ -50,7 +43,15 @@ class _DummyDispatcher:
     def dispatch_copy(self, src_node, dst_node, edge, sdfg, cfg, dfg, state_id, function_stream, callsite_stream):
         self.copies.append((src_node, dst_node, edge, state_id))
 
-    def dispatch_subgraph(self, sdfg, cfg, dfg_scope, state_id, function_stream, callsite_stream, skip_entry_node=False):
+    def dispatch_subgraph(self,
+                          sdfg,
+                          cfg,
+                          dfg_scope,
+                          state_id,
+                          function_stream,
+                          callsite_stream,
+                          skip_entry_node=False,
+                          skip_exit_node=False):
         return None
 
 
@@ -127,7 +128,7 @@ class TestGenerateNodeDispatch:
             sdfg.generate_code()
 
     def test_generate_node_unknown_type(self):
-        """MapExit (which has no handler) raises NotImplementedError."""
+        """Mapped code generation succeeds without dispatching MapExit directly."""
         sdfg = _make_python_sdfg('test_unknown_node')
         sdfg.add_array('A', [10], dace.float64)
         sdfg.add_array('B', [10], dace.float64)
@@ -138,8 +139,8 @@ class TestGenerateNodeDispatch:
         t = state.add_tasklet('t', {'inp'}, {'out'}, 'out = inp')
         state.add_memlet_path(a, me, t, dst_conn='inp', memlet=Memlet(data='A', subset='i'))
         state.add_memlet_path(t, mx, b, src_conn='out', memlet=Memlet(data='B', subset='i'))
-        with pytest.raises(NotImplementedError, match="MapExit"):
-            sdfg.generate_code()
+        code = sdfg.generate_code()[0].code
+        assert 'for i in range' in code
 
 
 # =============================================================================
@@ -163,7 +164,7 @@ class TestAccessNode:
         state.add_edge(t, 'b', w, None, Memlet(data='y'))
         code_objs = sdfg.generate_code()
         code = code_objs[0].code
-        assert 'y = b' in code
+        assert 'y[...] = b' in code
 
     def test_access_node_incoming_copy(self):
         """src is AccessNode, same scope -- dispatch_copy generates copy."""
@@ -300,7 +301,7 @@ class TestTasklet:
         state.add_edge(read_s, None, t, 'a', Memlet(data='s'))
         state.add_edge(t, 'b', write_r, None, Memlet(data='r'))
         code = sdfg.generate_code()[0].code
-        assert 'r = b' in code
+        assert 'r[...] = b' in code
 
     def test_tasklet_array_output(self):
         """Array output -- array[subset] = connector."""
@@ -328,7 +329,7 @@ class TestTasklet:
         state.add_edge(r, None, t, None, Memlet(data='x'))
         state.add_edge(t, 'out', w, None, Memlet(data='y'))
         code = sdfg.generate_code()[0].code
-        assert 'y = out' in code
+        assert 'y[...] = out' in code
 
     def test_tasklet_no_output_connectors(self):
         """Edges without src_conn are skipped."""
@@ -364,8 +365,8 @@ class TestTasklet:
         code = sdfg.generate_code()[0].code
         assert 'x = a' in code
         assert 'y = b' in code
-        assert 'c = p' in code
-        assert 'd = q' in code
+        assert 'c[...] = p' in code
+        assert 'd[...] = q' in code
         assert 'p = x + y' in code or 'p = (x + y)' in code
 
     def test_tasklet_python_body_multi_statement(self):
@@ -527,6 +528,14 @@ class TestPythonTargetDirectBranches:
         assert 'for i in range(' in code
         assert 'pass' in code
 
+    def test_map_range_statement_with_symbolic_step_uses_runtime_stop_expression(self):
+        sdfg = _make_python_sdfg('test_symbolic_range_statement')
+        codegen, _ = _make_codegen(sdfg)
+
+        statement = codegen._map_range_statement('i', 'begin', 'end', 'STEP')
+
+        assert 'if (STEP) > 0 else' in statement
+
     def test_copy_memory_src_non_access_uses_src_connector(self):
         sdfg = _make_python_sdfg('test_copy_nonaccess_src')
         sdfg.add_scalar('B', dace.float64)
@@ -539,7 +548,7 @@ class TestPythonTargetDirectBranches:
         stream = PythonCodeIOStream()
         codegen.copy_memory(sdfg, sdfg, state, 0, src_tasklet, b, edge, stream, stream)
 
-        assert 'B = out' in stream.getvalue()
+        assert 'B[...] = out' in stream.getvalue()
 
     def test_copy_memory_dst_non_access_uses_dst_connector(self):
         sdfg = _make_python_sdfg('test_copy_nonaccess_dst')
@@ -554,6 +563,72 @@ class TestPythonTargetDirectBranches:
         codegen.copy_memory(sdfg, sdfg, state, 0, a, dst_tasklet, edge, stream, stream)
 
         assert 'inp = A' in stream.getvalue()
+
+    def test_nested_sdfg_helper_emits_single_header_and_import_block(self):
+        sdfg = _make_python_sdfg('nested_header_once')
+        sdfg.add_array('A', [1], dace.float64)
+        sdfg.add_array('B', [1], dace.float64)
+
+        nested_sdfg = SDFG('nested_header_child')
+        nested_sdfg.add_array('X', [1], dace.float64)
+        nested_sdfg.add_array('Y', [1], dace.float64)
+        nested_state = nested_sdfg.add_state('nested_state', is_start_block=True)
+        tasklet = nested_state.add_tasklet('copy', {'inp'}, {'out'}, 'out = inp')
+        nested_state.add_edge(nested_state.add_read('X'), None, tasklet, 'inp', Memlet('X[0]'))
+        nested_state.add_edge(tasklet, 'out', nested_state.add_write('Y'), None, Memlet('Y[0]'))
+
+        state = sdfg.add_state('state')
+        nested_node = state.add_nested_sdfg(nested_sdfg, {'X'}, {'Y'})
+        state.add_edge(state.add_read('A'), None, nested_node, 'X', Memlet('A[0]'))
+        state.add_edge(nested_node, 'Y', state.add_write('B'), None, Memlet('B[0]'))
+
+        generated_code = sdfg.generate_code()[0].code
+
+        assert generated_code.count('# DaCe AUTO-GENERATED FILE. DO NOT MODIFY') == 1
+        assert generated_code.count('import numpy') == 1
+
+    def test_nested_sdfg_helper_propagates_nested_environment_headers(self):
+        sdfg = _make_python_sdfg('nested_environment_headers')
+        sdfg.add_array('A', [1], dace.float64)
+        sdfg.add_array('B', [1], dace.float64)
+
+        nested_sdfg = SDFG('nested_environment_child')
+        nested_sdfg.add_array('X', [1], dace.float64)
+        nested_sdfg.add_array('Y', [1], dace.float64)
+        nested_state = nested_sdfg.add_state('nested_state', is_start_block=True)
+        tasklet = nested_state.add_tasklet('copy', {'inp'}, {'out'}, 'out = inp')
+
+        class FakeEnv:
+            headers = {'frame': ['import math']}
+            dependencies = []
+            state_fields = []
+
+        environment_name = 'nested_environment_headers_fake_env'
+        dace.library._DACE_REGISTERED_ENVIRONMENTS[environment_name] = FakeEnv
+        tasklet.environments = {environment_name}
+        nested_state.add_edge(nested_state.add_read('X'), None, tasklet, 'inp', Memlet('X[0]'))
+        nested_state.add_edge(tasklet, 'out', nested_state.add_write('Y'), None, Memlet('Y[0]'))
+
+        state = sdfg.add_state('state')
+        nested_node = state.add_nested_sdfg(nested_sdfg, {'X'}, {'Y'})
+        state.add_edge(state.add_read('A'), None, nested_node, 'X', Memlet('A[0]'))
+        state.add_edge(nested_node, 'Y', state.add_write('B'), None, Memlet('B[0]'))
+
+        try:
+            generated_code = sdfg.generate_code()[0].code
+        finally:
+            dace.library._DACE_REGISTERED_ENVIRONMENTS.pop(environment_name, None)
+
+        assert generated_code.count('import math') == 1
+
+    def test_nested_scalar_bridge_rejects_multidimensional_singleton_arrays(self):
+        sdfg = _make_python_sdfg('nested_singleton_shape_guard')
+        codegen, _ = _make_codegen(sdfg)
+        nested_sdfg = SDFG('nested_singleton_child')
+        nested_sdfg.add_array('Y', [1, 1], dace.float64)
+
+        with pytest.raises(NotImplementedError, match='size-1 buffers'):
+            codegen._nested_buffer_initialization('nested_buffer', nested_sdfg.arrays['Y'])
 
 
 # =============================================================================

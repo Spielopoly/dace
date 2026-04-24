@@ -1,12 +1,14 @@
 # Project Guidelines
 
 ## Code Style
-- Follow the style and contribution rules in [CONTRIBUTING.md](../CONTRIBUTING.md).
 - Prefer small, targeted changes that preserve existing public APIs unless the task requires API changes.
 - For new Python functions, add type hints and keep imports explicit (no `import *`).
 - Run formatting and checks before finalizing changes:
   - `pre-commit run --all-files`
 - Use spaces for indentation (4 spaces per level), NEVER tabs.
+- Make good variable and function names — avoid abbreviations and single-letter names except for tight loop indices. There is no reason to save a few characters at the cost of readability.
+- Use docstrings and comments liberally to explain the purpose and rationale of code, especially for non-obvious logic.
+- Also use comments to explain what longer code sections are doing at a high level, even if the code is straightforward. This helps future readers understand the intent without having to parse every line.
 
 ## Architecture
 - DaCe is organized around the SDFG IR and transformation pipeline.
@@ -30,6 +32,8 @@
 - **CRITICAL: Always use the `-B` flag** when running Python tests (`/venv/main/bin/python -B -m pytest ...`). Without `-B`, stale `.pyc` bytecache can mask errors (e.g., TypeError from changed function signatures). This has caused hours of debugging in the past.
 - Default test workflow:
   - `/venv/main/bin/python -m pytest tests -m "not gpu and not long"`
+- Full Python backend suite:
+  - `/venv/main/bin/pytest /workspace/dace/tests/codegen/python_backend -q`
 - Run focused tests for touched areas (examples):
   - `/venv/main/bin/python -m pytest tests/transformations -m "not gpu"`
   - `/venv/main/bin/python -m pytest tests/sdfg -m "not gpu"`
@@ -45,6 +49,7 @@
 - Place tests under [tests](../tests) with names matching `test_*.py`, `*_test.py`, or `*_cudatest.py` (see [pytest.ini](../pytest.ini)).
 - Use pytest markers for hardware/software requirements instead of ad-hoc skips (see [pytest.ini](../pytest.ini)).
 - Keep environment-dependent behavior explicit in tests (cache mode, config toggles) when reproducing codegen/serialization behavior.
+- In the Python backend path, default map schedules are normalized to `Sequential` before backend dispatch, so schedule-sensitive fixes often need to be reasoned about before target-specific code generation.
 - For cuTile pipeline work, ensure regressions cover unnecessary data movement removal before scalar-to-tile lowering.
 - Prefer detailed comments and documentation — don't shorten docstrings or inline comments during refactoring.
 - Don't create local variables for `self.xxx` unless the value is used many times or the expression is long. Access through `self.` directly.
@@ -57,7 +62,7 @@
 - All function parameters and return values should have type hints. Omit return type only when the function returns `None` or when the return type is obvious (e.g. `__init__`).
 - Prefer reusing existing DaCe utilities (e.g. `SDFGState.remove_memlet_path`, `sdfg.utils.*`, `subsets.*`) over reimplementing graph manipulation logic. Search the codebase before writing new utility code.
 - Keep functions small and single-responsibility. If a function does multiple logically distinct steps, split it.
-- Use descriptive variable and function names — avoid abbreviations or single-letter names outside tight loop indices.
+- Use descriptive variable and function names — AVOID ABBREVIATIONS or single-letter names outside tight loop indices.
 - Avoid `sp.simplify()` for equality/zero checks on symbolic expressions — it is expensive and unreliable. Prefer structural comparison (`==`, `!=`) or `.is_zero` where appropriate.
 - Flag and remove dead code, unused imports, and stale comments during any refactoring pass.
 

@@ -14,12 +14,31 @@ from dace import memlet, Memlet, symbolic, dtypes, subsets
 from dace.frontend.python import astutils
 from dace.sdfg import nodes, propagation, utils
 from dace.sdfg.graph import MultiConnectorEdge, SubgraphView
+from dace.sdfg.replace import replace_in_runtime_codeblock
 from dace.sdfg import SDFG, SDFGState
 from dace.sdfg import utils as sdutil, infer_types, propagation
 from dace.sdfg.state import LoopRegion
 from dace.transformation import transformation, helpers
 from dace.properties import make_properties, Property
 from dace import data
+
+
+def _append_runtime_codeblocks(parent_sdfg: SDFG, nested_sdfg: SDFG, replacements: Dict[str, str]) -> None:
+    """Copy nested runtime code into the parent SDFG after applying name replacements."""
+    runtime_code_sources = (
+        (nested_sdfg.global_code, parent_sdfg.append_global_code),
+        (nested_sdfg.init_code, parent_sdfg.append_init_code),
+        (nested_sdfg.exit_code, parent_sdfg.append_exit_code),
+    )
+
+    for codeblocks, append_code in runtime_code_sources:
+        for location, codeblock in codeblocks.items():
+            copied_codeblock = dc(codeblock)
+            if replacements:
+                if copied_codeblock.language == dtypes.Language.Python and isinstance(copied_codeblock.code, str):
+                    copied_codeblock.code = ast.parse(copied_codeblock.as_string).body
+                replace_in_runtime_codeblock(copied_codeblock, replacements)
+            append_code(copied_codeblock.as_string, location, language=copied_codeblock.language)
 
 
 @make_properties
@@ -270,14 +289,6 @@ class InlineSDFG(transformation.SingleStateTransformation):
         #######################################################
         # Collect and update top-level SDFG metadata
 
-        # Global/init/exit code
-        for loc, code in nsdfg.global_code.items():
-            sdfg.append_global_code(code.code, loc)
-        for loc, code in nsdfg.init_code.items():
-            sdfg.append_init_code(code.code, loc)
-        for loc, code in nsdfg.exit_code.items():
-            sdfg.append_exit_code(code.code, loc)
-
         # Callbacks and other types
         sdfg._callback_mapping.update(nsdfg.callback_mapping)
 
@@ -484,6 +495,8 @@ class InlineSDFG(transformation.SingleStateTransformation):
             elif edge.data.data in repldict:
                 orig_data[edge] = edge.data.data
                 edge.data.data = repldict[edge.data.data]
+
+        _append_runtime_codeblocks(sdfg, nsdfg, repldict)
 
         # Add extra access nodes for out/in view nodes
         inv_reshapes = {repldict[r]: r for r in reshapes}

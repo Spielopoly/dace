@@ -85,6 +85,80 @@ class TestCodeblockToPython:
 
 class TestInitAndSymbolResolution:
 
+    def test_runtime_code_helpers_use_python_language_for_python_backend(self):
+        """Public runtime-code helpers accept an explicit Python language override."""
+        sdfg = _make_sdfg("runtime_helper_language")
+
+        sdfg.set_global_code("GLOBAL_VALUE = 1", language=dtypes.Language.Python)
+        sdfg.append_init_code("INIT_VALUE = GLOBAL_VALUE + 1", language=dtypes.Language.Python)
+        sdfg.append_exit_code("EXIT_VALUE = INIT_VALUE + 1", language=dtypes.Language.Python)
+
+        assert sdfg.global_code['frame'].language == dtypes.Language.Python
+        assert sdfg.init_code['frame'].language == dtypes.Language.Python
+        assert sdfg.exit_code['frame'].language == dtypes.Language.Python
+
+    def test_runtime_code_append_preserves_python_codeblock_representation(self):
+        """Appending Python runtime code keeps the block AST-backed instead of downgrading to a raw string."""
+        sdfg = _make_sdfg("runtime_append_representation")
+
+        sdfg.set_global_code("value = 1", language=dtypes.Language.Python)
+        sdfg.append_global_code("value = value + 1")
+
+        assert sdfg.global_code['frame'].language == dtypes.Language.Python
+        assert isinstance(sdfg.global_code['frame'].code, list)
+        assert sdfg.global_code['frame'].as_string == "value = 1\nvalue = (value + 1)"
+
+    def test_runtime_code_append_rejects_explicit_language_conflict(self):
+        """Appending runtime code with a conflicting explicit language fails fast."""
+        sdfg = _make_sdfg("runtime_append_conflict")
+        sdfg.set_init_code("sentinel = 1", language=dtypes.Language.Python)
+
+        with pytest.raises(ValueError, match='already uses language'):
+            sdfg.append_init_code('int sentinel = 1;', language=dtypes.Language.CPP)
+
+    def test_replace_dict_updates_runtime_code_for_full_sdfg_replacements(self):
+        """Full SDFG replacements still rewrite runtime code blocks."""
+        sdfg = _make_sdfg("runtime_replace_full")
+        sdfg.set_global_code("value = SOURCE_NAME", language=dtypes.Language.Python)
+
+        sdfg.replace_dict({'SOURCE_NAME': 'TARGET_NAME'})
+
+        assert sdfg.global_code['frame'].as_string == 'value = TARGET_NAME'
+
+    def test_replace_dict_skips_runtime_code_when_graph_replacement_disabled(self):
+        """replace_in_graph=False must leave runtime code untouched."""
+        sdfg = _make_sdfg("runtime_replace_no_graph")
+        sdfg.set_global_code("value = SOURCE_NAME", language=dtypes.Language.Python)
+
+        sdfg.replace_dict({'SOURCE_NAME': 'TARGET_NAME'}, replace_in_graph=False)
+
+        assert sdfg.global_code['frame'].as_string == 'value = SOURCE_NAME'
+
+    def test_replace_dict_skips_runtime_code_when_key_replacement_disabled(self):
+        """replace_keys=False must preserve runtime code for partial replacements."""
+        sdfg = _make_sdfg("runtime_replace_no_keys")
+        sdfg.set_global_code("value = SOURCE_NAME", language=dtypes.Language.Python)
+
+        sdfg.replace_dict({'SOURCE_NAME': 'TARGET_NAME'}, replace_keys=False)
+
+        assert sdfg.global_code['frame'].as_string == 'value = SOURCE_NAME'
+
+    def test_python_backend_default_map_schedule_becomes_sequential(self):
+        """Default-scheduled maps are normalized to Sequential before Python dispatch."""
+        sdfg = dace.SDFG('python_default_map_schedule')
+        sdfg.backend = dace.dtypes.BackendLanguage.Python
+        sdfg.add_array('A', [4], dace.float64)
+        sdfg.add_array('B', [4], dace.float64)
+        state = sdfg.add_state('compute')
+        map_entry, map_exit = state.add_map('m', {'i': '0:4'})
+        tasklet = state.add_tasklet('copy', {'inp'}, {'out'}, 'out = inp')
+        state.add_memlet_path(state.add_read('A'), map_entry, tasklet, dst_conn='inp', memlet=dace.Memlet('A[i]'))
+        state.add_memlet_path(tasklet, map_exit, state.add_write('B'), src_conn='out', memlet=dace.Memlet('B[i]'))
+
+        generated_code = sdfg.generate_code()[0].code
+
+        assert 'for i in range' in generated_code
+
     def test_init_root_sdfg_symbols(self):
         """Root SDFG symbols resolved correctly during __init__."""
         sdfg = dace.SDFG("root_sym")
@@ -131,6 +205,52 @@ class TestInitAndSymbolResolution:
         # N should propagate from outer to inner
         assert "N" in inner_syms
         assert "N" in outer_syms
+
+    def test_nested_runtime_names_do_not_hide_outer_free_symbols(self):
+        """Nested helper runtime globals must not remove outer free symbols from the top-level signature."""
+        outer = dace.SDFG("outer_runtime_symbol")
+        outer.backend = dace.dtypes.BackendLanguage.Python
+        outer.add_symbol("N", dace.int32)
+        outer.add_array("A", [1], dace.int32)
+        outer.add_array("B", [1], dace.int32)
+        outer.add_transient("tmp", [1], dace.int32)
+
+        inner = dace.SDFG("inner_runtime_symbol")
+        inner.backend = dace.dtypes.BackendLanguage.Python
+        inner.set_global_code("N = 5", language=dtypes.Language.Python)
+        inner.add_array("X", [1], dace.int32)
+        inner.add_array("Y", [1], dace.int32)
+        inner_state = inner.add_state("inner_state", is_start_block=True)
+        inner_tasklet = inner_state.add_tasklet("inner_add", {"inp"}, {"out"}, "out = inp + N")
+        inner_state.add_edge(inner_state.add_read("X"), None, inner_tasklet, "inp", dace.Memlet("X[0]"))
+        inner_state.add_edge(inner_tasklet, "out", inner_state.add_write("Y"), None, dace.Memlet("Y[0]"))
+
+        outer_state = outer.add_state("outer_state", is_start_block=True)
+        nested = outer_state.add_nested_sdfg(inner, {"X"}, {"Y"})
+        outer_state.add_edge(outer_state.add_read("A"), None, nested, "X", dace.Memlet("A[0]"))
+        outer_state.add_edge(nested, "Y", outer_state.add_access("tmp"), None, dace.Memlet("tmp[0]"))
+        outer_tasklet = outer_state.add_tasklet("outer_add", {"inp"}, {"out"}, "out = inp + N")
+        outer_state.add_edge(outer_state.add_read("tmp"), None, outer_tasklet, "inp", dace.Memlet("tmp[0]"))
+        outer_state.add_edge(outer_tasklet, "out", outer_state.add_write("B"), None, dace.Memlet("B[0]"))
+
+        codegen = DaCePythonCodeGenerator(outer)
+
+        assert "N" in codegen.arglist
+
+    def test_runtime_name_analysis_handles_loop_assignments(self):
+        """Names assigned inside top-level Python control flow are treated as runtime-defined names."""
+        sdfg = dace.SDFG("runtime_loop_assignment")
+        sdfg.backend = dace.dtypes.BackendLanguage.Python
+        sdfg.add_array("A", [1], dace.int64)
+        sdfg.append_init_code("for idx in range(1):\n    LOOP_VALUE = idx + 1", language=dtypes.Language.Python)
+
+        state = sdfg.add_state("state", is_start_block=True)
+        tasklet = state.add_tasklet("write", {}, {"out"}, "out = LOOP_VALUE")
+        state.add_edge(tasklet, "out", state.add_write("A"), None, dace.Memlet("A[0]"))
+
+        codegen = DaCePythonCodeGenerator(sdfg)
+
+        assert "LOOP_VALUE" not in codegen.arglist
 
     def test_init_constant_propagation_to_nested(self):
         """Constant edge propagated to nested SDFG."""
@@ -920,7 +1040,6 @@ class TestGenerateCode:
         assert "def loop_sdfg" in code
         assert "while" in code or "for" in code or "i" in code
 
-    @pytest.mark.xfail(reason="Python backend: no code generator for node type NestedSDFG")
     def test_generate_code_cfg_id_nonzero(self):
         """cfg_id formatting for non-zero SDFG (via nested SDFG)."""
         outer = dace.SDFG("outer_cfg")

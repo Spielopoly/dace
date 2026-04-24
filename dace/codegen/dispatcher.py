@@ -479,12 +479,18 @@ class TargetDispatcher(object):
         """ Dispatches a code generator for data allocation. """
         self._used_targets.add(self._array_dispatchers[datadesc.storage])
 
+        def _new_stream_like(template_stream: prettycode.CodeIOStream) -> prettycode.CodeIOStream:
+            try:
+                return type(template_stream)()
+            except TypeError:
+                return CodeIOStream()
+
         if datadesc.lifetime == dtypes.AllocationLifetime.Persistent:
-            declaration_stream = CodeIOStream()
+            declaration_stream = _new_stream_like(function_stream)
             callsite_stream = self.frame._initcode
         elif datadesc.lifetime == dtypes.AllocationLifetime.External:
-            declaration_stream = CodeIOStream()
-            callsite_stream = CodeIOStream()
+            declaration_stream = _new_stream_like(function_stream)
+            callsite_stream = _new_stream_like(function_stream)
         else:
             declaration_stream = callsite_stream
 

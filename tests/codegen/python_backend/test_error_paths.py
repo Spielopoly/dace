@@ -96,6 +96,34 @@ def test_generate_node_unknown_type_raises_not_implemented():
         target.generate_node(sdfg, sdfg, state, state.block_id, map_exit, function_stream, callsite_stream)
 
 
+def test_generate_scope_rejects_nonsequential_map_schedule():
+    sdfg = _make_sdfg('nonsequential_map')
+    sdfg.add_array('A', [4], dace.float64)
+    sdfg.add_array('B', [4], dace.float64)
+    state = sdfg.add_state('state')
+    map_entry, map_exit = state.add_map('m', {'i': '0:4'}, schedule=dtypes.ScheduleType.CPU_Multicore)
+    tasklet = state.add_tasklet('copy', {'inp'}, {'out'}, 'out = inp')
+    state.add_memlet_path(state.add_read('A'), map_entry, tasklet, dst_conn='inp', memlet=Memlet('A[i]'))
+    state.add_memlet_path(tasklet, map_exit, state.add_write('B'), src_conn='out', memlet=Memlet('B[i]'))
+
+    with pytest.raises(NotImplementedError, match='only supports sequential maps'):
+        sdfg.generate_code()
+
+
+def test_generate_node_rejects_consume_scopes_explicitly():
+    sdfg = _make_sdfg('consume_scope')
+    sdfg.add_stream('S', dace.int32, transient=True)
+    state = sdfg.add_state('state')
+    consume_entry, consume_exit = state.add_consume('cons', ('p', '4'))
+    _, target = _make_python_codegen(sdfg)
+    function_stream, callsite_stream = _make_streams()
+
+    with pytest.raises(NotImplementedError, match='Consume scopes'):
+        target.generate_node(sdfg, sdfg, state, state.block_id, consume_entry, function_stream, callsite_stream)
+    with pytest.raises(NotImplementedError, match='Consume scopes'):
+        target.generate_node(sdfg, sdfg, state, state.block_id, consume_exit, function_stream, callsite_stream)
+
+
 def test_generate_node_unexpanded_library_node_raises_node_not_expanded():
     sdfg = _make_sdfg('unexpanded_library')
     state = sdfg.add_state('state')
@@ -168,7 +196,7 @@ def test_allocate_array_unsupported_data_descriptor_raises_not_implemented():
     function_stream, declaration_stream = _make_streams()
     allocation_stream = PythonCodeIOStream()
 
-    with pytest.raises(NotImplementedError, match='cannot allocate Stream'):
+    with pytest.raises(NotImplementedError, match='Stream descriptors'):
         target.allocate_array(
             sdfg,
             sdfg,

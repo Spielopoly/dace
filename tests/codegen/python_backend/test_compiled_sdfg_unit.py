@@ -58,6 +58,31 @@ def test_code_property():
     assert csdfg.code == code
 
 
+def test_finalize_allows_reinitialize():
+    """finalize tears down runtime state so a later call reinitializes it."""
+    sdfg = _make_sdfg("lifecycle")
+    code = (
+        "init_calls = []\n"
+        "exit_calls = []\n"
+        "def __dace_init_lifecycle(value):\n"
+        "    init_calls.append(value)\n"
+        "def __dace_exit_lifecycle():\n"
+        "    exit_calls.append(len(init_calls))\n"
+        "def lifecycle(value):\n"
+        "    return len(init_calls), len(exit_calls)\n"
+    )
+    csdfg = PythonCompiledSDFG(sdfg, code)
+
+    assert csdfg(1) == (1, 0)
+    csdfg.finalize()
+    assert csdfg._namespace['exit_calls'] == [1]
+
+    assert csdfg(2) == (2, 1)
+    csdfg.finalize()
+    assert csdfg._namespace['init_calls'] == [1, 2]
+    assert csdfg._namespace['exit_calls'] == [1, 2]
+
+
 # ---------------------------------------------------------------------------
 # __call__
 # ---------------------------------------------------------------------------

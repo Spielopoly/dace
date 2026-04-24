@@ -21,6 +21,13 @@ from dace.transformation.pass_pipeline import FixedPointPipeline
 from dace.transformation.passes.simplification.control_flow_raising import ControlFlowRaising
 
 
+def _default_toplevel_schedule_for_backend(sdfg: SDFG):
+    """Return an optional top-level schedule override for backend-specific codegen."""
+    if sdfg.backend == dtypes.BackendLanguage.Python:
+        return dtypes.ScheduleType.Sequential
+    return None
+
+
 def generate_headers(sdfg: SDFG, frame: framecode.DaCeCodeGenerator) -> str:
     """ Generate a header file for the SDFG """
     proto = ""
@@ -201,14 +208,19 @@ def generate_code(sdfg: SDFG, validate=True) -> List[CodeObject]:
     infer_types.infer_connector_types(sdfg)
 
     # Set default storage/schedule types in SDFG
-    infer_types.set_default_schedule_and_storage_types(sdfg, None)
+    default_toplevel_schedule = _default_toplevel_schedule_for_backend(sdfg)
+    infer_types.set_default_schedule_and_storage_types(sdfg,
+                                                       None,
+                                                       default_top_level_schedule=default_toplevel_schedule)
 
     # Recursively expand library nodes that have not yet been expanded
     sdfg.expand_library_nodes()
 
     # After expansion, run another pass of connector/type inference
     infer_types.infer_connector_types(sdfg)
-    infer_types.set_default_schedule_and_storage_types(sdfg, None)
+    infer_types.set_default_schedule_and_storage_types(sdfg,
+                                                       None,
+                                                       default_top_level_schedule=default_toplevel_schedule)
 
     match sdfg.backend:
         case dtypes.BackendLanguage.CPP:

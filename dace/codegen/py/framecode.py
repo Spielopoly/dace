@@ -42,21 +42,125 @@ def _normalize_python_import(import_entry: str) -> Optional[str]:
     return f'import {import_entry}'
 
 
-def _split_codeblock_imports(cb: CodeBlock) -> Tuple[List[str], str]:
-    if cb.language != dtypes.Language.Python:
-        return [], codeblock_to_python(cb)
+def _split_codeblock_imports(code_block: CodeBlock) -> Tuple[List[str], str]:
+    if code_block.language != dtypes.Language.Python:
+        return [], codeblock_to_python(code_block)
 
-    statements = cb.code if isinstance(cb.code, list) else ast.parse(cb.as_string).body
+    statements = code_block.code if isinstance(code_block.code, list) else ast.parse(code_block.as_string).body
     import_statements: List[str] = []
     remaining_statements: List[ast.AST] = []
-    for stmt in statements:
-        if isinstance(stmt, (ast.Import, ast.ImportFrom)):
-            import_statements.append(astutils.unparse(stmt))
+    for statement in statements:
+        if isinstance(statement, (ast.Import, ast.ImportFrom)):
+            import_statements.append(astutils.unparse(statement))
         else:
-            remaining_statements.append(stmt)
+            remaining_statements.append(statement)
 
     remaining_code = astutils.unparse(remaining_statements) if remaining_statements else ""
     return import_statements, remaining_code
+
+
+def _extract_assigned_names(target: ast.AST) -> Set[str]:
+    names: Set[str] = set()
+    if isinstance(target, ast.Name):
+        names.add(target.id)
+    elif isinstance(target, (ast.Tuple, ast.List)):
+        for element in target.elts:
+            names |= _extract_assigned_names(element)
+    return names
+
+
+def _extract_python_defined_names(source: str) -> Set[str]:
+    if not source.strip():
+        return set()
+
+    try:
+        module = ast.parse(source)
+    except SyntaxError:
+        return set()
+
+    def _collect_defined_names(statements: List[ast.stmt]) -> Set[str]:
+        names: Set[str] = set()
+        for stmt in statements:
+            if isinstance(stmt, ast.Assign):
+                for target in stmt.targets:
+                    names |= _extract_assigned_names(target)
+            elif isinstance(stmt, ast.AnnAssign):
+                names |= _extract_assigned_names(stmt.target)
+            elif isinstance(stmt, ast.AugAssign):
+                names |= _extract_assigned_names(stmt.target)
+            elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                names.add(stmt.name)
+            elif isinstance(stmt, ast.Import):
+                for alias in stmt.names:
+                    names.add(alias.asname or alias.name.split('.')[0])
+            elif isinstance(stmt, ast.ImportFrom):
+                for alias in stmt.names:
+                    names.add(alias.asname or alias.name)
+            elif isinstance(stmt, (ast.For, ast.AsyncFor)):
+                names |= _extract_assigned_names(stmt.target)
+                names |= _collect_defined_names(stmt.body)
+                names |= _collect_defined_names(stmt.orelse)
+            elif isinstance(stmt, (ast.With, ast.AsyncWith)):
+                for item in stmt.items:
+                    if item.optional_vars is not None:
+                        names |= _extract_assigned_names(item.optional_vars)
+                names |= _collect_defined_names(stmt.body)
+            elif isinstance(stmt, (ast.If, ast.While)):
+                names |= _collect_defined_names(stmt.body)
+                names |= _collect_defined_names(stmt.orelse)
+            elif isinstance(stmt, ast.Try):
+                names |= _collect_defined_names(stmt.body)
+                names |= _collect_defined_names(stmt.orelse)
+                names |= _collect_defined_names(stmt.finalbody)
+                for handler in stmt.handlers:
+                    if handler.name is not None:
+                        names.add(handler.name)
+                    names |= _collect_defined_names(handler.body)
+            elif hasattr(ast, 'Match') and isinstance(stmt, ast.Match):
+                for case in stmt.cases:
+                    names |= _collect_defined_names(case.body)
+        return names
+
+    return _collect_defined_names(module.body)
+
+
+def _codeblock_defined_names(code_block: CodeBlock) -> Set[str]:
+    try:
+        return _extract_python_defined_names(codeblock_to_python(code_block))
+    except ValueError:
+        return set()
+
+
+def _iter_runtime_codeblocks(sdfg: SDFG, attr_name: str):
+    codeblocks = getattr(sdfg, attr_name)
+    for key in (None, 'python', 'frame'):
+        if key in codeblocks:
+            yield codeblocks[key]
+
+
+def _runtime_sources_for_sdfg(sdfg: SDFG, attr_name: str) -> List[str]:
+    sources: List[str] = []
+    for codeblock in _iter_runtime_codeblocks(sdfg, attr_name):
+        source = codeblock_to_python(codeblock)
+        if source.strip():
+            sources.append(source.strip())
+    return sources
+
+
+def _collect_runtime_defined_names(sdfg: SDFG) -> Set[str]:
+    names: Set[str] = set()
+    for attr in ('global_code', 'init_code'):
+        for codeblock in _iter_runtime_codeblocks(sdfg, attr):
+            names |= _codeblock_defined_names(codeblock)
+    return names
+
+
+def _collect_nested_runtime_defined_names(sdfg: SDFG) -> Set[str]:
+    names: Set[str] = set()
+    for node, _ in sdfg.all_nodes_recursive():
+        if isinstance(node, nodes.NestedSDFG) and node.sdfg is not None:
+            names |= _collect_runtime_defined_names(node.sdfg)
+    return names
 
 
 class DaCePythonCodeGenerator(object):
@@ -78,7 +182,10 @@ class DaCePythonCodeGenerator(object):
         self.where_allocated: Dict[Tuple[SDFG, str], SDFG] = {}
         self.fsyms: Dict[int, Set[str]] = {}
         self._symbols_and_constants: Dict[int, Set[str]] = {}
-        fsyms = self.free_symbols(sdfg)
+        self._runtime_defined_names = _collect_runtime_defined_names(sdfg)
+        nested_runtime_defined_names = _collect_nested_runtime_defined_names(sdfg)
+        nested_only_runtime_names = {name for name in nested_runtime_defined_names if name not in sdfg.symbols}
+        fsyms = self.free_symbols(sdfg) - self._runtime_defined_names - nested_only_runtime_names
         self.arglist = sdfg.arglist(scalars_only=False, free_symbols=fsyms)
 
         # resolve all symbols and constants
@@ -145,10 +252,23 @@ class DaCePythonCodeGenerator(object):
         for cstname, (csttype, cstval) in sdfg.constants_prop.items():
             if isinstance(csttype, data.Array):
                 # TODO: Multidimensional arrays
-                const_str = cstname + " = [" + ', '.join(str(it[0]) for it in np.nditer(cstval, order='C')) + "]"
+                const_str = cstname + " = [" + ', '.join(str(it.item()) for it in np.nditer(cstval, order='C')) + "]"
                 callsite_stream.write(const_str, sdfg)
             else:
                 callsite_stream.write(f"{cstname} = {cstval}", sdfg)
+
+    def generate_embedded_function_preamble(self, sdfg: SDFG, callsite_stream: PythonCodeIOStream) -> None:
+        """Emit helper-local definitions required when embedding an SDFG helper into another function file."""
+        self.generate_constants(sdfg, callsite_stream)
+        for source in _runtime_sources_for_sdfg(sdfg, 'global_code'):
+            callsite_stream.write(source, sdfg)
+        for source in _runtime_sources_for_sdfg(sdfg, 'init_code'):
+            callsite_stream.write(source, sdfg)
+
+    def generate_embedded_function_finalizer(self, sdfg: SDFG, callsite_stream: PythonCodeIOStream) -> None:
+        """Emit helper-local cleanup required after an embedded SDFG call finishes."""
+        for source in _runtime_sources_for_sdfg(sdfg, 'exit_code'):
+            callsite_stream.write(source, sdfg)
 
     def generate_fileheader(self, sdfg: SDFG, global_stream: PythonCodeIOStream, backend: str = 'frame'):
         """ Generate a header in every output file that includes custom types
@@ -242,13 +362,8 @@ class DaCePythonCodeGenerator(object):
             with global_stream.indented():
                 global_stream.write(structstr, sdfg)
 
-        for sd in sdfg.all_sdfgs_recursive():
-            if None in sd.global_code:
-                _write_global_code(sd.global_code[None], sd)
-            if 'python' in sd.global_code:
-                _write_global_code(sd.global_code['python'], sd)
-            if backend in sd.global_code:
-                _write_global_code(sd.global_code[backend], sd)
+        for codeblock in _iter_runtime_codeblocks(sdfg, 'global_code'):
+            _write_global_code(codeblock, sdfg)
 
     def generate_header(self, sdfg: SDFG, global_stream: PythonCodeIOStream, callsite_stream: PythonCodeIOStream):
         """ Generate the header of the frame-code. Code exists in a separate
@@ -713,7 +828,12 @@ class DaCePythonCodeGenerator(object):
     def generate_code(self,
                       sdfg: SDFG,
                       schedule: Optional[dtypes.ScheduleType],
-                      cfg_id: str = "") -> Tuple[str, str, Set[TargetCodeGenerator], Set[str]]:
+                      cfg_id: str = "",
+                      function_name: Optional[str] = None,
+                      include_lifecycle: bool = True,
+                      include_file_header: bool = True,
+                      function_body_preamble: str = "",
+                      function_body_finally: str = "") -> Tuple[str, str, Set[TargetCodeGenerator], Set[str]]:
         """ Generate frame code for a given SDFG, calling registered targets'
             code generation callbacks for them to generate their own code.
 
@@ -818,7 +938,10 @@ class DaCePythonCodeGenerator(object):
 
         # Now that we have all the information about dependencies, generate
         # header and footer
-        if is_top_level:
+        emit_function_wrapper = is_top_level or function_name is not None
+        emitted_function_name = function_name or sdfg.name
+
+        if is_top_level and include_file_header:
             # Get all environments used in the generated code, including
             # dependent environments
             self.environments = dace.library.get_environments_and_dependencies(self._dispatcher.used_environments)
@@ -832,27 +955,90 @@ class DaCePythonCodeGenerator(object):
             # Merge global streams
             header_global_stream.write(global_stream.getvalue())
             generated_header = header_global_stream.getvalue()
-
-            # Build Python function wrapper
-            params = ', '.join(self.arglist.keys())
-            body = callsite_stream.getvalue().strip()
-
-            func_code = PythonCodeIOStream()
-            func_code.write(f'def {sdfg.name}({params}):\n', cfg=sdfg)
-            if body:
-                with func_code.indented():
-                    func_code.write(body)
-            else:
-                with func_code.indented():
-                    func_code.write('pass\n', cfg=sdfg)
-
-            generated_code = func_code.getvalue()
         else:
             generated_header = global_stream.getvalue()
+
+        params = ', '.join(self.arglist.keys())
+        body = callsite_stream.getvalue().strip()
+        body_preamble = function_body_preamble.strip()
+        if body_preamble:
+            body = '\n'.join(section for section in (body_preamble, body) if section)
+
+        if emit_function_wrapper:
+            generated_code = self._build_function(emitted_function_name, params, body, sdfg, function_body_finally)
+            if is_top_level and include_lifecycle:
+                generated_code = self._build_lifecycle_functions(sdfg, params) + generated_code
+        else:
             generated_code = callsite_stream.getvalue()
 
         # Return the generated global and local code strings
         return (generated_header, generated_code, self._dispatcher.used_targets, self._dispatcher.used_environments)
+
+    def _build_function(self,
+                        function_name: str,
+                        params: str,
+                        body: str,
+                        sdfg: SDFG,
+                        finalizer: str = "") -> str:
+        func_code = PythonCodeIOStream()
+        func_code.write(f'def {function_name}({params}):\n', cfg=sdfg)
+        with func_code.indented():
+            if finalizer.strip():
+                func_code.write('try:', cfg=sdfg)
+                with func_code.indented():
+                    if body:
+                        func_code.write(body)
+                    else:
+                        func_code.write('pass', cfg=sdfg)
+                func_code.write('finally:', cfg=sdfg)
+                with func_code.indented():
+                    func_code.write(finalizer.strip(), cfg=sdfg)
+            else:
+                if body:
+                    func_code.write(body)
+                else:
+                    func_code.write('pass', cfg=sdfg)
+        return func_code.getvalue()
+
+    def _collect_runtime_code(self, sdfg: SDFG, attr_name: str) -> List[str]:
+        return _runtime_sources_for_sdfg(sdfg, attr_name)
+
+    def _collect_assigned_runtime_names(self, source_lines: List[str], excluded_names: Set[str]) -> List[str]:
+        names = _extract_python_defined_names('\n'.join(source_lines))
+        return sorted(name for name in names if name not in excluded_names and not name.startswith('__dace'))
+
+    def _build_runtime_helper(self, helper_name: str, params: str, body_sources: List[str], global_names: List[str],
+                              sdfg: SDFG) -> str:
+        body = '\n'.join(source for source in body_sources if source.strip()).strip()
+        if not body:
+            return ''
+
+        helper = PythonCodeIOStream()
+        helper.write(f'def {helper_name}({params}):\n', cfg=sdfg)
+        with helper.indented():
+            if global_names:
+                helper.write(f'global {", ".join(global_names)}', cfg=sdfg)
+            helper.write(body)
+        return helper.getvalue()
+
+    def _build_lifecycle_functions(self, sdfg: SDFG, params: str) -> str:
+        init_sources: List[str] = []
+        if self._initcode.getvalue().strip():
+            init_sources.append(self._initcode.getvalue().strip())
+        init_sources.extend(self._collect_runtime_code(sdfg, 'init_code'))
+
+        exit_sources: List[str] = []
+        if self._exitcode.getvalue().strip():
+            exit_sources.append(self._exitcode.getvalue().strip())
+        exit_sources.extend(self._collect_runtime_code(sdfg, 'exit_code'))
+
+        parameter_names = {name.strip() for name in params.split(',') if name.strip()}
+        init_globals = self._collect_assigned_runtime_names(init_sources, parameter_names)
+        exit_globals = self._collect_assigned_runtime_names(exit_sources, set())
+
+        init_helper = self._build_runtime_helper(f'__dace_init_{sdfg.name}', params, init_sources, init_globals, sdfg)
+        exit_helper = self._build_runtime_helper(f'__dace_exit_{sdfg.name}', '', exit_sources, exit_globals, sdfg)
+        return init_helper + exit_helper
 
 
 def _get_dominator_and_postdominator(sdfg: SDFG, accesses: List[Tuple[SDFGState, nodes.AccessNode]]):

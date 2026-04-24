@@ -8,6 +8,7 @@ from dace.dtypes import BackendLanguage, ScheduleType
 from dace.properties import CodeBlock
 from dace.sdfg import InterstateEdge, SDFG
 from dace.sdfg.state import ConditionalBlock, ControlFlowRegion, LoopRegion
+from dace.transformation.interstate import InlineMultistateSDFG, InlineSDFG
 
 
 _SDFG_COUNTER = itertools.count()
@@ -42,6 +43,80 @@ def _add_branch_pick_index(region: ControlFlowRegion, src_name: str, dst_name: s
     tasklet = state.add_tasklet(f'{region.label}_copy', {'inp'}, {'out'}, 'out = inp')
     state.add_edge(state.add_read(src_name), None, tasklet, 'inp', dace.Memlet(f'{src_name}[{index_expr}]'))
     state.add_edge(tasklet, 'out', state.add_write(dst_name), None, dace.Memlet(f'{dst_name}[0]'))
+
+
+def _make_runtime_inlining_regression_sdfg(multistate: bool) -> tuple[SDFG, type]:
+    """Build an outer/nested SDFG pair that relies on Python runtime code after inlining."""
+    outer = _new_sdfg('runtime_inline_outer')
+    outer.add_array('A', [1], dace.int64)
+    outer.add_array('B', [1], dace.int64)
+    outer.add_constant('OFFSET', 100)
+    outer.set_global_code('OUTER_RUNTIME = 1', language=dace.dtypes.Language.Python)
+    outer.append_init_code('OUTER_INIT = 2', language=dace.dtypes.Language.Python)
+    outer.append_exit_code('OUTER_EXIT = 3', language=dace.dtypes.Language.Python)
+
+    inner = SDFG('runtime_inline_inner')
+    inner.backend = BackendLanguage.Python
+    inner.add_constant('OFFSET', 4)
+    inner.set_global_code('GLOBAL_RUNTIME = 10\nEXIT_RUNTIME = -1', language=dace.dtypes.Language.Python)
+    inner.append_init_code('INIT_RUNTIME = OFFSET + GLOBAL_RUNTIME', language=dace.dtypes.Language.Python)
+    inner.append_exit_code('EXIT_RUNTIME = INIT_RUNTIME + 1', language=dace.dtypes.Language.Python)
+    inner.add_array('X', [1], dace.int64)
+    inner.add_array('Y', [1], dace.int64)
+
+    if multistate:
+        entry_state = inner.add_state('entry', is_start_block=True)
+        compute_state = inner.add_state('compute')
+        inner.add_edge(entry_state, compute_state, InterstateEdge())
+    else:
+        compute_state = inner.add_state('compute', is_start_block=True)
+
+    tasklet = compute_state.add_tasklet('shift', {'inp'}, {'out'}, 'out = inp + INIT_RUNTIME')
+    compute_state.add_edge(compute_state.add_read('X'), None, tasklet, 'inp', dace.Memlet('X[0]'))
+    compute_state.add_edge(tasklet, 'out', compute_state.add_write('Y'), None, dace.Memlet('Y[0]'))
+
+    outer_state = outer.add_state('state', is_start_block=True)
+    nested_node = outer_state.add_nested_sdfg(inner, {'X'}, {'Y'})
+    outer_state.add_edge(outer_state.add_read('A'), None, nested_node, 'X', dace.Memlet('A[0]'))
+    outer_state.add_edge(nested_node, 'Y', outer_state.add_write('B'), None, dace.Memlet('B[0]'))
+
+    transformation = InlineMultistateSDFG if multistate else InlineSDFG
+    return outer, transformation
+
+
+def _make_runtime_inlining_symbol_mapping_sdfg(multistate: bool) -> tuple[SDFG, type]:
+    """Build an inlining case where runtime code depends on both symbol and data remapping."""
+    outer = _new_sdfg('runtime_inline_mapping_outer')
+    outer.add_symbol('M', dace.int64)
+    outer.add_array('A', [1], dace.int64)
+    outer.add_array('B', [1], dace.int64)
+
+    inner = SDFG('runtime_inline_mapping_inner')
+    inner.backend = BackendLanguage.Python
+    inner.add_symbol('N', dace.int64)
+    inner.set_global_code('RUNTIME_BIAS = 1', language=dace.dtypes.Language.Python)
+    inner.append_init_code('X[0] = N + X[0] + RUNTIME_BIAS', language=dace.dtypes.Language.Python)
+    inner.add_array('X', [1], dace.int64)
+    inner.add_array('Y', [1], dace.int64)
+
+    if multistate:
+        entry_state = inner.add_state('entry', is_start_block=True)
+        compute_state = inner.add_state('compute')
+        inner.add_edge(entry_state, compute_state, InterstateEdge())
+    else:
+        compute_state = inner.add_state('compute', is_start_block=True)
+
+    tasklet = compute_state.add_tasklet('shift', {'inp'}, {'out'}, 'out = inp')
+    compute_state.add_edge(compute_state.add_read('X'), None, tasklet, 'inp', dace.Memlet('X[0]'))
+    compute_state.add_edge(tasklet, 'out', compute_state.add_write('Y'), None, dace.Memlet('Y[0]'))
+
+    outer_state = outer.add_state('state', is_start_block=True)
+    nested_node = outer_state.add_nested_sdfg(inner, {'X'}, {'Y'}, symbol_mapping={'N': 'M'})
+    outer_state.add_edge(outer_state.add_read('A'), None, nested_node, 'X', dace.Memlet('A[0]'))
+    outer_state.add_edge(nested_node, 'Y', outer_state.add_write('B'), None, dace.Memlet('B[0]'))
+
+    transformation = InlineMultistateSDFG if multistate else InlineSDFG
+    return outer, transformation
 
 
 @pytest.mark.parametrize(('flag', 'expected'), [(True, 11), (False, 22)])
@@ -346,8 +421,7 @@ def test_loop_region_zero_iterations():
     np.testing.assert_array_equal(a, np.zeros(0, dtype=np.int64))
 
 
-@pytest.mark.xfail(strict=True, reason='Python backend has no code generator for NestedSDFG nodes.')
-def test_nested_sdfg_simple_xfail():
+def test_nested_sdfg_simple():
     outer = _new_sdfg('outer_nested_simple')
     outer.add_array('A', [1], dace.float64)
     outer.add_array('B', [1], dace.float64)
@@ -368,10 +442,10 @@ def test_nested_sdfg_simple_xfail():
     a = np.array([2.0], dtype=np.float64)
     b = np.zeros(1, dtype=np.float64)
     _run_sdfg(outer, A=a, B=b)
+    np.testing.assert_allclose(b, np.array([3.0], dtype=np.float64))
 
 
-@pytest.mark.xfail(strict=True, reason='Python backend has no code generator for NestedSDFG nodes, including symbol-mapped nested graphs.')
-def test_nested_sdfg_with_symbols_xfail():
+def test_nested_sdfg_with_symbols():
     n_symbol = dace.symbol('N')
     outer = _new_sdfg('outer_nested_symbols')
     outer.add_symbol('N', dace.int64)
@@ -387,17 +461,117 @@ def test_nested_sdfg_with_symbols_xfail():
 
     state = outer.add_state(is_start_block=True)
     nested = state.add_nested_sdfg(inner, {'X'}, {'Y'}, symbol_mapping={'N': 'N'})
-    state.add_edge(state.add_read('A'), None, nested, 'X', dace.Memlet('A[0:N] -> [0:N]'))
-    state.add_edge(nested, 'Y', state.add_write('B'), None, dace.Memlet('B[0:N] -> [0:N]'))
+    state.add_edge(state.add_read('A'), None, nested, 'X', dace.Memlet('A[0:N]'))
+    state.add_edge(nested, 'Y', state.add_write('B'), None, dace.Memlet('B[0:N]'))
 
     n = 4
     a = np.arange(n, dtype=np.float64)
     b = np.zeros(n, dtype=np.float64)
     _run_sdfg(outer, A=a, B=b, N=n)
+    np.testing.assert_allclose(b, a)
 
 
-@pytest.mark.xfail(strict=True, reason='Mapped computations inside Python-backend control flow still fail because MapExit dispatch is unsupported.')
-def test_map_inside_conditional_xfail():
+@pytest.mark.parametrize('multistate', [False, True], ids=['single_state_inline', 'multistate_inline'])
+def test_python_runtime_code_language_survives_inlining(multistate: bool):
+    sdfg, transformation = _make_runtime_inlining_regression_sdfg(multistate)
+
+    assert sdfg.apply_transformations(transformation) == 1
+    assert sdfg.global_code['frame'].language == dace.dtypes.Language.Python
+    assert sdfg.init_code['frame'].language == dace.dtypes.Language.Python
+    assert sdfg.exit_code['frame'].language == dace.dtypes.Language.Python
+
+    compiled = sdfg.compile()
+    a = np.array([1], dtype=np.int64)
+    b = np.zeros(1, dtype=np.int64)
+    compiled(A=a, B=b)
+    np.testing.assert_array_equal(b, np.array([15], dtype=np.int64))
+
+    compiled.finalize()
+    assert compiled._namespace['EXIT_RUNTIME'] == 15
+
+
+@pytest.mark.parametrize('multistate', [False, True], ids=['single_state_inline', 'multistate_inline'])
+def test_python_runtime_code_replacements_survive_inlining(multistate: bool):
+    sdfg, transformation = _make_runtime_inlining_symbol_mapping_sdfg(multistate)
+
+    assert sdfg.apply_transformations(transformation) == 1
+    compiled = sdfg.compile()
+    a = np.array([3], dtype=np.int64)
+    b = np.zeros(1, dtype=np.int64)
+    compiled(A=a, B=b, M=4)
+
+    np.testing.assert_array_equal(b, np.array([8], dtype=np.int64))
+
+
+def test_nested_sdfg_local_constants_available_without_duplicate_headers():
+    outer = _new_sdfg('outer_nested_constant_helper')
+    outer.add_array('A', [1], dace.int64)
+    outer.add_array('B', [1], dace.int64)
+
+    inner = SDFG('inner_nested_constant_helper')
+    inner.backend = BackendLanguage.Python
+    inner.add_constant('LOOKUP', np.array([7], dtype=np.int64))
+    inner.add_array('X', [1], dace.int64)
+    inner.add_array('Y', [1], dace.int64)
+    inner_state = inner.add_state('inner_state', is_start_block=True)
+    tasklet = inner_state.add_tasklet('shift', {'inp'}, {'out'}, 'out = inp + LOOKUP[0]')
+    inner_state.add_edge(inner_state.add_read('X'), None, tasklet, 'inp', dace.Memlet('X[0]'))
+    inner_state.add_edge(tasklet, 'out', inner_state.add_write('Y'), None, dace.Memlet('Y[0]'))
+
+    outer_state = outer.add_state('outer_state', is_start_block=True)
+    nested_node = outer_state.add_nested_sdfg(inner, {'X'}, {'Y'})
+    outer_state.add_edge(outer_state.add_read('A'), None, nested_node, 'X', dace.Memlet('A[0]'))
+    outer_state.add_edge(nested_node, 'Y', outer_state.add_write('B'), None, dace.Memlet('B[0]'))
+
+    generated_code = outer.generate_code()[0].code
+
+    assert 'LOOKUP = [7]' in generated_code
+    assert generated_code.count('# DaCe AUTO-GENERATED FILE. DO NOT MODIFY') == 1
+    assert generated_code.count('import numpy') == 1
+
+    a = np.array([2], dtype=np.int64)
+    b = np.zeros(1, dtype=np.int64)
+    _run_sdfg(outer, A=a, B=b)
+    np.testing.assert_array_equal(b, np.array([9], dtype=np.int64))
+
+
+def test_nested_sdfg_runtime_code_stays_helper_local_and_keeps_local_context():
+    outer = _new_sdfg('outer_nested_runtime_local')
+    outer.add_array('A', [1], dace.int64)
+    outer.add_array('B', [1], dace.int64)
+
+    inner = SDFG('inner_nested_runtime_local')
+    inner.backend = BackendLanguage.Python
+    inner.add_constant('LOOKUP', np.array([7], dtype=np.int64))
+    inner.append_init_code('SHIFT = LOOKUP[0]', language=dace.dtypes.Language.Python)
+    inner.append_exit_code('Y[0] = Y[0] + SHIFT', language=dace.dtypes.Language.Python)
+    inner.add_array('X', [1], dace.int64)
+    inner.add_array('Y', [1], dace.int64)
+    inner_state = inner.add_state('inner_state', is_start_block=True)
+    tasklet = inner_state.add_tasklet('shift', {'inp'}, {'out'}, 'out = inp + SHIFT')
+    inner_state.add_edge(inner_state.add_read('X'), None, tasklet, 'inp', dace.Memlet('X[0]'))
+    inner_state.add_edge(tasklet, 'out', inner_state.add_write('Y'), None, dace.Memlet('Y[0]'))
+
+    outer_state = outer.add_state('outer_state', is_start_block=True)
+    nested_node = outer_state.add_nested_sdfg(inner, {'X'}, {'Y'})
+    outer_state.add_edge(outer_state.add_read('A'), None, nested_node, 'X', dace.Memlet('A[0]'))
+    outer_state.add_edge(nested_node, 'Y', outer_state.add_write('B'), None, dace.Memlet('B[0]'))
+
+    generated_code = outer.generate_code()[0].code
+
+    assert 'SHIFT = LOOKUP[0]' in generated_code
+    assert 'finally:' in generated_code
+    assert generated_code.count('# DaCe AUTO-GENERATED FILE. DO NOT MODIFY') == 1
+    assert generated_code.count('import numpy') == 1
+
+    a = np.array([2], dtype=np.int64)
+    b = np.zeros(1, dtype=np.int64)
+    _run_sdfg(outer, A=a, B=b)
+
+    np.testing.assert_array_equal(b, np.array([16], dtype=np.int64))
+
+
+def test_map_inside_conditional():
     sdfg = _new_sdfg('map_inside_conditional')
     sdfg.add_array('A', [4], dace.float64)
     sdfg.add_array('B', [4], dace.float64)
@@ -420,10 +594,10 @@ def test_map_inside_conditional_xfail():
     a = np.arange(4, dtype=np.float64)
     b = np.zeros(4, dtype=np.float64)
     _run_sdfg(sdfg, A=a, B=b, flag=True)
+    np.testing.assert_allclose(b, a)
 
 
-@pytest.mark.xfail(strict=True, reason='Loop-region bodies containing maps still fail because the Python backend has no MapExit code generator.')
-def test_loop_region_with_map_xfail():
+def test_loop_region_with_map():
     sdfg = _new_sdfg('loop_with_map')
     sdfg.add_array('A', [4], dace.float64)
     sdfg.add_array('B', [4], dace.float64)
@@ -439,32 +613,33 @@ def test_loop_region_with_map_xfail():
     a = np.arange(4, dtype=np.float64)
     b = np.zeros(4, dtype=np.float64)
     _run_sdfg(sdfg, A=a, B=b)
+    np.testing.assert_allclose(b, a)
 
 
-@pytest.mark.xfail(strict=True, reason='Reduction-style vector norms are not yet supported end-to-end by the Python backend.')
-def test_vector_norm_reduction_xfail():
+def test_vector_norm_reduction():
     sdfg = _new_sdfg('vector_norm')
     sdfg.add_array('A', [4], dace.float64)
     sdfg.add_array('out', [1], dace.float64)
 
     state = sdfg.add_state(is_start_block=True)
-    init = state.add_tasklet('init', {}, {'out'}, 'out = 0.0')
-    state.add_edge(init, 'out', state.add_write('out'), None, dace.Memlet('out[0]'))
+    init = state.add_tasklet('init', {}, {'result'}, 'result = 0.0')
+    state.add_edge(init, 'result', state.add_write('out'), None, dace.Memlet('out[0]'))
     map_entry, map_exit = state.add_map('m', {'i': '0:4'}, schedule=ScheduleType.Sequential)
-    tasklet = state.add_tasklet('square', {'inp'}, {'out'}, 'out = inp * inp')
+    tasklet = state.add_tasklet('square', {'inp'}, {'result'}, 'result = inp * inp')
     state.add_memlet_path(state.add_read('A'), map_entry, tasklet, dst_conn='inp', memlet=dace.Memlet('A[i]'))
-    state.add_memlet_path(tasklet, map_exit, state.add_write('out'), src_conn='out', memlet=dace.Memlet('out[0]', wcr='lambda x, y: x + y'))
+    state.add_memlet_path(tasklet,
+                          map_exit,
+                          state.add_write('out'),
+                          src_conn='result',
+                          memlet=dace.Memlet('out[0]', wcr='lambda x, y: x + y'))
 
     a = np.arange(4, dtype=np.float64)
     out = np.zeros(1, dtype=np.float64)
     _run_sdfg(sdfg, A=a, out=out)
+    np.testing.assert_allclose(out, np.array([14.0], dtype=np.float64))
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason='Python backend still treats names assigned in SDFG-level global_code as free symbols during argument collection.',
-)
-def test_global_code_constant_xfail():
+def test_global_code_constant():
     sdfg = _new_sdfg('global_code_constant')
     sdfg.add_array('A', [1], dace.int64)
     sdfg.global_code[None] = CodeBlock('GLOBAL_CONSTANT = 13')
@@ -475,10 +650,10 @@ def test_global_code_constant_xfail():
 
     a = np.zeros(1, dtype=np.int64)
     _run_sdfg(sdfg, A=a)
+    np.testing.assert_array_equal(a, np.array([13], dtype=np.int64))
 
 
-@pytest.mark.xfail(strict=True, reason='Python backend does not emit init_code into the executable Python runtime path.')
-def test_init_code_semantics_xfail():
+def test_init_code_semantics():
     sdfg = _new_sdfg('init_code_semantics')
     sdfg.add_array('A', [1], dace.int64)
     sdfg.init_code[None] = CodeBlock('INIT_SENTINEL = 11')
@@ -489,6 +664,44 @@ def test_init_code_semantics_xfail():
 
     a = np.zeros(1, dtype=np.int64)
     _run_sdfg(sdfg, A=a)
+    np.testing.assert_array_equal(a, np.array([11], dtype=np.int64))
+
+
+def test_runtime_code_public_api_and_lifecycle_reinitialize():
+    sdfg = _new_sdfg('runtime_code_helpers')
+    sdfg.add_array('A', [1], dace.int64)
+    sdfg.set_global_code('GLOBAL_SENTINEL = 7\nEXIT_LOG = []', language=dace.dtypes.Language.Python)
+    sdfg.append_init_code('INIT_COUNTER = globals().get("INIT_COUNTER", 0) + 1',
+                          language=dace.dtypes.Language.Python)
+    sdfg.append_exit_code('EXIT_LOG.append(INIT_COUNTER)', language=dace.dtypes.Language.Python)
+
+    state = sdfg.add_state(is_start_block=True)
+    tasklet = state.add_tasklet('write', {}, {'out'}, 'out = GLOBAL_SENTINEL + INIT_COUNTER')
+    state.add_edge(tasklet, 'out', state.add_write('A'), None, dace.Memlet('A[0]'))
+
+    compiled = sdfg.compile()
+    a = np.zeros(1, dtype=np.int64)
+
+    compiled(A=a)
+    np.testing.assert_array_equal(a, np.array([8], dtype=np.int64))
+    assert compiled._namespace['EXIT_LOG'] == []
+
+    compiled.finalize()
+    assert compiled._namespace['EXIT_LOG'] == [1]
+
+    compiled.finalize()
+    assert compiled._namespace['EXIT_LOG'] == [1] # Finalize should not run exit code again
+
+    a.fill(0)
+    compiled(A=a)
+    np.testing.assert_array_equal(a, np.array([9], dtype=np.int64)) # Init code should run again because it was finalized
+    
+    a.fill(0)
+    compiled(A=a)
+    np.testing.assert_array_equal(a, np.array([9], dtype=np.int64)) # Init code should not run again
+
+    compiled.finalize()
+    assert compiled._namespace['EXIT_LOG'] == [1, 2]
 
 
 def test_transient_array_pipeline():
