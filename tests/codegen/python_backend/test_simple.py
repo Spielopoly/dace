@@ -6,10 +6,11 @@ import pytest
 N = dace.symbol('N')
 Modulo = dace.symbol('Modulo')
 
+FIVE = 5.0
 
 def foo(x: dace.float64[3,7]):
     s = np.sum(x)
-    return 5.0 + s
+    return FIVE + s
 
 @dace.program
 def simple_program(x: dace.float64[N,7], y: dace.float64[Modulo * N,7]):
@@ -44,13 +45,11 @@ def test_simple_program(n_value, modulo_value, save_generated_code=False):
     expected = _reference_simple_program(x_expected, y_expected, modulo_value)
 
     with set_temporary('compiler', 'codegen_lineinfo', value=False):
+        if save_generated_code:
+            sdfg.compile('simple_program.py', return_program_handle=False, validate=False)
+            sdfg.save('simple_program.sdfg')
         generated_code = sdfg.generate_code()[0].code
         sdfg(x=x_test, y=y_test, __return=return_buffer, N=n_value, Modulo=modulo_value)
-    
-    if save_generated_code:
-        sdfg.save('simple_program.sdfg')
-        with open('simple_program.py', 'w') as f:
-            f.write(generated_code)
 
     np.testing.assert_allclose(return_buffer, expected)
     np.testing.assert_allclose(x_test, x_expected)

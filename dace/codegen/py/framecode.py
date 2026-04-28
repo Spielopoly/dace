@@ -985,7 +985,7 @@ class DaCePythonCodeGenerator(object):
                         sdfg: SDFG,
                         finalizer: str = "") -> str:
         func_code = PythonCodeIOStream()
-        func_code.write(f'def {function_name}({params}):\n', cfg=sdfg)
+        func_code.write(f'\ndef {function_name}({params}):\n', cfg=sdfg)
         with func_code.indented():
             if finalizer.strip():
                 func_code.write('try:', cfg=sdfg)
@@ -1018,7 +1018,7 @@ class DaCePythonCodeGenerator(object):
             return ''
 
         helper = PythonCodeIOStream()
-        helper.write(f'def {helper_name}({params}):\n', cfg=sdfg)
+        helper.write(f'\ndef {helper_name}({params}):\n', cfg=sdfg)
         with helper.indented():
             if global_names:
                 helper.write(f'global {", ".join(global_names)}', cfg=sdfg)

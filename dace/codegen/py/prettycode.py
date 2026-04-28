@@ -86,7 +86,7 @@ class PythonCodeIOStream(io.StringIO):
         # Build location annotation (Python comment style)
         location_identifier = ''
         # If SDFG/state/node location is given, annotate this line
-        if cfg is not None:
+        if cfg is not None and self._lineinfo: # TODO: remove and self._lineinfo
             location_identifier = '  #__DACE:%d' % cfg.cfg_id
             if state_id is not None:
                 location_identifier += ':' + str(state_id)
