@@ -805,9 +805,6 @@ class DaCePythonCodeGenerator(object):
 
             self._dispatcher.dispatch_allocate(tsdfg, cfg if state is None else state.parent_graph, state, state_id,
                                                node, desc, function_stream, callsite_stream, declare, allocate)
-        for instr in self._dispatcher.instrumentation.values():
-            if instr is not None:
-                instr.on_allocation_end(sdfg, scope, callsite_stream)
 
     def deallocate_arrays_in_scope(self, sdfg: SDFG, cfg: ControlFlowRegion, scope: Union[nodes.EntryNode, SDFGState,
                                                                                           SDFG],

@@ -18,7 +18,8 @@ def simple_program(x: dace.float64[N,7], y: dace.float64[Modulo * N,7]):
         for j in range(7):
             if i % Modulo == 0 and j % 2 == 0:
                 y[Modulo * i, j] = x[i, j] * foo(x)
-    return x + y[::Modulo, :]
+    print(y)
+    return x[..., ::3] + y[::Modulo, ::3]
 
 def _reference_simple_program(x: np.ndarray, y: np.ndarray, modulo: int) -> np.ndarray:
     """Mirror the source program exactly for backend regression checks."""
@@ -26,7 +27,8 @@ def _reference_simple_program(x: np.ndarray, y: np.ndarray, modulo: int) -> np.n
         for column_index in range(x.shape[1]):
             if row_index % modulo == 0 and column_index % 2 == 0:
                 y[modulo * row_index, column_index] = x[row_index, column_index] * foo(x)
-    return x + y[::modulo, :]
+    print(y)
+    return x[..., ::3] + y[::modulo, ::3]
 
 
 @pytest.mark.parametrize(('n_value', 'modulo_value'), [(1, 1), (3, 2), (5, 3)])
@@ -35,7 +37,7 @@ def test_simple_program(n_value, modulo_value, save_generated_code=False):
     sdfg.backend = dace.dtypes.BackendLanguage.Python
 
     rng = np.random.default_rng(7)
-    return_buffer = np.zeros((n_value, 7), dtype=np.float64)
+    return_buffer = np.zeros((n_value, 3), dtype=np.float64)
     x_start = rng.random((n_value, 7), dtype=np.float64)
     x_expected = np.copy(x_start)
     x_test = np.copy(x_start)
@@ -44,12 +46,12 @@ def test_simple_program(n_value, modulo_value, save_generated_code=False):
     y_test = np.copy(y_start)
     expected = _reference_simple_program(x_expected, y_expected, modulo_value)
 
-    with set_temporary('compiler', 'codegen_lineinfo', value=False):
+    with set_temporary('compiler', 'codegen_lineinfo', value=True):
         if save_generated_code:
             sdfg.compile('simple_program.py', return_program_handle=False, validate=False)
             sdfg.save('simple_program.sdfg')
         generated_code = sdfg.generate_code()[0].code
-        sdfg(x=x_test, y=y_test, __return=return_buffer, N=n_value, Modulo=modulo_value)
+        sdfg(x=x_test, y=y_test, __return=return_buffer, N=n_value, Modulo=modulo_value, print=print)
 
     np.testing.assert_allclose(return_buffer, expected)
     np.testing.assert_allclose(x_test, x_expected)
@@ -77,4 +79,3 @@ if __name__ == "__main__":
 
     test_simple_program(3, 2, save_generated_code=True)
     print("simple_program test passed.")
-        

@@ -558,7 +558,8 @@ class PythonCodeGen(TargetCodeGenerator):
         return re.sub(r'\W|^(?=\d)', '_', name)
 
     def _static_step_direction(self, step) -> int:
-        """Return -1, 0, or 1 when the map step direction is statically known."""
+        """Return -1, 0, or 1 when the map step direction is statically known.
+        Returns 0 for unknown or dynamic step values."""
         try:
             numeric_step = int(step)
         except (TypeError, ValueError):

@@ -390,11 +390,12 @@ def _write_control_flow_region(region: AbstractControlFlowRegion,
                                stop: Optional[ControlFlowBlock] = None,
                                generate_children_of: Optional[ControlFlowBlock] = None,
                                ptree: Optional[Dict[ControlFlowBlock, ControlFlowBlock]] = None,
-                               visited: Optional[Set[ControlFlowBlock]] = None) -> None:
+                               visited: Optional[Set[ControlFlowBlock]] = None) -> int:
     """Writes control flow region code to *stream*."""
     contains_irreducible = (any(region.out_degree(node) > 1 for node in region.nodes())
                             or isinstance(region, UnstructuredControlFlow))
 
+    tell = stream.tell()
     if contains_irreducible:
         _write_state_machine(region, dispatch_state, codegen, symbols, stream,
                                  start=start, stop=stop, generate_children_of=generate_children_of,
@@ -403,7 +404,7 @@ def _write_control_flow_region(region: AbstractControlFlowRegion,
         _write_structured_region(region, dispatch_state, codegen, symbols, stream,
                                  start=start, stop=stop, generate_children_of=generate_children_of,
                                  ptree=ptree, visited=visited)
-
+    return stream.tell() - tell  # Return how many characters were written
 
 # ---------------------------------------------------------------------------
 # Public entry point
