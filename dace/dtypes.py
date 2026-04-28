@@ -239,6 +239,55 @@ _CTYPES = {
     numpy.complex128: "dace::complex128",
 }
 
+# Translation of types to python or numpy types
+PYTHON_TYPES = {
+    None: "None",
+    int: "int",
+    float: "float",
+    complex: "complex",
+    bool: "bool",
+    numpy.bool_: "numpy.bool_",
+    numpy.int8: "numpy.int8",
+    numpy.int16: "numpy.int16",
+    numpy.int32: "numpy.int32",
+    numpy.int64: "numpy.int64",
+    numpy.intc: "numpy.intc",
+    numpy.uint8: "numpy.uint8",
+    numpy.uint16: "numpy.uint16",
+    numpy.uint32: "numpy.uint32",
+    numpy.uint64: "numpy.uint64",
+    numpy.uintc: "numpy.uintc",
+    numpy.float16: "numpy.float16",
+    numpy.float32: "numpy.float32",
+    numpy.float64: "numpy.float64",
+    numpy.complex64: "numpy.complex64",
+    numpy.complex128: "numpy.complex128",
+}
+
+NUMPY_TYPES = {
+    None: "None",
+    int: "numpy.int64",
+    float: "numpy.float64",
+    complex: "numpy.complex128",
+    bool: "numpy.bool_",
+    numpy.bool_: "numpy.bool_",
+    numpy.int8: "numpy.int8",
+    numpy.int16: "numpy.int16",
+    numpy.int32: "numpy.int32",
+    numpy.int64: "numpy.int64",
+    numpy.intc: "numpy.intc",
+    numpy.uint8: "numpy.uint8",
+    numpy.uint16: "numpy.uint16",
+    numpy.uint32: "numpy.uint32",
+    numpy.uint64: "numpy.uint64",
+    numpy.uintc: "numpy.uintc",
+    numpy.float16: "numpy.float16",
+    numpy.float32: "numpy.float32",
+    numpy.float64: "numpy.float64",
+    numpy.complex64: "numpy.complex64",
+    numpy.complex128: "numpy.complex128",
+}
+
 # Translation of types to ctypes types
 _FFI_CTYPES = {
     None: ctypes.c_void_p,

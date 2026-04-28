@@ -69,7 +69,7 @@ class PythonCompiledSDFG:
     def __del__(self):
         try:
             self.finalize()
-        except Exception:
+        except AttributeError: # can happen if __init__ raised an exception
             pass
 
 

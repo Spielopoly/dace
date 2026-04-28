@@ -680,6 +680,8 @@ def test_runtime_code_public_api_and_lifecycle_reinitialize():
     state.add_edge(tasklet, 'out', state.add_write('A'), None, dace.Memlet('A[0]'))
 
     compiled = sdfg.compile()
+    from dace.codegen.py.compiled_sdfg import PythonCompiledSDFG
+    assert isinstance(compiled, PythonCompiledSDFG)
     a = np.zeros(1, dtype=np.int64)
 
     compiled(A=a)

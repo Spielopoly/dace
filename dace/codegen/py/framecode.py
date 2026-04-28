@@ -251,11 +251,16 @@ class DaCePythonCodeGenerator(object):
         # Write constants
         for cstname, (csttype, cstval) in sdfg.constants_prop.items():
             if isinstance(csttype, data.Array):
-                # TODO: Multidimensional arrays
-                const_str = cstname + " = [" + ', '.join(str(it.item()) for it in np.nditer(cstval, order='C')) + "]"
-                callsite_stream.write(const_str, sdfg)
-            else:
+                try:
+                    const_str = f"{cstname} = numpy.array({cstval.tolist()}, dtype={dtypes.NUMPY_TYPES[csttype.dtype.type]})"
+                    callsite_stream.write(const_str, sdfg)
+                except KeyError as e:
+                    raise NotImplementedError(f"Unsupported constant value for array constant {cstname}: {cstval} with type {csttype.dtype.type}") from e
+            elif isinstance(csttype, data.Scalar):
+                # TODO: strings
                 callsite_stream.write(f"{cstname} = {cstval}", sdfg)
+            else:
+                raise NotImplementedError(f"Unsupported constant type {csttype} for constant {cstname}.")
 
     def generate_embedded_function_preamble(self, sdfg: SDFG, callsite_stream: PythonCodeIOStream) -> None:
         """Emit helper-local definitions required when embedding an SDFG helper into another function file."""

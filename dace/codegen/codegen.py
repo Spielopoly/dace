@@ -242,6 +242,16 @@ def generate_code(sdfg: SDFG, validate=True) -> List[CodeObject]:
 
         # Query codegen targets and preprocess
         frame.targets.add(py_target)
+        
+        # TODO: This is somewhat hacky, should look into doing this more like the C++ codgen.
+        # The problem was that if you have something that only generates constants, the Python 
+        # target would never be added to used_targets and thus the header generator would not 
+        # know to import numpy, which is required for array literals. This ensures that the Python 
+        # target is always visible to the header generator.
+        # But now it's obviously always there, which is also not ideal.
+        # I should also check if those constant thingies even represent a valid usecase
+        frame._dispatcher.used_targets.add(py_target)
+        
         py_target.preprocess(sdfg)
         
         # TODO: Add other targets

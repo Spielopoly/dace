@@ -347,11 +347,12 @@ class TestGenerateConstants:
         codegen = DaCePythonCodeGenerator(sdfg)
         stream = PythonCodeIOStream()
         codegen.generate_constants(sdfg, stream)
-        code = stream.getvalue()
-        assert "MY_ARR = [" in code
-        assert "1.0" in code
-        assert "2.0" in code
-        assert "3.0" in code
+        code = "import numpy\n" # Need to import numpy for the array literal because we only call generate_constants, not the full codegen pipeline which would add the import
+        code += stream.getvalue()
+        namespace = {}
+        exec(code, namespace)
+        assert "MY_ARR" in namespace
+        np.testing.assert_array_equal(namespace["MY_ARR"], arr)
 
     def test_generate_constants_empty(self):
         """No constants: nothing written."""
@@ -1402,11 +1403,12 @@ class TestEdgeCasesAndErrors:
         codegen = DaCePythonCodeGenerator(sdfg)
         stream = PythonCodeIOStream()
         codegen.generate_constants(sdfg, stream)
-        code = stream.getvalue()
-        assert "MATRIX = [" in code
-        # All elements should appear
-        assert "1" in code
-        assert "4" in code
+        code = "import numpy\n" # Need to import numpy for the array literal because we only call generate_constants, not the full codegen pipeline which would add the import
+        code += stream.getvalue()
+        namespace = {}
+        exec(code, namespace)
+        assert "MATRIX" in namespace
+        np.testing.assert_array_equal(namespace["MATRIX"], arr)
 
     def test_single_scalar_constant(self):
         """Single scalar constant float."""
@@ -1420,6 +1422,33 @@ class TestEdgeCasesAndErrors:
         codegen.generate_constants(sdfg, stream)
         code = stream.getvalue()
         assert "PI = 3.14159" in code
+
+    @pytest.mark.parametrize(
+        ('value', 'expected_literal'),
+        [
+            ('hello world', "'hello world'"),
+            (True, 'True'),
+            (None, 'None'),
+            (3 + 4j, '(3+4j)'),
+        ],
+        ids=['string', 'bool', 'none', 'complex'])
+    def test_scalar_constants_emit_valid_python_literals(self, value, expected_literal):
+        """Scalar constants should be emitted as valid Python literals for exec()."""
+        sdfg = dace.SDFG('scalar_literal')
+        sdfg.backend = dace.dtypes.BackendLanguage.Python
+        sdfg.add_state('s0')
+        sdfg.add_constant('CONST_VALUE', value)
+
+        codegen = object.__new__(DaCePythonCodeGenerator)
+        stream = PythonCodeIOStream()
+        codegen.generate_constants(sdfg, stream)
+        code = stream.getvalue()
+
+        assert f'CONST_VALUE = {expected_literal}' in code
+
+        namespace = {}
+        exec(code, namespace)
+        assert namespace['CONST_VALUE'] == value
 
 
 # ===========================================================================
