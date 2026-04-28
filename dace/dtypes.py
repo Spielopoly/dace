@@ -854,9 +854,7 @@ class struct(typeclass):
         code_stream.write(class_definition, cfg, state_id, node_id)
         with code_stream.indented():
             for tname, t in self._data.items():
-                type_annotation = f"{t.type!r}"
-                if "<class " in type_annotation:
-                    type_annotation = type_annotation.replace("<class ", "").replace(">", "")
+                type_annotation = PYTHON_TYPES[t.type]
                 code_stream.write(f"{tname}: {type_annotation}", cfg, state_id, node_id)
 
 class pyobject(opaque):

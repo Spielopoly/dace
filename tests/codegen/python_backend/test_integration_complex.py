@@ -525,7 +525,7 @@ def test_nested_sdfg_local_constants_available_without_duplicate_headers():
 
     generated_code = outer.generate_code()[0].code
 
-    assert 'LOOKUP = [7]' in generated_code
+    assert 'LOOKUP = numpy.array([7], dtype=numpy.int64)' in generated_code
     assert generated_code.count('# DaCe AUTO-GENERATED FILE. DO NOT MODIFY') == 1
     assert generated_code.count('import numpy') == 1
 

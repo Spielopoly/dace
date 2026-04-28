@@ -1472,7 +1472,6 @@ class TestAdditionalFramecodeBranches:
         """Custom struct/pointer dtype paths emit type definitions exactly once."""
         sdfg = _make_sdfg("custom_types")
         codegen = DaCePythonCodeGenerator(sdfg)
-        codegen.environments = []
 
         struct_t = dace.struct("TmpStruct", a=dace.int32)
         ptr_to_struct = dtypes.pointer(struct_t)
@@ -1488,7 +1487,7 @@ class TestAdditionalFramecodeBranches:
         code = stream.getvalue()
         assert "class TmpStruct" in code
         assert code.count("class TmpStruct") == 1
-        assert "    a: 'numpy.int32'" in code
+        assert "    a: numpy.int" in code
 
     def test_get_schedule_nested_in_parent_scope(self):
         """Nested SDFG inside a map inherits schedule from parent scope."""

@@ -252,13 +252,12 @@ class DaCePythonCodeGenerator(object):
         for cstname, (csttype, cstval) in sdfg.constants_prop.items():
             if isinstance(csttype, data.Array):
                 try:
-                    const_str = f"{cstname} = numpy.array({cstval.tolist()}, dtype={dtypes.NUMPY_TYPES[csttype.dtype.type]})"
+                    const_str = f"{cstname} = numpy.array({cstval.tolist()!r}, dtype={dtypes.NUMPY_TYPES[csttype.dtype.type]})"
                     callsite_stream.write(const_str, sdfg)
                 except KeyError as e:
                     raise NotImplementedError(f"Unsupported constant value for array constant {cstname}: {cstval} with type {csttype.dtype.type}") from e
             elif isinstance(csttype, data.Scalar):
-                # TODO: strings
-                callsite_stream.write(f"{cstname} = {cstval}", sdfg)
+                callsite_stream.write(f"{cstname} = {cstval!r}", sdfg)
             else:
                 raise NotImplementedError(f"Unsupported constant type {csttype} for constant {cstname}.")
 
