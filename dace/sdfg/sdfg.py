@@ -972,9 +972,11 @@ class SDFG(ControlFlowRegion):
 
         new_code = code_string
         if action == 'append':
-            codeblocks[location] = CodeBlock(existing + "\n" + new_code, language)
+            new_line = '' if existing.endswith('\n') or new_code.startswith('\n') else '\n'
+            codeblocks[location] = CodeBlock(existing + new_line + new_code, language)
         elif action == 'prepend':
-            codeblocks[location] = CodeBlock(new_code + "\n" + existing, language)
+            new_line = '' if new_code.endswith('\n') or existing.startswith('\n') else '\n'
+            codeblocks[location] = CodeBlock(new_code + new_line + existing, language)
         else:
             raise ValueError(f'Invalid action "{action}".')
 
