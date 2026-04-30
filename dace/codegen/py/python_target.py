@@ -9,7 +9,6 @@ import re
 from typing import TYPE_CHECKING, Optional
 
 from dace import data, dtypes, subsets
-from dace.codegen.dispatcher import TargetDispatcher
 from dace.codegen.py.prettycode import PythonCodeIOStream
 from dace.codegen.target import TargetCodeGenerator
 from dace.memlet import Memlet
@@ -19,6 +18,7 @@ from dace.sdfg.state import ControlFlowRegion, StateSubgraphView
 
 if TYPE_CHECKING:
     from dace.codegen.py.framecode import DaCePythonCodeGenerator
+    from dace.codegen.dispatcher import TargetDispatcher
 
 
 class PythonCodeGen(TargetCodeGenerator):
@@ -40,7 +40,7 @@ class PythonCodeGen(TargetCodeGenerator):
 
     def __init__(self, frame_codegen: 'DaCePythonCodeGenerator', sdfg: SDFG):
         self._frame = frame_codegen
-        self._dispatcher: TargetDispatcher = frame_codegen.dispatcher
+        self._dispatcher: 'TargetDispatcher' = frame_codegen.dispatcher
         self._generated_nested_sdfgs: dict[int, tuple[str, list[str]]] = {}
         dispatcher = self._dispatcher
 
