@@ -27,7 +27,7 @@ def test_threadlocal():
 
     # Add OpenMP include
     sdfg = tlarray.to_sdfg()
-    sdfg.set_global_code('#include <omp.h>')
+    sdfg.set_global_code('#include <omp.h>', language=dace.Language.CPP)
 
     sdfg(A=A)
     assert np.all(A >= 0)

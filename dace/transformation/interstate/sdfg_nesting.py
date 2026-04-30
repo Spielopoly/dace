@@ -272,11 +272,11 @@ class InlineSDFG(transformation.SingleStateTransformation):
 
         # Global/init/exit code
         for loc, code in nsdfg.global_code.items():
-            sdfg.append_global_code(code.code, loc)
+            sdfg.append_global_code(code, loc)
         for loc, code in nsdfg.init_code.items():
-            sdfg.append_init_code(code.code, loc)
+            sdfg.append_init_code(code, loc)
         for loc, code in nsdfg.exit_code.items():
-            sdfg.append_exit_code(code.code, loc)
+            sdfg.append_exit_code(code, loc)
 
         # Callbacks and other types
         sdfg._callback_mapping.update(nsdfg.callback_mapping)

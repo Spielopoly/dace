@@ -192,7 +192,7 @@ using namespace nvcuda;
     # global code dictionary. The `None` key refers to global code that will
     # be added to every generated file.
     if ('cuda' not in sdfg.global_code or 'mma.h' not in sdfg.global_code['cuda'].code):
-        sdfg.append_global_code(global_code, 'cuda')
+        sdfg.append_global_code(global_code, 'cuda', language=dace.Language.CPP)
 
 
 def frag_fill(frag, fill):

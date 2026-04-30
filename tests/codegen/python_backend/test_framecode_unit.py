@@ -102,7 +102,7 @@ class TestInitAndSymbolResolution:
         sdfg = _make_sdfg("runtime_append_representation")
 
         sdfg.set_global_code("value = 1", language=dtypes.Language.Python)
-        sdfg.append_global_code("value = value + 1")
+        sdfg.append_global_code("value = value + 1", language=dtypes.Language.Python)
 
         assert sdfg.global_code['frame'].language == dtypes.Language.Python
         assert isinstance(sdfg.global_code['frame'].code, list)

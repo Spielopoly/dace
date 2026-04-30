@@ -14,7 +14,7 @@ class TimerProvider(InstrumentationProvider):
         global_stream.write('#include <chrono>')
 
         # For other file headers
-        sdfg.append_global_code('\n#include <chrono>', None)
+        sdfg.append_global_code('\n#include <chrono>', None, language=dtypes.Language.CPP)
 
         if sdfg.instrument == dtypes.InstrumentationType.Timer:
             self.on_tbegin(local_stream, sdfg, sdfg)

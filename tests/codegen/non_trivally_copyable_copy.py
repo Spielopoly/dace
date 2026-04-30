@@ -93,7 +93,7 @@ def _gen_sdfg():
 
     s1.add_edge(a, None, b, None, dace.memlet.Memlet.from_array("A", sdfg.arrays["A"]))
 
-    sdfg.append_global_code(struct_str)
+    sdfg.append_global_code(struct_str, language=dace.Language.CPP)
 
     return sdfg
 
@@ -126,7 +126,7 @@ def _gen_sdfg_with_copy_in_and_out():
 
     s1.add_edge(ia, None, ib, None, dace.memlet.Memlet.from_array("iA", sdfg.arrays["iA"]))
 
-    sdfg.append_global_code(struct_str)
+    sdfg.append_global_code(struct_str, language=dace.Language.CPP)
 
     a = s0.add_access("A")
     ia = s0.add_access("iA")

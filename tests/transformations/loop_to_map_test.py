@@ -17,7 +17,7 @@ from dace.transformation.interstate.loop_lifting import LoopLifting
 def make_sdfg(with_wcr, map_in_guard, reverse_loop, use_variable, assign_after, log_path):
 
     sdfg = dace.SDFG(f"loop_to_map_test_{with_wcr}_{map_in_guard}_{reverse_loop}_{use_variable}_{assign_after}")
-    sdfg.set_global_code("#include <fstream>\n#include <mutex>")
+    sdfg.set_global_code("#include <fstream>\n#include <mutex>", language=dace.Language.CPP)
 
     init = sdfg.add_state("init")
     guard = sdfg.add_state("guard")

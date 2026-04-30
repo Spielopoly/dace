@@ -22,7 +22,7 @@ def make_sdfg():
     n = dace.symbol("N")
 
     sdfg_outer = dace.SDFG("prune_connectors_test")
-    sdfg_outer.set_global_code("#include <fstream>\n#include <mutex>")
+    sdfg_outer.set_global_code("#include <fstream>\n#include <mutex>", language=dace.Language.CPP)
     state_outer = sdfg_outer.add_state("state_outer")
     sdfg_outer.add_symbol("N", dace.int32)
 

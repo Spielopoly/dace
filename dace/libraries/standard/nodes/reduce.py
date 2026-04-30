@@ -600,10 +600,10 @@ DACE_EXPORTED void __dace_reduce_{id}({intype} *input, {outtype} *output, {reduc
                                    language=dace.Language.CPP)
 
         # Add the rest of the code
-        sdfg.append_global_code(host_globalcode.getvalue())
-        sdfg.append_global_code(cuda_globalcode.getvalue(), 'cuda')
-        sdfg.append_init_code(cuda_initcode.getvalue(), 'cuda')
-        sdfg.append_exit_code(cuda_exitcode.getvalue(), 'cuda')
+        sdfg.append_global_code(host_globalcode.getvalue(), language=dace.Language.CPP)
+        sdfg.append_global_code(cuda_globalcode.getvalue(), 'cuda', language=dace.Language.CPP)
+        sdfg.append_init_code(cuda_initcode.getvalue(), 'cuda', language=dace.Language.CPP)
+        sdfg.append_exit_code(cuda_exitcode.getvalue(), 'cuda', language=dace.Language.CPP)
 
         # Rename outer connectors and add to node
         input_edge._dst_conn = '_in'

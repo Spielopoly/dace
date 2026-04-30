@@ -84,11 +84,11 @@ state.add_nedge(gC, C, dp.Memlet.simple('gC', '0:N, 0:N'))
 # Add CUBLAS initialization and teardown code
 # Global code (top of file, can be used for includes and global variables)
 sdfg.append_global_code('''#include <cublas_v2.h>
-cublasHandle_t handle;''')
+cublasHandle_t handle;''', language=dp.Language.CPP)
 # Initialization code (called in __dace_init())
-sdfg.append_init_code('cublasCreate(&handle);')
+sdfg.append_init_code('cublasCreate(&handle);', language=dp.Language.CPP)
 # Teardown code (called in __dace_exit())
-sdfg.append_exit_code('cublasDestroy(handle);')
+sdfg.append_exit_code('cublasDestroy(handle);', language=dp.Language.CPP)
 
 ######################################################################
 

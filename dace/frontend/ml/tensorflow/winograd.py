@@ -18,7 +18,7 @@ def add_cublas_cusolver(sdfg: dace.SDFG):
         cublasHandle_t handle;
         float* const_zero;
         float* const_pone;
-        """)
+        """, language=dace.Language.CPP)
     sdfg.set_init_code("""
             cublasCreate(&handle);
             cublasSetPointerMode(handle, CUBLAS_POINTER_MODE_DEVICE);
@@ -32,12 +32,12 @@ def add_cublas_cusolver(sdfg: dace.SDFG):
             float pone = 1.0;
             cudaMemcpy(const_pone, &pone, sizeof(float) * 1,
             cudaMemcpyHostToDevice);
-        """)
+        """, language=dace.Language.CPP)
     sdfg.set_exit_code("""
             cublasDestroy(handle);
             cudaFree(const_zero);
             cudaFree(const_pone);
-        """)
+        """, language=dace.Language.CPP)
 
 
 # TODO: Use library nodes

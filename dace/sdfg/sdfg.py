@@ -11,7 +11,7 @@ from hashlib import md5, sha256
 import random
 import shutil
 import sys
-from typing import Any, AnyStr, Dict, List, Optional, Sequence, Set, Tuple, Type, TYPE_CHECKING, Union
+from typing import Any, AnyStr, Dict, List, Literal, Optional, Sequence, Set, Tuple, Type, TYPE_CHECKING, Union
 import warnings
 import subprocess
 import tempfile
@@ -939,104 +939,170 @@ class SDFG(ControlFlowRegion):
     def regenerate_code(self, value):
         self._regenerate_code = value
 
-    def set_global_code(self, cpp_code: str, location: str = 'frame'):
+    def _update_code(self,
+                     codeblocks: Dict[str, CodeBlock],
+                     code: str | CodeBlock,
+                     location: str | None,
+                     action: Literal['set', 'append', 'prepend'],
+                     language: dtypes.Language | None = None) -> None:
+        if isinstance(code, CodeBlock):
+            if language is not None and code.language != language:
+                raise ValueError(f'Language argument {language} does not match code block language {code.language}.')
+            language = code.language
+            code_string = code.as_string
+        elif not isinstance(code, str):
+            raise TypeError('Code must be either a string or a CodeBlock.')
+        elif language is None:
+            raise ValueError('Language must be specified when code is not a CodeBlock.')
+        else:
+            code_string = code
+
+        if action == 'set':
+            codeblocks[location] = CodeBlock(code_string, language) # type: ignore
+            return
+
+        if location not in codeblocks:
+            codeblocks[location] = CodeBlock(code_string, language) # type: ignore
+            return
+
+        existing = codeblocks[location].as_string or ''
+        
+        if existing and codeblocks[location].language != language:
+            raise ValueError(f'Cannot {action} code with language {language} to code with language {codeblocks[location].language} at location "{location}".')
+
+        new_code = code_string
+        if action == 'append':
+            codeblocks[location] = CodeBlock(existing + "\n" + new_code, language)
+        elif action == 'prepend':
+            codeblocks[location] = CodeBlock(new_code + "\n" + existing, language)
+        else:
+            raise ValueError(f'Invalid action "{action}".')
+
+    def set_global_code(self,
+                        code: str | CodeBlock,
+                        location: str | None = 'frame',
+                        language: dtypes.Language | None = None):
         """
-        Sets C++ code that will be generated in a global scope on
+        Sets code that will be generated in a global scope on
         one of the generated code files.
 
-        :param cpp_code: The code to set.
+        :param code: The code to set.
         :param location: The file/backend in which to generate the code.
                          Options are None (all files), "frame", "openmp",
                          "cuda", or any code generator
                          name.
+        :param language: The programming language of the code to set.
+                         Only used if code is not a CodeBlock.
         """
-        self.global_code[location] = CodeBlock(cpp_code, dace.dtypes.Language.CPP)
+        self._update_code(self.global_code, code, location, 'set', language)
 
-    def set_init_code(self, cpp_code: str, location: str = 'frame'):
+    def set_init_code(self,
+                      code: str | CodeBlock,
+                      location: str | None = 'frame',
+                      language: dtypes.Language | None = None):
         """
-        Sets C++ code that will be generated in the __dace_init_* functions on
+        Sets code that will be generated in the __dace_init_* functions on
         one of the generated code files.
 
-        :param cpp_code: The code to set.
+        :param code: The code to set.
         :param location: The file/backend in which to generate the code.
                          Options are None (all files), "frame", "openmp",
                          "cuda", or any code generator
                          name.
+        :param language: The programming language of the code to set.
+                         Only used if code is not a CodeBlock.
         """
-        self.init_code[location] = CodeBlock(cpp_code, dtypes.Language.CPP)
+        self._update_code(self.init_code, code, location, 'set', language)
 
-    def set_exit_code(self, cpp_code: str, location: str = 'frame'):
+    def set_exit_code(self,
+                      code: str | CodeBlock,
+                      location: str | None = 'frame',
+                      language: dtypes.Language | None = None):
         """
-        Sets C++ code that will be generated in the __dace_exit_* functions on
+        Sets code that will be generated in the __dace_exit_* functions on
         one of the generated code files.
 
-        :param cpp_code: The code to set.
+        :param code: The code to set.
         :param location: The file/backend in which to generate the code.
                          Options are None (all files), "frame", "openmp",
                          "cuda", or any code generator
                          name.
+        :param language: The programming language of the code to set.
+                         Only used if code is not a CodeBlock.
         """
-        self.exit_code[location] = CodeBlock(cpp_code, dtypes.Language.CPP)
+        self._update_code(self.exit_code, code, location, 'set', language)
 
-    def append_global_code(self, cpp_code: str, location: str = 'frame'):
+    def append_global_code(self,
+                           code: str | CodeBlock,
+                           location: str | None = 'frame',
+                           language: dtypes.Language | None = None):
         """
-        Appends C++ code that will be generated in a global scope on
+        Appends code that will be generated in a global scope on
         one of the generated code files.
 
-        :param cpp_code: The code to set.
+        :param code: The code to set.
         :param location: The file/backend in which to generate the code.
                          Options are None (all files), "frame", "openmp",
                          "cuda", or any code generator
                          name.
+        :param language: The programming language of the code to set.
+                         Only used if code is not a CodeBlock.
         """
-        if location not in self.global_code:
-            self.global_code[location] = CodeBlock('', dtypes.Language.CPP)
-        self.global_code[location].code += cpp_code
+        self._update_code(self.global_code, code, location, 'append', language)
 
-    def append_init_code(self, cpp_code: str, location: str = 'frame'):
+    def append_init_code(self,
+                         code: str | CodeBlock,
+                         location: str | None = 'frame',
+                         language: dtypes.Language | None = None):
         """
-        Appends C++ code that will be generated in the __dace_init_* functions on
+        Appends code that will be generated in the __dace_init_* functions on
         one of the generated code files.
 
-        :param cpp_code: The code to append.
+        :param code: The code to append.
         :param location: The file/backend in which to generate the code.
                          Options are None (all files), "frame", "openmp",
                          "cuda", or any code generator
                          name.
+        :param language: The programming language of the code to set.
+                         Only used if code is not a CodeBlock.
         """
-        if location not in self.init_code:
-            self.init_code[location] = CodeBlock('', dtypes.Language.CPP)
-        self.init_code[location].code += cpp_code
+        self._update_code(self.init_code, code, location, 'append', language)
 
-    def append_exit_code(self, cpp_code: str, location: str = 'frame'):
+    def append_exit_code(self,
+                         code: str | CodeBlock,
+                         location: str | None = 'frame',
+                         language: dtypes.Language | None = None):
         """
-        Appends C++ code that will be generated in the __dace_exit_* functions on
+        Appends code that will be generated in the __dace_exit_* functions on
         one of the generated code files.
 
-        :param cpp_code: The code to append.
+        :param code: The code to append.
         :param location: The file/backend in which to generate the code.
                          Options are None (all files), "frame", "openmp",
                          "cuda", or any code generator
                          name.
+        :param language: The programming language of the code to set.
+                         Only used if code is not a CodeBlock.
         """
-        if location not in self.exit_code:
-            self.exit_code[location] = CodeBlock('', dtypes.Language.CPP)
-        self.exit_code[location].code += cpp_code
+        self._update_code(self.exit_code, code, location, 'append', language)
 
-    def prepend_exit_code(self, cpp_code: str, location: str = 'frame'):
+    def prepend_exit_code(self,
+                          code: str | CodeBlock,
+                          location: str | None = 'frame',
+                          language: dtypes.Language | None = None):
         """
-        Prepends C++ code that will be generated in the __dace_exit_* functions on
+        Prepends code that will be generated in the __dace_exit_* functions on
         one of the generated code files.
 
-        :param cpp_code: The code to prepend.
+        :param code: The code to prepend.
         :param location: The file/backend in which to generate the code.
                          Options are None (all files), "frame", "openmp",
                          "cuda", or any code generator
                          name.
+        :param language: The programming language of the code to set.
+                         Only used if code is not a CodeBlock.
         """
-        if location not in self.exit_code:
-            self.exit_code[location] = CodeBlock('', dtypes.Language.CPP)
-        self.exit_code[location].code = cpp_code + self.exit_code[location].code
+        self._update_code(self.exit_code, code, location, 'prepend', language)
 
     def append_transformation(self, transformation):
         """
@@ -2276,8 +2342,8 @@ class SDFG(ControlFlowRegion):
 
         self._pgrids[grid_name] = ProcessGrid(grid_name, is_subgrid, shape, parent_grid, color, exact_grid, root)
 
-        self.append_init_code(self._pgrids[grid_name].init_code())
-        self.append_exit_code(self._pgrids[grid_name].exit_code())
+        self.append_init_code(self._pgrids[grid_name].init_code(), language=dtypes.Language.CPP)
+        self.append_exit_code(self._pgrids[grid_name].exit_code(), language=dtypes.Language.CPP)
 
         return grid_name
 
@@ -2320,8 +2386,8 @@ class SDFG(ControlFlowRegion):
         subarray_name = self._find_new_name('__subarray')
 
         self._subarrays[subarray_name] = SubArray(subarray_name, dtype, shape, subshape, pgrid, correspondence)
-        self.append_init_code(self._subarrays[subarray_name].init_code())
-        self.append_exit_code(self._subarrays[subarray_name].exit_code())
+        self.append_init_code(self._subarrays[subarray_name].init_code(), language=dtypes.Language.CPP)
+        self.append_exit_code(self._subarrays[subarray_name].exit_code(), language=dtypes.Language.CPP)
 
         return subarray_name
 
@@ -2337,8 +2403,8 @@ class SDFG(ControlFlowRegion):
         name = self._find_new_name('__rdistrarray')
 
         self._rdistrarrays[name] = RedistrArray(name, array_a, array_b)
-        self.append_init_code(self._rdistrarrays[name].init_code(self))
-        self.append_exit_code(self._rdistrarrays[name].exit_code(self))
+        self.append_init_code(self._rdistrarrays[name].init_code(self), language=dtypes.Language.CPP)
+        self.append_exit_code(self._rdistrarrays[name].exit_code(self), language=dtypes.Language.CPP)
         return name
 
     def add_loop(

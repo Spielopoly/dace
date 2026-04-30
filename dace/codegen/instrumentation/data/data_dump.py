@@ -1,5 +1,5 @@
 # Copyright 2019-2026 ETH Zurich and the DaCe authors. All rights reserved.
-from dace import data as dt, dtypes, registry, SDFG
+from dace import data as dt, dtypes, registry, SDFG, Language
 from dace.sdfg import nodes
 from dace.codegen.prettycode import CodeIOStream
 from dace.codegen.instrumentation.provider import InstrumentationProvider
@@ -33,7 +33,7 @@ class DataInstrumentationProviderMixin:
         global_stream.write('#include <%s>' % header_name)
 
         # For other file headers
-        sdfg.append_global_code('\n#include <%s>' % header_name, None)
+        sdfg.append_global_code('\n#include <%s>' % header_name, None, language=Language.CPP)
 
     def _generate_copy_to_host(self, node: nodes.AccessNode, desc: dt.Array, ptr: str) -> Tuple[str, str, str]:
         """ Copies to host and returns (preamble, postamble, name of new host pointer). """
@@ -92,12 +92,12 @@ class SaveProvider(InstrumentationProvider, DataInstrumentationProviderMixin):
             self.framecode = codegen
             path = os.path.abspath(os.path.join(sdfg.build_folder, 'data')).replace('\\', '/')
             codegen.statestruct.append('dace::DataSerializer *serializer;')
-            sdfg.append_init_code(f'__state->serializer = new dace::DataSerializer("{path}");\n')
+            sdfg.append_init_code(f'__state->serializer = new dace::DataSerializer("{path}");\n', language=dtypes.Language.CPP)
 
     def on_sdfg_end(self, sdfg: SDFG, local_stream: CodeIOStream, global_stream: CodeIOStream):
         # Teardown serializer versioning object
         if sdfg.parent is None:
-            sdfg.append_exit_code('delete __state->serializer;\n')
+            sdfg.append_exit_code('delete __state->serializer;\n', language=dtypes.Language.CPP)
 
     def on_state_begin(self, sdfg: SDFG, cfg: ControlFlowRegion, state: SDFGState, local_stream: CodeIOStream,
                        global_stream: CodeIOStream):
@@ -199,7 +199,7 @@ class RestoreProvider(InstrumentationProvider, DataInstrumentationProviderMixin)
         if sdfg.parent is None:
             self.framecode = codegen
             codegen.statestruct.append('dace::DataSerializer *serializer;')
-            sdfg.append_init_code(f'__state->serializer = new dace::DataSerializer("");\n')
+            sdfg.append_init_code(f'__state->serializer = new dace::DataSerializer("");\n', language=dtypes.Language.CPP)
 
             # Add method that controls serializer input
             global_stream.write(self._generate_report_setter(sdfg))
@@ -207,7 +207,7 @@ class RestoreProvider(InstrumentationProvider, DataInstrumentationProviderMixin)
     def on_sdfg_end(self, sdfg: SDFG, local_stream: CodeIOStream, global_stream: CodeIOStream):
         # Teardown serializer versioning object
         if sdfg.parent is None:
-            sdfg.append_exit_code('delete __state->serializer;\n')
+            sdfg.append_exit_code('delete __state->serializer;\n', language=dtypes.Language.CPP)
 
     def on_state_begin(self, sdfg: SDFG, cfg: ControlFlowRegion, state: SDFGState, local_stream: CodeIOStream,
                        global_stream: CodeIOStream):

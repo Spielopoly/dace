@@ -1,6 +1,6 @@
 # Copyright 2019-2021 ETH Zurich and the DaCe authors. All rights reserved.
 from typing import Union
-from dace import config, dtypes, registry
+from dace import config, dtypes, registry, Language
 from dace.codegen.prettycode import CodeIOStream
 from dace.sdfg import nodes, is_devicelevel_gpu
 from dace.codegen import common
@@ -29,8 +29,8 @@ class GPUEventProvider(InstrumentationProvider):
         global_stream.write('#include <%s>' % header_name)
 
         # For other file headers
-        sdfg.append_global_code('\n#include <chrono>', None)
-        sdfg.append_global_code('\n#include <%s>' % header_name, None)
+        sdfg.append_global_code('\n#include <chrono>', None, language=Language.CPP)
+        sdfg.append_global_code('\n#include <%s>' % header_name, None, language=Language.CPP)
 
     def _get_sobj(self, node: Union[nodes.EntryNode, nodes.ExitNode]):
         # Get object behind scope

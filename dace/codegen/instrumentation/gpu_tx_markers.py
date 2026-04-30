@@ -40,10 +40,10 @@ class GPUTXMarkersProvider(InstrumentationProvider):
         if self.include_generated:
             return
         if self.backend == 'cuda':
-            sdfg.append_global_code(self.NVTX_HEADER_INCLUDE, 'frame')
+            sdfg.append_global_code(self.NVTX_HEADER_INCLUDE, 'frame', language=dtypes.Language.CPP)
         elif self.backend == 'hip':
             if self.enable_rocTX:
-                sdfg.append_global_code(self.ROCTX_HEADER_INCLUDE, 'frame')
+                sdfg.append_global_code(self.ROCTX_HEADER_INCLUDE, 'frame', language=dtypes.Language.CPP)
         else:
             raise NameError('GPU backend "%s" not recognized' % self.backend)
         self.include_generated = True
