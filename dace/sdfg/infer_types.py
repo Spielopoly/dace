@@ -124,8 +124,7 @@ def set_default_schedule_and_storage_types(scope: Union[SDFG, SDFGState, nodes.E
                                            parent_schedules: List[dtypes.ScheduleType] = None,
                                            use_parent_schedule: bool = False,
                                            state: SDFGState = None,
-                                           child_nodes: Dict[nodes.Node, List[nodes.Node]] = None,
-                                           default_top_level_schedule: Optional[dtypes.ScheduleType] = None):
+                                           child_nodes: Dict[nodes.Node, List[nodes.Node]] = None):
     """
     Sets default storage and schedule types throughout SDFG in-place.
     Replaces ``ScheduleType.Default`` and ``StorageType.Default``
@@ -156,9 +155,6 @@ def set_default_schedule_and_storage_types(scope: Union[SDFG, SDFGState, nodes.E
     :param state: (Use when working with a single scope) The parent state.
     :param child_nodes: (Use when working with a single scope) A mapping of each scope entry
                         node to its children.
-    :param default_top_level_schedule: Optional override for the schedule that should be used
-                                       when a Default-scheduled scope has no surrounding schedule
-                                       constraints.
     """
     parent_schedules = parent_schedules or [None]
 
@@ -169,8 +165,7 @@ def set_default_schedule_and_storage_types(scope: Union[SDFG, SDFGState, nodes.E
                                                    parent_schedules,
                                                    use_parent_schedule=use_parent_schedule,
                                                    state=state,
-                                                   child_nodes=state.scope_children(),
-                                                   default_top_level_schedule=default_top_level_schedule)
+                                                   child_nodes=state.scope_children())
 
         # Take care of remaining scalars without access nodes
         for aname, desc in scope.arrays.items():
@@ -199,7 +194,7 @@ def set_default_schedule_and_storage_types(scope: Union[SDFG, SDFGState, nodes.E
 
     # Set default schedules in this scope based on parent schedule and inferred storage types
     nested_scopes = _set_default_schedule_in_scope(state, parent_node, parent_schedules, child_nodes,
-                                                   use_parent_schedule, default_top_level_schedule)
+                                                   use_parent_schedule)
 
     # Loop over internal nested SDFGs and scope entry nodes
     for nnode in nested_scopes:
@@ -215,19 +210,16 @@ def set_default_schedule_and_storage_types(scope: Union[SDFG, SDFGState, nodes.E
                                                parent_schedules + extra_parent_schedules,
                                                use_parent_schedule=False,
                                                state=state,
-                                               child_nodes=child_nodes,
-                                               default_top_level_schedule=default_top_level_schedule)
+                                               child_nodes=child_nodes)
 
 
-def _determine_child_schedule(parent_schedules: List[dtypes.ScheduleType],
-                              default_top_level_schedule: Optional[dtypes.ScheduleType] = None
-                              ) -> Optional[dtypes.ScheduleType]:
+def _determine_child_schedule(parent_schedules: List[dtypes.ScheduleType]) -> Optional[dtypes.ScheduleType]:
     for sched in reversed(parent_schedules):
         if sched is not None and sched in dtypes.SCOPEDEFAULT_SCHEDULE:
             child_sched = dtypes.SCOPEDEFAULT_SCHEDULE[sched]
             if child_sched is not None:
                 return child_sched
-    return default_top_level_schedule
+    return None
 
 
 def _determine_child_storage(parent_schedules: List[dtypes.ScheduleType]) -> Optional[dtypes.StorageType]:
@@ -239,10 +231,7 @@ def _determine_child_storage(parent_schedules: List[dtypes.ScheduleType]) -> Opt
     return None
 
 
-def _determine_schedule_from_storage(state: SDFGState,
-                                     node: nodes.Node,
-                                     default_top_level_schedule: Optional[dtypes.ScheduleType] = None
-                                     ) -> Optional[dtypes.ScheduleType]:
+def _determine_schedule_from_storage(state: SDFGState, node: nodes.Node) -> Optional[dtypes.ScheduleType]:
     child_schedule = None
     memlets: Set[str] = set()
     if node is None or isinstance(node, nodes.NestedSDFG):  # State or nested SDFG
@@ -283,7 +272,7 @@ def _determine_schedule_from_storage(state: SDFGState,
 
     # If no valid schedules are found and there are no conflicts with storage, use default top-level schedule
     if child_schedule is None:
-        child_schedule = default_top_level_schedule or dtypes.SCOPEDEFAULT_SCHEDULE[None]
+        child_schedule = dtypes.SCOPEDEFAULT_SCHEDULE[None]
 
     return child_schedule
 
@@ -292,16 +281,14 @@ def _set_default_schedule_in_scope(state: SDFGState,
                                    parent_node: nodes.Node,
                                    parent_schedules: List[dtypes.ScheduleType],
                                    child_nodes: Dict[nodes.Node, List[nodes.Node]],
-                                   use_parent_schedule: bool = False,
-                                   default_top_level_schedule: Optional[dtypes.ScheduleType] = None
-                                   ) -> List[Union[nodes.EntryNode, nodes.NestedSDFG]]:
+                                   use_parent_schedule: bool = False) -> List[Union[nodes.EntryNode, nodes.NestedSDFG]]:
     nested_scopes: List[Union[nodes.EntryNode, nodes.NestedSDFG]] = []
 
     # Try to determine schedule based on parent schedule(s)
     if use_parent_schedule:
         child_schedule = parent_schedules[-1]
     else:
-        child_schedule = _determine_child_schedule(parent_schedules, default_top_level_schedule)
+        child_schedule = _determine_child_schedule(parent_schedules)
 
         # Special case for dynamic thread-block neighboring schedules
         if child_schedule == dtypes.ScheduleType.GPU_ThreadBlock:
@@ -318,14 +305,14 @@ def _set_default_schedule_in_scope(state: SDFGState,
                 # If parent schedules do not determine child schedule,
                 # test for storage of the scope by collecting all neighboring memlets
                 if child_schedule is None:
-                    local_child_schedule = _determine_schedule_from_storage(state, node, default_top_level_schedule)
+                    local_child_schedule = _determine_schedule_from_storage(state, node)
                 else:
                     local_child_schedule = child_schedule
                 node.schedule = local_child_schedule
         elif getattr(node, 'schedule', False) and not isinstance(node, nodes.ExitNode):
             if node.schedule == dtypes.ScheduleType.Default:
                 if child_schedule is None:
-                    local_child_schedule = _determine_schedule_from_storage(state, node, default_top_level_schedule)
+                    local_child_schedule = _determine_schedule_from_storage(state, node)
                 else:
                     local_child_schedule = child_schedule
                 node.schedule = local_child_schedule

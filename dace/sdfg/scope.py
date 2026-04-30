@@ -9,7 +9,7 @@ from dace.config import Config
 from dace.sdfg import nodes as nd
 from dace.sdfg.state import StateSubgraphView
 
-ScopeDictType = Dict[nd.Node, nd.Node | None]
+ScopeDictType = Dict[nd.Node, List[nd.Node]]
 
 
 class ScopeTree(object):

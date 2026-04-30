@@ -883,15 +883,6 @@ class SDFG(ControlFlowRegion):
         for array in self.arrays.values():
             replace_properties_dict(array, repldict, symrepl)
 
-        if replace_in_graph and replace_keys:
-            # Runtime code participates only in full SDFG-wide replacements.
-            # Partial replace_dict callers rely on the existing scoping flags to
-            # leave helper/module code untouched.
-            from dace.sdfg.replace import replace_in_runtime_codeblock
-            for runtime_code in (self.global_code, self.init_code, self.exit_code):
-                for codeblock in runtime_code.values():
-                    replace_in_runtime_codeblock(codeblock, repldict)
-
         super().replace_dict(repldict, symrepl, replace_in_graph, replace_keys)
 
     def add_symbol(self, name, stype, find_new_name: bool = False):
@@ -948,72 +939,9 @@ class SDFG(ControlFlowRegion):
     def regenerate_code(self, value):
         self._regenerate_code = value
 
-    def _runtime_codeblock_language(self,
-                                    language: Optional[dtypes.Language],
-                                    existing: Optional[CodeBlock] = None) -> dtypes.Language:
-        if language is not None:
-            return language
-        if existing is not None:
-            return existing.language
-        return dtypes.Language.CPP
-
-    def _ensure_runtime_codeblock(self,
-                                  codeblocks: Dict[str, CodeBlock],
-                                  location: str,
-                                  language: Optional[dtypes.Language]) -> CodeBlock:
-        existing_codeblock = codeblocks.get(location)
-        resolved_language = self._runtime_codeblock_language(language, existing_codeblock)
-        if location not in codeblocks:
-            codeblocks[location] = CodeBlock('', resolved_language)
-        else:
-            existing_codeblock = codeblocks[location]
-            if existing_codeblock.as_string and existing_codeblock.language != resolved_language:
-                raise ValueError(
-                    f'Runtime code at location {location!r} already uses language '
-                    f'{existing_codeblock.language}, cannot append {resolved_language}.')
-            existing_codeblock.language = resolved_language
-        return codeblocks[location]
-
-    def _extend_runtime_codeblock(self, codeblock: CodeBlock, code: str, prepend: bool = False) -> None:
-        """Merge runtime code into an existing CodeBlock without depending on its backing representation."""
-        if not code:
-            return
-
-        existing_source = codeblock.as_string or ''
-        if not existing_source:
-            merged_source = code
-        elif prepend:
-            separator = '' if code.endswith('\n') or existing_source.startswith('\n') else '\n'
-            merged_source = code + separator + existing_source
-        else:
-            separator = '' if existing_source.endswith('\n') or code.startswith('\n') else '\n'
-            merged_source = existing_source + separator + code
-        codeblock.as_string = merged_source
-
-    def set_global_code(self,
-                        cpp_code: str,
-                        location: str = 'frame',
-                        language: Optional[dtypes.Language] = None):
+    def set_global_code(self, cpp_code: str, location: str = 'frame'):
         """
-        Sets runtime code that will be generated in a global scope on one of
-        the generated code files.
-
-        :param cpp_code: The code to set.
-        :param location: The file/backend in which to generate the code.
-                         Options are None (all files), "frame", "openmp",
-                         "cuda", or any code generator
-                         name.
-        :param language: Optional explicit language for the code block. If not
-                         provided, the helper keeps the legacy C++ default.
-        """
-        self.global_code[location] = CodeBlock(cpp_code, self._runtime_codeblock_language(language))
-
-    def set_init_code(self,
-                      cpp_code: str,
-                      location: str = 'frame',
-                      language: Optional[dtypes.Language] = None):
-        """
-        Sets runtime code that will be generated in the __dace_init_* functions on
+        Sets C++ code that will be generated in a global scope on
         one of the generated code files.
 
         :param cpp_code: The code to set.
@@ -1021,17 +949,12 @@ class SDFG(ControlFlowRegion):
                          Options are None (all files), "frame", "openmp",
                          "cuda", or any code generator
                          name.
-        :param language: Optional explicit language for the code block. If not
-                         provided, the helper keeps the legacy C++ default.
         """
-        self.init_code[location] = CodeBlock(cpp_code, self._runtime_codeblock_language(language))
+        self.global_code[location] = CodeBlock(cpp_code, dace.dtypes.Language.CPP)
 
-    def set_exit_code(self,
-                      cpp_code: str,
-                      location: str = 'frame',
-                      language: Optional[dtypes.Language] = None):
+    def set_init_code(self, cpp_code: str, location: str = 'frame'):
         """
-        Sets runtime code that will be generated in the __dace_exit_* functions on
+        Sets C++ code that will be generated in the __dace_init_* functions on
         one of the generated code files.
 
         :param cpp_code: The code to set.
@@ -1039,36 +962,40 @@ class SDFG(ControlFlowRegion):
                          Options are None (all files), "frame", "openmp",
                          "cuda", or any code generator
                          name.
-        :param language: Optional explicit language for the code block. If not
-                         provided, the helper keeps the legacy C++ default.
         """
-        self.exit_code[location] = CodeBlock(cpp_code, self._runtime_codeblock_language(language))
+        self.init_code[location] = CodeBlock(cpp_code, dtypes.Language.CPP)
 
-    def append_global_code(self,
-                           cpp_code: str,
-                           location: str = 'frame',
-                           language: Optional[dtypes.Language] = None):
+    def set_exit_code(self, cpp_code: str, location: str = 'frame'):
         """
-        Appends runtime code that will be generated in a global scope on one of
-        the generated code files.
+        Sets C++ code that will be generated in the __dace_exit_* functions on
+        one of the generated code files.
 
         :param cpp_code: The code to set.
         :param location: The file/backend in which to generate the code.
                          Options are None (all files), "frame", "openmp",
                          "cuda", or any code generator
                          name.
-        :param language: Optional explicit language for the code block. If not
-                         provided, the helper keeps the legacy C++ default.
         """
-        codeblock = self._ensure_runtime_codeblock(self.global_code, location, language)
-        self._extend_runtime_codeblock(codeblock, cpp_code)
+        self.exit_code[location] = CodeBlock(cpp_code, dtypes.Language.CPP)
 
-    def append_init_code(self,
-                         cpp_code: str,
-                         location: str = 'frame',
-                         language: Optional[dtypes.Language] = None):
+    def append_global_code(self, cpp_code: str, location: str = 'frame'):
         """
-        Appends runtime code that will be generated in the __dace_init_* functions on
+        Appends C++ code that will be generated in a global scope on
+        one of the generated code files.
+
+        :param cpp_code: The code to set.
+        :param location: The file/backend in which to generate the code.
+                         Options are None (all files), "frame", "openmp",
+                         "cuda", or any code generator
+                         name.
+        """
+        if location not in self.global_code:
+            self.global_code[location] = CodeBlock('', dtypes.Language.CPP)
+        self.global_code[location].code += cpp_code
+
+    def append_init_code(self, cpp_code: str, location: str = 'frame'):
+        """
+        Appends C++ code that will be generated in the __dace_init_* functions on
         one of the generated code files.
 
         :param cpp_code: The code to append.
@@ -1076,18 +1003,14 @@ class SDFG(ControlFlowRegion):
                          Options are None (all files), "frame", "openmp",
                          "cuda", or any code generator
                          name.
-        :param language: Optional explicit language for the code block. If not
-                         provided, the helper keeps the legacy C++ default.
         """
-        codeblock = self._ensure_runtime_codeblock(self.init_code, location, language)
-        self._extend_runtime_codeblock(codeblock, cpp_code)
+        if location not in self.init_code:
+            self.init_code[location] = CodeBlock('', dtypes.Language.CPP)
+        self.init_code[location].code += cpp_code
 
-    def append_exit_code(self,
-                         cpp_code: str,
-                         location: str = 'frame',
-                         language: Optional[dtypes.Language] = None):
+    def append_exit_code(self, cpp_code: str, location: str = 'frame'):
         """
-        Appends runtime code that will be generated in the __dace_exit_* functions on
+        Appends C++ code that will be generated in the __dace_exit_* functions on
         one of the generated code files.
 
         :param cpp_code: The code to append.
@@ -1095,18 +1018,14 @@ class SDFG(ControlFlowRegion):
                          Options are None (all files), "frame", "openmp",
                          "cuda", or any code generator
                          name.
-        :param language: Optional explicit language for the code block. If not
-                         provided, the helper keeps the legacy C++ default.
         """
-        codeblock = self._ensure_runtime_codeblock(self.exit_code, location, language)
-        self._extend_runtime_codeblock(codeblock, cpp_code)
+        if location not in self.exit_code:
+            self.exit_code[location] = CodeBlock('', dtypes.Language.CPP)
+        self.exit_code[location].code += cpp_code
 
-    def prepend_exit_code(self,
-                          cpp_code: str,
-                          location: str = 'frame',
-                          language: Optional[dtypes.Language] = None):
+    def prepend_exit_code(self, cpp_code: str, location: str = 'frame'):
         """
-        Prepends runtime code that will be generated in the __dace_exit_* functions on
+        Prepends C++ code that will be generated in the __dace_exit_* functions on
         one of the generated code files.
 
         :param cpp_code: The code to prepend.
@@ -1114,11 +1033,10 @@ class SDFG(ControlFlowRegion):
                          Options are None (all files), "frame", "openmp",
                          "cuda", or any code generator
                          name.
-        :param language: Optional explicit language for the code block. If not
-                         provided, the helper keeps the legacy C++ default.
         """
-        codeblock = self._ensure_runtime_codeblock(self.exit_code, location, language)
-        self._extend_runtime_codeblock(codeblock, cpp_code, prepend=True)
+        if location not in self.exit_code:
+            self.exit_code[location] = CodeBlock('', dtypes.Language.CPP)
+        self.exit_code[location].code = cpp_code + self.exit_code[location].code
 
     def append_transformation(self, transformation):
         """

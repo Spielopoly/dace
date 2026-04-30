@@ -5,6 +5,7 @@ flexible code generation with multiple backends by dispatching certain
 functionality to registered code generators based on user-defined predicates.
 """
 from dace.codegen.prettycode import CodeIOStream
+from dace.codegen.py.prettycode import PythonCodeIOStream
 from dace import attr_enum, config, data as dt, dtypes, nodes
 from dace.memlet import Memlet
 from dace.codegen import exceptions as cgx, prettycode
@@ -212,6 +213,12 @@ class TargetDispatcher(object):
         """ Returns a list of environments required to build and run the code.
         """
         return self._used_environments
+    
+    def _get_code_io_stream_class(self, sdfg: SDFG) -> type[CodeIOStream] | type[PythonCodeIOStream]:
+        if sdfg.backend == dtypes.BackendLanguage.Python:
+            return PythonCodeIOStream
+        else:
+            return CodeIOStream
 
     def register_state_dispatcher(self, dispatcher, predicate=None):
         """ Registers a code generator that processes a single state, calling
@@ -472,25 +479,19 @@ class TargetDispatcher(object):
                           state_id: int,
                           node: nodes.AccessNode,
                           datadesc: dt.Data,
-                          function_stream: prettycode.CodeIOStream,
-                          callsite_stream: prettycode.CodeIOStream,
+                          function_stream: CodeIOStream | PythonCodeIOStream,
+                          callsite_stream: CodeIOStream | PythonCodeIOStream,
                           declare: bool = True,
                           allocate: bool = True) -> None:
         """ Dispatches a code generator for data allocation. """
         self._used_targets.add(self._array_dispatchers[datadesc.storage])
 
-        def _new_stream_like(template_stream: prettycode.CodeIOStream) -> prettycode.CodeIOStream:
-            try:
-                return type(template_stream)()
-            except TypeError:
-                return CodeIOStream()
-
         if datadesc.lifetime == dtypes.AllocationLifetime.Persistent:
-            declaration_stream = _new_stream_like(function_stream)
+            declaration_stream = self._get_code_io_stream_class(sdfg)()
             callsite_stream = self.frame._initcode
         elif datadesc.lifetime == dtypes.AllocationLifetime.External:
-            declaration_stream = _new_stream_like(function_stream)
-            callsite_stream = _new_stream_like(function_stream)
+            declaration_stream = self._get_code_io_stream_class(sdfg)()
+            callsite_stream = self._get_code_io_stream_class(sdfg)()
         else:
             declaration_stream = callsite_stream
 
@@ -503,8 +504,8 @@ class TargetDispatcher(object):
                                                                      callsite_stream)
 
     def dispatch_deallocate(self, sdfg: SDFG, cfg: ControlFlowRegion, dfg: ScopeSubgraphView, state_id: int,
-                            node: nodes.AccessNode, datadesc: dt.Data, function_stream: prettycode.CodeIOStream,
-                            callsite_stream: prettycode.CodeIOStream) -> None:
+                            node: nodes.AccessNode, datadesc: dt.Data, function_stream: CodeIOStream | PythonCodeIOStream,
+                            callsite_stream: CodeIOStream | PythonCodeIOStream) -> None:
         """ Dispatches a code generator for a data deallocation. """
         self._used_targets.add(self._array_dispatchers[datadesc.storage])
 

@@ -21,13 +21,6 @@ from dace.transformation.pass_pipeline import FixedPointPipeline
 from dace.transformation.passes.simplification.control_flow_raising import ControlFlowRaising
 
 
-def _default_toplevel_schedule_for_backend(sdfg: SDFG):
-    """Return an optional top-level schedule override for backend-specific codegen."""
-    if sdfg.backend == dtypes.BackendLanguage.Python:
-        return dtypes.ScheduleType.Sequential
-    return None
-
-
 def generate_headers(sdfg: SDFG, frame: framecode.DaCeCodeGenerator) -> str:
     """ Generate a header file for the SDFG """
     proto = ""
@@ -208,19 +201,14 @@ def generate_code(sdfg: SDFG, validate=True) -> List[CodeObject]:
     infer_types.infer_connector_types(sdfg)
 
     # Set default storage/schedule types in SDFG
-    default_toplevel_schedule = _default_toplevel_schedule_for_backend(sdfg)
-    infer_types.set_default_schedule_and_storage_types(sdfg,
-                                                       None,
-                                                       default_top_level_schedule=default_toplevel_schedule)
+    infer_types.set_default_schedule_and_storage_types(sdfg, None)
 
     # Recursively expand library nodes that have not yet been expanded
     sdfg.expand_library_nodes()
 
     # After expansion, run another pass of connector/type inference
     infer_types.infer_connector_types(sdfg)
-    infer_types.set_default_schedule_and_storage_types(sdfg,
-                                                       None,
-                                                       default_top_level_schedule=default_toplevel_schedule)
+    infer_types.set_default_schedule_and_storage_types(sdfg, None)
 
     match sdfg.backend:
         case dtypes.BackendLanguage.CPP:
@@ -242,16 +230,6 @@ def generate_code(sdfg: SDFG, validate=True) -> List[CodeObject]:
 
         # Query codegen targets and preprocess
         frame.targets.add(py_target)
-        
-        # TODO: This is somewhat hacky, should look into doing this more like the C++ codgen.
-        # The problem was that if you have something that only generates constants, the Python 
-        # target would never be added to used_targets and thus the header generator would not 
-        # know to import numpy, which is required for array literals. This ensures that the Python 
-        # target is always visible to the header generator.
-        # But now it's obviously always there, which is also not ideal.
-        # I should also check if those constant thingies even represent a valid usecase
-        frame._dispatcher.used_targets.add(py_target)
-        
         py_target.preprocess(sdfg)
         
         # TODO: Add other targets

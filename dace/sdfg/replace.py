@@ -1,7 +1,6 @@
 # Copyright 2019-2024 ETH Zurich and the DaCe authors. All rights reserved.
 """ Contains functionality to perform find-and-replace of symbols in SDFGs. """
 
-import ast
 import re
 import warnings
 from typing import TYPE_CHECKING, Any, Dict, Optional
@@ -170,40 +169,6 @@ def replace_in_codeblock(codeblock: properties.CodeBlock, repl: Dict[str, str], 
         afr = ASTFindReplace(repl)
         for stmt in codeblock.code:
             afr.visit(stmt)
-
-
-def replace_in_runtime_codeblock(codeblock: properties.CodeBlock, repl: Dict[str, str]) -> None:
-    """Replace names in runtime/global code without introducing local aliases.
-
-    Runtime code executes in module or helper scope, so it needs direct substitution
-    rather than the tasklet-specific alias prefix emitted by ``replace_in_codeblock``.
-    """
-    if codeblock is None or not repl:
-        return
-
-    source = codeblock.as_string or ''
-    if not source:
-        return
-
-    normalized_replacements = {str(name): str(new_name) for name, new_name in repl.items()}
-
-    if codeblock.language == dtypes.Language.Python:
-        statements = codeblock.code if isinstance(codeblock.code, list) else ast.parse(source).body
-        replacer = ASTFindReplace(normalized_replacements)
-        for statement in statements:
-            replacer.visit(statement)
-        codeblock.code = statements
-        return
-
-    if codeblock.language == dtypes.Language.CPP:
-        updated_source = source
-        for name, new_name in normalized_replacements.items():
-            replacement = cppunparse.pyexpr2cpp(new_name)
-            updated_source = re.sub(rf'\b{re.escape(name)}\b', replacement, updated_source)
-        codeblock.code = updated_source
-        return
-
-    warnings.warn(f'Replacement was not made for runtime code of language {codeblock.language}')
 
 
 def replace_properties_dict(node: Any,
