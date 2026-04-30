@@ -337,6 +337,7 @@ class PythonCodeGen(TargetCodeGenerator):
     def define_out_memlet(self, sdfg: SDFG, cfg: ControlFlowRegion, dfg, state_id: int, src_node: nodes.Node,
                           dst_node: nodes.Node, edge: MultiConnectorEdge[Memlet],
                           function_stream: PythonCodeIOStream, callsite_stream: PythonCodeIOStream) -> None:
+        # TODO: Is this correct to leave empty?
         pass
 
     def emit_interstate_variable_declaration(self, name: str, dtype: dtypes.typeclass,
