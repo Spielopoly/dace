@@ -113,7 +113,7 @@ class TestInitAndSymbolResolution:
         sdfg = _make_sdfg("runtime_append_conflict")
         sdfg.set_init_code("sentinel = 1", language=dtypes.Language.Python)
 
-        with pytest.raises(ValueError, match='already uses language'):
+        with pytest.raises(ValueError, match='Cannot append code with language'):
             sdfg.append_init_code('int sentinel = 1;', language=dtypes.Language.CPP)
 
     def test_replace_dict_updates_runtime_code_for_full_sdfg_replacements(self):

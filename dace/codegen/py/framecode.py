@@ -27,7 +27,7 @@ from dace.properties import CodeBlock
 def codeblock_to_python(cb: CodeBlock):
     if cb.language == dtypes.Language.Python:
         return cb.as_string or ""
-    if cb.as_string:
+    if cb.as_string.strip():
         raise ValueError(f"CodeBlock language {cb.language} cannot be converted to Python.")
     # ignore empty code blocks
     return ""

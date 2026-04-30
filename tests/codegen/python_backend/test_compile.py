@@ -144,13 +144,15 @@ def test_output_file_includes_numpy_for_constant_only_sdfg(tmp_path, monkeypatch
     monkeypatch.setitem(dace.dtypes.NUMPY_TYPES, const_dtype, 'numpy.float64')
 
     out_file = tmp_path / 'const_only.py'
-    sdfg.compile(output_file=str(out_file))
+    compiled = sdfg.compile(output_file=str(out_file))
 
     assert out_file.exists()
     content = out_file.read_text()
     assert 'import numpy' in content
     assert 'const_arr = numpy.array(' in content
     assert 'dtype=numpy.float64' in content
+    
+    np.testing.assert_equal(compiled._namespace['const_arr'], np.array([1.0, 2.0], dtype=np.float64))
 
 
 if __name__ == "__main__":
