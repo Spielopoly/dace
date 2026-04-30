@@ -18,7 +18,7 @@ def simple_program(x: dace.float64[N,7], y: dace.float64[Modulo * N,7]):
         for j in range(7):
             if i % Modulo == 0 and j % 2 == 0:
                 y[Modulo * i, j] = x[i, j] * foo(x)
-    print(y)
+    # print(y)
     return x[..., ::3] + y[::Modulo, ::3]
 
 def _reference_simple_program(x: np.ndarray, y: np.ndarray, modulo: int) -> np.ndarray:
@@ -27,7 +27,7 @@ def _reference_simple_program(x: np.ndarray, y: np.ndarray, modulo: int) -> np.n
         for column_index in range(x.shape[1]):
             if row_index % modulo == 0 and column_index % 2 == 0:
                 y[modulo * row_index, column_index] = x[row_index, column_index] * foo(x)
-    print(y)
+    # print(y)
     return x[..., ::3] + y[::modulo, ::3]
 
 
@@ -51,7 +51,7 @@ def test_simple_program(n_value, modulo_value, save_generated_code=False):
             sdfg.compile('simple_program.py', return_program_handle=False, validate=False)
             sdfg.save('simple_program.sdfg')
         generated_code = sdfg.generate_code()[0].code
-        sdfg(x=x_test, y=y_test, __return=return_buffer, N=n_value, Modulo=modulo_value, print=print)
+        sdfg(x=x_test, y=y_test, __return=return_buffer, N=n_value, Modulo=modulo_value)
 
     np.testing.assert_allclose(return_buffer, expected)
     np.testing.assert_allclose(x_test, x_expected)

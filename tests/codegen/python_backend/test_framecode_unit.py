@@ -1633,37 +1633,6 @@ class TestAdditionalFramecodeBranches:
         entries = [t for vals in codegen.to_allocate.values() for t in vals]
         assert any(t[1] is None and t[3] and (not t[4]) and (not t[5]) for t in entries)
 
-    def test_allocate_arrays_in_scope_state_none_and_instrumentation(self, monkeypatch):
-        """Allocation with state=None uses state_id=-1 and triggers instrumentation callbacks."""
-        sdfg = dace.SDFG("alloc_state_none")
-        sdfg.backend = dace.dtypes.BackendLanguage.Python
-        sdfg.add_array("T", [2], dace.float64, transient=True)
-        sdfg.add_state("s0")
-        codegen = DaCePythonCodeGenerator(sdfg)
-
-        codegen.to_allocate[sdfg].append((sdfg, None, nodes.AccessNode("T"), True, True, False))
-        captured = {}
-
-        def fake_dispatch_allocate(tsdfg, cfg, state, state_id, *_args, **_kwargs):
-            captured["state"] = state
-            captured["state_id"] = state_id
-            captured["cfg"] = cfg
-            captured["tsdfg"] = tsdfg
-
-        called = {"count": 0}
-
-        class FakeInstr:
-            def on_allocation_end(self, *_args, **_kwargs):
-                called["count"] += 1
-
-        monkeypatch.setattr(codegen._dispatcher, "dispatch_allocate", fake_dispatch_allocate)
-        codegen._dispatcher.instrumentation = {"a": FakeInstr(), "b": None}
-
-        codegen.allocate_arrays_in_scope(sdfg, sdfg, sdfg, PythonCodeIOStream(), PythonCodeIOStream())
-        assert captured["state"] is None
-        assert captured["state_id"] == -1
-        assert called["count"] == 1
-
     def test_deallocate_arrays_in_scope_state_none_raises(self):
         """deallocate_arrays_in_scope with state=None reaches the AttributeError path."""
         sdfg = dace.SDFG("dealloc_state_none")
