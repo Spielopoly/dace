@@ -12,6 +12,7 @@ from dace import data, dtypes
 import dace.codegen.py.framecode as framecode_module
 from dace.codegen.py.framecode import DaCePythonCodeGenerator, codeblock_to_python
 from dace.codegen.py.prettycode import PythonCodeIOStream
+from dace.codegen.py.python_target import PythonCodeGen
 from dace.properties import CodeBlock
 from dace.sdfg import SDFG, nodes
 from dace.sdfg.state import ControlFlowRegion, LoopRegion, SDFGState
@@ -47,6 +48,13 @@ def _make_sdfg_with_tasklet(name: str = "tasklet_sdfg") -> SDFG:
 def _generate_code_for(sdfg: SDFG):
     """Run full code generation on the SDFG and return the code objects."""
     return sdfg.generate_code()
+
+
+def _make_codegen_with_python_target(sdfg: SDFG) -> DaCePythonCodeGenerator:
+    """Create frame codegen with the real Python target registered but still unused."""
+    codegen = DaCePythonCodeGenerator(sdfg)
+    codegen.targets.add(PythonCodeGen(codegen, sdfg))
+    return codegen
 
 
 # ===========================================================================
@@ -488,6 +496,38 @@ class TestGenerateFileheader:
         codegen.generate_fileheader(sdfg, stream, backend='frame')
         code = stream.getvalue()
         assert "import json" in code
+
+    def test_fileheader_constant_only_sdfg_includes_numpy_without_used_targets(self):
+        """Array constants should request numpy through the real Python target even when no target was dispatched."""
+        sdfg = dace.SDFG("const_only_header")
+        sdfg.backend = dace.dtypes.BackendLanguage.Python
+        sdfg.add_state("empty")
+        sdfg.add_constant("CONST_ARR", np.array([1.0, 2.0], dtype=np.float64))
+
+        codegen = _make_codegen_with_python_target(sdfg)
+
+        assert codegen._dispatcher.used_targets == set()
+
+        stream = PythonCodeIOStream()
+        codegen.generate_fileheader(sdfg, stream, backend='frame')
+        code = stream.getvalue()
+
+        assert code.count("import numpy") == 1
+        assert "CONST_ARR = numpy.array(" in code
+        assert "dtype=numpy.float64" in code
+
+    def test_fileheader_empty_program_without_used_targets_does_not_include_numpy(self):
+        """An unused real Python target should not add numpy imports for empty programs."""
+        sdfg = _make_sdfg("empty_header_no_numpy")
+        codegen = _make_codegen_with_python_target(sdfg)
+
+        assert codegen._dispatcher.used_targets == set()
+
+        stream = PythonCodeIOStream()
+        codegen.generate_fileheader(sdfg, stream, backend='frame')
+        code = stream.getvalue()
+
+        assert "import numpy" not in code
 
     def test_fileheader_verbatim_import_headers(self):
         """Raw import statements are emitted verbatim."""

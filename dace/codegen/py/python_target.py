@@ -8,9 +8,9 @@ import itertools
 import re
 from typing import TYPE_CHECKING, Optional
 
-from dace import data, dtypes, subsets
+from dace import data, dtypes, subsets, registry
 from dace.codegen.py.prettycode import PythonCodeIOStream
-from dace.codegen.target import TargetCodeGenerator
+from dace.codegen.py.target import PythonTargetCodeGenerator
 from dace.memlet import Memlet
 from dace.sdfg import NodeNotExpandedError, SDFG, ScopeSubgraphView, nodes, scope_contains_scope
 from dace.sdfg.graph import MultiConnectorEdge
@@ -20,8 +20,8 @@ if TYPE_CHECKING:
     from dace.codegen.py.framecode import DaCePythonCodeGenerator
     from dace.codegen.dispatcher import TargetDispatcher
 
-
-class PythonCodeGen(TargetCodeGenerator):
+@registry.autoregister_params(name='python')
+class PythonCodeGen(PythonTargetCodeGenerator):
     """Pure-Python code generator for SDFG nodes, scopes, and copies."""
 
     title = "Python"

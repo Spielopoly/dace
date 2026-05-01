@@ -2659,6 +2659,10 @@ class SDFG(ControlFlowRegion):
                 if p.is_dir():
                     p = p / f'{sdfg.name}.py'
                 p.write_text(program_objects[0].code)
+                if len(program_objects) > 1:
+                    for obj in program_objects[1:]:
+                        p_obj = p.parent / f'{obj.name}.py'
+                        p_obj.write_text(obj.code)
 
             if return_program_handle:
                 return compile_python_sdfg(sdfg, program_objects)

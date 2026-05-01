@@ -133,22 +133,19 @@ def test_output_file(tmp_path):
     assert exact_path.exists()
 
 
-def test_output_file_includes_numpy_for_constant_only_sdfg(tmp_path, monkeypatch):
+def test_output_file_includes_numpy_for_constant_only_sdfg(tmp_path):
     """compile(output_file=...) should emit numpy imports for array constants even without dispatch nodes."""
     sdfg = dace.SDFG('test_const_only_output_file')
     sdfg.add_state('empty')
     sdfg.add_constant('const_arr', np.array([1.0, 2.0], dtype=np.float64))
     sdfg.backend = dace.dtypes.BackendLanguage.Python
 
-    const_dtype = sdfg.constants_prop['const_arr'][0].dtype
-    monkeypatch.setitem(dace.dtypes.NUMPY_TYPES, const_dtype, 'numpy.float64')
-
     out_file = tmp_path / 'const_only.py'
     compiled = sdfg.compile(output_file=str(out_file))
 
     assert out_file.exists()
     content = out_file.read_text()
-    assert 'import numpy' in content
+    assert content.count('import numpy') == 1
     assert 'const_arr = numpy.array(' in content
     assert 'dtype=numpy.float64' in content
     

@@ -83,5 +83,6 @@ def compile_python_sdfg(sdfg, code_objects: 'list[CodeObject]') -> PythonCompile
     """
     if not code_objects:
         raise RuntimeError("No code objects generated for Python backend")
+    # TODO: What if there are multiple code objects?
     code = code_objects[0].code
     return PythonCompiledSDFG(sdfg, code)

@@ -49,6 +49,12 @@ def test_generated_code_has_pass_body():
     assert 'pass' in code[0].code
 
 
+def test_generated_code_does_not_import_numpy():
+    """An empty Python SDFG should not emit a numpy import in the frame header."""
+    _, code = _generate_empty_program()
+    assert 'import numpy' not in code[0].code
+
+
 def test_generated_code_is_valid_python():
     """Generated code must be compilable Python."""
     _, code = _generate_empty_program()
