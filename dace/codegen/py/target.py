@@ -44,6 +44,15 @@ class PythonTargetCodeGenerator(TargetCodeGeneratorBase):
         """
         pass
 
+    def write_and_resolve_expr(self,
+                            memlet: mm.Memlet,
+                            current_expr: str,
+                            new_expr: str) -> str:
+        """
+        Emits a conflict resolution call from a memlet.
+        """
+        raise NotImplementedError('Abstract class')
+
     def generate_scope(self, sdfg: SDFG, cfg: ControlFlowRegion, dfg_scope: ScopeSubgraphView, state_id: int,
                        function_stream: PythonCodeIOStream, callsite_stream: PythonCodeIOStream) -> None:
         """ Generates code for an SDFG state scope (from a scope-entry node
