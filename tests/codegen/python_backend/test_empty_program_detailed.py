@@ -13,10 +13,10 @@ def _generate_empty_program():
     return sdfg, sdfg.generate_code()
 
 
-def test_single_code_object():
-    """Exactly one CodeObject should be returned."""
+def test_number_of_code_objects():
+    """Exactly two CodeObjects should be returned."""
     _, code = _generate_empty_program()
-    assert len(code) == 1
+    assert len(code) == 2  # One for the frame, one for the usage example
 
 
 def test_language_is_py():
@@ -71,7 +71,7 @@ def test_generated_code_is_executable():
 
 
 if __name__ == "__main__":
-    test_single_code_object()
+    test_number_of_code_objects()
     test_language_is_py()
     test_title_is_frame()
     test_name_matches_sdfg()
