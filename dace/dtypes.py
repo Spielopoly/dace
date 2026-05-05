@@ -90,6 +90,8 @@ GPU_STORAGES = [
     StorageType.GPU_Shared,
 ]
 
+GPU_KERNEL_ACCESSIBLE_STORAGES = [StorageType.GPU_Global, StorageType.GPU_Shared, StorageType.Register]
+
 
 class ReductionType(Enum):
     """ Reduction types natively supported by the SDFG compiler. """
@@ -183,7 +185,7 @@ SCOPEDEFAULT_STORAGE = {
     ScheduleType.GPU_ThreadBlock: StorageType.Register,
     ScheduleType.GPU_ThreadBlock_Dynamic: StorageType.Register,
     ScheduleType.SVE_Map: StorageType.CPU_Heap,
-    ScheduleType.Snitch: StorageType.Snitch_TCDM
+    ScheduleType.Snitch: StorageType.Snitch_TCDM,
 }
 
 # Maps from ScheduleType to default ScheduleType for sub-scopes
@@ -200,7 +202,7 @@ SCOPEDEFAULT_SCHEDULE = {
     ScheduleType.GPU_ThreadBlock_Dynamic: ScheduleType.Sequential,
     ScheduleType.SVE_Map: ScheduleType.Sequential,
     ScheduleType.Snitch: ScheduleType.Snitch,
-    ScheduleType.Snitch_Multicore: ScheduleType.Snitch_Multicore
+    ScheduleType.Snitch_Multicore: ScheduleType.Snitch_Multicore,
 }
 
 # Maps from StorageType to a preferred ScheduleType for helping determine schedules.
@@ -1247,6 +1249,7 @@ if TYPE_CHECKING:
     class string(_DaCeArray, npt.NDArray[numpy.str_]): ...
     class vector(_DaCeArray, npt.NDArray[numpy.void]): ...
     class MPI_Request(_DaCeArray, npt.NDArray[numpy.void]): ...
+    class gpuStream_t(_DaCeArray, npt.NDArray[numpy.void]): ...
     # yapf: enable
 else:
     # Runtime definitions
@@ -1267,6 +1270,7 @@ else:
     complex128 = typeclass(numpy.complex128)
     string = stringtype()
     MPI_Request = opaque('MPI_Request')
+    gpuStream_t = opaque('gpuStream_t')
 
 _bool = bool
 
