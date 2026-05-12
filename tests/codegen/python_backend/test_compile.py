@@ -152,6 +152,39 @@ def test_output_file_includes_numpy_for_constant_only_sdfg(tmp_path):
     np.testing.assert_equal(compiled._namespace['const_arr'], np.array([1.0, 2.0], dtype=np.float64))
 
 
+def test_persistent_transient_resets_after_finalize():
+    """finalize() should clear persistent Python backend state before the next initialize cycle."""
+    sdfg = dace.SDFG('persistent_finalize_reset')
+    sdfg.backend = dace.dtypes.BackendLanguage.Python
+    sdfg.add_array('out', [1], dace.int64)
+    sdfg.add_scalar('counter', dace.int64, transient=True, lifetime=dace.dtypes.AllocationLifetime.Persistent)
+
+    state = sdfg.add_state('state')
+    counter_read = state.add_read('counter')
+    counter_write = state.add_write('counter')
+    out_write = state.add_write('out')
+    tasklet = state.add_tasklet('inc', {'current'}, {'next_value', 'result'}, 'next_value = current + 1\nresult = next_value')
+    state.add_edge(counter_read, None, tasklet, 'current', dace.Memlet('counter'))
+    state.add_edge(tasklet, 'next_value', counter_write, None, dace.Memlet('counter'))
+    state.add_edge(tasklet, 'result', out_write, None, dace.Memlet('out[0]'))
+
+    compiled = sdfg.compile()
+    out = np.zeros(1, dtype=np.int64)
+
+    compiled(out=out)
+    assert out[0] == 1
+
+    compiled(out=out)
+    assert out[0] == 2
+
+    compiled.finalize()
+    assert compiled._namespace['__dace_persistent_transients'] == {}
+
+    out.fill(0)
+    compiled(out=out)
+    assert out[0] == 1
+
+
 if __name__ == "__main__":
     import pytest
     pytest.main([__file__, '-q'])

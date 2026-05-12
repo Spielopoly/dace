@@ -9,6 +9,8 @@ import numpy as np
 
 import dace
 from dace import dtypes, data
+from dace.codegen.py.framecode import DaCePythonCodeGenerator
+from dace.codegen.py.python_target import PythonCodeGen
 from dace.dtypes import ScheduleType
 from dace.sdfg import SDFG
 from dace.memlet import Memlet
@@ -320,6 +322,35 @@ class TestMapCorrectness:
         expected = np.zeros(6, dtype=np.float64)
         expected[[5, 3, 1]] = a[[5, 3, 1]]
         np.testing.assert_allclose(b, expected)
+
+    def test_default_schedule_map_executes_as_sequential(self):
+        """Default-schedule maps are normalized to sequential loops in the Python backend."""
+        sdfg = _make_python_sdfg('test_default_schedule_corr')
+        sdfg.add_array('A', [4], dace.float64)
+        sdfg.add_array('B', [4], dace.float64)
+        state = sdfg.add_state('s')
+        map_entry, map_exit = state.add_map('m', {'i': '0:4'})
+        map_entry.map.schedule = ScheduleType.Default
+        tasklet = state.add_tasklet('copy', {'inp'}, {'out'}, 'out = inp + 1')
+        state.add_memlet_path(state.add_read('A'), map_entry, tasklet, dst_conn='inp', memlet=Memlet(data='A', subset='i'))
+        state.add_memlet_path(tasklet, map_exit, state.add_write('B'), src_conn='out', memlet=Memlet(data='B', subset='i'))
+
+        assert map_entry.map.schedule == ScheduleType.Default
+
+        frame = DaCePythonCodeGenerator(sdfg)
+        target = PythonCodeGen(frame, sdfg)
+        target.preprocess(sdfg)
+        assert map_entry.map.schedule == ScheduleType.Sequential
+
+        generated_code = sdfg.generate_code()[0].code
+        assert 'for i in range' in generated_code
+
+        compiled_sdfg = sdfg.compile()
+        a = np.arange(4, dtype=np.float64)
+        b = np.zeros(4, dtype=np.float64)
+        compiled_sdfg(A=a, B=b)
+
+        np.testing.assert_allclose(b, a + 1)
 
     @_MAP_XFAIL
     def test_map_square_elements(self):

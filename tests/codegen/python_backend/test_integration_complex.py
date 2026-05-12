@@ -119,6 +119,78 @@ def _make_runtime_inlining_symbol_mapping_sdfg(multistate: bool) -> tuple[SDFG, 
     return outer, transformation
 
 
+def _make_runtime_inlining_assignment_target_sdfg(multistate: bool) -> tuple[SDFG, type]:
+    """Build an inlining case where a mapped symbol is assigned in runtime code and must stay local."""
+    outer = _new_sdfg('runtime_inline_assignment_target_outer')
+    outer.add_symbol('M', dace.int64)
+    outer.add_array('A', [1], dace.int64)
+    outer.add_transient('tmp', [1], dace.int64)
+    outer.add_array('B', [1], dace.int64)
+
+    inner = SDFG('runtime_inline_assignment_target_inner')
+    inner.backend = BackendLanguage.Python
+    inner.add_symbol('N', dace.int64)
+    inner.append_init_code('N = X[0] + 1', language=dace.dtypes.Language.Python)
+    inner.add_array('X', [1], dace.int64)
+    inner.add_array('Y', [1], dace.int64)
+
+    if multistate:
+        entry_state = inner.add_state('entry', is_start_block=True)
+        compute_state = inner.add_state('compute')
+        inner.add_edge(entry_state, compute_state, InterstateEdge())
+    else:
+        compute_state = inner.add_state('compute', is_start_block=True)
+
+    compute_state.add_edge(compute_state.add_read('X'), None, compute_state.add_write('Y'), None, dace.Memlet('X[0] -> [0]'))
+
+    outer_state = outer.add_state('state', is_start_block=True)
+    nested_node = outer_state.add_nested_sdfg(inner, {'X'}, {'Y'}, symbol_mapping={'N': 'M'})
+    outer_state.add_edge(outer_state.add_read('A'), None, nested_node, 'X', dace.Memlet('A[0]'))
+    outer_state.add_edge(nested_node, 'Y', outer_state.add_access('tmp'), None, dace.Memlet('tmp[0]'))
+
+    tasklet = outer_state.add_tasklet('combine', {'inp'}, {'out'}, 'out = inp + M')
+    outer_state.add_edge(outer_state.add_read('tmp'), None, tasklet, 'inp', dace.Memlet('tmp[0]'))
+    outer_state.add_edge(tasklet, 'out', outer_state.add_write('B'), None, dace.Memlet('B[0]'))
+
+    transformation = InlineMultistateSDFG if multistate else InlineSDFG
+    return outer, transformation
+
+
+def _make_runtime_inlining_local_data_name_sdfg(multistate: bool) -> tuple[SDFG, type]:
+    """Build an inlining case where a local runtime variable matches a renamed transient data name."""
+    outer = _new_sdfg('runtime_inline_local_data_outer')
+    outer.add_array('A', [1], dace.int64)
+    outer.add_array('B', [1], dace.int64)
+    outer.add_array('tmp', [1], dace.int64)
+
+    inner = SDFG('runtime_inline_local_data_inner')
+    inner.backend = BackendLanguage.Python
+    inner.append_init_code('tmp = X[0] + 1', language=dace.dtypes.Language.Python)
+    inner.add_array('X', [1], dace.int64)
+    inner.add_array('Y', [1], dace.int64)
+    inner.add_transient('tmp', [1], dace.int64)
+
+    if multistate:
+        entry_state = inner.add_state('entry', is_start_block=True)
+        compute_state = inner.add_state('compute')
+        inner.add_edge(entry_state, compute_state, InterstateEdge())
+    else:
+        compute_state = inner.add_state('compute', is_start_block=True)
+
+    compute_state.add_edge(compute_state.add_read('X'), None, compute_state.add_write('tmp'), None,
+                           dace.Memlet('X[0] -> tmp[0]'))
+    compute_state.add_edge(compute_state.add_read('tmp'), None, compute_state.add_write('Y'), None,
+                           dace.Memlet('tmp[0] -> Y[0]'))
+
+    outer_state = outer.add_state('state', is_start_block=True)
+    nested_node = outer_state.add_nested_sdfg(inner, {'X'}, {'Y'})
+    outer_state.add_edge(outer_state.add_read('A'), None, nested_node, 'X', dace.Memlet('A[0]'))
+    outer_state.add_edge(nested_node, 'Y', outer_state.add_write('B'), None, dace.Memlet('B[0]'))
+
+    transformation = InlineMultistateSDFG if multistate else InlineSDFG
+    return outer, transformation
+
+
 @pytest.mark.parametrize(('flag', 'expected'), [(True, 11), (False, 22)])
 def test_conditional_block_singleton_output(flag, expected):
     sdfg = _new_sdfg('conditional_singleton')
@@ -495,12 +567,83 @@ def test_python_runtime_code_replacements_survive_inlining(multistate: bool):
     sdfg, transformation = _make_runtime_inlining_symbol_mapping_sdfg(multistate)
 
     assert sdfg.apply_transformations(transformation) == 1
+    init_code = sdfg.init_code['frame'].as_string
+    assert 'A[0]' in init_code
+    assert 'M' in init_code
+    assert 'X[0]' not in init_code
+    assert 'N +' not in init_code
+
     compiled = sdfg.compile()
     a = np.array([3], dtype=np.int64)
     b = np.zeros(1, dtype=np.int64)
     compiled(A=a, B=b, M=4)
 
     np.testing.assert_array_equal(b, np.array([8], dtype=np.int64))
+
+
+@pytest.mark.parametrize('multistate', [False, True], ids=['single_state_inline', 'multistate_inline'])
+def test_python_runtime_assignment_targets_remain_local_during_inlining(multistate: bool):
+    sdfg, transformation = _make_runtime_inlining_assignment_target_sdfg(multistate)
+
+    assert sdfg.apply_transformations(transformation) == 1
+    init_code = sdfg.init_code['frame'].as_string
+    assert 'N = (A[0] + 1)' in init_code or 'N = A[0] + 1' in init_code
+    assert 'M = A[0] + 1' not in init_code
+
+    compiled = sdfg.compile()
+    a = np.array([7], dtype=np.int64)
+    b = np.zeros(1, dtype=np.int64)
+    compiled(A=a, B=b, M=3)
+
+    np.testing.assert_array_equal(b, np.array([10], dtype=np.int64))
+
+
+@pytest.mark.parametrize('multistate', [False, True], ids=['single_state_inline', 'multistate_inline'])
+def test_python_runtime_local_data_names_remain_local_during_inlining(multistate: bool):
+    sdfg, transformation = _make_runtime_inlining_local_data_name_sdfg(multistate)
+
+    assert sdfg.apply_transformations(transformation) == 1
+    init_code = sdfg.init_code['frame'].as_string
+    renamed_tmp = next(name for name in sdfg.arrays if name not in {'A', 'B', 'tmp'})
+    assert 'tmp = (A[0] + 1)' in init_code or 'tmp = A[0] + 1' in init_code
+    assert f'{renamed_tmp} =' not in init_code
+
+    compiled = sdfg.compile()
+    a = np.array([5], dtype=np.int64)
+    b = np.zeros(1, dtype=np.int64)
+    tmp = np.zeros(1, dtype=np.int64)
+    compiled(A=a, B=b, tmp=tmp)
+
+    np.testing.assert_array_equal(b, np.array([5], dtype=np.int64))
+
+
+def test_nested_sdfg_helper_scope_isolated_from_parent_names():
+    outer = _new_sdfg('outer_nested_same_connector_names')
+    outer.add_array('X', [1], dace.float64)
+    outer.add_array('Y', [1], dace.float64)
+
+    inner = SDFG('inner_nested_same_connector_names')
+    inner.backend = BackendLanguage.Python
+    inner.add_array('X', [1], dace.float64)
+    inner.add_array('Y', [1], dace.float64)
+    inner_state = inner.add_state('inner_state', is_start_block=True)
+    tasklet = inner_state.add_tasklet('shift', {'inp'}, {'out'}, 'out = inp + 2.0')
+    inner_state.add_edge(inner_state.add_read('X'), None, tasklet, 'inp', dace.Memlet('X[0]'))
+    inner_state.add_edge(tasklet, 'out', inner_state.add_write('Y'), None, dace.Memlet('Y[0]'))
+
+    outer_state = outer.add_state('outer_state', is_start_block=True)
+    nested_node = outer_state.add_nested_sdfg(inner, {'X'}, {'Y'})
+    outer_state.add_edge(outer_state.add_read('X'), None, nested_node, 'X', dace.Memlet('X[0]'))
+    outer_state.add_edge(nested_node, 'Y', outer_state.add_write('Y'), None, dace.Memlet('Y[0]'))
+
+    generated_code = outer.generate_code()[0].code
+    assert 'def inner_nested_same_connector_names_' in generated_code
+
+    x = np.array([3.0], dtype=np.float64)
+    y = np.zeros(1, dtype=np.float64)
+    _run_sdfg(outer, X=x, Y=y)
+
+    np.testing.assert_allclose(y, np.array([5.0], dtype=np.float64))
 
 
 def test_nested_sdfg_local_constants_available_without_duplicate_headers():

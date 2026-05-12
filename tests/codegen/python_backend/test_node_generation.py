@@ -381,8 +381,8 @@ class TestTasklet:
         state.add_edge(r, None, t, 'a', Memlet(data='x'))
         state.add_edge(t, 'b', w, None, Memlet(data='y'))
         code = sdfg.generate_code()[0].code
-        assert 'temp = a * 2' in code
-        assert 'b = temp + 1' in code
+        assert 'temp = a * 2' in code or 'temp = (a * 2)' in code
+        assert 'b = temp + 1' in code or 'b = (temp + 1)' in code
 
     def test_tasklet_non_python_language(self):
         """Non-Python tasklet language raises NotImplementedError."""

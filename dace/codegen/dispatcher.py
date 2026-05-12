@@ -5,7 +5,7 @@ flexible code generation with multiple backends by dispatching certain
 functionality to registered code generators based on user-defined predicates.
 """
 from dace.codegen.prettycode import CodeIOStream
-from dace.codegen.py import PythonCodeIOStream
+from dace.codegen.py.prettycode import PythonCodeIOStream
 from dace import attr_enum, config, data as dt, dtypes, nodes
 from dace.memlet import Memlet
 from dace.codegen import exceptions as cgx, prettycode

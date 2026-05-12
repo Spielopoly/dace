@@ -48,8 +48,8 @@ def test_simple_program(n_value, modulo_value, save_generated_code=False):
 
     with set_temporary('compiler', 'codegen_lineinfo', value=True):
         if save_generated_code:
-            sdfg.compile('simple_program.py', return_program_handle=False, validate=False)
             sdfg.save('simple_program.sdfg')
+            sdfg.compile('simple_program.py', return_program_handle=False, validate=False)
         generated_code = sdfg.generate_code()[0].code
         sdfg(x=x_test, y=y_test, __return=return_buffer, N=n_value, Modulo=modulo_value)
 

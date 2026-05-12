@@ -1,68 +1,96 @@
-from dace import data, subsets
-
 from typing import TYPE_CHECKING
+
+from dace import data, subsets, symbolic
+
 if TYPE_CHECKING:
     from dace.codegen.py.framecode import DaCePythonCodeGenerator
     from dace.codegen.py.target import PythonTargetCodeGenerator
 
 
+def python_symbolic(expr) -> str:
+    return symbolic.symstr(expr, cpp_mode=False)
+
+
+def _python_slice_component(start, end, step) -> str:
+    try:
+        start_int = int(start)
+        end_int = int(end)
+        step_int = int(step)
+    except (TypeError, ValueError):
+        start_int = end_int = step_int = None
+
+    if step_int is not None:
+        if step_int == 1 and start_int == end_int:
+            return str(start_int)
+        stop_expr = str(end_int + 1) if step_int > 0 else str(end_int - 1)
+        if step_int == 1:
+            return f'{start_int}:{stop_expr}'
+        return f'{start_int}:{stop_expr}:{step_int}'
+
+    start_expr = python_symbolic(start)
+    end_expr = python_symbolic(end)
+    step_expr = python_symbolic(step)
+    if step_expr == '1' and start_expr == end_expr:
+        return start_expr
+    stop_expr = f'(({end_expr}) + (1 if ({step_expr}) > 0 else -1))'
+    if step_expr == '1':
+        return f'{start_expr}:{stop_expr}'
+    return f'{start_expr}:{stop_expr}:{step_expr}'
+
+
+def subset_to_python_indices(desc: data.Data, subset: subsets.Subset | None) -> str:
+    if subset is None:
+        return ''
+
+    if hasattr(desc, 'offset') and any(str(offset) != '0' for offset in desc.offset):
+        subset = subset.offset_new(desc.offset, False)
+
+    if isinstance(subset, subsets.Indices):
+        parts = [python_symbolic(index) for index in subset.indices]
+    elif isinstance(subset, subsets.Range):
+        parts = [_python_slice_component(start, end, step) for start, end, step in subset.ranges]
+    else:
+        raise NotImplementedError(f'Unsupported subset type for Python backend: {type(subset).__name__}')
+
+    if len(parts) == 1:
+        return parts[0]
+    return ', '.join(parts)
+
+
+def data_access_expression(name: str,
+                           desc: data.Data,
+                           subset: subsets.Subset | None = None,
+                           scalar_buffer: bool = False) -> str:
+    if isinstance(desc, data.Scalar):
+        if scalar_buffer:
+            return f'{name}[...]'
+        return name
+
+    indices = subset_to_python_indices(desc, subset)
+    if not indices:
+        return name
+    return f'{name}[{indices}]'
+
+
 def numpy_array_expression(sdfg,
-                   memlet,
-                   with_brackets=True,
-                   offset=None,
-                   relative_offset=True,
-                   packed_veclen=1,
-                   use_other_subset=False,
-                   indices=None,
-                   referenced_array=None,
-                   codegen: 'PythonTargetCodeGenerator | None' = None,
-                   framecode: 'DaCePythonCodeGenerator | None' = None):
-    """ Converts an Indices/Range object to a numpy array access string. """
-    # TODO: Make python compatible, update docstring
-    subset = memlet.subset if not use_other_subset else memlet.other_subset
-    s = subset if relative_offset else subsets.Range.from_indices(offset)
-    o = offset if relative_offset else None
-    desc = (sdfg.arrays[memlet.data] if referenced_array is None else referenced_array)
-    offset_str = numpy_offset_expression(desc, s, o, packed_veclen, indices=indices)
+                           memlet,
+                           with_brackets=True,
+                           offset=None,
+                           relative_offset=True,
+                           packed_veclen=1,
+                           use_other_subset=False,
+                           indices=None,
+                           referenced_array=None,
+                           codegen: 'PythonTargetCodeGenerator | None' = None,
+                           framecode: 'DaCePythonCodeGenerator | None' = None):
+    del offset, relative_offset, packed_veclen, indices, framecode
+    subset = memlet.other_subset if use_other_subset else memlet.subset
+    desc = sdfg.arrays[memlet.data] if referenced_array is None else referenced_array
+    name = codegen.ptr(memlet.data, desc, sdfg, subset=subset) if codegen is not None else memlet.data
+    if not with_brackets:
+        return subset_to_python_indices(desc, subset)
+    return data_access_expression(name, desc, subset)
 
-    name = memlet.data
 
-    if with_brackets:
-        if codegen is not None:
-            ptrname = codegen.ptr(name, desc, sdfg, memlet.subset)
-        else:
-            ptrname = ptr(name, desc, sdfg, framecode=framecode)
-        return "%s[%s]" % (ptrname, offset_str)
-    else:
-        return offset_str
-
-def numpy_offset_expression(d: data.Data, subset_in: subsets.Subset, offset=None, packed_veclen=1, indices=None) -> str:
-    """ Creates a C++ expression that can be added to a pointer in order
-        to offset it to the beginning of the given subset and offset.
-
-        :param d: The data structure to use for sizes/strides.
-        :param subset_in: The subset to offset by.
-        :param offset: An additional list of offsets or a Subset object
-        :param packed_veclen: If packed types are targeted, specifies the
-                              vector length that the final offset should be
-                              divided by.
-        :param indices: A tuple of indices to use for expression.
-        :param codegen: Optional code generator to adjust subset.
-        :return: A string in C++ syntax with the correct offset
-    """
-    # TODO: Make python compatible, update docstring
-    # Offset according to parameters, then offset according to array
-    if offset is not None:
-        subset = subset_in.offset_new(offset, False)
-        subset.offset(d.offset, False)
-    else:
-        subset = subset_in.offset_new(d.offset, False)
-
-    # Obtain start range from offsetted subset
-    indices = indices or ([0] * len(d.strides))
-
-    index = subset.at(indices, d.strides)
-    if packed_veclen > 1:
-        index /= packed_veclen
-
-    return sym2cpp(index)
+def numpy_offset_expression(d: data.Data, subset_in: subsets.Subset) -> str:
+    return subset_to_python_indices(d, subset_in)

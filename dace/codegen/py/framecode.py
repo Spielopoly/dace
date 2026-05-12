@@ -124,6 +124,18 @@ def _extract_python_defined_names(source: str) -> Set[str]:
     return _collect_defined_names(module.body)
 
 
+def _extract_python_used_names(source: str) -> Set[str]:
+    if not source.strip():
+        return set()
+
+    try:
+        module = ast.parse(source)
+    except SyntaxError:
+        return set()
+
+    return {node.id for node in ast.walk(module) if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)}
+
+
 def _codeblock_defined_names(code_block: CodeBlock) -> Set[str]:
     try:
         return _extract_python_defined_names(codeblock_to_python(code_block))
@@ -152,6 +164,14 @@ def _collect_runtime_defined_names(sdfg: SDFG) -> Set[str]:
     for attr in ('global_code', 'init_code'):
         for codeblock in _iter_runtime_codeblocks(sdfg, attr):
             names |= _codeblock_defined_names(codeblock)
+    return names
+
+
+def _collect_runtime_used_names(sdfg: SDFG) -> Set[str]:
+    names: Set[str] = set()
+    for attr in ('global_code', 'init_code', 'exit_code'):
+        for codeblock in _iter_runtime_codeblocks(sdfg, attr):
+            names |= _extract_python_used_names(codeblock_to_python(codeblock))
     return names
 
 
@@ -185,7 +205,8 @@ class DaCePythonCodeGenerator(object):
         self._runtime_defined_names = _collect_runtime_defined_names(sdfg)
         nested_runtime_defined_names = _collect_nested_runtime_defined_names(sdfg)
         nested_only_runtime_names = {name for name in nested_runtime_defined_names if name not in sdfg.symbols}
-        fsyms = self.free_symbols(sdfg) - self._runtime_defined_names - nested_only_runtime_names
+        runtime_symbol_names = {name for name in _collect_runtime_used_names(sdfg) if name in sdfg.symbols}
+        fsyms = (self.free_symbols(sdfg) | runtime_symbol_names) - self._runtime_defined_names - nested_only_runtime_names
         self.arglist = sdfg.arglist(scalars_only=False, free_symbols=fsyms)
 
         # resolve all symbols and constants
@@ -356,7 +377,11 @@ class DaCePythonCodeGenerator(object):
 
         #########################################################
         # Write constants
+        if any(isinstance(csttype, data.Array) for csttype, _ in sdfg.constants_prop.values()):
+            _write_imports(['numpy'], sdfg)
         self.generate_constants(sdfg, global_stream)
+
+        global_stream.write('__dace_persistent_transients = {}', sdfg)
 
         #########################################################
         # Write state struct (only if there are fields)
@@ -594,8 +619,7 @@ class DaCePythonCodeGenerator(object):
                 if first_node_instance is None:
                     continue
 
-                # TODO: as_arg can return c-style definitions that may break python code
-                definition = desc.as_arg(name=f'__{sdfg.cfg_id}_{name}')
+                definition = f'__{sdfg.cfg_id}_{name}: object | None = None'
 
                 if top_storage != dtypes.StorageType.CPU_ThreadLocal:  # If thread-local, skip struct entry
                     self.statestruct.append(definition)
@@ -611,8 +635,7 @@ class DaCePythonCodeGenerator(object):
                 # If unused, skip
                 if first_node_instance is None:
                     continue
-                # TODO: as_arg can return c-style definitions that may break python code
-                definition = desc.as_arg(name=f'__{sdfg.cfg_id}_{name}')
+                definition = f'__{sdfg.cfg_id}_{name}: object | None = None'
                 self.statestruct.append(definition)
 
                 self.to_allocate[top_sdfg].append((sdfg, first_state_instance, first_node_instance, True, True, True))
