@@ -1,6 +1,7 @@
 # Copyright 2019-2026 ETH Zurich and the DaCe authors. All rights reserved.
 import ast
 from typing import TYPE_CHECKING, Optional
+import warnings
 
 from dace import Config, data, dtypes, memlet as mmlt, registry, subsets, symbolic
 import dace.codegen.dispatcher as dispatcher_mod
@@ -17,6 +18,7 @@ from dace.sdfg.state import ControlFlowRegion
 
 if TYPE_CHECKING:
     from dace.codegen.dispatcher import TargetDispatcher
+    from dace.codegen.py.framecode import DaCePythonCodeGenerator
 
 
 def _python_expr(expr) -> str:
@@ -30,7 +32,8 @@ def _python_view_component(start, end, step) -> str:
         start_int = int(start)
         end_int = int(end)
         step_int = int(step)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError) as e:
+        # We likely have a symbolic expression
         start_int = end_int = step_int = None
 
     if step_int is not None:
@@ -68,7 +71,7 @@ def _defined_type_for(desc: data.Data):
     return dispatcher_mod.DefinedType.Pointer
 
 
-def _defined_ctype_for(desc: data.Data) -> str:
+def _defined_ptype_for(desc: data.Data) -> str:
     if isinstance(desc, data.Scalar):
         return _python_type(desc.dtype)
     if isinstance(desc, data.Structure):
@@ -84,7 +87,7 @@ class PythonCodeGen(PythonTargetCodeGenerator):
     target_name = 'python'
     language = 'python'
 
-    def __init__(self, frame_codegen, sdfg: SDFG):
+    def __init__(self, frame_codegen: 'DaCePythonCodeGenerator', sdfg: SDFG):
         self._frame = frame_codegen
         self._dispatcher: 'TargetDispatcher' = frame_codegen.dispatcher
         self.calling_codegen = self
@@ -100,8 +103,16 @@ class PythonCodeGen(PythonTargetCodeGenerator):
 
         dispatcher = self._dispatcher
         dispatcher.register_node_dispatcher(self)
+        
+        SUPPORTED_SCHEDULES = [
+            # This is kind of a hack. In practice all of these are treated as sequential schedules
+            # TODO: Refactor this somehow, for example by not defaulting to CPU_Multicore for maps in infer_types
+            dtypes.ScheduleType.CPU_Multicore,
+            dtypes.ScheduleType.CPU_Persistent,
+            dtypes.ScheduleType.Sequential,
+        ]
         dispatcher.register_map_dispatcher(
-            [dtypes.ScheduleType.CPU_Multicore, dtypes.ScheduleType.CPU_Persistent, dtypes.ScheduleType.Sequential],
+            SUPPORTED_SCHEDULES,
             self)
 
         cpu_storage = [dtypes.StorageType.CPU_Heap, dtypes.StorageType.Register]
@@ -110,9 +121,8 @@ class PythonCodeGen(PythonTargetCodeGenerator):
         for src_storage in cpu_storage:
             for dst_storage in cpu_storage:
                 dispatcher.register_copy_dispatcher(src_storage, dst_storage, None, self)
-                dispatcher.register_copy_dispatcher(src_storage, dst_storage, dtypes.ScheduleType.Sequential, self)
-                dispatcher.register_copy_dispatcher(src_storage, dst_storage, dtypes.ScheduleType.CPU_Multicore, self)
-                dispatcher.register_copy_dispatcher(src_storage, dst_storage, dtypes.ScheduleType.CPU_Persistent, self)
+                for schedule in SUPPORTED_SCHEDULES:
+                    dispatcher.register_copy_dispatcher(src_storage, dst_storage, schedule, self)
 
     def get_generated_codeobjects(self):
         return []
@@ -121,15 +131,8 @@ class PythonCodeGen(PythonTargetCodeGenerator):
         return {'frame': ['import numpy', 'from dataclasses import dataclass']}
 
     def preprocess(self, sdfg: SDFG) -> None:
-        # TODO: In practice this has no effect because preprocess is called after infer_types in codegen
-        for node, _ in sdfg.all_nodes_recursive():
-            if not isinstance(node, nodes.MapEntry):
-                continue
-            if node.map.schedule == dtypes.ScheduleType.Default:
-                node.map.schedule = dtypes.ScheduleType.Sequential
-            elif node.map.schedule != dtypes.ScheduleType.Sequential:
-                raise NotImplementedError(
-                    f'Python backend only supports sequential maps, got {node.map.schedule}')
+        # TODO: Maybe apply copy-node transformations
+        pass
 
     @property
     def has_initializer(self):
@@ -154,7 +157,7 @@ class PythonCodeGen(PythonTargetCodeGenerator):
                                                       _python_type(field_desc.dtype))
                 else:
                     raise NotImplementedError(
-                        f'Python backend MVP only supports Scalars, Arrays, and nested Structures in Structures. '
+                        f'Python backend only supports Scalars, Arrays, and nested Structures in Structures. '
                         f'Unsupported member type: {type(field_desc).__name__}')
 
         for name, arg_type in arglist.items():
@@ -188,21 +191,31 @@ class PythonCodeGen(PythonTargetCodeGenerator):
             return 'False'
         return '0'
 
-    def _structure_default_expr(self, desc: data.Structure) -> str:
+    def _structure_default_expression(self, desc: data.Structure) -> str:
         members = []
         for field_name, field_desc in desc.members.items():
             if isinstance(field_desc, data.Structure):
-                value = self._structure_default_expr(field_desc)
+                value = self._structure_default_expression(field_desc)
             elif isinstance(field_desc, data.Array):
                 value = self._zeros_expr(field_desc)
             elif isinstance(field_desc, data.Scalar):
                 value = self._scalar_default(field_desc)
             else:
                 raise NotImplementedError(
-                    f'Python backend MVP only supports Scalars, Arrays, and nested Structures in Structures. '
+                    f'Python backend only supports Scalars, Arrays, and nested Structures in Structures. '
                     f'Unsupported member {field_name}: {type(field_desc).__name__}')
             members.append(f'{field_name}={value}')
         return f'{_structure_type_name(desc)}({", ".join(members)})'
+    
+    def _default_expression(self, desc: data.Data) -> str:
+        """Returns an expression that evaluates to a default-initialized value of the given descriptor's type."""
+        if isinstance(desc, data.Structure):
+            return self._structure_default_expression(desc)
+        if isinstance(desc, data.Array):
+            return self._zeros_expr(desc)
+        if isinstance(desc, data.Scalar):
+            return self._scalar_default(desc)
+        raise NotImplementedError(f'Unsupported descriptor in Python backend: {type(desc).__name__}')
 
     def _zeros_expr(self, desc: data.Array) -> str:
         return f'numpy.zeros({self._shape_expression(desc.shape)}, dtype={_numpy_dtype(desc.dtype)})'
@@ -212,7 +225,7 @@ class PythonCodeGen(PythonTargetCodeGenerator):
 
     def _register_defined_name(self, name: str, desc: data.Data, *, is_global: bool = False) -> None:
         define = self._dispatcher.defined_vars.add_global if is_global else self._dispatcher.defined_vars.add
-        define(name, _defined_type_for(desc), _defined_ctype_for(desc))
+        define(name, _defined_type_for(desc), _defined_ptype_for(desc))
 
     def _register_structure_members(self, name: str, desc: data.Structure, *, is_global: bool = False) -> None:
         for field_name, field_desc in desc.members.items():
@@ -224,6 +237,7 @@ class PythonCodeGen(PythonTargetCodeGenerator):
     def _normalize_subset(self, subset):
         if isinstance(subset, subsets.Subset) or subset is None:
             return subset
+        # TODO: Is this correct?
         return None
 
     def _runtime_data_name(self, sdfg: SDFG, name: str) -> str:
@@ -274,6 +288,7 @@ class PythonCodeGen(PythonTargetCodeGenerator):
                 if symname in free_symbols and symname not in node.sdfg.constants and symname not in runtime_defined_names]
 
     def _data_expr(self, name: str, desc: data.Data, subset=None) -> str:
+        # TODO: Pass sdfg as argument instead of relying on self._current_sdfg
         runtime_name = self._runtime_data_name(self._current_sdfg, name) if hasattr(self, '_current_sdfg') else name
         return pyutils.data_access_expression(runtime_name, desc, self._normalize_subset(subset),
                                               scalar_buffer=self._is_scalar_buffer(name, desc))
@@ -286,8 +301,9 @@ class PythonCodeGen(PythonTargetCodeGenerator):
         actual_subset = self._normalize_subset(subset if subset is not None else memlet.subset)
         previous_sdfg = getattr(self, '_current_sdfg', None)
         self._current_sdfg = sdfg
+        # TODO: After changing self._data_expr to take sdfg as argument, remove the need to set self._current_sdfg here
         try:
-            return self._data_expr(self.ptr(name, desc, sdfg, subset=actual_subset), desc, actual_subset)
+            return self._data_expr(name, desc, actual_subset)
         finally:
             self._current_sdfg = previous_sdfg
 
@@ -296,9 +312,9 @@ class PythonCodeGen(PythonTargetCodeGenerator):
         actual_subset = self._normalize_subset(subset)
         previous_sdfg = getattr(self, '_current_sdfg', None)
         self._current_sdfg = sdfg
+        # TODO: After changing self._data_expr to take sdfg as argument, remove the need to set self._current_sdfg here
         try:
-            return self._data_expr(self.ptr(data_name, desc, sdfg, subset=actual_subset, is_write=True), desc,
-                                   actual_subset)
+            return self._data_expr(data_name, desc, actual_subset)
         finally:
             self._current_sdfg = previous_sdfg
 
@@ -332,6 +348,9 @@ class PythonCodeGen(PythonTargetCodeGenerator):
             value_expr = self.write_and_resolve_expr(memlet, current_expr, value_expr)
             stream.write(f'{target_expr} = {value_expr}', cfg, state_id)
             return
+        # TODO: Inconsistent handling of copies. What happens if we have something that is not scalar or array?
+        # On the other hand is that even possible? I can only think of structures but not sure if those can be memlet targets
+        # And we don't support views or references or streams
         if isinstance(desc, data.Array) and actual_subset is None:
             stream.write(f'numpy.copyto({self._runtime_data_name(sdfg, name)}, {value_expr})', cfg, state_id)
             return
@@ -353,6 +372,7 @@ class PythonCodeGen(PythonTargetCodeGenerator):
 
     def generate_scope(self, sdfg: SDFG, cfg: ControlFlowRegion, dfg_scope: ScopeSubgraphView, state_id: int,
                        function_stream: PythonCodeIOStream, callsite_stream: PythonCodeIOStream) -> None:
+        # TODO: What if there are more than one source nodes?
         entry_node = dfg_scope.source_nodes()[0]
         self.generate_node(sdfg, cfg, dfg_scope, state_id, entry_node, function_stream, callsite_stream)
         self._dispatcher.dispatch_subgraph(sdfg, cfg, dfg_scope, state_id, function_stream, callsite_stream,
@@ -375,20 +395,18 @@ class PythonCodeGen(PythonTargetCodeGenerator):
     def declare_array(self, sdfg: SDFG, cfg: ControlFlowRegion, dfg, state_id: int, node: nodes.Node,
                       nodedesc: data.Data, global_stream: PythonCodeIOStream,
                       declaration_stream: PythonCodeIOStream) -> None:
-        del global_stream, dfg
         if isinstance(nodedesc, (data.View, data.Reference, data.Stream)) or not isinstance(node, nodes.AccessNode):
             return
-        name = self.ptr(node.data, nodedesc, sdfg)
+        name = node.data
         if self._dispatcher.declared_arrays.has(name):
             return
-        declaration_stream.write(f'{name} = None', cfg, state_id)
-        self._dispatcher.declared_arrays.add(name, _defined_type_for(nodedesc), _defined_ctype_for(nodedesc))
+        declaration_stream.write(f'{name}: {_defined_ptype_for(nodedesc)} | None = None', cfg, state_id)
+        self._dispatcher.declared_arrays.add(name, _defined_type_for(nodedesc), _defined_ptype_for(nodedesc))
 
     def allocate_array(self, sdfg: SDFG, cfg: ControlFlowRegion, dfg, state_id: int, node: nodes.Node,
                        nodedesc: data.Data, global_stream: PythonCodeIOStream,
                        declaration_stream: PythonCodeIOStream, allocation_stream: PythonCodeIOStream,
                        allocate_nested_data: bool = True) -> None:
-        del global_stream, declaration_stream, allocate_nested_data, dfg
         if not isinstance(node, nodes.AccessNode):
             return
         if isinstance(nodedesc, data.View):
@@ -407,7 +425,7 @@ class PythonCodeGen(PythonTargetCodeGenerator):
             self._register_defined_name(node.data, nodedesc)
             return
 
-        name = self.ptr(node.data, nodedesc, sdfg)
+        name = node.data
         is_global = root_desc.lifetime in (dtypes.AllocationLifetime.Global, dtypes.AllocationLifetime.Persistent,
                                            dtypes.AllocationLifetime.External)
         if self._dispatcher.defined_vars.has(name):
@@ -417,14 +435,7 @@ class PythonCodeGen(PythonTargetCodeGenerator):
             raise NotImplementedError('External memory management is not supported in the Python backend.')
 
         desc = update_persistent_desc(nodedesc, sdfg) if is_global else nodedesc
-        if isinstance(desc, data.Structure):
-            init_expr = self._structure_default_expr(desc)
-        elif isinstance(desc, data.Scalar):
-            init_expr = self._scalar_default(desc)
-        elif isinstance(desc, data.Array):
-            init_expr = self._zeros_expr(desc)
-        else:
-            raise NotImplementedError(f'Unsupported descriptor in Python backend: {type(desc).__name__}')
+        init_expr = self._default_expression(desc)
 
         if is_global:
             allocation_stream.write(f'global {name}', cfg, state_id)
@@ -443,7 +454,6 @@ class PythonCodeGen(PythonTargetCodeGenerator):
     def deallocate_array(self, sdfg: SDFG, cfg: ControlFlowRegion, dfg, state_id: int, node: nodes.Node,
                          nodedesc: data.Data, function_stream: PythonCodeIOStream,
                          callsite_stream: PythonCodeIOStream) -> None:
-        del sdfg, dfg, function_stream
         if not isinstance(node, nodes.AccessNode):
             return
         if isinstance(nodedesc, (data.Scalar, data.View, data.Stream, data.Reference)):
@@ -458,7 +468,6 @@ class PythonCodeGen(PythonTargetCodeGenerator):
     def copy_memory(self, sdfg: SDFG, cfg: ControlFlowRegion, dfg, state_id: int, src_node: nodes.Node,
                     dst_node: nodes.Node, edge, function_stream: PythonCodeIOStream,
                     callsite_stream: PythonCodeIOStream) -> None:
-        del function_stream, dfg
         self._emit_copy(sdfg, cfg, state_id, src_node, dst_node, edge, callsite_stream)
 
     def _emit_copy(self, sdfg: SDFG, cfg: ControlFlowRegion, state_id: int, src_node: nodes.Node, dst_node: nodes.Node,
@@ -503,13 +512,12 @@ class PythonCodeGen(PythonTargetCodeGenerator):
 
     def write_and_resolve_expr(self, memlet: mmlt.Memlet, current_expr: str, new_expr: str) -> str:
         reduction = memlet.wcr
-        reduction_expr = ast.unparse(reduction) if isinstance(reduction, ast.AST) else str(reduction)
+        reduction_expr = _python_expr(reduction)
         return f'({reduction_expr})({current_expr}, {new_expr})'
 
     def process_out_memlets(self, sdfg: SDFG, cfg: ControlFlowRegion, state_id: int, node: nodes.Node, dfg,
                             dispatcher: 'TargetDispatcher', result: PythonCodeIOStream, locals_defined: bool,
                             function_stream: PythonCodeIOStream, skip_wcr: bool = False, codegen=None):
-        del dispatcher, locals_defined, function_stream, codegen
         for edge in dfg.out_edges(node):
             if skip_wcr and edge.data.wcr is not None:
                 continue
@@ -528,7 +536,6 @@ class PythonCodeGen(PythonTargetCodeGenerator):
 
     def memlet_definition(self, sdfg: SDFG, memlet: mmlt.Memlet, output: bool, local_name: str, conntype=None,
                           allow_shadowing: bool = False, codegen=None):
-        del conntype, allow_shadowing, codegen
         if output:
             return f'{local_name} = None'
         return f'{local_name} = {self._read_expr(sdfg, memlet)}'
@@ -537,13 +544,11 @@ class PythonCodeGen(PythonTargetCodeGenerator):
         raise NotImplementedError('Streams are not supported for the Python backend.')
 
     def memlet_ctor(self, sdfg: SDFG, memlet: mmlt.Memlet, dtype, is_output: bool) -> str:
-        del dtype, is_output
         return self._read_expr(sdfg, memlet)
 
     def _generate_Tasklet(self, sdfg: SDFG, cfg: ControlFlowRegion, dfg, state_id: int, node: nodes.Tasklet,
                           function_stream: PythonCodeIOStream, callsite_stream: PythonCodeIOStream,
                           codegen=None):
-        del function_stream, codegen, dfg
         if node.code.language != dtypes.Language.Python:
             raise NotImplementedError('Python backend only supports Python tasklets.')
 
@@ -567,7 +572,12 @@ class PythonCodeGen(PythonTargetCodeGenerator):
             self._dispatcher.defined_vars.add(edge.dst_conn, dispatcher_mod.DefinedType.Scalar, 'object')
 
         tasklet_body = codeblock_to_python(node.code).strip()
-        callsite_stream.write(tasklet_body or 'pass', cfg, state_id)
+        
+        callsite_stream.write(f'\n####### Tasklet: {node.label}\n\n', cfg, state_id)
+        
+        callsite_stream.write(tasklet_body or 'pass')
+        
+        callsite_stream.write(f'\n####### End of tasklet: {node.label}\n\n', cfg, state_id)
 
         for edge in state_dfg.out_edges(node):
             if edge.src_conn is None:
@@ -575,13 +585,13 @@ class PythonCodeGen(PythonTargetCodeGenerator):
             dst_node = state_dfg.memlet_path(edge)[-1].dst
             if isinstance(dst_node, nodes.CodeNode):
                 raise NotImplementedError('Code-to-code memlets not supported in the Python backend.')
+            # TODO: Involve self._dispatcher.dispatch_copy instead?
             self._emit_memlet_write(sdfg, edge.data, edge.src_conn, callsite_stream, cfg, state_id)
 
         self._dispatcher.defined_vars.exit_scope(node)
 
     def unparse_tasklet(self, sdfg, cfg, state_id, dfg, node, function_stream, inner_stream, locals, ldepth,
                         toplevel_schedule):
-        del sdfg, cfg, state_id, dfg, function_stream, locals, ldepth, toplevel_schedule
         if node.code.language != dtypes.Language.Python:
             raise NotImplementedError('Python backend only supports Python tasklets.')
         inner_stream.write(codeblock_to_python(node.code).strip() or 'pass')
@@ -589,16 +599,16 @@ class PythonCodeGen(PythonTargetCodeGenerator):
     def define_out_memlet(self, sdfg: SDFG, cfg: ControlFlowRegion, state_dfg, state_id: int, src_node: nodes.Node,
                           dst_node: nodes.Node, edge, function_stream: PythonCodeIOStream,
                           callsite_stream: PythonCodeIOStream) -> None:
-        del sdfg, cfg, state_dfg, state_id, src_node, dst_node, edge, function_stream, callsite_stream
+        # TODO: Is this correct?
+        pass
 
     def generate_nsdfg_header(self, sdfg, cfg, state, state_id, node, memlet_references, sdfg_label, state_struct=True):
-        del sdfg, cfg, state, state_id, state_struct
         arguments = [aname for _, aname, _ in memlet_references]
         arguments.extend(self._nsdfg_runtime_symbol_names(node))
         return f'def {sdfg_label}({", ".join(arguments)}):'
 
     def generate_nsdfg_call(self, sdfg, cfg, state, node, memlet_references, sdfg_label, state_struct=True):
-        del sdfg, cfg, state, state_struct
+        # TODO: state struct?
         args = [argval for _, _, argval in memlet_references]
         args.extend(_python_expr(node.symbol_mapping[symname]) for symname in self._nsdfg_runtime_symbol_names(node))
         return f'{sdfg_label}({", ".join(args)})'
@@ -646,7 +656,7 @@ class PythonCodeGen(PythonTargetCodeGenerator):
                     f'Nested SDFG connector {connector_name!r} is bound inconsistently in the Python backend.')
             if existing_expr is None:
                 bindings[connector_name] = arg_expr
-                references.append((_defined_ctype_for(desc), connector_name, arg_expr))
+                references.append((_defined_ptype_for(desc), connector_name, arg_expr))
 
         for _, _, _, dst_conn, in_memlet in sorted(state.in_edges(node), key=lambda e: e.dst_conn or ''):
             if dst_conn in seen_inputs:
@@ -667,7 +677,6 @@ class PythonCodeGen(PythonTargetCodeGenerator):
         return references, pre_call_statements, post_call_actions
 
     def generate_nsdfg_arguments(self, sdfg, cfg, dfg, state, node):
-        del dfg
         references, _, _ = self._prepare_nsdfg_arguments(sdfg, cfg, state, node)
         return references
 
@@ -681,25 +690,30 @@ class PythonCodeGen(PythonTargetCodeGenerator):
     def _generate_NestedSDFG(self, sdfg: SDFG, cfg: ControlFlowRegion, dfg: ScopeSubgraphView, state_id: int,
                              node: nodes.NestedSDFG, function_stream: PythonCodeIOStream,
                              callsite_stream: PythonCodeIOStream):
-        del dfg
         state = cfg.state(state_id)
         self._dispatcher.defined_vars.enter_scope(node.sdfg, can_access_parent=False)
         self._dispatcher.declared_arrays.enter_scope(node.sdfg, can_access_parent=False)
+        
+        # We do not support function inlining for nested SDFGs
+        if Config.get_bool('compiler', 'inline_sdfgs'):
+            warnings.warn('Function inlining for nested SDFGs is not supported in the Python backend. Ignoring inline_sdfgs=True.')
 
         fsyms = self._frame.free_symbols(node.sdfg)
         self._define_sdfg_arguments(node.sdfg, node.sdfg.arglist(scalars_only=False, free_symbols=fsyms))
 
+        # TODO: There are more options for the key here such as 'unique_name' or False or 'none'
         if Config.get('compiler', 'unique_functions') in (True, 'hash'):
             nested_key = str(node.sdfg.hash_sdfg())
         else:
             nested_key = f'{cfg.cfg_id}:{state_id}:{state.node_id(node)}'
+        is_function_already_defined = nested_key in self._generated_nested_sdfg
         sdfg_label = self._generated_nested_sdfg.setdefault(
             nested_key, f'{node.sdfg.name}_{cfg.cfg_id}_{state_id}_{state.node_id(node)}')
 
         memlet_references, pre_call_statements, post_call_actions = self._prepare_nsdfg_arguments(sdfg, cfg, state, node)
         runtime_symbol_names = self._nsdfg_runtime_symbol_names(node)
 
-        if function_stream.getvalue().find(f'def {sdfg_label}(') == -1:
+        if not is_function_already_defined:
             preamble_stream = PythonCodeIOStream()
             finalizer_stream = PythonCodeIOStream()
             self._frame.generate_embedded_function_preamble(node.sdfg, preamble_stream)
@@ -758,12 +772,12 @@ class PythonCodeGen(PythonTargetCodeGenerator):
 
     def _generate_MapEntry(self, sdfg: SDFG, cfg: ControlFlowRegion, dfg, state_id: int, node: nodes.MapEntry,
                            function_stream: PythonCodeIOStream, callsite_stream: PythonCodeIOStream):
-        del function_stream
         schedule = node.map.schedule
         if schedule == dtypes.ScheduleType.Default:
             schedule = dtypes.ScheduleType.Sequential
-        if schedule != dtypes.ScheduleType.Sequential:
-            raise NotImplementedError('Python backend only supports sequential maps.')
+        # Technically we don't support other schedules, but let's just treat them all as sequential for now
+        # if schedule != dtypes.ScheduleType.Sequential:
+        #     raise NotImplementedError('Python backend only supports sequential maps.')
         if node.map.unroll:
             raise NotImplementedError('Map unrolling is not supported in the Python backend.')
 
@@ -786,29 +800,24 @@ class PythonCodeGen(PythonTargetCodeGenerator):
 
     def _generate_MapExit(self, sdfg: SDFG, cfg: ControlFlowRegion, dfg, state_id: int, node: nodes.MapExit,
                           function_stream: PythonCodeIOStream, callsite_stream: PythonCodeIOStream) -> None:
-        del state_id
         map_node = dfg.scope_dict()[node]
         if map_node is None:
             raise NotImplementedError('MapExit generation requires an enclosing MapEntry scope.')
         if hasattr(self._frame, 'deallocate_arrays_in_scope'):
             self._frame.deallocate_arrays_in_scope(sdfg, cfg, map_node, function_stream, callsite_stream)
-        for _ in map_node.map.range:
-            callsite_stream.dedent()
+        callsite_stream.dedent(len(map_node.map.range))
 
     def _generate_ConsumeEntry(self, sdfg: SDFG, cfg: ControlFlowRegion, dfg, state_id: int,
                                node: nodes.ConsumeEntry, function_stream: PythonCodeIOStream,
                                callsite_stream: PythonCodeIOStream) -> None:
-        del sdfg, cfg, dfg, state_id, node, function_stream, callsite_stream
         raise NotImplementedError('Consume scopes are not supported in the Python backend.')
 
     def _generate_ConsumeExit(self, sdfg: SDFG, cfg: ControlFlowRegion, dfg, state_id: int, node: nodes.ConsumeExit,
                               function_stream: PythonCodeIOStream, callsite_stream: PythonCodeIOStream) -> None:
-        del sdfg, cfg, dfg, state_id, node, function_stream, callsite_stream
         raise NotImplementedError('Consume scopes are not supported in the Python backend.')
 
     def _generate_AccessNode(self, sdfg: SDFG, cfg: ControlFlowRegion, dfg, state_id: int, node: nodes.Node,
                              function_stream: PythonCodeIOStream, callsite_stream: PythonCodeIOStream) -> None:
-        del function_stream, dfg
         if not isinstance(node, nodes.AccessNode):
             return
         state_dfg = cfg.state(state_id)
@@ -843,29 +852,25 @@ class PythonCodeGen(PythonTargetCodeGenerator):
             self._dispatcher.dispatch_copy(node, dst_node, edge, sdfg, cfg, state_dfg, state_id,
                                            PythonCodeIOStream(), callsite_stream)
 
+
+    # TODO: docstrings
+    # TODO: Incorporate methods into code so they can be overwritten by subclasses instead of having
+    # to overwrite entire node generation methods
+
     def generate_scope_preamble(self, sdfg, dfg_scope, state_id, function_stream, outer_stream, inner_stream):
-        del sdfg, dfg_scope, state_id, function_stream, outer_stream, inner_stream
+        pass
 
     def generate_scope_postamble(self, sdfg, dfg_scope, state_id, function_stream, outer_stream, inner_stream):
-        del sdfg, dfg_scope, state_id, function_stream, outer_stream, inner_stream
+        pass
 
     def generate_tasklet_preamble(self, sdfg, cfg, dfg_scope, state_id, node, function_stream, before_memlets_stream,
                                   after_memlets_stream):
-        del sdfg, cfg, dfg_scope, state_id, node, function_stream, before_memlets_stream, after_memlets_stream
+        pass
 
     def generate_tasklet_postamble(self, sdfg, cfg, dfg_scope, state_id, node, function_stream,
                                    before_memlets_stream, after_memlets_stream):
-        del sdfg, cfg, dfg_scope, state_id, node, function_stream, before_memlets_stream, after_memlets_stream
-
-    def make_ptr_vector_cast(self, ptr_expr, *args, **kwargs):
-        del args, kwargs
-        return ptr_expr
-
-    def ptr(self, name: str, desc: data.Data, sdfg: Optional[SDFG] = None, subset=None, is_write: Optional[bool] = None,
-            ancestor: int = 0) -> str:
-        del desc, sdfg, subset, is_write, ancestor
-        return name
+        pass
 
     def emit_interstate_variable_declaration(self, name: str, dtype: dtypes.typeclass,
                                              callsite_stream: PythonCodeIOStream, sdfg: SDFG):
-        del name, dtype, callsite_stream, sdfg
+        pass
