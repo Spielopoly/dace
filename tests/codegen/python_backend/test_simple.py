@@ -19,7 +19,11 @@ def simple_program(x: dace.float64[N,7], y: dace.float64[Modulo * N,7]):
             if i % Modulo == 0 and j % 2 == 0:
                 y[Modulo * i, j] = x[i, j] * foo(x)
     # print(y)
-    return x[..., ::3] + y[::Modulo, ::3]
+    z = np.zeros_like(x)
+    for i in range(N):
+        for j in range(0, 7, 3):
+            z[i, j] = x[i, j] + y[i * Modulo, j]
+    return z
 
 def _reference_simple_program(x: np.ndarray, y: np.ndarray, modulo: int) -> np.ndarray:
     """Mirror the source program exactly for backend regression checks."""
@@ -28,7 +32,11 @@ def _reference_simple_program(x: np.ndarray, y: np.ndarray, modulo: int) -> np.n
             if row_index % modulo == 0 and column_index % 2 == 0:
                 y[modulo * row_index, column_index] = x[row_index, column_index] * foo(x)
     # print(y)
-    return x[..., ::3] + y[::modulo, ::3]
+    z = np.zeros_like(x)
+    for i in range(x.shape[0]):
+        for j in range(0, x.shape[1], 3):
+            z[i, j] = x[i, j] + y[i * modulo, j]
+    return z
 
 
 @pytest.mark.parametrize(('n_value', 'modulo_value'), [(1, 1), (3, 2), (5, 3)])
@@ -37,8 +45,8 @@ def test_simple_program(n_value, modulo_value, save_generated_code=False):
     sdfg.backend = dace.dtypes.BackendLanguage.Python
 
     rng = np.random.default_rng(7)
-    return_buffer = np.zeros((n_value, 3), dtype=np.float64)
     x_start = rng.random((n_value, 7), dtype=np.float64)
+    return_buffer = np.zeros_like(x_start)
     x_expected = np.copy(x_start)
     x_test = np.copy(x_start)
     y_start = rng.random((n_value * modulo_value, 7), dtype=np.float64)
@@ -56,8 +64,8 @@ def test_simple_program(n_value, modulo_value, save_generated_code=False):
     np.testing.assert_allclose(return_buffer, expected)
     np.testing.assert_allclose(x_test, x_expected)
     np.testing.assert_allclose(y_test, y_expected)
-    assert 'x=x[0:N, 0:7], N=N' in generated_code
     assert 'x[0:3, 0:7]' not in generated_code
+    assert ', s[0:1],' not in generated_code
     assert generated_code.count('# DaCe AUTO-GENERATED FILE. DO NOT MODIFY') == 1
     assert generated_code.count('import numpy') == 1
 

@@ -281,6 +281,29 @@ class PythonCodeGen(PythonTargetCodeGenerator):
             return None
         return self._runtime_data_name(sdfg, data_name)
 
+    def _is_singleton_buffer_desc(self, desc: data.Data) -> bool:
+        return isinstance(desc, data.Array) and desc.total_size == 1 and len(desc.shape) <= 1
+
+    def _nested_bridge_source_expr(self, sdfg: SDFG, memlet: mmlt.Memlet) -> str:
+        outer_desc = sdfg.arrays[memlet.data]
+        if isinstance(outer_desc, data.Scalar):
+            return self._runtime_data_name(sdfg, memlet.data)
+        return self._read_expr(sdfg, memlet)
+
+    def _nested_bridge_target_subset(self, desc: data.Data, subset):
+        if isinstance(desc, data.Scalar):
+            return None
+        return self._normalize_subset(subset)
+
+    def _nested_bridge_value_expr(self, name: str, desc: data.Data) -> str:
+        if isinstance(desc, data.Scalar):
+            return f'{name}[...]'
+        if self._is_singleton_buffer_desc(desc):
+            if len(desc.shape) == 0:
+                return f'{name}[()]'
+            return f'{name}[0]'
+        raise NotImplementedError('Nested scalar bridge currently only supports scalar values or 1D size-1 buffers.')
+
     def _nsdfg_runtime_symbol_names(self, node: nodes.NestedSDFG) -> list[str]:
         runtime_defined_names = _collect_runtime_defined_names(node.sdfg)
         free_symbols = set(map(str, node.sdfg.used_symbols(all_symbols=False, keep_defined_in_mapping=True)))
@@ -622,29 +645,36 @@ class PythonCodeGen(PythonTargetCodeGenerator):
         seen_inputs = set()
         seen_outputs = set()
 
+        def _bind_bridge(connector_name: str, memlet: mmlt.Memlet, desc: data.Data, is_input: bool) -> str:
+            bridge_name = self._nested_scalar_bridge_name(cfg, state, node, connector_name)
+            if bridge_name not in initialized_bridges:
+                pre_call_statements.append(self._nested_buffer_initialization(bridge_name, desc))
+                initialized_bridges.add(bridge_name)
+            if is_input:
+                pre_call_statements.append(f'{bridge_name}[...] = {self._nested_bridge_source_expr(sdfg, memlet)}')
+            else:
+                target_desc = sdfg.arrays[memlet.data]
+                post_call_actions.append({
+                    'memlet': memlet,
+                    'target_name': memlet.data,
+                    'target_desc': target_desc,
+                    'subset': self._nested_bridge_target_subset(target_desc, memlet.subset),
+                    'value_expr': self._nested_bridge_value_expr(bridge_name, desc),
+                })
+            return bridge_name
+
         def _register_reference(connector_name: str, memlet: mmlt.Memlet, is_input: bool) -> None:
             if connector_name is None or memlet.data is None:
                 return
 
             desc = node.sdfg.arrays[connector_name]
+            outer_desc = sdfg.arrays[memlet.data]
             if isinstance(desc, data.Scalar):
                 arg_expr = self._nested_scalar_direct_expr(sdfg, memlet.data, memlet.subset)
                 if arg_expr is None:
-                    bridge_name = self._nested_scalar_bridge_name(cfg, state, node, connector_name)
-                    arg_expr = bridge_name
-                    if bridge_name not in initialized_bridges:
-                        pre_call_statements.append(self._nested_buffer_initialization(bridge_name, desc))
-                        initialized_bridges.add(bridge_name)
-                    if is_input:
-                        pre_call_statements.append(f'{bridge_name}[...] = {self._read_expr(sdfg, memlet)}')
-                    else:
-                        post_call_actions.append({
-                            'memlet': memlet,
-                            'target_name': memlet.data,
-                            'target_desc': sdfg.arrays[memlet.data],
-                            'subset': self._normalize_subset(memlet.subset),
-                            'value_expr': f'{bridge_name}[...]',
-                        })
+                    arg_expr = _bind_bridge(connector_name, memlet, desc, is_input)
+            elif self._is_singleton_buffer_desc(desc) and isinstance(outer_desc, data.Scalar):
+                arg_expr = _bind_bridge(connector_name, memlet, desc, is_input)
             elif isinstance(desc, data.Array):
                 arg_expr = self._nested_view_expr(sdfg, memlet.data, memlet.subset)
             else:
@@ -683,7 +713,7 @@ class PythonCodeGen(PythonTargetCodeGenerator):
     def _nested_buffer_initialization(self, name: str, desc: data.Data) -> str:
         if isinstance(desc, data.Scalar):
             return f'{name} = numpy.zeros((), dtype={_numpy_dtype(desc.dtype)})'
-        if isinstance(desc, data.Array) and desc.total_size == 1 and len(desc.shape) <= 1:
+        if self._is_singleton_buffer_desc(desc):
             return f'{name} = numpy.zeros({self._shape_expression(desc.shape)}, dtype={_numpy_dtype(desc.dtype)})'
         raise NotImplementedError('Nested scalar bridge currently only supports scalar values or 1D size-1 buffers.')
 

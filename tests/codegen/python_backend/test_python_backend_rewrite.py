@@ -174,6 +174,41 @@ def test_nested_sdfg_multiple_scalar_connectors_preserve_order_and_bridge_scalar
     np.testing.assert_array_equal(d, np.array([203], dtype=np.int64))
 
 
+def test_nested_sdfg_singleton_array_connector_bridges_to_outer_scalar():
+    outer = _make_python_sdfg('outer_nested_singleton_array_bridge')
+    outer.add_array('A', [1], dace.int64)
+    outer.add_array('B', [1], dace.int64)
+    outer.add_scalar('tmp', dace.int64, transient=True)
+
+    inner = SDFG('inner_nested_singleton_array_bridge')
+    inner.backend = dtypes.BackendLanguage.Python
+    inner.add_array('X', [1], dace.int64)
+    inner.add_array('Y', [1], dace.int64)
+    inner_state = inner.add_state('inner_state', is_start_block=True)
+    tasklet = inner_state.add_tasklet('inc', {'inp'}, {'out'}, 'out = inp + 1')
+    inner_state.add_edge(inner_state.add_read('X'), None, tasklet, 'inp', Memlet('X[0]'))
+    inner_state.add_edge(tasklet, 'out', inner_state.add_write('Y'), None, Memlet('Y[0]'))
+
+    outer_state = outer.add_state('outer_state', is_start_block=True)
+    nested = outer_state.add_nested_sdfg(inner, {'X'}, {'Y'})
+    outer_state.add_edge(outer_state.add_read('A'), None, nested, 'X', Memlet('A[0:1]'))
+    outer_state.add_edge(nested, 'Y', outer_state.add_write('tmp'), None, Memlet('tmp'))
+    passthrough = outer_state.add_tasklet('passthrough', {'inp'}, {'out'}, 'out = inp * 2')
+    outer_state.add_edge(outer_state.add_read('tmp'), None, passthrough, 'inp', Memlet('tmp'))
+    outer_state.add_edge(passthrough, 'out', outer_state.add_write('B'), None, Memlet('B[0]'))
+
+    generated = outer.generate_code()[0].code
+    assert '__dace_nested_scalar_' in generated
+    assert 'tmp[0:1]' not in generated
+
+    csdfg = outer.compile()
+    a = np.array([4], dtype=np.int64)
+    b = np.zeros(1, dtype=np.int64)
+    csdfg(A=a, B=b)
+
+    np.testing.assert_array_equal(b, np.array([10], dtype=np.int64))
+
+
 def test_structure_transient_allocation_uses_python_constructor():
     sdfg = _make_python_sdfg('structure_allocation')
     struct_desc = data.Structure({
