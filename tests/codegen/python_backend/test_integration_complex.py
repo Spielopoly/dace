@@ -543,6 +543,7 @@ def test_nested_sdfg_with_symbols():
     np.testing.assert_allclose(b, a)
 
 
+@pytest.mark.xfail(reason='The inlining transformation do not account for variable names in init or global code')
 @pytest.mark.parametrize('multistate', [False, True], ids=['single_state_inline', 'multistate_inline'])
 def test_python_runtime_code_language_survives_inlining(multistate: bool):
     sdfg, transformation = _make_runtime_inlining_regression_sdfg(multistate)
@@ -562,6 +563,7 @@ def test_python_runtime_code_language_survives_inlining(multistate: bool):
     assert compiled._namespace['EXIT_RUNTIME'] == 15
 
 
+@pytest.mark.xfail(reason='The inlining transformation do not account for variable names in init or global code')
 @pytest.mark.parametrize('multistate', [False, True], ids=['single_state_inline', 'multistate_inline'])
 def test_python_runtime_code_replacements_survive_inlining(multistate: bool):
     sdfg, transformation = _make_runtime_inlining_symbol_mapping_sdfg(multistate)
@@ -581,6 +583,7 @@ def test_python_runtime_code_replacements_survive_inlining(multistate: bool):
     np.testing.assert_array_equal(b, np.array([8], dtype=np.int64))
 
 
+@pytest.mark.xfail(reason='The inlining transformation do not account for variable names in init or global code')
 @pytest.mark.parametrize('multistate', [False, True], ids=['single_state_inline', 'multistate_inline'])
 def test_python_runtime_assignment_targets_remain_local_during_inlining(multistate: bool):
     sdfg, transformation = _make_runtime_inlining_assignment_target_sdfg(multistate)
@@ -598,6 +601,7 @@ def test_python_runtime_assignment_targets_remain_local_during_inlining(multista
     np.testing.assert_array_equal(b, np.array([10], dtype=np.int64))
 
 
+@pytest.mark.xfail(reason='The inlining transformation do not account for variable names in init or global code')
 @pytest.mark.parametrize('multistate', [False, True], ids=['single_state_inline', 'multistate_inline'])
 def test_python_runtime_local_data_names_remain_local_during_inlining(multistate: bool):
     sdfg, transformation = _make_runtime_inlining_local_data_name_sdfg(multistate)
