@@ -39,7 +39,7 @@ if TYPE_CHECKING:
     from dace.codegen.instrumentation.report import InstrumentationReport
     from dace.codegen.instrumentation.data.data_report import InstrumentedDataReport
     from dace.codegen.compiled_sdfg import CompiledSDFG
-    from dace.sdfg.analysis.schedule_tree.treenodes import ScheduleTreeScope
+    from dace.sdfg.analysis.schedule_tree.treenodes import ScheduleTreeRoot
     from dace.codegen.py.compiled_sdfg import PythonCompiledSDFG
 
 
@@ -415,7 +415,7 @@ class InterstateEdge(object):
     def label(self):
         assignments = ','.join(['%s=%s' % (k, v) for k, v in self.assignments.items()])
 
-        # Edge with assigment only (no condition)
+        # Edge with assignment only (no condition)
         if self.condition.as_string == '1':
             # Edge without conditions or assignments
             if len(self.assignments) == 0:
@@ -426,7 +426,7 @@ class InterstateEdge(object):
         if len(self.assignments) == 0:
             return self.condition.as_string
 
-        # Edges with assigments and conditions
+        # Edges with assignments and conditions
         return self.condition.as_string + '; ' + assignments
 
 
@@ -1276,7 +1276,7 @@ class SDFG(ControlFlowRegion):
 
     ##########################################
 
-    def as_schedule_tree(self, in_place: bool = False) -> 'ScheduleTreeScope':
+    def as_schedule_tree(self, in_place: bool = False) -> 'ScheduleTreeRoot':
         """
         Creates a schedule tree from this SDFG and all nested SDFGs. The schedule tree is a tree of nodes that represent
         the execution order of the SDFG.
@@ -1284,7 +1284,8 @@ class SDFG(ControlFlowRegion):
         etc.) or a ``ScheduleTreeScope`` block (map, for-loop, etc.) that contains other nodes.
 
         It can be used to generate code from an SDFG, or to perform schedule transformations on the SDFG. For example,
-        erasing an empty if branch, or merging two consecutive for-loops.
+        erasing an empty if branch, or merging two consecutive for-loops. The SDFG can then be reconstructed via the
+        ``as_sdfg`` method or the ``from_schedule_tree`` function in ``dace.sdfg.analysis.schedule_tree.tree_to_sdfg``.
 
         :param in_place: If True, the SDFG is modified in-place. Otherwise, a copy is made. Note that the SDFG might
                          not be usable after the conversion if ``in_place`` is True!
@@ -2226,17 +2227,33 @@ class SDFG(ControlFlowRegion):
             return self.add_datadesc(name, newdesc, find_new_name=True), newdesc
         return self.add_datadesc(self.temp_data_name(), newdesc), newdesc
 
-    def add_datadesc(self, name: str, datadesc: dt.Data, find_new_name=False) -> str:
+    # Names reserved by framework pipelines (currently just ``gpu_streams``
+    # for the gpu_specialization pipeline). User SDFG code can't add these;
+    # only the owning pipeline can, via ``_internal_use=True`` below.
+    RESERVED_NAMES = frozenset({"gpu_streams"})
+
+    def add_datadesc(self,
+                     name: str,
+                     datadesc: dt.Data,
+                     find_new_name: bool = False,
+                     _internal_use: bool = False) -> str:
         """ Adds an existing data descriptor to the SDFG array store.
 
             :param name: Name to use.
             :param datadesc: Data descriptor to add.
             :param find_new_name: If True and data descriptor with this name
                                   exists, finds a new name to add.
+            :param _internal_use: Bypass for framework pipelines that own
+                                  reserved descriptor names (see
+                                  :attr:`RESERVED_NAMES`). Not for user code.
             :return: Name of the new data descriptor
         """
         if not isinstance(name, str):
             raise TypeError("Data descriptor name must be a string. Got %s" % type(name).__name__)
+
+        if name in self.RESERVED_NAMES and not _internal_use:
+            raise NameError(f'Data descriptor name "{name}" is reserved for framework pipeline use. '
+                            f'Pick a different name.')
 
         if find_new_name:
             # These characters might be introduced through the creation of views to members

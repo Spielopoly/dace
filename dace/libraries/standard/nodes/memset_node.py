@@ -14,16 +14,21 @@ from dace.codegen.common import sym2cpp
 from dace.transformation.transformation import ExpandTransformation
 from .. import environments
 
-from dace.libraries.standard.helper import (STREAM_CONN as _STREAM_CONN, add_dynamic_inputs,
-                                            extract_stream_and_dynamic_inputs)
-from dace.libraries.standard.nodes.copy_node import _add_stream_descriptor, _wire_stream_to
+from dace.libraries.standard.helper import (STREAM_CONN as _STREAM_CONN, add_dynamic_inputs, add_stream_descriptor as
+                                            _add_stream_descriptor, extract_stream_and_dynamic_inputs, wire_stream_to as
+                                            _wire_stream_to)
+
+# Outer connector name this libnode publishes. Republished as
+# ``MemsetLibraryNode.OUTPUT_CONNECTOR_NAME`` so external consumers
+# reference a class constant instead of a string.
+_OUTPUT_CONNECTOR_NAME = "_mset_out"
 
 
 def _make_memset_skeleton(
     node: "MemsetLibraryNode", parent_state: dace.SDFGState, parent_sdfg: dace.SDFG
 ) -> Tuple[dace.SDFG, dace.SDFGState, str, dace.data.Data, dace.subsets.Range, List[Any], List[Any],
            Optional[dace.data.Data]]:
-    """Shared SDFG skeleton for every memset expansion."""
+    """Shared SDFG skeleton for the mapped (``ExpandPure``) memset expansion."""
     out_name, out, out_subset, dynamic_inputs, stream_input = node.validate(parent_sdfg, parent_state)
     keep = [(e + 1 - b) // s != 1 for (b, e, s) in out_subset]
     out_shape_collapsed = [(e + 1 - b) // s for (b, e, s), k in zip(out_subset, keep) if k]
@@ -40,31 +45,89 @@ def _make_memset_skeleton(
     return sdfg, state, out_name, out, out_subset, map_lengths, out_shape_collapsed, stream_input
 
 
-def _make_memset_memcpy_tasklet(sdfg: dace.SDFG, state: dace.SDFGState, out_name: str, out: dace.data.Data,
-                                out_shape_collapsed: List[Any], cp_size: Any, stream_input: Optional[dace.data.Data],
-                                cuda: bool):
-    """Emit a ``memset`` / ``cudaMemsetAsync`` tasklet writing zeros to ``out``."""
-    tasklet_inputs = set()
-    if cuda:
-        stream_expr = _STREAM_CONN if stream_input is not None else "__dace_current_stream"
-        if stream_input is not None:
-            tasklet_inputs.add(_STREAM_CONN)
-        code = (f"cudaMemsetAsync(_memset_out, 0, {sym2cpp(cp_size)} * sizeof({out.dtype.ctype}), "
-                f"{stream_expr});")
-    else:
-        code = f"memset(_memset_out, 0, {sym2cpp(cp_size)} * sizeof({out.dtype.ctype}));"
+def _validate_no_dynamic_inputs(node: "MemsetLibraryNode", dynamic_inputs):
+    """Direct-tasklet memset paths can't bind dynamic scalar inputs (no map
+    around them); use the 'pure' implementation if you need that."""
+    if dynamic_inputs:
+        raise NotImplementedError(
+            f"{type(node).__name__} direct-tasklet expansion does not support dynamic input scalars; "
+            f"use the 'pure' implementation for this case.")
 
-    out_access = state.add_access(out_name)
-    tasklet = state.add_tasklet(name="memset_tasklet",
-                                inputs=tasklet_inputs,
-                                outputs={"_memset_out"},
-                                code=code,
-                                language=dace.Language.CPP)
-    state.add_edge(
-        tasklet, "_memset_out", out_access, None,
-        dace.memlet.Memlet(data=out_name, subset=dace.subsets.Range([(0, e - 1, 1) for e in out_shape_collapsed])))
-    if cuda:
-        _wire_stream_to(sdfg, state, tasklet, _STREAM_CONN, stream_input)
+
+def _make_cuda_memset_tasklet(node: "MemsetLibraryNode", parent_state: dace.SDFGState,
+                              parent_sdfg: dace.SDFG) -> nodes.Tasklet:
+    """Tasklet emitting ``cudaMemsetAsync(_out, 0, n)``."""
+    out_name, out, out_subset, dynamic_inputs, stream_input = node.validate(parent_sdfg, parent_state)
+    _validate_no_dynamic_inputs(node, dynamic_inputs)
+
+    cp_size = reduce(operator.mul, [(e + 1 - b) // s for (b, e, s) in out_subset], 1)
+    has_stream = stream_input is not None
+    stream_expr = _STREAM_CONN if has_stream else "__dace_current_stream"
+    code = (f"cudaMemsetAsync({_OUTPUT_CONNECTOR_NAME}, 0, "
+            f"{sym2cpp(cp_size)} * sizeof({out.dtype.ctype}), {stream_expr});")
+
+    in_conns = {_STREAM_CONN: dace.dtypes.gpuStream_t} if has_stream else {}
+    return nodes.Tasklet(node.name,
+                         inputs=in_conns,
+                         outputs={_OUTPUT_CONNECTOR_NAME: dace.dtypes.pointer(out.dtype)},
+                         code=code,
+                         language=dace.Language.CPP)
+
+
+def _make_cpu_memset_tasklet(node: "MemsetLibraryNode", parent_state: dace.SDFGState,
+                             parent_sdfg: dace.SDFG) -> nodes.Tasklet:
+    """Tasklet emitting ``memset(_out, 0, n)``."""
+    out_name, out, out_subset, dynamic_inputs, _stream = node.validate(parent_sdfg, parent_state)
+    _validate_no_dynamic_inputs(node, dynamic_inputs)
+
+    cp_size = reduce(operator.mul, [(e + 1 - b) // s for (b, e, s) in out_subset], 1)
+    code = f"memset({_OUTPUT_CONNECTOR_NAME}, 0, {sym2cpp(cp_size)} * sizeof({out.dtype.ctype}));"
+
+    return nodes.Tasklet(node.name,
+                         inputs={},
+                         outputs={_OUTPUT_CONNECTOR_NAME: dace.dtypes.pointer(out.dtype)},
+                         code=code,
+                         language=dace.Language.CPP)
+
+
+def select_memset_implementation(node, parent_state, parent_sdfg) -> str:
+    """Single source of truth for resolving ``MemsetLibraryNode.implementation``
+    when set to ``'Auto'``. Returns one of ``'pure'`` / ``'CUDA'`` / ``'CPU'``.
+
+    - In-device scope: ``'pure'`` (a Sequential map of element-zero, the only
+      thing safe inside device code — ``cudaMemsetAsync`` cannot be issued
+      from a kernel).
+    - GPU storage on the destination, host-issued: ``'CUDA'``
+      (``cudaMemsetAsync``).
+    - Else: ``'CPU'`` (``std::memset``).
+
+    Falls back to ``'pure'`` whenever dynamic scalar inputs are present —
+    only the mapped expansion supports those."""
+    from dace.sdfg.scope import is_devicelevel_gpu
+
+    out_name, out, out_subset, dynamic_inputs, _stream = node.validate(parent_sdfg, parent_state)
+
+    if is_devicelevel_gpu(parent_sdfg, parent_state, node) or dynamic_inputs:
+        return 'pure'
+
+    if out.storage == dace.dtypes.StorageType.GPU_Global:
+        return 'CUDA'
+    return 'CPU'
+
+
+@library.expansion
+class ExpandAuto(ExpandTransformation):
+    """Default expansion: dispatches to the implementation chosen by
+    :func:`select_memset_implementation` based on the destination storage,
+    dynamic inputs, and the surrounding scope."""
+    environments = []
+
+    @staticmethod
+    def expansion(node: "MemsetLibraryNode", parent_state: dace.SDFGState, parent_sdfg: dace.SDFG):
+        impl_name = select_memset_implementation(node, parent_state, parent_sdfg)
+        assert impl_name != 'Auto', "select_memset_implementation must not return 'Auto'."
+        node.implementation = impl_name
+        return MemsetLibraryNode.implementations[impl_name].expansion(node, parent_state, parent_sdfg)
 
 
 @library.expansion
@@ -100,12 +163,8 @@ class ExpandCUDA(ExpandTransformation):
     environments = [environments.CUDA]
 
     @staticmethod
-    def expansion(node: "MemsetLibraryNode", parent_state: dace.SDFGState, parent_sdfg: dace.SDFG) -> dace.SDFG:
-        sdfg, state, out_name, out, _out_subset, map_lengths, out_shape_collapsed, stream_input = (
-            _make_memset_skeleton(node, parent_state, parent_sdfg))
-        cp_size = reduce(operator.mul, map_lengths, 1)
-        _make_memset_memcpy_tasklet(sdfg, state, out_name, out, out_shape_collapsed, cp_size, stream_input, cuda=True)
-        return sdfg
+    def expansion(node: "MemsetLibraryNode", parent_state: dace.SDFGState, parent_sdfg: dace.SDFG) -> nodes.Tasklet:
+        return _make_cuda_memset_tasklet(node, parent_state, parent_sdfg)
 
 
 @library.expansion
@@ -113,28 +172,30 @@ class ExpandCPU(ExpandTransformation):
     environments = [environments.CPU]
 
     @staticmethod
-    def expansion(node: "MemsetLibraryNode", parent_state: dace.SDFGState, parent_sdfg: dace.SDFG) -> dace.SDFG:
-        sdfg, state, out_name, out, _out_subset, map_lengths, out_shape_collapsed, stream_input = (
-            _make_memset_skeleton(node, parent_state, parent_sdfg))
-        cp_size = reduce(operator.mul, map_lengths, 1)
-        _make_memset_memcpy_tasklet(sdfg, state, out_name, out, out_shape_collapsed, cp_size, stream_input, cuda=False)
-        return sdfg
+    def expansion(node: "MemsetLibraryNode", parent_state: dace.SDFGState, parent_sdfg: dace.SDFG) -> nodes.Tasklet:
+        return _make_cpu_memset_tasklet(node, parent_state, parent_sdfg)
 
 
 @library.node
 class MemsetLibraryNode(nodes.LibraryNode):
-    implementations = {"pure": ExpandPure, "CUDA": ExpandCUDA, "CPU": ExpandCPU}
-    default_implementation = 'pure'
+    implementations = {"Auto": ExpandAuto, "pure": ExpandPure, "CUDA": ExpandCUDA, "CPU": ExpandCPU}
+    default_implementation = 'Auto'
+
+    # Connector name this libnode publishes. External consumers (tests,
+    # other passes) must reference this constant instead of the string
+    # literal so a future rename is a single-line change.
+    OUTPUT_CONNECTOR_NAME = _OUTPUT_CONNECTOR_NAME
 
     def __init__(self, name: str, *args, **kwargs):
-        super().__init__(name, *args, **kwargs)
+        super().__init__(name, *args, outputs={MemsetLibraryNode.OUTPUT_CONNECTOR_NAME}, **kwargs)
 
     def validate(
             self, sdfg: dace.SDFG,
             state: dace.SDFGState) -> Tuple[str, dace.data.Data, dace.subsets.Range, dict, Optional[dace.data.Data]]:
-        data_oes = [oe for oe in state.out_edges(self) if oe.src_conn == "_out"]
+        data_oes = [oe for oe in state.out_edges(self) if oe.src_conn == _OUTPUT_CONNECTOR_NAME]
         if len(data_oes) != 1:
-            raise ValueError(f"{type(self).__name__} expects exactly one `_out` output edge.")
+            raise ValueError(f"{type(self).__name__} expects exactly one "
+                             f"`{_OUTPUT_CONNECTOR_NAME}` output edge.")
 
         oe = data_oes[0]
         out = sdfg.arrays[oe.data.data]

@@ -66,6 +66,7 @@ class ScheduleType(ExtensibleAttributeEnum):
     GPU_ThreadBlock = auto()  #: Thread-block code
     GPU_ThreadBlock_Dynamic = auto()  #: Allows rescheduling work within a block
     GPU_Persistent = auto()
+    GPU_Warp = auto()
 
     Snitch = auto()
     Snitch_Multicore = auto()
@@ -77,6 +78,19 @@ GPU_SCHEDULES = [
     ScheduleType.GPU_ThreadBlock,
     ScheduleType.GPU_ThreadBlock_Dynamic,
     ScheduleType.GPU_Persistent,
+]
+
+# A subset of GPU schedule types for ExperimentalCUDACodeGen
+GPU_SCHEDULES_EXPERIMENTAL_CUDACODEGEN = [
+    ScheduleType.GPU_Device,
+    ScheduleType.GPU_ThreadBlock,
+    ScheduleType.GPU_Warp,
+]
+
+# A subset of on-GPU storage types for ExperimentalCUDACodeGen
+GPU_MEMORY_STORAGES_EXPERIMENTAL_CUDACODEGEN = [
+    StorageType.GPU_Global,
+    StorageType.GPU_Shared,
 ]
 
 # A subset of CPU schedule types
@@ -186,6 +200,7 @@ SCOPEDEFAULT_STORAGE = {
     ScheduleType.GPU_ThreadBlock_Dynamic: StorageType.Register,
     ScheduleType.SVE_Map: StorageType.CPU_Heap,
     ScheduleType.Snitch: StorageType.Snitch_TCDM,
+    ScheduleType.GPU_Warp: StorageType.Register,
 }
 
 # Maps from ScheduleType to default ScheduleType for sub-scopes
@@ -203,6 +218,7 @@ SCOPEDEFAULT_SCHEDULE = {
     ScheduleType.SVE_Map: ScheduleType.Sequential,
     ScheduleType.Snitch: ScheduleType.Snitch,
     ScheduleType.Snitch_Multicore: ScheduleType.Snitch_Multicore,
+    ScheduleType.GPU_Warp: ScheduleType.Sequential,
 }
 
 # Maps from StorageType to a preferred ScheduleType for helping determine schedules.
@@ -437,10 +453,10 @@ class typeclass(object):
         return self.type(*args, **kwargs)
 
     def __eq__(self, other):
-        return other is not None and self.ctype == other.ctype
+        return other is not None and self.ctype == getattr(other, 'ctype', False)
 
     def __ne__(self, other):
-        return other is not None and self.ctype != other.ctype
+        return other is not None and self.ctype != getattr(other, 'ctype', False)
 
     def __getitem__(self, s):
         """ This is syntactic sugar that allows us to define an array type
@@ -1271,7 +1287,6 @@ else:
     string = stringtype()
     MPI_Request = opaque('MPI_Request')
     gpuStream_t = opaque('gpuStream_t')
-
 _bool = bool
 
 

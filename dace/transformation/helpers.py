@@ -787,13 +787,14 @@ def isolate_nested_sdfg(
 ) -> Union[Tuple[SDFGState, SDFGState, SDFGState], bool]:
     """Isolate the nested SDFG.
 
-    The function will split `state` into three states:
-    - Pre State: Contains the data flow that is needed to compute the dependency
-        of the nested SDFG.
-    - Middle State: This state contains the nested SDFG and the nodes that are needed
-        as input or output to the nested SDFG.
-    - Post State: Contains the data flow that uses the data that was computed
-        by the nested SDFG.
+    The function will split ``state`` into three states:
+
+        - Pre State: Contains the data flow that is needed to compute the dependency
+          of the nested SDFG.
+        - Middle State: This state contains the nested SDFG and the nodes that are needed
+          as input or output to the nested SDFG.
+        - Post State: Contains the data flow that uses the data that was computed
+          by the nested SDFG.
 
     The important aspect of this function is, that it will not increase the
     number of AccessNodes that are written to, it might, however, add new AccessNodes
@@ -801,8 +802,11 @@ def isolate_nested_sdfg(
 
     :param state: The state on which we operate.
     :param nested_sdfg: The nested SDFG node that should be isolated.
-    :param test_if_applicable: If `True` then do not perform the splitting, only verify
-        that it can be performed by returning either `True` or `False`.
+    :param test_if_applicable: If ``True`` then do not perform the splitting, only verify
+        that it can be performed by returning either ``True`` or ``False``.
+    :return: If ``test_if_applicable`` is ``False`` then the function will return a tuple of the three states
+        (pre, middle, post). If ``test_if_applicable`` is ``True``, then the function will return ``True``
+        if the split can be performed and ``False`` otherwise.
     """
 
     # We can only isolate the nested SDFG if it is on global scope, for example
@@ -1553,6 +1557,38 @@ def get_parent_map(state: SDFGState, node: Optional[nodes.Node] = None) -> Optio
     return None
 
 
+def is_within_schedule_types(state: SDFGState, node: nodes.Node, schedules: Set[dtypes.ScheduleType]) -> bool:
+    """
+    Checks if the given node is enclosed within a Map whose schedule type
+    matches any in the `schedules` set.
+
+    Parameters
+    ----------
+    state : SDFGState
+        The State where the node resides
+    node : nodes.Node
+        The node to check.
+    schedules : set[dtypes.ScheduleType]
+        A set of schedule types to match (e.g., {dtypes.ScheduleType.GPU_Device}).
+
+    Returns
+    ----------
+    bool
+        True if the node is enclosed by a Map with a schedule type in `schedules`, False otherwise.
+    """
+    current = node
+
+    while current is not None:
+        if isinstance(current, nodes.MapEntry):
+            if current.map.schedule in schedules:
+                return True
+
+        parent = get_parent_map(state, current)
+        if parent is None:
+            return False
+        current, state = parent
+
+
 def redirect_edge(state: SDFGState,
                   edge: graph.MultiConnectorEdge[Memlet],
                   new_src: Optional[nodes.Node] = None,
@@ -2062,3 +2098,33 @@ def _is_pointer(obj) -> bool:
 def _is_structure_view(obj) -> bool:
     """Check if object is a StructureView."""
     return isinstance(obj, data.StructureView)
+
+
+def is_within_schedule_types(state: SDFGState, node: nodes.Node, schedules: Set[dtypes.ScheduleType]) -> bool:
+    """
+    Checks if the given node is enclosed within a Map whose schedule type
+    matches any in the `schedules` set.
+    Parameters
+    ----------
+    state : SDFGState
+        The State where the node resides
+    node : nodes.Node
+        The node to check.
+    schedules : set[dtypes.ScheduleType]
+        A set of schedule types to match (e.g., {dtypes.ScheduleType.GPU_Device}).
+    Returns
+    ----------
+    bool
+        True if the node is enclosed by a Map with a schedule type in `schedules`, False otherwise.
+    """
+    current = node
+
+    while current is not None:
+        if isinstance(current, nodes.MapEntry):
+            if current.map.schedule in schedules:
+                return True
+
+        parent = get_parent_map(state, current)
+        if parent is None:
+            return False
+        current, state = parent

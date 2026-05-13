@@ -1,4 +1,4 @@
-name: Pauli GPU Tests (ExperimentalCUDACodeGen)
+name: Pauli GPU New
 
 on:
   workflow_dispatch:

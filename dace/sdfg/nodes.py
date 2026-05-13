@@ -921,6 +921,9 @@ class MapEntry(EntryNode):
 
             free_symbols |= e.data.used_symbols(all_symbols, e)
 
+        # Update with the symbols needed by the map
+        free_symbols |= self.free_symbols
+
         # Do not consider SDFG constants as symbols
         new_symbols.update(set(parent_sdfg.constants.keys()))
         return free_symbols - new_symbols
@@ -1380,15 +1383,17 @@ class LibraryNode(CodeNode):
             node.
 
             This method supports two interfaces:
-            1. New interface: expand(state, implementation=None, **kwargs)
-            2. Old interface: expand(sdfg, state, **kwargs) [for backward compatibility]
+
+                1. New interface: ``expand(state, implementation=None, **kwargs)``
+                2. Old interface: ``expand(sdfg, state, **kwargs)`` [for backward compatibility]
 
             :param state_or_sdfg: Either a ControlFlowBlock (new interface) or SDFG (old interface)
             :param state_or_impl: Either implementation name (new interface) or SDFGState (old interface)
             :param kwargs: Additional expansion arguments
             :return: the name of the expanded implementation
 
-            Examples:
+            Examples::
+
                 # New interface (recommended):
                 result = node.expand(state, 'pure')
 

@@ -1,4 +1,4 @@
-# Copyright 2019-2025 ETH Zurich and the DaCe authors. All rights reserved.
+# Copyright 2019-2026 ETH Zurich and the DaCe authors. All rights reserved.
 """ Various utility functions to create, traverse, and modify SDFGs. """
 
 import collections
@@ -1611,7 +1611,7 @@ def inline_sdfgs(sdfg: SDFG, permissive: bool = False, progress: bool = None, mu
                      inaccurate, requires ``tqdm``). If None, prints out
                      progress if over 5 seconds have passed. If False, never
                      shows progress bar.
-    :param multistate: Include
+    :param multistate: If True, include multi-state inlining.
     :return: The total number of SDFGs inlined.
     """
     # Avoid import loops
@@ -1764,8 +1764,12 @@ def is_nonfree_sym_dependent(node: nd.AccessNode, desc: dt.Data, state: SDFGStat
     """
     if isinstance(desc, (dt.View)):
         # Views can be non-free symbol dependent due to the adjacent edges.
+        # ``get_view_edge`` returns ``None`` for an orphaned view (no
+        # incoming/outgoing edge that points at the viewed access node) —
+        # treat such a view as having no edge-side dependencies and fall
+        # through to the viewed-node check below.
         e = get_view_edge(state, node)
-        if e.data:
+        if e is not None and e.data:
             src_subset = e.data.get_src_subset(e, state)
             dst_subset = e.data.get_dst_subset(e, state)
             free_symbols = set()
@@ -1931,6 +1935,7 @@ def map_view_to_array(vdesc: dt.View, adesc: dt.Array,
     out of a view, we need to compose the subset with the new view dimensions and new subset.
     The precondition to this method is that the array has unique strides (if not, the process fails).
     The process works in three steps, as follows:
+
         * First, The degenerate (shape=1) dimensions are removed from both the array and the view for consideration.
         * The mapping between non-degenerate dimensions is done from the view to the array based on the strides.
             Note that in a slice, the strides can be expanded or squeezed, but never reordered. This fact is used
@@ -1941,9 +1946,11 @@ def map_view_to_array(vdesc: dt.View, adesc: dt.Array,
         * Third, the remainder of the dimensions of the original (non-view) data descriptor are considered
             "squeezed".
 
+
     For example, a scalar view ``A[i, j] -> v`` would return ``({}, [], [0, 1])``.
     Example 2: ``A[0:2, 3:5, i, j, 0:N] -> V[0:2, 0, 0:2, 0, 0:N, 0]`` would return
     ``({0: 0, 2: 1, 3: 2, 4: 4}, [1, 5], [3])``.
+
     :param vdesc: The data descriptor of the view.
     :param adesc: The data descriptor of the viewed data container.
     :return: A tuple of (mapping of view->array, expanded, squeezed) dimensions, or None if the process failed.
@@ -2536,6 +2543,10 @@ def _get_used_symbols_impl(scope: Union[SDFG, ControlFlowRegion, SDFGState, nd.M
             return offset_symbols | used_symbols
     elif isinstance(scope, nd.MapEntry):
         used_symbols = scope.used_symbols_within_scope(parent_state=parent_state)
+        if not include_symbols_for_offset_calculations:
+            # The map's own range free symbols are iteration/offset-calculation
+            # symbols; surface them only when offset symbols were requested.
+            used_symbols = used_symbols - scope.free_symbols
         return offset_symbols | used_symbols
     else:
         raise Exception("Unsupported scope type for get_constant_data: {}".format(type(scope)))

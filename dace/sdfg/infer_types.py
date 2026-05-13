@@ -67,7 +67,7 @@ def infer_connector_types(sdfg: SDFG):
                 cname = e.dst_conn
                 if cname is None:
                     continue
-                scalar = (e.data.subset and e.data.subset.num_elements() == 1)
+                scalar = bool(e.data.subset is not None and e.data.subset.num_elements() == 1)
                 if e.data.data is not None:
                     allocated_as_scalar = (sdfg.arrays[e.data.data].storage is not dtypes.StorageType.GPU_Global)
                 else:
@@ -146,6 +146,7 @@ def set_default_schedule_and_storage_types(scope: Union[SDFG, SDFGState, nodes.E
     ``dtypes.DEFAULT_TOPLEVEL_SCHEDULE``.
     May raise ``InvalidSDFGNodeError`` if a default scope is ambiguous based on surrounding
     storage types.
+
     :param scope: The SDFG, state, or scope to infer.
     :param parent_schedules: A list of ScheduleType elements representing
                              an ordered list of schedules, from the global schedule
@@ -252,16 +253,36 @@ def _determine_schedule_from_storage(state: SDFGState, node: nodes.Node) -> Opti
     constraints: Set[dtypes.ScheduleType] = set()
     sdfg = state.parent
     for dname in memlets:
-        if isinstance(sdfg.arrays[dname], data.Scalar):
+        desc = sdfg.arrays[dname]
+        if isinstance(desc, data.Scalar):
             continue  # Skip scalars
 
-        storage = sdfg.arrays[dname].storage
+        # The GPU stream handle array is plumbing, not data: it carries a
+        # scheduler-assigned stream slot into stream-using nodes and must
+        # not be interpreted as imposing a schedule constraint.  (Today it
+        # uses Register storage, which is already excluded by the map
+        # lookup below; this explicit guard keeps the invariant even if
+        # the stream array's storage changes in the future.)
+        if desc.dtype == dtypes.gpuStream_t:
+            continue
+
+        storage = desc.storage
         if storage not in dtypes.STORAGEDEFAULT_SCHEDULE:
             continue
         sched = dtypes.STORAGEDEFAULT_SCHEDULE[storage]
         if sched is None:
             continue
         constraints.add(sched)
+
+    # Copy/Memset library nodes are the one class of nodes that legitimately
+    # bridge storage types (CPU->GPU copies, GPU buffer zero-fill, etc.).
+    # If any GPU storage is involved on either side, the node must schedule
+    # as GPU_Device; otherwise fall through to the normal single-constraint
+    # path so pure-CPU copies still land on CPU_Multicore.
+    from dace.libraries.standard.nodes.copy_node import CopyLibraryNode
+    from dace.libraries.standard.nodes.memset_node import MemsetLibraryNode
+    if isinstance(node, (CopyLibraryNode, MemsetLibraryNode)) and dtypes.ScheduleType.GPU_Device in constraints:
+        return dtypes.ScheduleType.GPU_Device
 
     if not constraints:  # No constraints found
         child_schedule = None
