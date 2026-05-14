@@ -4,7 +4,7 @@
 from copy import deepcopy as dcpy
 from collections import defaultdict
 from functools import reduce
-from dace import sdfg as sd, memlet as mm, subsets, data as dt
+from dace import sdfg as sd, memlet as mm, subsets, data as dt, dtypes
 from dace.properties import CodeBlock
 from dace.sdfg import nodes, graph as gr
 from dace.sdfg import utils as sdutil
@@ -258,18 +258,14 @@ class MapFission(transformation.SingleStateTransformation):
                     map_syms.update(parent_sdfg.arrays[edge.data.data].free_symbols)
             for sym in map_syms:
                 symname = str(sym)
-                if symname in outer_map.params:
-                    continue
                 if symname not in nsdfg_node.symbol_mapping.keys():
-                    nsdfg_node.symbol_mapping[symname] = sym
-                    nsdfg_node.sdfg.symbols[symname] = graph.symbols_defined_at(nsdfg_node)[symname]
+                    symbols_at_node = graph.symbols_defined_at(nsdfg_node)
+                    if symname in symbols_at_node:
+                        nsdfg_node.symbol_mapping[symname] = sym
+                        nsdfg_node.sdfg.symbols[symname] = symbols_at_node[symname]
 
-            # Remove map symbols from nested mapping
-            for name in outer_map.params:
-                if str(name) in nsdfg_node.symbol_mapping:
-                    del nsdfg_node.symbol_mapping[str(name)]
-                if str(name) in nsdfg_node.sdfg.symbols:
-                    del nsdfg_node.sdfg.symbols[str(name)]
+            # Keep outer map-parameter symbol mappings conservatively.
+            # Rewrites below (unsqueeze/propagation) can introduce late uses.
 
         for state, subgraph in subgraphs:
             components = MapFission._components(subgraph)
@@ -506,7 +502,13 @@ class MapFission(transformation.SingleStateTransformation):
                                 # propagation will stop at the first AccessNode outside the Map scope. For example, see
                                 # `test.transformations.mapfission_test.MapFissionTest.test_array_copy_outside_scope`.
                                 if not (scope_dict[e.src] and scope_dict[e.dst]):
-                                    e.data = propagate_subset([e.data], desc, outer_map.params, outer_map.range)
+                                    e.data = propagate_subset(
+                                        [e.data],
+                                        desc,
+                                        outer_map.params,
+                                        outer_map.range,
+                                        use_dst=(e.dst is node),
+                                    )
 
                         # Only after offsetting memlets we can modify the
                         # overall offset
@@ -540,6 +542,21 @@ class MapFission(transformation.SingleStateTransformation):
 
         # If nested SDFG, reconnect nodes around map and modify memlets
         if self.expr_index == 1:
+            connectors = set(nsdfg_node.in_connectors.keys()) | set(nsdfg_node.out_connectors.keys())
+            symbols_at_node = graph.symbols_defined_at(nsdfg_node)
+            for pname in outer_map.params:
+                if pname not in nsdfg_node.symbol_mapping:
+                    nsdfg_node.symbol_mapping[pname] = pystr_to_symbolic(pname)
+                if pname not in nsdfg_node.sdfg.symbols:
+                    nsdfg_node.sdfg.symbols[pname] = symbols_at_node.get(pname, dtypes.int64)
+
+            for symname in nsdfg_node.sdfg.free_symbols:
+                if symname in connectors or symname in nsdfg_node.symbol_mapping:
+                    continue
+                nsdfg_node.symbol_mapping[symname] = pystr_to_symbolic(symname)
+                if symname not in nsdfg_node.sdfg.symbols:
+                    nsdfg_node.sdfg.symbols[symname] = symbols_at_node.get(symname, dtypes.int64)
+
             for edge in graph.in_edges(map_entry):
                 if not edge.dst_conn or not edge.dst_conn.startswith('IN_'):
                     continue
@@ -564,6 +581,20 @@ class MapFission(transformation.SingleStateTransformation):
 
         # Remove outer map
         graph.remove_nodes_from([map_entry, map_exit])
+
+        # If we transformed inside a nested SDFG, the rewrite above may have
+        # introduced additional free symbols (e.g., map parameters) that must
+        # be visible on the parent NestedSDFG node.
+        if sdfg.parent_nsdfg_node is not None and sdfg.parent is not None:
+            parent_nsdfg = sdfg.parent_nsdfg_node
+            connectors = set(parent_nsdfg.in_connectors.keys()) | set(parent_nsdfg.out_connectors.keys())
+            symbols_at_node = sdfg.parent.symbols_defined_at(parent_nsdfg)
+            for symname in sdfg.free_symbols:
+                if symname in connectors or symname in parent_nsdfg.symbol_mapping:
+                    continue
+                parent_nsdfg.symbol_mapping[symname] = pystr_to_symbolic(symname)
+                if symname not in sdfg.symbols:
+                    sdfg.symbols[symname] = symbols_at_node.get(symname, dtypes.int64)
 
         # NOTE: It is better to manually call memlet propagation here to ensure that all subsets are properly updated.
         # This can solve issues when, e.g., applying MapFission through `SDFG.apply_transformations_repeated`.

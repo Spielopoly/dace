@@ -322,7 +322,14 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
             outer_to_inner = self._find_path_edge(tasklet_edge, self._outer_entry, self._inner_entry)
             if outer_to_inner is None:
                 continue
-            edge_key = (outer_to_inner.src_conn, outer_to_inner.dst_conn)
+            # Connector names can be None for multiple distinct edges.
+            # Include data name to avoid collapsing different inputs
+            # (e.g., A and B in self-write kernels) into a single staging path.
+            edge_key = (
+                outer_to_inner.src_conn,
+                outer_to_inner.dst_conn,
+                cast(Optional[str], outer_to_inner.data.data),
+            )
             if edge_key not in input_plan:
                 input_plan[edge_key] = (outer_to_inner, [], tasklet_edge)
             input_plan[edge_key][1].extend(lib_conns)
@@ -524,6 +531,10 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
         # matcher.  Child hook may add extra connectors (mask, preload).
         self._library_node = self._node_info.type(self._node_info.node_name)
         graph.add_node(self._library_node)
+        if getattr(sdfg, 'backend', None) is not None:
+            from dace import dtypes as _dtypes
+            if sdfg.backend == _dtypes.BackendLanguage.Python:
+                self._library_node.implementation = "cutile_python"
         self._configure_library_node()
 
         # === Input lowering ===

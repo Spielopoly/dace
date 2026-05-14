@@ -34,6 +34,7 @@ from .base import (
     get_all_input_descs, build_multi_op_code, get_tile_strides,
     _BINARY_OPS, _UNARY_OPS,
 )
+from .python_spec import CuTileSpec, make_marker_code
 
 
 @library.node
@@ -225,6 +226,60 @@ for (std::size_t i = 0; i < n; ++i) {{
 
 
 # ── Register all supported ops ──────────────────────────────────────
+
+# ── cuTile Python expansion (``cutile_python``) ───────────────────────────
+
+@library.register_expansion(TileOpLibraryNode, "cutile_python")
+class ExpandTileOpCuTilePython(ExpandTransformation):
+    """Expand TileOpLibraryNode into a Python marker tasklet for cuTile."""
+
+    environments: list = []
+
+    @staticmethod
+    def expansion(node: TileOpLibraryNode, state: SDFGState, sdfg: SDFG) -> nodes.Tasklet:
+        out_conn = get_output_connector_name(node)
+        inputs: set = set()
+
+        if node.expr is not None:
+            from .base import expr_connectors, get_all_input_descs
+            input_descs, c_desc = get_all_input_descs(node, state, sdfg)
+            inputs = set(input_descs.keys())
+            shape, ndim, _ = resolve_shape_and_scalar_form(node, c_desc)
+            tile_shape = [int(s) for s in shape]
+            spec = CuTileSpec(
+                kind="unmasked",
+                op=node.op,
+                tile_shape=tile_shape,
+                ndim=ndim,
+                expr_str=str(node.expr),
+            )
+        else:
+            a_desc, b_desc, c_desc, _, _ = get_tile_descriptors(node, state, sdfg)
+            ref_desc = a_desc or b_desc or c_desc
+            shape, ndim, _ = resolve_shape_and_scalar_form(node, ref_desc)
+            tile_shape = [int(s) for s in shape]
+            if a_desc is not None:
+                inputs.add("_a")
+            if b_desc is not None:
+                inputs.add("_b")
+            spec = CuTileSpec(
+                kind="unmasked",
+                op=node.op,
+                constant1=node.constant1,
+                constant2=node.constant2,
+                tile_shape=tile_shape,
+                ndim=ndim,
+            )
+
+        return nodes.Tasklet(
+            label=node.name + "_cutile_py",
+            inputs=inputs,
+            outputs={out_conn},
+            code=make_marker_code(spec),
+            language=dtypes.Language.Python,
+        )
+
+
 _BINARY_DISPLAY_NAMES = {
     "+": "TileAdd", "-": "TileSubtract", "*": "TileMultiply", "/": "TileDivide",
     ">": "TileGreaterThan", "<": "TileLessThan",
