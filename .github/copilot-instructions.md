@@ -99,6 +99,9 @@
   13. **Simplify** — final cleanup
 - **Tests**: `tests/cutile/*.py` Run all tests after any cuTile changes to check for regressions.
 
+### cuTile Python Backend Conventions
+- Trigger cuTile Python backend dispatch through schedule-based detection (`ScheduleType.CuTile` maps).
+
 ## Memlet Propagation (`dace/sdfg/propagation.py`)
 - The propagation pattern dispatch chain is: `AffineSMemlet` → `ModuloSMemlet` → `ConstantSMemlet` → `GenericSMemlet`. Each pattern's `can_be_applied()` filters what it handles; rejected cases fall through.
 - **AffineSMemlet stride shortcut**: The `i:i+stride` shortcut (returns stride=1) is only valid when `multiplier == 1`. For non-identity access like `A[2*i]`, removing this guard silently loses stride information.

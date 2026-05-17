@@ -1,6 +1,7 @@
 # Copyright 2019-2026 ETH Zurich and the DaCe authors. All rights reserved.
 """Contains functionality to compile and invoke Python-generated SDFG code."""
 
+import linecache
 from typing import Any, Dict, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -24,9 +25,22 @@ class PythonCompiledSDFG:
         self._initialized = False
         self._finalized = False
 
+        # Register generated source under a pseudo filename so inspect can
+        # retrieve source lines for nested/generated functions.
+        # This is necessary for features like CuTile that generate kernels and 
+        # rely on inspect.getsource() to retrieve their source code for compilation.
+        pseudo_filename = (
+            f'<dace_generated_python_sdfg_{sdfg.name}_{id(self)}>'
+        )
+        code_lines = self._code.splitlines(True)
+        linecache.cache[pseudo_filename] = (len(self._code), None, code_lines,
+                            pseudo_filename)
+
         # Execute the generated code in an isolated namespace
         self._namespace: Dict[str, Any] = {}
-        exec(self._code, self._namespace)
+        self._namespace['__file__'] = pseudo_filename
+        compiled_code = compile(self._code, pseudo_filename, 'exec')
+        exec(compiled_code, self._namespace)
 
         # Extract the generated function (name matches the SDFG name)
         func_name = sdfg.name
@@ -59,6 +73,11 @@ class PythonCompiledSDFG:
             return
         if self._exit is not None:
             self._exit()
+        # Clear persistent transients so that the next initialize() cycle
+        # starts fresh, matching the semantics of a full re-initialization.
+        # TODO: This needs to be part of the generated code, not here
+        if '__dace_persistent_transients' in self._namespace:
+            self._namespace['__dace_persistent_transients'].clear()
         self._initialized = False
         self._finalized = True
 

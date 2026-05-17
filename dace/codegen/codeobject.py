@@ -9,7 +9,7 @@ from dace.properties import (Property, DictProperty, SetProperty, make_propertie
 class CodeObject(object):
     name = Property(dtype=str, desc="Filename to use")
     code = Property(dtype=str, desc="The code attached to this object")
-    language = Property(dtype=str, desc="Language used for this code (same " + "as its file extension)")
+    language = Property(dtype=str, desc="Language used for this code (same as its file extension)")
     target = Property(dtype=type, desc="Target to use for compilation", allow_none=True)
     target_type = Property(dtype=str, desc="Sub-target within target (e.g., host or device code)", default="")
     title = Property(dtype=str, desc="Title of code for GUI")

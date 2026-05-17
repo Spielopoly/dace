@@ -25,7 +25,6 @@ from dace.symbolic import symstr
 from dace.transformation.transformation import ExpandTransformation
 
 from .base import resolve_shape_and_scalar_form, TileNodeBase, SUPPORTED_MASK_DTYPES, get_tile_strides
-from .python_spec import CuTileSpec, make_marker_code
 
 
 # ── Helper to read tile descriptors for where-select ─────────────────
@@ -272,20 +271,10 @@ class ExpandTileWhereSelectCuTilePython(ExpandTransformation):
     def expansion(
         node: TileWhereSelectLibraryNode, state: SDFGState, sdfg: SDFG
     ) -> nodes.Tasklet:
-        cond_desc, x_desc, y_desc, c_desc = _get_where_descriptors(node, state, sdfg)
-        shape, ndim, _ = resolve_shape_and_scalar_form(node, c_desc)
-        tile_shape = [int(s) for s in shape]
-
-        spec = CuTileSpec(
-            kind="where_select",
-            op="where",
-            tile_shape=tile_shape,
-            ndim=ndim,
-        )
         return nodes.Tasklet(
             label=node.name + "_cutile_py",
             inputs={"_cond", "_x", "_y"},
             outputs={"_c"},
-            code=make_marker_code(spec),
+            code="_c = ct.where(_cond, _x, _y)",
             language=dtypes.Language.Python,
         )

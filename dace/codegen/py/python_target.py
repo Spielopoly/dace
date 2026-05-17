@@ -111,17 +111,20 @@ class PythonCodeGen(PythonTargetCodeGenerator):
             dtypes.ScheduleType.CPU_Persistent,
             dtypes.ScheduleType.Sequential,
         ]
+        # TODO: Move cutile schedule copy to cutile target?
+        COPY_SCHEDULES = [*SUPPORTED_SCHEDULES, dtypes.ScheduleType.CuTile]
         dispatcher.register_map_dispatcher(
             SUPPORTED_SCHEDULES,
             self)
 
-        cpu_storage = [dtypes.StorageType.CPU_Heap, dtypes.StorageType.Register]
-        for storage in cpu_storage:
+        # Is GPU_Global correct?
+        supported_storage = [dtypes.StorageType.CPU_Heap, dtypes.StorageType.Register, dtypes.StorageType.GPU_Global]
+        for storage in supported_storage:
             dispatcher.register_array_dispatcher(storage, self)
-        for src_storage in cpu_storage:
-            for dst_storage in cpu_storage:
+        for src_storage in supported_storage:
+            for dst_storage in supported_storage:
                 dispatcher.register_copy_dispatcher(src_storage, dst_storage, None, self)
-                for schedule in SUPPORTED_SCHEDULES:
+                for schedule in COPY_SCHEDULES:
                     dispatcher.register_copy_dispatcher(src_storage, dst_storage, schedule, self)
 
     def get_generated_codeobjects(self):

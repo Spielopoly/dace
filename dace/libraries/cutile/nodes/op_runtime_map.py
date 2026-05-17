@@ -37,7 +37,6 @@ from .base import (
     get_tile_strides,
     _BINARY_OPS, _UNARY_OPS, SUPPORTED_MASK_DTYPES,
 )
-from .python_spec import CuTileSpec, make_marker_code
 
 
 @library.node
@@ -484,7 +483,7 @@ for (std::size_t i = 0; i < n; ++i) {{
 
 @library.register_expansion(TileRuntimeMaskedOpLibraryNode, "cutile_python")
 class ExpandTileRuntimeMaskedOpCuTilePython(ExpandTransformation):
-    """Expand TileRuntimeMaskedOpLibraryNode into a Python marker tasklet."""
+    """Expand TileRuntimeMaskedOpLibraryNode into a simple Python tasklet."""
 
     environments: list = []
 
@@ -494,9 +493,12 @@ class ExpandTileRuntimeMaskedOpCuTilePython(ExpandTransformation):
     ) -> nodes.Tasklet:
         out_conn = get_output_connector_name(node)
         a_desc, b_desc, c_desc, m_desc, c_in_desc = get_tile_descriptors(node, state, sdfg)
-        ref_desc = a_desc or b_desc or c_desc
-        shape, ndim, _ = resolve_shape_and_scalar_form(node, ref_desc)
-        tile_shape = [int(s) for s in shape]
+
+        if c_in_desc is None:
+            raise ValueError(
+                "TileRuntimeMaskedOp cutile_python expansion requires '_c_in' "
+                "to preserve masked-off output lanes"
+            )
 
         inputs: set = {"_m"}
         if a_desc is not None:
@@ -506,32 +508,35 @@ class ExpandTileRuntimeMaskedOpCuTilePython(ExpandTransformation):
         if c_in_desc is not None:
             inputs.add("_c_in")
 
+        fallback = "_c_in"
+
         if node.expr is not None:
             from .base import expr_connectors
             inputs.update(expr_connectors(node.expr))
             inputs.discard(out_conn)
-            spec = CuTileSpec(
-                kind="runtime_mask",
-                op=node.op,
-                tile_shape=tile_shape,
-                ndim=ndim,
-                expr_str=str(node.expr),
-            )
+            base_expr = str(node.expr)
         else:
-            spec = CuTileSpec(
-                kind="runtime_mask",
-                op=node.op,
-                constant1=node.constant1,
-                constant2=node.constant2,
-                tile_shape=tile_shape,
-                ndim=ndim,
-            )
+            left = node.constant1 if node.constant1 is not None else "_a"
+            if node.constant2 is None and b_desc is None:
+                if node.op in ("-", "+"):
+                    base_expr = f"({node.op}{left})"
+                elif node.op == "abs":
+                    base_expr = f"abs({left})"
+                elif node.op in ("sin", "cos", "exp", "sqrt", "log", "ceil", "floor"):
+                    base_expr = f"ct.{node.op}({left})"
+                else:
+                    base_expr = f"{node.op}({left})"
+            else:
+                right = node.constant2 if node.constant2 is not None else "_b"
+                base_expr = f"({left} {node.op} {right})"
+
+        code = f"{out_conn} = ct.where(_m, {base_expr}, {fallback})"
 
         return nodes.Tasklet(
             label=node.name + "_cutile_py",
             inputs=inputs,
             outputs={out_conn},
-            code=make_marker_code(spec),
+            code=code,
             language=dtypes.Language.Python,
         )
 

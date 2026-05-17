@@ -70,6 +70,8 @@ class ScheduleType(ExtensibleAttributeEnum):
 
     Snitch = auto()
     Snitch_Multicore = auto()
+    
+    CuTile = auto()
 
 
 # A subset of GPU schedule types
@@ -201,6 +203,7 @@ SCOPEDEFAULT_STORAGE = {
     ScheduleType.SVE_Map: StorageType.CPU_Heap,
     ScheduleType.Snitch: StorageType.Snitch_TCDM,
     ScheduleType.GPU_Warp: StorageType.Register,
+    ScheduleType.CuTile: StorageType.GPU_Global,
 }
 
 # Maps from ScheduleType to default ScheduleType for sub-scopes
@@ -219,6 +222,7 @@ SCOPEDEFAULT_SCHEDULE = {
     ScheduleType.Snitch: ScheduleType.Snitch,
     ScheduleType.Snitch_Multicore: ScheduleType.Snitch_Multicore,
     ScheduleType.GPU_Warp: ScheduleType.Sequential,
+    ScheduleType.CuTile: ScheduleType.Sequential,
 }
 
 # Maps from StorageType to a preferred ScheduleType for helping determine schedules.

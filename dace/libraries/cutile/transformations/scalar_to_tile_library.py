@@ -32,6 +32,7 @@ Result (AFTER, non-canonical inner maps)::
 
 import abc
 import copy
+import itertools
 from typing import Dict, Optional, cast
 
 import dace
@@ -47,7 +48,6 @@ from dace.libraries.cutile.op_registry import match_tasklet_to_tile_library_node
 from dace.libraries.cutile.transformations.utils import (
     tile_subset_from_shape,
     create_tile_transient,
-    is_canonical_inner_map,
     primary_memlet_subset,
     with_primary_subset,
     memlet_with_primary_subset,
@@ -531,10 +531,6 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
         # matcher.  Child hook may add extra connectors (mask, preload).
         self._library_node = self._node_info.type(self._node_info.node_name)
         graph.add_node(self._library_node)
-        if getattr(sdfg, 'backend', None) is not None:
-            from dace import dtypes as _dtypes
-            if sdfg.backend == _dtypes.BackendLanguage.Python:
-                self._library_node.implementation = "cutile_python"
         self._configure_library_node()
 
         # === Input lowering ===
@@ -688,14 +684,93 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
             map_symbol = expr_symbols[pname]
             low, high = param_bounds[pname]
 
+            # Require affine dependence and preserve coefficient as stride.
+            # TODO: Is second derivative actually a requirement?
+            second_derivative = sp.simplify(sp.diff(expr, map_symbol, 2))
+            if second_derivative != 0:
+                raise ValueError(
+                    "Tasklet subset dimension is not affine in inner-map parameter."
+                )
+            stride_expr = sp.Abs(sp.simplify(sp.diff(expr, map_symbol)))
+            if stride_expr == 0:
+                raise ValueError(
+                    "Tasklet subset dimension is independent after simplification."
+                )
+
             # Evaluate access expression at both map extremes.
             low_expr = expr.subs(map_symbol, low)
             high_expr = expr.subs(map_symbol, high)
             new_ranges.append((sp.Min(low_expr, high_expr),
                                sp.Max(low_expr, high_expr),
-                               1))
+                               stride_expr))
 
         return subsets.Range(new_ranges)
+
+    def _map_param_bounds(self) -> dict[str, tuple[sp.Basic, sp.Basic]]:
+        """Return symbolic min/max bounds for inner and outer map parameters."""
+        bounds: dict[str, tuple[sp.Basic, sp.Basic]] = {}
+        for params, rng in ((self._inner_entry.map.params, self._inner_entry.map.range),
+                            (self._outer_entry.map.params, self._outer_entry.map.range)):
+            for pname, (start, end, _step) in zip(params, rng):
+                s = self._to_sympy_expr(start)
+                e = self._to_sympy_expr(end)
+                bounds[str(pname)] = (sp.Min(s, e), sp.Max(s, e))
+        return bounds
+
+    def _expr_uses_outer_map_param(self, expr: sp.Basic) -> bool:
+        """Return True iff expr references at least one outer-map parameter."""
+        expr_symbols = {str(s) for s in expr.free_symbols}
+        return any(str(p) in expr_symbols for p in self._outer_entry.map.params)
+
+    def _expr_range_over_map_params(self, expr: sp.Basic) -> tuple[sp.Basic, sp.Basic]:
+        """Conservatively evaluate expr min/max over used outer+inner map params."""
+        bounds = self._map_param_bounds()
+        symtab = {str(s): s for s in expr.free_symbols}
+        used = [name for name in bounds.keys() if name in symtab]
+        if not used:
+            return expr, expr
+
+        candidates: list[sp.Basic] = []
+        for corner in itertools.product((0, 1), repeat=len(used)):
+            repl = {}
+            for bit, name in zip(corner, used):
+                lo, hi = bounds[name]
+                repl[symtab[name]] = hi if bit else lo
+            candidates.append(expr.subs(repl))
+
+        return sp.Min(*candidates), sp.Max(*candidates)
+
+    def _infer_implicit_stride_factor(self, expr: sp.Basic, data_dim: int) -> int:
+        """Infer hidden affine stride from compressed iteration-space cardinality.
+
+        Returns 1 when no reliable stride can be inferred.
+        """
+        if not self._expr_uses_outer_map_param(expr):
+            return 1
+
+        low, high = self._expr_range_over_map_params(expr)
+        low_s = sp.simplify(low)
+        extent = sp.simplify(high - low + 1)
+        if not (isinstance(data_dim, int) and data_dim > 1 and extent.is_integer):
+            return 1
+
+        try:
+            extent_i = int(extent)
+        except TypeError:
+            return 1
+        if extent_i <= 1 or data_dim <= extent_i:
+            return 1
+
+        # Candidate stride from ceil(data_dim / extent).
+        stride = (data_dim + extent_i - 1) // extent_i
+        if stride <= 1:
+            return 1
+        # Validate by inverse cardinality and 0-based alignment.
+        if (data_dim + stride - 1) // stride != extent_i:
+            return 1
+        if low_s != 0:
+            return 1
+        return stride
 
     @staticmethod
     def _build_mask_condition_symbolic(inner_map: nodes.Map) -> sp.Basic:
@@ -787,6 +862,53 @@ class ScalarToTileCanonical(_ScalarToTileBase):
                 return False
         return True
 
+    def _has_identity_tasklet_indexing(self) -> bool:
+        """Require identity indexing w.r.t. inner-map parameters.
+
+        Canonical lowering assumes pointwise alignment between inner-map
+        coordinates and array accesses. Scaled accesses (e.g. ``2*i``) are
+        handled by the masked path.
+        """
+        for edge in self._get_all_edges_of_node(self._tasklet_node):
+            subset = primary_memlet_subset(edge.data)
+            if not isinstance(subset, subsets.Range):
+                return False
+
+            data_name = cast(Optional[str], edge.data.data)
+            data_desc = self._sdfg.arrays.get(data_name) if data_name is not None else None
+
+            for dim, rng in enumerate(subset):
+                expr = self._to_sympy_expr(rng[0])
+                expr_symbols = {str(s): s for s in expr.free_symbols}
+                used_params = [str(p) for p in self._inner_entry.map.params if str(p) in expr_symbols]
+
+                if len(used_params) > 1:
+                    return False
+                if not used_params:
+                    continue
+
+                p = expr_symbols[used_params[0]]
+                if sp.simplify(sp.diff(expr, p, 2)) != 0:
+                    return False
+                if sp.simplify(sp.diff(expr, p)) != 1:
+                    return False
+
+                if data_desc is not None and dim < len(data_desc.shape):
+                    try:
+                        data_dim = int(data_desc.shape[dim])
+                    except TypeError:
+                        data_dim = -1
+                    if data_dim > 0 and self._infer_implicit_stride_factor(expr, data_dim) > 1:
+                        return False
+
+        return True
+
+    def can_be_applied(self, graph: SDFGState, expr_index: int,
+                       sdfg: SDFG, permissive: bool = False) -> bool:
+        if not super().can_be_applied(graph, expr_index, sdfg, permissive):
+            return False
+        return self._has_identity_tasklet_indexing()
+
     def _get_mask_type(self) -> MaskType:
         """Return ``MaskType.UNMASKED`` since canonical maps need no mask."""
         return MaskType.UNMASKED
@@ -826,9 +948,6 @@ class ScalarToTileMasked(_ScalarToTileBase):
         for start, end, step in self._inner_entry.map.range:
             if step == 0:
                 return False
-        # Only match non-canonical maps.
-        if is_canonical_inner_map(self._inner_entry.map):
-            return False
         return True
 
     def _get_mask_type(self) -> MaskType:
@@ -866,6 +985,28 @@ class ScalarToTileMasked(_ScalarToTileBase):
             raise ValueError("ScalarToTileMasked expects tasklet memlets to define a subset")
         load_subset = self._build_contiguous_outer_subset(
             tasklet_subset, self._inner_entry.map)
+
+        # Recover implicit affine strides that may have been compressed to
+        # contiguous map coordinates by earlier preprocessing passes.
+        data_desc = self._sdfg.arrays[cast(str, map_edge.data.data)]
+        if isinstance(tasklet_subset, subsets.Range):
+            scaled_ranges = []
+            for dim, (orig_rng, lifted_rng) in enumerate(zip(tasklet_subset, load_subset)):
+                expr = self._to_sympy_expr(orig_rng[0])
+                data_dim = -1
+                if dim < len(data_desc.shape):
+                    try:
+                        data_dim = int(data_desc.shape[dim])
+                    except TypeError:
+                        data_dim = -1
+                stride_factor = self._infer_implicit_stride_factor(expr, data_dim) if data_dim > 0 else 1
+                if stride_factor > 1:
+                    s, e, st = lifted_rng
+                    scaled_ranges.append((s * stride_factor, e * stride_factor, st * stride_factor))
+                else:
+                    scaled_ranges.append(lifted_rng)
+            load_subset = subsets.Range(scaled_ranges)
+
         return with_primary_subset(map_edge.data, load_subset)
 
     def _configure_library_node(self) -> None:

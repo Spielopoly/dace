@@ -34,7 +34,6 @@ from .base import (
     get_tile_strides,
     _BINARY_OPS, _UNARY_OPS,
 )
-from .python_spec import CuTileSpec, make_marker_code
 
 
 def _sympy_condition_to_cpp(cond: sp.Basic) -> str:
@@ -463,12 +462,7 @@ for (std::size_t i = 0; i < n; ++i) {{
 
 @library.register_expansion(TileSymbolicMaskedOpLibraryNode, "cutile_python")
 class ExpandTileSymbolicMaskedOpCuTilePython(ExpandTransformation):
-    """Expand TileSymbolicMaskedOpLibraryNode into a Python marker tasklet.
-
-    Note: symbolic masks cannot be faithfully reproduced in cuTile; the
-    generated kernel operates unmasked.  The mask_condition is stored in
-    the spec for informational purposes only.
-    """
+    """Expand TileSymbolicMaskedOpLibraryNode into a masked Python tasklet."""
 
     environments: list = []
 
@@ -476,54 +470,10 @@ class ExpandTileSymbolicMaskedOpCuTilePython(ExpandTransformation):
     def expansion(
         node: TileSymbolicMaskedOpLibraryNode, state: SDFGState, sdfg: SDFG
     ) -> nodes.Tasklet:
-        out_conn = get_output_connector_name(node)
-        a_desc, b_desc, c_desc, _, c_in_desc = get_tile_descriptors(node, state, sdfg)
-        ref_desc = a_desc or b_desc or c_desc
-        shape, ndim, _ = resolve_shape_and_scalar_form(node, ref_desc)
-        tile_shape = [int(s) for s in shape]
-
-        inputs: set = set()
-        if a_desc is not None:
-            inputs.add("_a")
-        if b_desc is not None:
-            inputs.add("_b")
-        if c_in_desc is not None:
-            inputs.add("_c_in")
-
-        mask_cond_str = (
-            str(node.mask_condition)
-            if node.mask_condition is not None
-            else None
-        )
-
-        if node.expr is not None:
-            inputs.update(expr_connectors(node.expr))
-            inputs.discard(out_conn)
-            spec = CuTileSpec(
-                kind="symbolic_mask",
-                op=node.op,
-                tile_shape=tile_shape,
-                ndim=ndim,
-                mask_condition=mask_cond_str,
-                expr_str=str(node.expr),
-            )
-        else:
-            spec = CuTileSpec(
-                kind="symbolic_mask",
-                op=node.op,
-                constant1=node.constant1,
-                constant2=node.constant2,
-                tile_shape=tile_shape,
-                ndim=ndim,
-                mask_condition=mask_cond_str,
-            )
-
-        return nodes.Tasklet(
-            label=node.name + "_cutile_py",
-            inputs=inputs,
-            outputs={out_conn},
-            code=make_marker_code(spec),
-            language=dtypes.Language.Python,
+        # TODO: implement
+        raise NotImplementedError(
+            "TileSymbolicMaskedOp cutile_python expansion is not supported; "
+            "symbolic mask scopes must not be lowered to the cuTile Python backend"
         )
 
 
