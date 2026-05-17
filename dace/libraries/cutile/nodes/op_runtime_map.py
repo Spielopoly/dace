@@ -16,7 +16,7 @@ When the mask is false, the output element is left untouched.
 """
 
 
-from typing import List, Optional
+from typing import List, Optional, cast
 
 import dace
 import sympy as sp
@@ -518,6 +518,7 @@ class ExpandTileRuntimeMaskedOpCuTilePython(ExpandTransformation):
         else:
             left = node.constant1 if node.constant1 is not None else "_a"
             if node.constant2 is None and b_desc is None:
+                # TODO: Extract into utility function as these are used in multiple places
                 if node.op in ("-", "+"):
                     base_expr = f"({node.op}{left})"
                 elif node.op == "abs":

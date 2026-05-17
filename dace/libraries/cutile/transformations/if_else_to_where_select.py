@@ -1045,6 +1045,7 @@ class IfElseMapToTileWhere(xf.SingleStateTransformation):
         )
         graph.add_node(compound_node)
         if getattr(sdfg, 'backend', None) is not None:
+            # TODO: Move to set_cutile_python_scope if not already done
             from dace import dtypes as _dtypes
             if sdfg.backend == _dtypes.BackendLanguage.Python:
                 compound_node.implementation = "cutile_python"

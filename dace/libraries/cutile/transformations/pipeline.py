@@ -332,20 +332,9 @@ def _apply_map_tiling_to_all_maps(sdfg: SDFG,
         if not isinstance(map_entry, sdfg_nodes.MapEntry):
             continue
 
-        map_ndim = len(map_entry.map.params)
-        if map_ndim <= 0:
-            continue
-
-        # MapTiling expects one tile size per map dimension.
-        # Normalize user-provided tile_shape to the map rank.
-        if len(tile_shape) >= map_ndim:
-            per_map_tile_sizes = tuple(tile_shape[:map_ndim])
-        else:
-            pad_value = tile_shape[-1] if tile_shape else 1
-            per_map_tile_sizes = tuple(tile_shape) + (pad_value, ) * (map_ndim - len(tile_shape))
 
         options = {
-            "tile_sizes": per_map_tile_sizes,
+            "tile_sizes": tile_shape,
             "skew": True,
             "tile_trivial": True,
         }

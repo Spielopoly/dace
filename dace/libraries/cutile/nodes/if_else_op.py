@@ -26,7 +26,6 @@ from dace.transformation.transformation import ExpandTransformation
 from .op import TileOpLibraryNode
 from .where_select import TileWhereSelectLibraryNode
 from .base import TileNodeBase, get_all_input_descs
-from .python_spec import CuTileSpec, make_marker_code
 
 
 # ── Library node ─────────────────────────────────────────────────────
@@ -163,6 +162,8 @@ class TileIfElseOpLibraryNode(TileNodeBase):
 
 # ── Expansion ────────────────────────────────────────────────────────
 
+# This also functions as the cutile_python expansion
+@library.register_expansion(TileIfElseOpLibraryNode, "cutile_python")  # type: ignore[arg-type]
 @library.register_expansion(TileIfElseOpLibraryNode, "pure")  # type: ignore[arg-type]
 class ExpandTileIfElseOpPure(ExpandTransformation):
     """Expand into an SDFG with four inner library nodes
@@ -356,44 +357,3 @@ class ExpandTileIfElseOpPure(ExpandTransformation):
 
         return inner_sdfg
 
-
-# ── cuTile Python expansion (``cutile_python``) ───────────────────────────
-
-@library.register_expansion(TileIfElseOpLibraryNode, "cutile_python")  # type: ignore[arg-type]
-class ExpandTileIfElseOpCuTilePython(ExpandTransformation):
-    """Expand TileIfElseOpLibraryNode into a single Python marker tasklet.
-
-    The condition, true, and false SymPy expressions are serialised to strings
-    in the spec; ``CuTilePythonCodeGen`` substitutes tile variable names and
-    emits a single ``ct.where`` call inside a ``@ct.kernel``.
-    """
-
-    environments: list = []
-
-    @staticmethod
-    def expansion(
-        node: TileIfElseOpLibraryNode, state: SDFGState, sdfg: SDFG
-    ) -> nodes.Tasklet:
-        from dace import dtypes as _dtypes
-        from .base import resolve_shape_and_scalar_form
-
-        in_descs, out_desc = get_all_input_descs(node, state, sdfg)
-        shape, ndim, _ = resolve_shape_and_scalar_form(node, out_desc)
-        tile_shape = [int(s) for s in shape]
-
-        spec = CuTileSpec(
-            kind="if_else",
-            op="where",
-            tile_shape=tile_shape,
-            ndim=ndim,
-            cond_str=str(node.condition) if node.condition is not None else "True",
-            true_str=str(node.true_expr) if node.true_expr is not None else "0",
-            false_str=str(node.false_expr) if node.false_expr is not None else "0",
-        )
-        return nodes.Tasklet(
-            label=node.name + "_cutile_py",
-            inputs=set(in_descs.keys()),
-            outputs={"_out"},
-            code=make_marker_code(spec),
-            language=_dtypes.Language.Python,
-        )
