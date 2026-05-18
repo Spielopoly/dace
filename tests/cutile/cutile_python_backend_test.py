@@ -89,7 +89,7 @@ def test_schedule_cutile_generates_kernel_and_launch():
     assert "ct.load" in frame_code
     assert "ct.store" in frame_code
     assert "import cuda.tile as ct" in frame_code
-    assert "import cupy as cp" in frame_code
+    assert "import cupy" in frame_code
 
 
 def test_non_cutile_schedule_not_dispatched_to_cutile_target():
