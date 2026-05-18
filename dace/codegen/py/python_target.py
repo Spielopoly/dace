@@ -71,6 +71,29 @@ def _defined_type_for(desc: data.Data):
     return dispatcher_mod.DefinedType.Pointer
 
 
+def _is_inside_cutile_scope(cfg: ControlFlowRegion, state_id: int, node: nodes.Node) -> bool:
+    """True if *node* lies inside a CuTile-scheduled map scope.
+
+    cuTile kernels allocate tile transients as Python locals via ct.load /
+    tasklet writes — there should be no module-level numpy.zeros allocation
+    for them.
+    """
+    if state_id is None or state_id < 0:
+        return False
+    try:
+        state = cfg.state(state_id)
+    except Exception:
+        return False
+    scope = state.scope_dict()
+    cur = scope.get(node)
+    while cur is not None:
+        if (isinstance(cur, nodes.MapEntry)
+                and cur.map.schedule == dtypes.ScheduleType.CuTile):
+            return True
+        cur = scope.get(cur)
+    return False
+
+
 def _defined_ptype_for(desc: data.Data) -> str:
     if isinstance(desc, data.Scalar):
         return _python_type(desc.dtype)
@@ -441,6 +464,8 @@ class PythonCodeGen(PythonTargetCodeGenerator):
             raise NotImplementedError('References are not supported for the Python backend.')
         if isinstance(nodedesc, data.Stream):
             raise NotImplementedError('Stream descriptors are not supported for the Python backend.')
+        if _is_inside_cutile_scope(cfg, state_id, node):
+            return
 
         root_name = node.data.split('.')[0]
         root_desc = sdfg.arrays[root_name]
@@ -488,6 +513,8 @@ class PythonCodeGen(PythonTargetCodeGenerator):
                                  dtypes.AllocationLifetime.External):
             return
         if '.' in node.data:
+            return
+        if _is_inside_cutile_scope(cfg, state_id, node):
             return
         callsite_stream.write(f'del {node.data}', cfg, state_id)
 

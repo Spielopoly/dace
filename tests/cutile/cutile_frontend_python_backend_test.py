@@ -266,3 +266,247 @@ def test_pipeline_scalar_multiply_runtime_correctness():
     csdfg(A=a_cp, B=b_cp, C=c_cp)
 
     np.testing.assert_allclose(cp.asnumpy(c_cp), a_np * b_np, rtol=1e-5, atol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# Additional pipeline integration programs
+# ---------------------------------------------------------------------------
+
+
+FN = dace.symbol("FN", dtype=dace.int32)
+FM = dace.symbol("FM", dtype=dace.int32)
+
+
+@dace.program
+def pipeline_negate(
+    A: dace.float32[24, 20],
+    C: dace.float32[24, 20],
+):
+    """Unary negation program — exercises single-input tile load + unary tasklet."""
+    for i, j in dace.map[0:24, 0:20]:
+        C[i, j] = -A[i, j]
+
+
+@dace.program
+def pipeline_sub(
+    A: dace.float32[16, 16],
+    B: dace.float32[16, 16],
+    C: dace.float32[16, 16],
+):
+    """Subtraction — exercises an op other than ``+`` / ``*``."""
+    for i, j in dace.map[0:16, 0:16]:
+        C[i, j] = A[i, j] - B[i, j]
+
+
+@dace.program
+def pipeline_symbolic_vadd(
+    A: dace.float32[FN, FM],
+    B: dace.float32[FN, FM],
+    C: dace.float32[FN, FM],
+):
+    """Symbolic-shape add — exercises free-symbol surfacing in kernel signature."""
+    for i, j in dace.map[0:FN, 0:FM]:
+        C[i, j] = A[i, j] + B[i, j]
+
+
+@dace.program
+def pipeline_3d_vadd(
+    A: dace.float32[8, 8, 8],
+    B: dace.float32[8, 8, 8],
+    C: dace.float32[8, 8, 8],
+):
+    """3-D add — exercises multi-dim ``ct.bid`` / index tuple construction."""
+    for i, j, k in dace.map[0:8, 0:8, 0:8]:
+        C[i, j, k] = A[i, j, k] + B[i, j, k]
+
+
+# ---------------------------------------------------------------------------
+# Structural codegen tests (no GPU required)
+# ---------------------------------------------------------------------------
+
+
+def test_pipeline_negate_codegen_structure():
+    """Unary negate should generate a kernel with one load, one store, no second input arg."""
+    sdfg = pipeline_negate.to_sdfg(simplify=True)
+    sdfg.backend = dtypes.BackendLanguage.Python
+    apply_cutile_pipeline(sdfg)
+
+    frame_code = _frame_code_of(sdfg)
+    assert "@ct.kernel" in frame_code
+    assert "ct.launch" in frame_code
+    assert frame_code.count("ct.load(A,") == 1
+    assert frame_code.count("ct.store(C,") == 1
+
+
+def test_pipeline_subtraction_codegen_structure():
+    """Subtraction (non-add/mul op) should generate a kernel with two loads and one store."""
+    sdfg = pipeline_sub.to_sdfg(simplify=True)
+    sdfg.backend = dtypes.BackendLanguage.Python
+    apply_cutile_pipeline(sdfg)
+
+    frame_code = _frame_code_of(sdfg)
+    assert "@ct.kernel" in frame_code
+    assert "ct.launch" in frame_code
+    assert "ct.load(A," in frame_code
+    assert "ct.load(B," in frame_code
+    assert "ct.store(C," in frame_code
+
+
+def test_pipeline_selfadd_emits_one_load_per_unique_array():
+    """Self-add: the same outer array A is read twice, but loaded only once."""
+    sdfg = pipeline_selfadd.to_sdfg(simplify=True)
+    sdfg.backend = dtypes.BackendLanguage.Python
+    apply_cutile_pipeline(sdfg)
+
+    frame_code = _frame_code_of(sdfg)
+    assert frame_code.count("ct.load(A,") == 1, (
+        "Expected exactly one ct.load(A, ...) call for self-add (deduplicated input).")
+
+
+def test_pipeline_symbolic_shape_codegen_includes_free_symbols():
+    """Symbolic-shape program: kernel signature and launch args must surface FN/FM."""
+    sdfg = pipeline_symbolic_vadd.to_sdfg(simplify=True)
+    sdfg.backend = dtypes.BackendLanguage.Python
+    apply_cutile_pipeline(sdfg)
+
+    frame_code = _frame_code_of(sdfg)
+    assert "@ct.kernel" in frame_code
+    assert "FN" in frame_code
+    assert "FM" in frame_code
+
+
+def test_pipeline_3d_vadd_codegen_uses_three_block_ids():
+    """3-D map should emit ``ct.bid(0)``, ``ct.bid(1)``, and ``ct.bid(2)``."""
+    sdfg = pipeline_3d_vadd.to_sdfg(simplify=True)
+    sdfg.backend = dtypes.BackendLanguage.Python
+    apply_cutile_pipeline(sdfg)
+
+    frame_code = _frame_code_of(sdfg)
+    assert "ct.bid(0)" in frame_code
+    assert "ct.bid(1)" in frame_code
+    assert "ct.bid(2)" in frame_code
+
+
+def test_pipeline_rectangular_tile_codegen_structure():
+    """Non-divisible tile shape (24×20 with tile_shape=(6, 5)) should still codegen."""
+    sdfg = pipeline_negate.to_sdfg(simplify=True)
+    sdfg.backend = dtypes.BackendLanguage.Python
+    apply_cutile_pipeline(sdfg, apply_map_collapse_and_tiling=True, tile_shape=(6, 5))
+
+    frame_code = _frame_code_of(sdfg)
+    assert "@ct.kernel" in frame_code
+    assert "ct.load(A," in frame_code
+    assert "ct.store(C," in frame_code
+
+
+# ---------------------------------------------------------------------------
+# Runtime correctness tests (require GPU + cupy + cuda.tile)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.gpu
+def test_pipeline_negate_runtime_correctness():
+    """Unary negate should compile, execute, and match NumPy reference."""
+    rng = np.random.default_rng(43)
+    a_np = rng.random((24, 20)).astype(np.float32)
+
+    a_cp = cp.asarray(a_np)
+    c_cp = cp.zeros((24, 20), dtype=cp.float32)
+
+    sdfg = pipeline_negate.to_sdfg(simplify=True)
+    sdfg.backend = dtypes.BackendLanguage.Python
+    apply_cutile_pipeline(sdfg)
+
+    csdfg = sdfg.compile()
+    assert csdfg is not None
+    csdfg(A=a_cp, C=c_cp)
+
+    np.testing.assert_allclose(cp.asnumpy(c_cp), -a_np, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.gpu
+def test_pipeline_subtraction_runtime_correctness():
+    """A - B should compile, execute, and match NumPy reference."""
+    rng = np.random.default_rng(44)
+    a_np = rng.random((16, 16)).astype(np.float32)
+    b_np = rng.random((16, 16)).astype(np.float32)
+
+    a_cp = cp.asarray(a_np)
+    b_cp = cp.asarray(b_np)
+    c_cp = cp.zeros((16, 16), dtype=cp.float32)
+
+    sdfg = pipeline_sub.to_sdfg(simplify=True)
+    sdfg.backend = dtypes.BackendLanguage.Python
+    apply_cutile_pipeline(sdfg)
+
+    csdfg = sdfg.compile()
+    assert csdfg is not None
+    csdfg(A=a_cp, B=b_cp, C=c_cp)
+
+    np.testing.assert_allclose(cp.asnumpy(c_cp), a_np - b_np, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.gpu
+def test_pipeline_symbolic_shape_runtime_correctness():
+    """Symbolic-shape add should compile, execute with runtime sizes, and match."""
+    rng = np.random.default_rng(45)
+    n_val = np.int32(18)
+    m_val = np.int32(14)
+    a_np = rng.random((n_val, m_val)).astype(np.float32)
+    b_np = rng.random((n_val, m_val)).astype(np.float32)
+
+    a_cp = cp.asarray(a_np)
+    b_cp = cp.asarray(b_np)
+    c_cp = cp.zeros((n_val, m_val), dtype=cp.float32)
+
+    sdfg = pipeline_symbolic_vadd.to_sdfg(simplify=True)
+    sdfg.backend = dtypes.BackendLanguage.Python
+    apply_cutile_pipeline(sdfg)
+
+    csdfg = sdfg.compile()
+    assert csdfg is not None
+    csdfg(A=a_cp, B=b_cp, C=c_cp, FN=n_val, FM=m_val)
+
+    np.testing.assert_allclose(cp.asnumpy(c_cp), a_np + b_np, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.gpu
+def test_pipeline_3d_vadd_runtime_correctness():
+    """3-D add should compile, execute, and match NumPy reference."""
+    rng = np.random.default_rng(46)
+    a_np = rng.random((8, 8, 8)).astype(np.float32)
+    b_np = rng.random((8, 8, 8)).astype(np.float32)
+
+    a_cp = cp.asarray(a_np)
+    b_cp = cp.asarray(b_np)
+    c_cp = cp.zeros((8, 8, 8), dtype=cp.float32)
+
+    sdfg = pipeline_3d_vadd.to_sdfg(simplify=True)
+    sdfg.backend = dtypes.BackendLanguage.Python
+    apply_cutile_pipeline(sdfg)
+
+    csdfg = sdfg.compile()
+    assert csdfg is not None
+    csdfg(A=a_cp, B=b_cp, C=c_cp)
+
+    np.testing.assert_allclose(cp.asnumpy(c_cp), a_np + b_np, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.gpu
+def test_pipeline_rectangular_tile_runtime_correctness():
+    """Non-divisible tile shape should still produce correct results."""
+    rng = np.random.default_rng(47)
+    a_np = rng.random((24, 20)).astype(np.float32)
+
+    a_cp = cp.asarray(a_np)
+    c_cp = cp.zeros((24, 20), dtype=cp.float32)
+
+    sdfg = pipeline_negate.to_sdfg(simplify=True)
+    sdfg.backend = dtypes.BackendLanguage.Python
+    apply_cutile_pipeline(sdfg, apply_map_collapse_and_tiling=True, tile_shape=(6, 5))
+
+    csdfg = sdfg.compile()
+    assert csdfg is not None
+    csdfg(A=a_cp, C=c_cp)
+
+    np.testing.assert_allclose(cp.asnumpy(c_cp), -a_np, rtol=1e-5, atol=1e-6)
