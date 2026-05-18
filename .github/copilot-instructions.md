@@ -48,6 +48,7 @@
 ## Conventions
 - Place tests under [tests](../tests) with names matching `test_*.py`, `*_test.py`, or `*_cudatest.py` (see [pytest.ini](../pytest.ini)).
 - Use pytest markers for hardware/software requirements instead of ad-hoc skips (see [pytest.ini](../pytest.ini)).
+- In cuTile frontend tests, avoid broad `except Exception` blocks because they can hide real pipeline regressions; prefer explicit `pytest.xfail` or `pytest.skip` with a reason, or narrow exception handling.
 - Keep environment-dependent behavior explicit in tests (cache mode, config toggles) when reproducing codegen/serialization behavior.
 - In the Python backend path, default map schedules are normalized to `Sequential` before backend dispatch, so schedule-sensitive fixes often need to be reasoned about before target-specific code generation.
 - For cuTile pipeline work, ensure regressions cover unnecessary data movement removal before scalar-to-tile lowering.
