@@ -31,14 +31,14 @@
   - `pre-commit install`
 - **CRITICAL: Always use the `-B` flag** when running Python tests (`/venv/main/bin/python -B -m pytest ...`). Without `-B`, stale `.pyc` bytecache can mask errors (e.g., TypeError from changed function signatures). This has caused hours of debugging in the past.
 - Default test workflow:
-  - `/venv/main/bin/python -m pytest tests -m "not gpu and not long"`
+  - `/venv/main/bin/python -B -m pytest tests -m "not gpu and not long"`
 - Full Python backend suite:
-  - `/venv/main/bin/pytest /workspace/dace/tests/codegen/python_backend -q`
+  - `/venv/main/bin/python -B -m pytest /workspace/dace/tests/codegen/python_backend -q`
 - Run focused tests for touched areas (examples):
-  - `/venv/main/bin/python -m pytest tests/transformations -m "not gpu"`
-  - `/venv/main/bin/python -m pytest tests/sdfg -m "not gpu"`
+  - `/venv/main/bin/python -B -m pytest tests/transformations -m "not gpu"`
+  - `/venv/main/bin/python -B -m pytest tests/sdfg -m "not gpu"`
 - GPU-only changes should also run:
-  - `/venv/main/bin/python -m pytest tests -m "gpu" --timeout=300`
+  - `/venv/main/bin/python -B -m pytest tests -m "gpu" --timeout=300`
 - cuTile library changes:
   - `/venv/main/bin/python -B tests/cutile/all_cutile_tests.py` (runs full cuTile suite)
   - `/venv/main/bin/python -B -m pytest tests/cutile/cutile_test.py -x` (core unit tests)
@@ -110,3 +110,4 @@
 - Cannot use `from __future__ import annotations` because it messes up type hints from dace. But the python version is new enough that it doesn't matter and we can use type hints anyway. Just don't add the future import to any files.
 - **SIGABRT in compiled code cannot be caught by pytest `xfail`** — use `@pytest.mark.skip(reason="...")` instead. This affects symbolic masked strided patterns that crash at the code generation level.
 - **Per-test `@pytest.mark.filterwarnings`** is preferred over blanket `pytest.ini` warning filters for traceability. Use when warnings are expected for specific test configurations (e.g., `validate_subsets` with symbolic ranges).
+- **cuTile masked scalar-to-tile descriptor symbols**: In masked scalar-to-tile paths, avoid leakage of map-local parameters into transient descriptor expressions (e.g., `tile_i`, `tile_j` in shape/stride formulas). Subsequent free-symbol analysis may then classify these leaked symbols as required program arguments, leading to `KeyError: Missing program argument "tile_i"` at call time.
