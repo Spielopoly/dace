@@ -122,6 +122,36 @@ def _assert_ifelse_node_min(sdfg: dace.SDFG, min_count: int = 1):
     )
 
 
+def _assert_no_tile_symbol_arg_leak(sdfg: dace.SDFG) -> None:
+    """Assert that tiled-loop local symbols are not promoted to SDFG args."""
+    disallowed = {
+        str(pname)
+        for state in sdfg.states()
+        for node in state.nodes()
+        if isinstance(node, nodes.MapEntry)
+        for pname in node.map.params
+        if str(pname).startswith("tile_")
+    }
+    if not disallowed:
+        disallowed = {
+            str(symbol)
+            for symbol in sdfg.used_symbols(all_symbols=False)
+            if str(symbol).startswith("tile_")
+        }
+
+    leaked_symbols = sorted(disallowed & sdfg.used_symbols(all_symbols=False))
+    leaked_args = sorted(disallowed & set(sdfg.arglist().keys()))
+
+    assert not leaked_symbols, (
+        "Map-local tile symbols leaked into SDFG used symbols: "
+        f"{leaked_symbols}"
+    )
+    assert not leaked_args, (
+        "Map-local tile symbols leaked into SDFG arglist: "
+        f"{leaked_args}"
+    )
+
+
 def test_frontend_vadd_pipeline_structure_and_runtime():
     """Untiled frontend add should tile, transform to TileAdd, and run correctly."""
     sdfg = frontend_vadd_program.to_sdfg(simplify=True)
@@ -296,6 +326,7 @@ def test_frontend_large_prime_strided_add_with_nonmultiple_tile_shape(tile_shape
     sym_nodes = [n for n in lib_nodes if isinstance(n, TileSymbolicMaskedOpLibraryNode)]
     assert sym_nodes
     assert all(n.mask_condition is not None for n in sym_nodes)
+    _assert_no_tile_symbol_arg_leak(sdfg)
 
     sdfg.expand_library_nodes()
     sdfg.validate()
@@ -328,6 +359,7 @@ def test_frontend_large_prime_strided_add_with_nondivisible_ranges(tile_shape):
     sym_nodes = [n for n in lib_nodes if isinstance(n, TileSymbolicMaskedOpLibraryNode)]
     assert sym_nodes
     assert all(n.mask_condition is not None for n in sym_nodes)
+    _assert_no_tile_symbol_arg_leak(sdfg)
 
     sdfg.expand_library_nodes()
     sdfg.validate()
@@ -1498,13 +1530,9 @@ def test_frontend_1d_multistep_masked_symbolic_structure_and_runtime():
     # The symbolic 1D masked multistep may hit a known validation issue
     # with missing symbols on nested SDFGs; verify structure when possible.
     sdfg = frontend_1d_multistep_masked_symbolic.to_sdfg(simplify=True)
-    try:
-        count = apply_cutile_pipeline(sdfg, validate=False, validate_all=False, apply_map_collapse_and_tiling=True, tile_shape=(6,))
-        assert count >= 1
-        _assert_masked_or_tileop_min(sdfg, 1)
-    except Exception:
-        pass  # pipeline may fail for symbolic 1D masked multistep
-
+    count = apply_cutile_pipeline(sdfg, validate=True, validate_all=True, apply_map_collapse_and_tiling=True, tile_shape=(6,))
+    assert count >= 1
+    _assert_masked_or_tileop_min(sdfg, 1)
     # Runtime: verify correctness (expansion of 1D masked nodes is WIP)
     sdfg = frontend_1d_multistep_masked_symbolic.to_sdfg(simplify=True)
     sdfg.validate()

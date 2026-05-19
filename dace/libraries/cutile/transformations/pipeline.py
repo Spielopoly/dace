@@ -52,7 +52,7 @@ class CuTilePipeline(ppl.Pass):
 
     CATEGORY: str = 'cuTile'
 
-    apply_map_collapse_and_tiling: bool = True  # Controls steps 3 (MapCollapse) and 7 (MapTiling)
+    apply_map_collapse_and_tiling: bool = True  # Controls steps 3/7 (MapCollapse) and 4/9 (MapTiling)
     tile_shape: Tuple[int, ...] = (16, 16, 16)
     validate: bool = True
     validate_all: bool = True
@@ -134,7 +134,7 @@ class CuTilePipeline(ppl.Pass):
         )
         debug_save()
         
-        # Step 7
+        # Step 7: Collapse directly nested maps produced by fission
         # MapFission may produce directly-nested 1-D maps (e.g. fission of
         # an outer loop that contained an inner loop map).  Collapse them so
         # that the subsequent tiling step sees a single multi-dimensional map.
@@ -160,7 +160,7 @@ class CuTilePipeline(ppl.Pass):
         debug_save()
 
         # Step 11: Apply IfElseMapToTileWhere for patterns that weren't
-        # handled in Step 3b (e.g. frontend patterns that needed MapFission first).
+        # handled in Step 4 (e.g. frontend patterns that needed MapFission first).
         count += sdfg.apply_transformations_repeated(
             [IfElseMapToTileWhere],
             validate=self.validate_all,
@@ -171,6 +171,7 @@ class CuTilePipeline(ppl.Pass):
         # Step 12: ScalarToTile transformations
         count += sdfg.apply_transformations_repeated(
             [ScalarToTileCanonical, ScalarToTileMasked],
+            options=[{}, {"tile_shape_hint": self.tile_shape}],
             validate=self.validate_all,
             validate_all=self.validate_all,
         )
@@ -295,10 +296,13 @@ def apply_cutile_pipeline(sdfg: SDFG, *,
         validate: Validate the SDFG after the full pipeline.
         validate_all: Validate after every single transformation application.
         apply_map_collapse_and_tiling: Whether to apply
-            :class:`~dace.transformation.dataflow.MapCollapse` (step 3) and
-            :class:`~dace.transformation.dataflow.MapTiling` (step 7).
+            :class:`~dace.transformation.dataflow.MapCollapse` (steps 3 and 7)
+            and :class:`~dace.transformation.dataflow.MapTiling` (steps 4 and 9).
         tile_shape: Tile sizes for
-            :class:`~dace.transformation.dataflow.MapTiling`.
+            :class:`~dace.transformation.dataflow.MapTiling`. The same tuple
+            is also provided as an optional descriptor-shape preference hint
+            for masked ScalarToTile lowering; masked descriptor extents remain
+            conservatively bounded.
         debug_save_sdfg_steps: When ``True``, save the SDFG to disk after
             each pipeline step for debugging.
 

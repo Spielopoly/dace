@@ -570,22 +570,27 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
     # ---- static utility methods (available to all child classes) -------------
 
     @staticmethod
-    def _to_sympy_expr(expr: sp.Basic | SymExpr | int) -> sp.Basic:
+    def _to_sympy_expr(expr: sp.Basic | SymExpr | int,
+                       use_approx: bool = False) -> sp.Basic:
         """Convert DaCe symbolic values (including ``SymExpr``) to plain SymPy.
 
         Args:
             expr: A SymPy expression, a DaCe :class:`~dace.symbolic.SymExpr`,
                 or an integer literal to convert.
+            use_approx: If ``True`` and *expr* is a
+                :class:`~dace.symbolic.SymExpr`, use ``expr.approx`` instead
+                of ``expr.expr``.
 
         Returns:
             An equivalent plain :class:`sympy.Basic` expression.
         """
         if isinstance(expr, dace.symbolic.SymExpr):
-            return expr.expr
+            return expr.approx if use_approx else expr.expr
         return sp.sympify(expr)
 
     @staticmethod
-    def _bounding_tile_shape(inner_map: nodes.Map) -> list[sp.Basic | int]:
+    def _bounding_tile_shape(inner_map: nodes.Map,
+                             use_approx: bool = False) -> list[sp.Basic | int]:
         """Compute per-dimension extents of a bounding box for an inner map range.
 
         Using ``Min``/``Max`` handles both increasing and decreasing ranges
@@ -595,14 +600,16 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
         Args:
             inner_map: The inner :class:`~dace.sdfg.nodes.Map` whose range to
                 compute the bounding box from.
+            use_approx: If ``True``, derive bounds from
+                :class:`~dace.symbolic.SymExpr.approx` when available.
 
         Returns:
             A list of per-dimension extents (symbolic or integer).
         """
         shape = []
         for start, end, _ in inner_map.range:
-            start = _ScalarToTileBase._to_sympy_expr(start)
-            end = _ScalarToTileBase._to_sympy_expr(end)
+            start = _ScalarToTileBase._to_sympy_expr(start, use_approx=use_approx)
+            end = _ScalarToTileBase._to_sympy_expr(end, use_approx=use_approx)
             low = sp.Min(start, end)
             high = sp.Max(start, end)
             shape.append(high - low + 1)
@@ -824,7 +831,202 @@ class ScalarToTileMasked(_ScalarToTileBase):
         """Return ``MaskType.SYMBOLIC`` for symbolic-mask tile ops."""
         return MaskType.SYMBOLIC
 
-    def _calculate_tile_shape(self) -> tuple:
+    def can_be_applied(self, graph: SDFGState, expr_index: int,
+                       sdfg: SDFG, permissive: bool = False) -> bool:
+        """Validate applicability and preflight descriptor-shape derivation.
+
+        The masked path derives descriptor shapes for tile transients during
+        ``apply``. If this derivation cannot produce map-parameter-free extents,
+        we reject applicability here so the pipeline can continue gracefully
+        without throwing from ``apply``.
+        """
+        if not super().can_be_applied(graph, expr_index, sdfg, permissive):
+            return False
+        self._precomputed_tile_shape = self._try_calculate_tile_shape()
+        return self._precomputed_tile_shape is not None
+
+    def apply(self, graph: SDFGState, sdfg: SDFG) -> None:  # type: ignore
+        """Apply masked lowering only when a safe descriptor shape is available."""
+        self._set_convenience_variables(sdfg, graph)
+        tile_shape = self._try_calculate_tile_shape()
+        if tile_shape is None:
+            # Gracefully skip instead of throwing from apply-path shape logic.
+            return
+
+        self._precomputed_tile_shape = tile_shape
+        super().apply(graph, sdfg)
+
+    @staticmethod
+    def _expr_uses_symbol_names(expr: sp.Basic | int,
+                                symbol_names: set[str]) -> bool:
+        """Return whether *expr* references any symbol in *symbol_names*."""
+        sym_expr = _ScalarToTileBase._to_sympy_expr(expr)
+        return any(str(symbol) in symbol_names for symbol in sym_expr.free_symbols)
+
+    def _collect_local_map_parameter_bounds(self) -> dict[str, tuple[sp.Basic, sp.Basic]]:
+        """Collect conservative ``(low, high)`` bounds for inner/outer map params.
+
+        Bounds are gathered for both the outer tile map parameters and the
+        inner map parameters. This allows us to eliminate map-local symbols
+        from top-level descriptor shapes while keeping memlet and mask logic
+        unchanged.
+        """
+        bounds: dict[str, tuple[sp.Basic, sp.Basic]] = {}
+        for map_node in (self._outer_entry.map, self._inner_entry.map):
+            for pname, (start, end, _) in zip(map_node.params, map_node.range):
+                start_expr = self._to_sympy_expr(start)
+                end_expr = self._to_sympy_expr(end)
+                bounds[str(pname)] = (
+                    sp.Min(start_expr, end_expr),
+                    sp.Max(start_expr, end_expr),
+                )
+        return bounds
+
+    @staticmethod
+    def _eliminate_local_map_parameters(expr: sp.Basic,
+                                        local_params: set[str],
+                                        parameter_bounds: dict[str, tuple[sp.Basic, sp.Basic]]) -> sp.Basic:
+        """Eliminate map-local symbols from *expr* via conservative bound substitution.
+
+        For every map-local symbol ``p``, we substitute ``p`` with both its
+        lower and upper bound and keep ``Max(sub_low, sub_high)`` as a safe
+        over-approximation.
+        """
+        result = sp.sympify(expr)
+        max_rounds = len(parameter_bounds) + 2
+        for _ in range(max_rounds):
+            active_symbols = [s for s in result.free_symbols if str(s) in local_params]
+            if not active_symbols:
+                break
+
+            changed = False
+            for symbol in active_symbols:
+                symbol_bounds = parameter_bounds.get(str(symbol))
+                if symbol_bounds is None:
+                    continue
+                low, high = symbol_bounds
+                result = sp.Max(result.subs(symbol, low), result.subs(symbol, high))
+                changed = True
+
+            if not changed:
+                break
+
+        return result
+
+    def _derive_conservative_extent(self,
+                                    expr: sp.Basic,
+                                    local_params: set[str],
+                                    parameter_bounds: dict[str, tuple[sp.Basic, sp.Basic]]) -> Optional[sp.Basic]:
+        """Return a conservative map-parameter-free upper bound for ``expr``.
+
+        This helper substitutes map-local symbols with their extreme bounds and
+        over-approximates the result, yielding an extent that is safe for
+        descriptor allocation.
+        """
+        extent = self._eliminate_local_map_parameters(expr,
+                                                      local_params,
+                                                      parameter_bounds)
+        extent = sp.sympify(dace.symbolic.overapproximate(extent))
+        extent = self._eliminate_local_map_parameters(extent,
+                                                      local_params,
+                                                      parameter_bounds)
+        extent = sp.sympify(dace.symbolic.overapproximate(extent))
+        if self._expr_uses_symbol_names(extent, local_params):
+            return None
+        return extent
+
+    def _choose_descriptor_extent(
+            self,
+            exact_expr: sp.Basic,
+            approx_expr: sp.Basic,
+            hint_expr: Optional[sp.Basic],
+            local_params: set[str],
+            parameter_bounds: dict[str, tuple[sp.Basic, sp.Basic]]) -> Optional[sp.Basic]:
+        """Choose a descriptor extent while enforcing conservative allocation.
+
+        Selection policy:
+        1. If exact extent is already map-parameter-free, use it directly.
+        2. Build a conservative bound from exact expression; fallback to approx
+           expression if needed.
+        3. Prefer approx or hint as shape preferences only when wrapped by
+           ``Max(conservative, preference)`` to avoid under-approximation.
+        """
+        if not self._expr_uses_symbol_names(exact_expr, local_params):
+            return exact_expr
+
+        conservative_extent = self._derive_conservative_extent(
+            exact_expr, local_params, parameter_bounds)
+        if conservative_extent is None:
+            conservative_extent = self._derive_conservative_extent(
+                approx_expr, local_params, parameter_bounds)
+        if conservative_extent is None:
+            return None
+
+        preferred_extent: Optional[sp.Basic] = None
+        if not self._expr_uses_symbol_names(approx_expr, local_params):
+            preferred_extent = approx_expr
+        elif hint_expr is not None and not self._expr_uses_symbol_names(
+                hint_expr, local_params):
+            preferred_extent = hint_expr
+
+        if preferred_extent is None:
+            return conservative_extent
+
+        # Keep preferences, but never allow smaller-than-safe descriptor extents.
+        return sp.Max(conservative_extent, preferred_extent)
+
+    def _normalized_tile_shape_hint(self, ndim: int) -> Optional[tuple[sp.Basic, ...]]:
+        """Return an optional per-dimension tile-shape hint from transformation options."""
+        hint = getattr(self, "tile_shape_hint", None)
+        if hint is None:
+            return None
+
+        if not isinstance(hint, tuple):
+            if isinstance(hint, list):
+                hint = tuple(hint)
+            else:
+                return None
+
+        if len(hint) < ndim:
+            return None
+
+        return tuple(sp.sympify(dim) for dim in hint[:ndim])
+
+    def _try_calculate_tile_shape(self) -> Optional[tuple[sp.Basic | int, ...]]:
+        """Try to compute a safe descriptor tile shape for masked lowering.
+
+        Returns ``None`` if no map-parameter-free conservative shape can be
+        derived for all dimensions.
+        """
+        local_params = {str(pname) for pname in self._inner_entry.map.params}
+        local_params.update(str(pname) for pname in self._outer_entry.map.params)
+
+        exact_shape = self._bounding_tile_shape(self._inner_entry.map)
+        approx_shape = self._bounding_tile_shape(self._inner_entry.map,
+                                                 use_approx=True)
+        tile_shape_hint = self._normalized_tile_shape_hint(len(exact_shape))
+        parameter_bounds = self._collect_local_map_parameter_bounds()
+
+        descriptor_shape: list[sp.Basic] = []
+        for dim, exact_extent in enumerate(exact_shape):
+            exact_expr = self._to_sympy_expr(exact_extent)
+            approx_expr = self._to_sympy_expr(approx_shape[dim])
+            hint_expr = tile_shape_hint[dim] if tile_shape_hint is not None else None
+
+            chosen_extent = self._choose_descriptor_extent(
+                exact_expr,
+                approx_expr,
+                hint_expr,
+                local_params,
+                parameter_bounds,
+            )
+            if chosen_extent is None:
+                return None
+            descriptor_shape.append(chosen_extent)
+
+        return tuple(descriptor_shape)
+
+    def _calculate_tile_shape(self) -> tuple[sp.Basic | int, ...]:
         """Return the bounding tile shape derived from the inner map ranges.
 
         The bounding tile is the smallest axis-aligned tile that contains all
@@ -833,7 +1035,16 @@ class ScalarToTileMasked(_ScalarToTileBase):
         Returns:
             A tuple of per-dimension extents (symbolic or integer).
         """
-        return tuple(self._bounding_tile_shape(self._inner_entry.map))
+        tile_shape = getattr(self, "_precomputed_tile_shape", None)
+        if tile_shape is None:
+            tile_shape = self._try_calculate_tile_shape()
+        if tile_shape is not None:
+            return tile_shape
+
+        # Defensive fallback for unexpected direct uses that bypass both
+        # can_be_applied and the masked apply guard above.
+        return tuple(self._bounding_tile_shape(self._inner_entry.map,
+                                               use_approx=True))
 
     def _build_memlet(self, map_edge: MultiConnectorEdge[Memlet], tasklet_edge: MultiConnectorEdge[Memlet]) -> Memlet:
         """Build a contiguous outer-subset memlet covering the inner map's footprint.
@@ -889,8 +1100,10 @@ class ScalarToTileMasked(_ScalarToTileBase):
             tasklet_out_edge: The tasklet output edge used to derive the
                 scalar subset for the contiguous-outer-subset computation.
         """
-        # 1. Add _c_in connector to the library node.
-        self._library_node.add_in_connector("_c_in")
+        preload_connector = self._node_info.out_in or "_c_in"
+
+        # 1. Add preload connector to the library node.
+        self._library_node.add_in_connector(preload_connector)
 
         # 2. Create a preload tile transient (same shape/dtype as output).
         #    We look up the descriptor from the original output array and use
@@ -933,8 +1146,8 @@ class ScalarToTileMasked(_ScalarToTileBase):
         self._graph.add_edge(self._outer_entry, out_conn, preload_node, None,
                      copy.deepcopy(preload_memlet))
 
-        # 7. Wire: preload_transient -> library_node._c_in
-        self._graph.add_edge(preload_node, None, self._library_node, "_c_in",
+        # 7. Wire: preload_transient -> library_node preload connector
+        self._graph.add_edge(preload_node, None, self._library_node, preload_connector,
                      memlet_with_primary_subset(preload_name,
                                                 self._tile_subset,
                                                 data_on_src=True))
