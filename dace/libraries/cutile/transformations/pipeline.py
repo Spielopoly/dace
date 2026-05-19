@@ -68,7 +68,7 @@ class CuTilePipeline(ppl.Pass):
         return set()
 
     def _simplify(self, sdfg: SDFG) -> None:
-        """Trivial tasklet elimination followed by standard simplification."""
+        """Run core cleanup: trivial tasklet elimination, simplify, transient cleanup."""
         sdfg.apply_transformations_repeated([TrivialTaskletElimination])
         sdfg.simplify()
         sdfg.apply_transformations_repeated([RemoveIntermediateTransient])
@@ -171,7 +171,6 @@ class CuTilePipeline(ppl.Pass):
         # Step 12: ScalarToTile transformations
         count += sdfg.apply_transformations_repeated(
             [ScalarToTileCanonical, ScalarToTileMasked],
-            options=[{}, {"tile_shape_hint": self.tile_shape}],
             validate=self.validate_all,
             validate_all=self.validate_all,
         )
@@ -299,10 +298,7 @@ def apply_cutile_pipeline(sdfg: SDFG, *,
             :class:`~dace.transformation.dataflow.MapCollapse` (steps 3 and 7)
             and :class:`~dace.transformation.dataflow.MapTiling` (steps 4 and 9).
         tile_shape: Tile sizes for
-            :class:`~dace.transformation.dataflow.MapTiling`. The same tuple
-            is also provided as an optional descriptor-shape preference hint
-            for masked ScalarToTile lowering; masked descriptor extents remain
-            conservatively bounded.
+            :class:`~dace.transformation.dataflow.MapTiling`.
         debug_save_sdfg_steps: When ``True``, save the SDFG to disk after
             each pipeline step for debugging.
 
