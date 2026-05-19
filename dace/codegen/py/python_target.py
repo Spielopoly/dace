@@ -94,6 +94,16 @@ def _is_inside_cutile_scope(cfg: ControlFlowRegion, state_id: int, node: nodes.N
     return False
 
 
+def _sdfg_uses_cutile(sdfg: SDFG) -> bool:
+    """True if *sdfg* (or any nested SDFG) contains a CuTile-scheduled map."""
+    found = False
+    for node, _ in sdfg.all_nodes_recursive():
+        if isinstance(node, nodes.MapEntry) and node.map.schedule == dtypes.ScheduleType.CuTile:
+            found = True
+            break
+    return found
+
+
 def _defined_ptype_for(desc: data.Data) -> str:
     if isinstance(desc, data.Scalar):
         return _python_type(desc.dtype)
@@ -233,18 +243,19 @@ class PythonCodeGen(PythonTargetCodeGenerator):
             members.append(f'{field_name}={value}')
         return f'{_structure_type_name(desc)}({", ".join(members)})'
     
-    def _default_expression(self, desc: data.Data) -> str:
+    def _default_expression(self, desc: data.Data, *, on_gpu: bool = False) -> str:
         """Returns an expression that evaluates to a default-initialized value of the given descriptor's type."""
         if isinstance(desc, data.Structure):
             return self._structure_default_expression(desc)
         if isinstance(desc, data.Array):
-            return self._zeros_expr(desc)
+            return self._zeros_expr(desc, on_gpu=on_gpu)
         if isinstance(desc, data.Scalar):
             return self._scalar_default(desc)
         raise NotImplementedError(f'Unsupported descriptor in Python backend: {type(desc).__name__}')
 
-    def _zeros_expr(self, desc: data.Array) -> str:
-        return f'numpy.zeros({self._shape_expression(desc.shape)}, dtype={_numpy_dtype(desc.dtype)})'
+    def _zeros_expr(self, desc: data.Array, *, on_gpu: bool = False) -> str:
+        module = 'cupy' if on_gpu else 'numpy'
+        return f'{module}.zeros({self._shape_expression(desc.shape)}, dtype={_numpy_dtype(desc.dtype)})'
 
     def _persistent_key(self, sdfg: SDFG, name: str) -> str:
         return f'{sdfg.cfg_id}:{name}'
@@ -486,7 +497,14 @@ class PythonCodeGen(PythonTargetCodeGenerator):
             raise NotImplementedError('External memory management is not supported in the Python backend.')
 
         desc = update_persistent_desc(nodedesc, sdfg) if is_global else nodedesc
-        init_expr = self._default_expression(desc)
+        # When the SDFG uses cuTile kernels, top-level transients that are
+        # passed between kernel launches must live in GPU memory (cupy) rather
+        # than host memory (numpy). Register-storage transients are still
+        # emitted as numpy because they are never passed to a kernel directly.
+        on_gpu = (isinstance(desc, data.Array)
+                  and desc.storage != dtypes.StorageType.Register
+                  and _sdfg_uses_cutile(sdfg))
+        init_expr = self._default_expression(desc, on_gpu=on_gpu)
 
         if is_global:
             allocation_stream.write(f'global {name}', cfg, state_id)
