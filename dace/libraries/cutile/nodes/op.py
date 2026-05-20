@@ -159,8 +159,8 @@ class ExpandTileOpPure(ExpandTransformation):
         if use_scalar_form:
             code = f"{out_conn} = {op_cpp_expr(op, left_scalar, right_scalar)};"
         else:
-            shape_expr = ", ".join(symstr(s) for s in shape)
-            c_strides_expr = ", ".join(symstr(s) for s in get_tile_strides(c_desc, ndim))
+            shape_expr = ", ".join(symstr(s, cpp_mode=True) for s in shape)
+            c_strides_expr = ", ".join(symstr(s, cpp_mode=True) for s in get_tile_strides(c_desc, ndim))
 
             # Collect array descriptors that need stride computation
             array_descs = collect_array_descs(a_desc, b_desc)
