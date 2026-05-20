@@ -158,7 +158,7 @@ def test_compile_python_sdfg_success():
 
 
 def test_compile_python_sdfg_auxiliary_module_importable():
-    """Linkable auxiliary code objects are injected as importable modules."""
+    """Linkable auxiliary code objects are resolvable via the import hook."""
     sdfg = _make_sdfg("my_fn")
     co_aux = CodeObject(
         name="my_helper",
@@ -179,9 +179,35 @@ def test_compile_python_sdfg_auxiliary_module_importable():
     assert csdfg() == 42
 
 
-def test_compile_python_sdfg_non_linkable_not_injected():
-    """Non-linkable code objects are excluded from module injection."""
+def test_compile_python_sdfg_does_not_touch_sys_modules():
+    """Auxiliary modules are resolved without ever being placed in sys.modules."""
     import sys
+    sdfg = _make_sdfg("clean_fn")
+    co_aux = CodeObject(
+        name="clean_aux_module",
+        code="AUX = 99\n",
+        language="Python",
+        target=None,
+        title="Aux",
+        linkable=True,
+    )
+    co_frame = CodeObject(
+        name="clean_fn",
+        code="from clean_aux_module import AUX\ndef clean_fn():\n    return AUX\n",
+        language="Python",
+        target=None,
+        title="Frame",
+    )
+    assert "clean_aux_module" not in sys.modules
+    csdfg = compile_python_sdfg(sdfg, [co_frame, co_aux])
+    assert csdfg() == 99
+    assert "clean_aux_module" not in sys.modules
+    csdfg.finalize()
+    assert "clean_aux_module" not in sys.modules
+
+
+def test_compile_python_sdfg_non_linkable_not_imported():
+    """Non-linkable code objects are excluded from the import hook."""
     sdfg = _make_sdfg("fn")
     co_frame = CodeObject(
         name="fn",
@@ -200,31 +226,18 @@ def test_compile_python_sdfg_non_linkable_not_injected():
     )
     csdfg = compile_python_sdfg(sdfg, [co_frame, co_nonlinkable])
     assert csdfg() == 1
-    assert "sample_main_module" not in sys.modules
+    assert "sample_main_module" not in csdfg._aux_modules
 
 
-def test_injected_modules_cleaned_up_on_finalize():
-    """Injected modules are removed from sys.modules when the SDFG is finalized."""
-    import sys
-    sdfg = _make_sdfg("cleanup_fn")
-    co_aux = CodeObject(
-        name="cleanup_aux_module",
-        code="AUX = 99\n",
-        language="Python",
-        target=None,
-        title="Aux",
-        linkable=True,
-    )
+def test_compile_python_sdfg_stdlib_imports_still_work():
+    """Imports of stdlib modules fall through to the real importer."""
+    sdfg = _make_sdfg("uses_stdlib")
     co_frame = CodeObject(
-        name="cleanup_fn",
-        code="from cleanup_aux_module import AUX\ndef cleanup_fn():\n    return AUX\n",
+        name="uses_stdlib",
+        code="import math\ndef uses_stdlib():\n    return math.floor(3.7)\n",
         language="Python",
         target=None,
         title="Frame",
     )
-    csdfg = compile_python_sdfg(sdfg, [co_frame, co_aux])
-    assert csdfg() == 99
-    assert "cleanup_aux_module" in sys.modules
-
-    csdfg.finalize()
-    assert "cleanup_aux_module" not in sys.modules
+    csdfg = compile_python_sdfg(sdfg, [co_frame])
+    assert csdfg() == 3

@@ -300,7 +300,7 @@ def test_dispatch_block_unknown_control_flow_type_raises_not_implemented():
 
 
 def test_compile_python_sdfg_auxiliary_object_non_linkable_is_skipped():
-    """Non-linkable code objects (e.g. SampleMain) are not injected as modules."""
+    """Non-linkable code objects (e.g. SampleMain) are not built into aux modules."""
     import sys
 
     class _FakeNonLinkableCodeObject:
@@ -317,4 +317,5 @@ def test_compile_python_sdfg_auxiliary_object_non_linkable_is_skipped():
     compiled = compile_python_sdfg(sdfg, [frame, aux])
 
     assert compiled() == 7
+    assert 'non_linkable_aux' not in compiled._aux_modules
     assert 'non_linkable_aux' not in sys.modules
