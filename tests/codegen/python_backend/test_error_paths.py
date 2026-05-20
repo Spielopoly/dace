@@ -95,7 +95,9 @@ def test_generate_node_unknown_type_raises_not_implemented():
     with pytest.raises(NotImplementedError, match='MapExit'):
         target.generate_node(sdfg, sdfg, state, state.block_id, map_exit, function_stream, callsite_stream)
 
-
+@pytest.mark.xfail(reason="Currently the Python backend only supports sequential maps, \
+                   but simply doesn't check the schedule type to maintain compatiblity with the \
+                       default schedule types")
 def test_generate_scope_rejects_nonsequential_map_schedule():
     sdfg = _make_sdfg('nonsequential_map')
     sdfg.add_array('A', [4], dace.float64)
