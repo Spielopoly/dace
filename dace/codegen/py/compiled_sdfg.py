@@ -2,10 +2,24 @@
 """Contains functionality to compile and invoke Python-generated SDFG code."""
 
 import linecache
-from typing import Any, Dict, TYPE_CHECKING
+import sys
+import types
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from dace.codegen.codeobject import CodeObject
+
+
+def _register_as_module(co: 'CodeObject') -> None:
+    """Exec a code object's code into a fresh module and register it in sys.modules."""
+    pseudo_filename = f'<dace_generated_module_{co.name}_{id(co)}>'
+    code_lines = co.code.splitlines(True)
+    linecache.cache[pseudo_filename] = (len(co.code), None, code_lines, pseudo_filename)
+    mod = types.ModuleType(co.name)
+    mod.__file__ = pseudo_filename
+    compiled = compile(co.code, pseudo_filename, 'exec')
+    exec(compiled, mod.__dict__)
+    sys.modules[co.name] = mod
 
 
 class PythonCompiledSDFG:
@@ -18,12 +32,13 @@ class PythonCompiledSDFG:
     namespace.
     """
 
-    def __init__(self, sdfg, code: str):
+    def __init__(self, sdfg, code: str, *, injected_module_names: Optional[List[str]] = None):
         from dace.sdfg import SDFG
         self._sdfg: SDFG = sdfg
         self._code: str = code
         self._initialized = False
         self._finalized = False
+        self._injected_module_names: List[str] = injected_module_names or []
 
         # Register generated source under a pseudo filename so inspect can
         # retrieve source lines for nested/generated functions.
@@ -78,6 +93,8 @@ class PythonCompiledSDFG:
         # TODO: This needs to be part of the generated code, not here
         if '__dace_persistent_transients' in self._namespace:
             self._namespace['__dace_persistent_transients'].clear()
+        for name in self._injected_module_names:
+            sys.modules.pop(name, None)
         self._initialized = False
         self._finalized = True
 
@@ -96,12 +113,25 @@ def compile_python_sdfg(sdfg, code_objects: 'list[CodeObject]') -> PythonCompile
     """
     Compile a Python-backend SDFG from the generated code objects.
 
+    The first code object is the frame (main SDFG function). Subsequent
+    linkable code objects are registered as importable Python modules in
+    ``sys.modules`` so that import statements in the frame code resolve
+    correctly. Non-linkable objects (e.g. SampleMain) are skipped.
+
     :param sdfg: The SDFG that was compiled.
     :param code_objects: List of CodeObject instances from code generation.
     :return: A callable PythonCompiledSDFG.
     """
     if not code_objects:
         raise RuntimeError("No code objects generated for Python backend")
-    # TODO: What if there are multiple code objects?
-    code = code_objects[0].code
-    return PythonCompiledSDFG(sdfg, code)
+
+    frame_co = code_objects[0]
+
+    injected_module_names = []
+    for co in code_objects[1:]:
+        if not co.linkable:
+            continue
+        _register_as_module(co)
+        injected_module_names.append(co.name)
+
+    return PythonCompiledSDFG(sdfg, frame_co.code, injected_module_names=injected_module_names)

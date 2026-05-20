@@ -299,13 +299,22 @@ def test_dispatch_block_unknown_control_flow_type_raises_not_implemented():
         _write_dispatch_block(object(), _make_dispatch(), _DummyCodegen(), {}, PythonCodeIOStream())
 
 
-def test_compile_python_sdfg_uses_first_code_object_only():
-    sdfg = _make_sdfg('first_code_object')
-    code_objects = [
-        _FakeCodeObject('def first_code_object():\n    return 7\n'),
-        _FakeCodeObject('def first_code_object():\n    return 99\n'),
-    ]
+def test_compile_python_sdfg_auxiliary_object_non_linkable_is_skipped():
+    """Non-linkable code objects (e.g. SampleMain) are not injected as modules."""
+    import sys
 
-    compiled = compile_python_sdfg(sdfg, code_objects)
+    class _FakeNonLinkableCodeObject:
+        code = "SHOULD_NOT_BE_INJECTED = True\n"
+        name = "non_linkable_aux"
+        linkable = False
+
+    sdfg = _make_sdfg('frame_func')
+    frame = _FakeCodeObject('def frame_func():\n    return 7\n')
+    frame.name = 'frame_func'
+    frame.linkable = True
+    aux = _FakeNonLinkableCodeObject()
+
+    compiled = compile_python_sdfg(sdfg, [frame, aux])
 
     assert compiled() == 7
+    assert 'non_linkable_aux' not in sys.modules

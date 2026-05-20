@@ -157,23 +157,74 @@ def test_compile_python_sdfg_success():
     np.testing.assert_array_equal(B, [6.0])
 
 
-def test_compile_python_sdfg_multiple_objects():
-    """Uses first code object only; second is ignored."""
+def test_compile_python_sdfg_auxiliary_module_importable():
+    """Linkable auxiliary code objects are injected as importable modules."""
     sdfg = _make_sdfg("my_fn")
-    co1 = CodeObject(
-        name="first",
-        code="def my_fn(x):\n    return x * 2\n",
+    co_aux = CodeObject(
+        name="my_helper",
+        code="HELPER_VALUE = 42\n",
+        language="Python",
+        target=None,
+        title="Helper",
+        linkable=True,
+    )
+    co_frame = CodeObject(
+        name="my_fn",
+        code="from my_helper import HELPER_VALUE\ndef my_fn():\n    return HELPER_VALUE\n",
         language="Python",
         target=None,
         title="Frame",
     )
-    co2 = CodeObject(
-        name="second",
-        code="def my_fn(x):\n    return x * 3\n",
+    csdfg = compile_python_sdfg(sdfg, [co_frame, co_aux])
+    assert csdfg() == 42
+
+
+def test_compile_python_sdfg_non_linkable_not_injected():
+    """Non-linkable code objects are excluded from module injection."""
+    import sys
+    sdfg = _make_sdfg("fn")
+    co_frame = CodeObject(
+        name="fn",
+        code="def fn():\n    return 1\n",
         language="Python",
         target=None,
         title="Frame",
     )
-    csdfg = compile_python_sdfg(sdfg, [co1, co2])
-    # First code object defines x*2
-    assert csdfg(5) == 10
+    co_nonlinkable = CodeObject(
+        name="sample_main_module",
+        code="SHOULD_NOT_EXIST = True\n",
+        language="Python",
+        target=None,
+        title="SampleMain",
+        linkable=False,
+    )
+    csdfg = compile_python_sdfg(sdfg, [co_frame, co_nonlinkable])
+    assert csdfg() == 1
+    assert "sample_main_module" not in sys.modules
+
+
+def test_injected_modules_cleaned_up_on_finalize():
+    """Injected modules are removed from sys.modules when the SDFG is finalized."""
+    import sys
+    sdfg = _make_sdfg("cleanup_fn")
+    co_aux = CodeObject(
+        name="cleanup_aux_module",
+        code="AUX = 99\n",
+        language="Python",
+        target=None,
+        title="Aux",
+        linkable=True,
+    )
+    co_frame = CodeObject(
+        name="cleanup_fn",
+        code="from cleanup_aux_module import AUX\ndef cleanup_fn():\n    return AUX\n",
+        language="Python",
+        target=None,
+        title="Frame",
+    )
+    csdfg = compile_python_sdfg(sdfg, [co_frame, co_aux])
+    assert csdfg() == 99
+    assert "cleanup_aux_module" in sys.modules
+
+    csdfg.finalize()
+    assert "cleanup_aux_module" not in sys.modules
