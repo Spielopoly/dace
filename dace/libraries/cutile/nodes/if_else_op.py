@@ -261,21 +261,25 @@ class ExpandTileIfElseOpPure(ExpandTransformation):
             tile_shape=node.tile_shape,
             out_connector="__cond_out",
         )
+        cond_node.implementation = node.implementation
         true_node = TileOpLibraryNode(
             "true_branch",
             expr=true_expr_renamed,
             tile_shape=node.tile_shape,
             out_connector="__true_out",
         )
+        true_node.implementation = node.implementation
         false_node = TileOpLibraryNode(
             "false_branch",
             expr=false_expr_renamed,
             tile_shape=node.tile_shape,
             out_connector="__false_out",
         )
+        false_node.implementation = node.implementation
         where_node = TileWhereSelectLibraryNode(
             "where", tile_shape=node.tile_shape,
         )
+        where_node.implementation = node.implementation
 
         inner_state.add_node(cond_node)
         inner_state.add_node(true_node)

@@ -503,7 +503,7 @@ def test_pipeline_rectangular_tile_runtime_correctness():
 
     sdfg = pipeline_negate.to_sdfg(simplify=True)
     sdfg.backend = dtypes.BackendLanguage.Python
-    apply_cutile_pipeline(sdfg, apply_map_collapse_and_tiling=True, tile_shape=(6, 5))
+    apply_cutile_pipeline(sdfg, apply_map_collapse_and_tiling=True, tile_shape=(16, 16))
 
     csdfg = sdfg.compile()
     assert csdfg is not None

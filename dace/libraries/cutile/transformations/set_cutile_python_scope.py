@@ -10,16 +10,12 @@ from dace.sdfg import SDFGState, nodes
 from dace.sdfg import utils as sdutil
 from dace.transformation import transformation as xf
 
-from dace.libraries.cutile.nodes import (
-    TileOpLibraryNode,
-    TileRuntimeMaskedOpLibraryNode,
-    TileSymbolicMaskedOpLibraryNode,
-    TileWhereSelectLibraryNode,
-)
+from dace.libraries.cutile.nodes.base import TileNodeBase
 
 
 class SetCuTilePythonScope(xf.SingleStateTransformation):
-    """Mark safe map scopes for cuTile Python backend dispatch."""
+    """If the backend is the python backend, marks maps containing cuTile library nodes
+    with cuTile schedule and sets the cuTile implementation for library nodes in the map scope."""
 
     map_entry = xf.PatternNode(nodes.MapEntry)
 
@@ -29,12 +25,7 @@ class SetCuTilePythonScope(xf.SingleStateTransformation):
 
     @staticmethod
     def _is_supported_cutile_library_node(node: nodes.LibraryNode) -> bool:
-        # TODO: make more general by checking for implementations instead of hardcoding node types
-        return isinstance(node, (
-            TileOpLibraryNode,
-            TileRuntimeMaskedOpLibraryNode,
-            TileWhereSelectLibraryNode,
-        ))
+        return "cutile_python" in getattr(node, "implementations", {})
 
     def can_be_applied(
         self,
@@ -65,12 +56,6 @@ class SetCuTilePythonScope(xf.SingleStateTransformation):
                 return False
 
             if isinstance(node, nodes.LibraryNode):
-                # Correctness-first: symbolic masks are not emitted through
-                # this backend path unless supported end-to-end.
-                # TODO: refactor
-                if isinstance(node, TileSymbolicMaskedOpLibraryNode):
-                    return False
-
                 if not self._is_supported_cutile_library_node(node):
                     return False
 

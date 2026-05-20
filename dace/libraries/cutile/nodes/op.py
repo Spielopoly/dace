@@ -30,8 +30,9 @@ from .base import (
     TileOpBase,
     get_output_connector_name,
     op_cpp_expr, get_tile_descriptors, resolve_shape_and_scalar_form,
-    build_stride_decls, resolve_operands, collect_array_descs,
-    get_all_input_descs, build_multi_op_code, get_tile_strides,
+    build_stride_decls_cpp, resolve_operands_cpp, collect_array_descs,
+    get_all_input_descs, build_multi_op_cpp_code, get_tile_strides,
+    op_python_expression,
     _BINARY_OPS, _UNARY_OPS,
 )
 
@@ -124,7 +125,7 @@ class ExpandTileOpPure(ExpandTransformation):
         if node.expr is not None:
             # ── Multi-op expression mode ──────────────────────────────────
             input_descs, c_desc = get_all_input_descs(node, state, sdfg)
-            code = build_multi_op_code(
+            code = build_multi_op_cpp_code(
                 node.expr, input_descs, c_desc, node.tile_shape, out_conn=out_conn)
             return nodes.Tasklet(
                 label=node.name + "_cutile",
@@ -152,7 +153,7 @@ class ExpandTileOpPure(ExpandTransformation):
             inputs.add("_b")
 
         # Determine operand values for scalar and indexed forms
-        left_scalar, right_scalar, left_indexed, right_indexed = resolve_operands(
+        left_scalar, right_scalar, left_indexed, right_indexed = resolve_operands_cpp(
             constant1, constant2, is_binary)
 
         if use_scalar_form:
@@ -164,7 +165,7 @@ class ExpandTileOpPure(ExpandTransformation):
             # Collect array descriptors that need stride computation
             array_descs = collect_array_descs(a_desc, b_desc)
 
-            stride_decls, index_decls, index_updates = build_stride_decls(array_descs, ndim)
+            stride_decls, index_decls, index_updates = build_stride_decls_cpp(array_descs, ndim)
 
             if not array_descs:
                 # Both operands are constants – fill output tile
@@ -230,49 +231,58 @@ for (std::size_t i = 0; i < n; ++i) {{
 
 @library.register_expansion(TileOpLibraryNode, "cutile_python")
 class ExpandTileOpCuTilePython(ExpandTransformation):
-    """Expand TileOpLibraryNode into a simple Python tasklet for cuTile."""
+    """ Expand TileOpLibraryNode into a simple Python tasklet for cuTile.
+        Does not support strides.
+    """
 
     environments: list = []
 
     @staticmethod
     def expansion(node: TileOpLibraryNode, state: SDFGState, sdfg: SDFG) -> nodes.Tasklet:
         out_conn = get_output_connector_name(node)
-        inputs: set = set()
-
-        def _unary_expr(op: str, operand: str) -> str:
-            # TODO: support all ops defined by the cutile documentation and don't hardcode them here
-            if op in ("-", "+"):
-                return f"({op}{operand})"
-            if op == "abs":
-                return f"abs({operand})"
-            if op in ("sin", "cos", "exp", "sqrt", "log", "ceil", "floor"):
-                return f"ct.{op}({operand})"
-            return f"{op}({operand})"
-
         if node.expr is not None:
-            from .base import expr_connectors, get_all_input_descs
+            # ── Multi-op expression mode ──────────────────────────────────
             input_descs, c_desc = get_all_input_descs(node, state, sdfg)
-            inputs = set(input_descs.keys())
-            expr = str(node.expr)
-        else:
-            a_desc, b_desc, c_desc, _, _ = get_tile_descriptors(node, state, sdfg)
-            if a_desc is not None:
-                inputs.add("_a")
-            if b_desc is not None:
-                inputs.add("_b")
+            code = symstr(node.expr, cpp_mode=False)
+            return nodes.Tasklet(
+                label=node.name + "_cutile",
+                inputs=set(input_descs.keys()),
+                outputs={out_conn},
+                code=code,
+                language=dtypes.Language.Python,
+            )
 
-            left = node.constant1 if node.constant1 is not None else "_a"
-            if node.constant2 is None and b_desc is None:
-                expr = _unary_expr(node.op, left)
-            else:
-                right = node.constant2 if node.constant2 is not None else "_b"
-                expr = f"({left} {node.op} {right})"
+        # ── Single-op mode ────────────────────────────────────────────────
+        op = node.op
+        constant1 = node.constant1
+        constant2 = node.constant2
+
+        a_desc, b_desc, c_desc, _, _ = get_tile_descriptors(node, state, sdfg)
+        is_binary = (constant2 is not None) or (b_desc is not None)
+
+        ref_desc = a_desc or b_desc or c_desc
+
+        inputs: set[str] = set()
+        if a_desc is not None:
+            inputs.add("_a")
+        if b_desc is not None:
+            inputs.add("_b")
+
+        # Determine operand values for scalar and indexed forms
+        left_scalar, right_scalar, left_indexed, right_indexed = resolve_operands_cpp(
+            constant1, constant2, is_binary)
+
+        code = f"{out_conn} = {op_python_expression(op, left_scalar, right_scalar)}"
+        
+        # Note: the Pure expansion can handle strides, but they are not supported in
+        # the cuTile expansion. The cutile transformations normally generate a
+        # masked library node in those cases so this is also not necessary
 
         return nodes.Tasklet(
-            label=node.name + "_cutile_py",
+            label=node.name + "_cutile",
             inputs=inputs,
             outputs={out_conn},
-            code=f"{out_conn} = {expr}",
+            code=code,
             language=dtypes.Language.Python,
         )
 

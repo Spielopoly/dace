@@ -78,11 +78,3 @@ def test_set_cutile_python_scope_rejects_foreign_tasklet():
 
     applied = sdfg.apply_transformations_repeated([SetCuTilePythonScope])
     assert applied == 0
-
-
-def test_set_cutile_python_scope_rejects_symbolic_mask_scope():
-    lib = TileSymbolicMaskedOpLibraryNode("SymMasked", op="+", tile_shape=[16])
-    sdfg = _build_map_with_library_node(lib)
-
-    applied = sdfg.apply_transformations_repeated([SetCuTilePythonScope])
-    assert applied == 0

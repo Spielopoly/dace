@@ -33,7 +33,7 @@ from .base import (
     expr_connectors,
     get_output_connector_name,
     op_cpp_expr, get_tile_descriptors, resolve_shape_and_scalar_form,
-    build_stride_decls, resolve_operands, collect_array_descs,
+    build_stride_decls_cpp, resolve_operands_cpp, collect_array_descs,
     get_tile_strides,
     _BINARY_OPS, _UNARY_OPS, SUPPORTED_MASK_DTYPES,
 )
@@ -371,7 +371,7 @@ for (std::size_t i = 0; i < n; ++i) {{
             inputs.add("_c_in")
 
         # Determine operand values
-        left_scalar, right_scalar, left_indexed, right_indexed = resolve_operands(
+        left_scalar, right_scalar, left_indexed, right_indexed = resolve_operands_cpp(
             constant1, constant2, is_binary)
 
         scalar_expr = op_cpp_expr(op, left_scalar, right_scalar)
@@ -390,7 +390,7 @@ for (std::size_t i = 0; i < n; ++i) {{
             # Collect array descriptors for stride computation
             array_descs = collect_array_descs(a_desc, b_desc)
 
-            stride_decls, index_decls, index_updates = build_stride_decls(array_descs, ndim)
+            stride_decls, index_decls, index_updates = build_stride_decls_cpp(array_descs, ndim)
 
             c_in_stride_decl = ""
             c_in_index_decl = ""
