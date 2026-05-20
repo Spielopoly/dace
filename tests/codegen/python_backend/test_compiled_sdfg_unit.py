@@ -157,23 +157,87 @@ def test_compile_python_sdfg_success():
     np.testing.assert_array_equal(B, [6.0])
 
 
-def test_compile_python_sdfg_multiple_objects():
-    """Uses first code object only; second is ignored."""
+def test_compile_python_sdfg_auxiliary_module_importable():
+    """Linkable auxiliary code objects are resolvable via the import hook."""
     sdfg = _make_sdfg("my_fn")
-    co1 = CodeObject(
-        name="first",
-        code="def my_fn(x):\n    return x * 2\n",
+    co_aux = CodeObject(
+        name="my_helper",
+        code="HELPER_VALUE = 42\n",
+        language="Python",
+        target=None,
+        title="Helper",
+        linkable=True,
+    )
+    co_frame = CodeObject(
+        name="my_fn",
+        code="from my_helper import HELPER_VALUE\ndef my_fn():\n    return HELPER_VALUE\n",
         language="Python",
         target=None,
         title="Frame",
     )
-    co2 = CodeObject(
-        name="second",
-        code="def my_fn(x):\n    return x * 3\n",
+    csdfg = compile_python_sdfg(sdfg, [co_frame, co_aux])
+    assert csdfg() == 42
+
+
+def test_compile_python_sdfg_does_not_touch_sys_modules():
+    """Auxiliary modules are resolved without ever being placed in sys.modules."""
+    import sys
+    sdfg = _make_sdfg("clean_fn")
+    co_aux = CodeObject(
+        name="clean_aux_module",
+        code="AUX = 99\n",
+        language="Python",
+        target=None,
+        title="Aux",
+        linkable=True,
+    )
+    co_frame = CodeObject(
+        name="clean_fn",
+        code="from clean_aux_module import AUX\ndef clean_fn():\n    return AUX\n",
         language="Python",
         target=None,
         title="Frame",
     )
-    csdfg = compile_python_sdfg(sdfg, [co1, co2])
-    # First code object defines x*2
-    assert csdfg(5) == 10
+    assert "clean_aux_module" not in sys.modules
+    csdfg = compile_python_sdfg(sdfg, [co_frame, co_aux])
+    assert csdfg() == 99
+    assert "clean_aux_module" not in sys.modules
+    csdfg.finalize()
+    assert "clean_aux_module" not in sys.modules
+
+
+def test_compile_python_sdfg_non_linkable_not_imported():
+    """Non-linkable code objects are excluded from the import hook."""
+    sdfg = _make_sdfg("fn")
+    co_frame = CodeObject(
+        name="fn",
+        code="def fn():\n    return 1\n",
+        language="Python",
+        target=None,
+        title="Frame",
+    )
+    co_nonlinkable = CodeObject(
+        name="sample_main_module",
+        code="SHOULD_NOT_EXIST = True\n",
+        language="Python",
+        target=None,
+        title="SampleMain",
+        linkable=False,
+    )
+    csdfg = compile_python_sdfg(sdfg, [co_frame, co_nonlinkable])
+    assert csdfg() == 1
+    assert "sample_main_module" not in csdfg._aux_modules
+
+
+def test_compile_python_sdfg_stdlib_imports_still_work():
+    """Imports of stdlib modules fall through to the real importer."""
+    sdfg = _make_sdfg("uses_stdlib")
+    co_frame = CodeObject(
+        name="uses_stdlib",
+        code="import math\ndef uses_stdlib():\n    return math.floor(3.7)\n",
+        language="Python",
+        target=None,
+        title="Frame",
+    )
+    csdfg = compile_python_sdfg(sdfg, [co_frame])
+    assert csdfg() == 3

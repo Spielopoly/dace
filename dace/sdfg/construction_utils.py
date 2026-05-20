@@ -1,4 +1,7 @@
 # Copyright 2019-2026 ETH Zurich and the DaCe authors. All rights reserved.
+"""
+Utility functions for construction (and construction analysis) of SDFGs
+"""
 from typing import List, Union
 
 import dace

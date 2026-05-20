@@ -24,6 +24,7 @@ from .utils import duplicate_conditions_for_whole_sdfgs
 from dace.sdfg import SDFG
 from dace.sdfg import nodes as sdfg_nodes
 from dace.sdfg.state import ConditionalBlock
+from dace import subsets
 from .scalar_to_tile_library import (
     ScalarToTileCanonical,
     ScalarToTileMasked,
@@ -31,6 +32,7 @@ from .scalar_to_tile_library import (
 from .if_else_to_where_select import (
     IfElseMapToTileWhere,
 )
+from .set_cutile_python_scope import SetCuTilePythonScope
 from dace.transformation.dataflow import MapTiling, TrivialTaskletElimination, MapFission, MapCollapse
 from dace.transformation.interstate.loop_lifting import LoopLifting
 from dace.transformation.interstate.loop_to_map import LoopToMap
@@ -176,7 +178,15 @@ class CuTilePipeline(ppl.Pass):
         )
         debug_save()
 
-        # Step 13: Final clean up
+        # Step 13: Mark eligible scopes for schedule-based Python cuTile backend
+        count += sdfg.apply_transformations_repeated(
+            [SetCuTilePythonScope],
+            validate=self.validate_all,
+            validate_all=self.validate_all,
+        )
+        debug_save()
+
+        # Step 14: Final clean up
         self._simplify(sdfg)
         debug_save()
 
@@ -227,12 +237,6 @@ def _apply_map_tiling_to_all_maps(sdfg: SDFG,
                                                        only_conditional_block_maps)
 
     # Apply MapTiling to each original MapEntry exactly once
-    options = {
-        "tile_sizes": tile_shape,
-        "skew": True,
-        "tile_trivial": True,
-    }
-
     for state, map_entry in map_entries_to_tile:
         # Check that the map entry still exists in the state
         # (it may have been removed or transformed by previous tiling)
@@ -258,6 +262,13 @@ def _apply_map_tiling_to_all_maps(sdfg: SDFG,
         if not isinstance(map_entry, sdfg_nodes.MapEntry):
             continue
 
+
+        options = {
+            "tile_sizes": tile_shape,
+            "skew": True,
+            "tile_trivial": True,
+        }
+
         try:
             # Apply MapTiling directly to this map entry.
             # MapTiling.apply_to() raises ValueError if the transformation
@@ -272,8 +283,6 @@ def _apply_map_tiling_to_all_maps(sdfg: SDFG,
             continue
 
     return count
-
-
 # ---------------------------------------------------------------------------
 # Convenience wrapper
 # ---------------------------------------------------------------------------

@@ -16,7 +16,7 @@ When the mask is false, the output element is left untouched.
 """
 
 
-from typing import List, Optional
+from typing import List, Optional, cast
 
 import dace
 import sympy as sp
@@ -33,7 +33,7 @@ from .base import (
     expr_connectors,
     get_output_connector_name,
     op_cpp_expr, get_tile_descriptors, resolve_shape_and_scalar_form,
-    build_stride_decls, resolve_operands, collect_array_descs,
+    build_stride_decls_cpp, resolve_operands_cpp, collect_array_descs,
     get_tile_strides,
     _BINARY_OPS, _UNARY_OPS, SUPPORTED_MASK_DTYPES,
 )
@@ -371,7 +371,7 @@ for (std::size_t i = 0; i < n; ++i) {{
             inputs.add("_c_in")
 
         # Determine operand values
-        left_scalar, right_scalar, left_indexed, right_indexed = resolve_operands(
+        left_scalar, right_scalar, left_indexed, right_indexed = resolve_operands_cpp(
             constant1, constant2, is_binary)
 
         scalar_expr = op_cpp_expr(op, left_scalar, right_scalar)
@@ -390,7 +390,7 @@ for (std::size_t i = 0; i < n; ++i) {{
             # Collect array descriptors for stride computation
             array_descs = collect_array_descs(a_desc, b_desc)
 
-            stride_decls, index_decls, index_updates = build_stride_decls(array_descs, ndim)
+            stride_decls, index_decls, index_updates = build_stride_decls_cpp(array_descs, ndim)
 
             c_in_stride_decl = ""
             c_in_index_decl = ""
@@ -478,6 +478,70 @@ for (std::size_t i = 0; i < n; ++i) {{
 
 
 # ── Register all masked ops ─────────────────────────────────────────
+
+# ── cuTile Python expansion (``cutile_python``) ───────────────────────────
+
+@library.register_expansion(TileRuntimeMaskedOpLibraryNode, "cutile_python")
+class ExpandTileRuntimeMaskedOpCuTilePython(ExpandTransformation):
+    """Expand TileRuntimeMaskedOpLibraryNode into a simple Python tasklet."""
+
+    environments: list = []
+
+    @staticmethod
+    def expansion(
+        node: TileRuntimeMaskedOpLibraryNode, state: SDFGState, sdfg: SDFG
+    ) -> nodes.Tasklet:
+        out_conn = get_output_connector_name(node)
+        a_desc, b_desc, c_desc, m_desc, c_in_desc = get_tile_descriptors(node, state, sdfg)
+
+        if c_in_desc is None:
+            raise ValueError(
+                "TileRuntimeMaskedOp cutile_python expansion requires '_c_in' "
+                "to preserve masked-off output lanes"
+            )
+
+        inputs: set = {"_m"}
+        if a_desc is not None:
+            inputs.add("_a")
+        if b_desc is not None:
+            inputs.add("_b")
+        if c_in_desc is not None:
+            inputs.add("_c_in")
+
+        fallback = "_c_in"
+
+        if node.expr is not None:
+            from .base import expr_connectors
+            inputs.update(expr_connectors(node.expr))
+            inputs.discard(out_conn)
+            base_expr = str(node.expr)
+        else:
+            left = node.constant1 if node.constant1 is not None else "_a"
+            if node.constant2 is None and b_desc is None:
+                # TODO: Extract into utility function as these are used in multiple places
+                if node.op in ("-", "+"):
+                    base_expr = f"({node.op}{left})"
+                elif node.op == "abs":
+                    base_expr = f"abs({left})"
+                elif node.op in ("sin", "cos", "exp", "sqrt", "log", "ceil", "floor"):
+                    base_expr = f"ct.{node.op}({left})"
+                else:
+                    base_expr = f"{node.op}({left})"
+            else:
+                right = node.constant2 if node.constant2 is not None else "_b"
+                base_expr = f"({left} {node.op} {right})"
+
+        code = f"{out_conn} = ct.where(_m, {base_expr}, {fallback})"
+
+        return nodes.Tasklet(
+            label=node.name + "_cutile_py",
+            inputs=inputs,
+            outputs={out_conn},
+            code=code,
+            language=dtypes.Language.Python,
+        )
+
+
 
 _MASKED_BINARY_DISPLAY_NAMES = {"+": "TileMaskedAdd", "-": "TileMaskedSubtract",
                                 "*": "TileMaskedMultiply", "/": "TileMaskedDivide"}

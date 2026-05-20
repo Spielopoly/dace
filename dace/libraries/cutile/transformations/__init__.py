@@ -2,3 +2,4 @@ from .scalar_to_tile_library import ScalarToTileCanonical, ScalarToTileMasked
 from .if_else_to_where_select import IfElseMapToTileWhere
 from .remove_intermediate_transient import RemoveIntermediateTransient
 from .pipeline import apply_cutile_pipeline
+from .set_cutile_python_scope import SetCuTilePythonScope

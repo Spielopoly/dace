@@ -15,9 +15,6 @@ from dace.dtypes import ScheduleType
 from dace.sdfg import SDFG
 from dace.memlet import Memlet
 
-def _MAP_XFAIL(func):
-    return func
-
 
 def _make_python_sdfg(name: str) -> SDFG:
     """Create an SDFG with backend set to Python."""
@@ -34,7 +31,6 @@ def _make_python_sdfg(name: str) -> SDFG:
 class TestMapCodeGeneration:
     """Test that map generation produces correct Python loop structures."""
 
-    @_MAP_XFAIL
     def test_single_param_map(self):
         """1D map generates a single for loop."""
         sdfg = _make_python_sdfg('test_1d_map')
@@ -50,7 +46,6 @@ class TestMapCodeGeneration:
         code = sdfg.generate_code()[0].code
         assert 'for i in range' in code
 
-    @_MAP_XFAIL
     def test_multi_param_map(self):
         """2D map generates nested for loops."""
         sdfg = _make_python_sdfg('test_2d_map')
@@ -67,7 +62,6 @@ class TestMapCodeGeneration:
         assert 'for i in range' in code
         assert 'for j in range' in code
 
-    @_MAP_XFAIL
     def test_map_with_step(self):
         """Non-unit step generates correct range."""
         sdfg = _make_python_sdfg('test_step_map')
@@ -83,7 +77,6 @@ class TestMapCodeGeneration:
         code = sdfg.generate_code()[0].code
         assert '2)' in code or ', 2)' in code
 
-    @_MAP_XFAIL
     def test_map_with_symbolic_bounds(self):
         """Symbolic bounds appear in generated range."""
         sdfg = _make_python_sdfg('test_sym_map')
@@ -101,7 +94,6 @@ class TestMapCodeGeneration:
         assert 'N' in code
         assert 'for i in range' in code
 
-    @_MAP_XFAIL
     def test_map_body_with_tasklet(self):
         """Map body with tasklet generates tasklet code inside loop."""
         sdfg = _make_python_sdfg('test_map_tasklet')
@@ -117,7 +109,6 @@ class TestMapCodeGeneration:
         code = sdfg.generate_code()[0].code
         assert 'y = x * x' in code or 'y = (x * x)' in code
 
-    @_MAP_XFAIL
     def test_nested_maps(self):
         """Map inside a map (nested maps) generates nested for loops."""
         N, M = 4, 6
@@ -136,7 +127,6 @@ class TestMapCodeGeneration:
         assert 'for i in range' in code
         assert 'for j in range' in code
 
-    @_MAP_XFAIL
     def test_map_with_multiple_access_nodes(self):
         """Map reading/writing multiple arrays."""
         N = 10
@@ -165,7 +155,6 @@ class TestMapCodeGeneration:
 class TestMapCorrectness:
     """End-to-end correctness tests for maps."""
 
-    @_MAP_XFAIL
     def test_map_correctness_1d(self):
         """1D map: element-wise double, verify against numpy."""
         N = 15
@@ -185,7 +174,6 @@ class TestMapCorrectness:
         csdfg(A=A, B=B)
         np.testing.assert_allclose(B, A * 2.0)
 
-    @_MAP_XFAIL
     def test_map_correctness_2d(self):
         """2D map: element-wise add with constant, verify against numpy."""
         R, C = 5, 7
@@ -205,7 +193,6 @@ class TestMapCorrectness:
         csdfg(A=A, B=B)
         np.testing.assert_allclose(B, A + 3.14)
 
-    @_MAP_XFAIL
     def test_map_correctness_with_step(self):
         """Stepped map (step=2): process even indices, verify against numpy."""
         N = 10
@@ -226,7 +213,6 @@ class TestMapCorrectness:
         for i in range(0, N, 2):
             assert B[i] == A[i] * 10
 
-    @_MAP_XFAIL
     def test_nested_map_correctness(self):
         """Nested maps: B[i,j] = A[i,j] + i + j, verify against numpy."""
         R, C = 3, 5
@@ -251,7 +237,6 @@ class TestMapCorrectness:
                 expected[i, j] = A[i, j] + i + j
         np.testing.assert_allclose(B, expected)
 
-    @_MAP_XFAIL
     def test_map_add_two_arrays(self):
         """Map adding two arrays: C = A + B, verify against numpy."""
         N = 12
@@ -275,7 +260,6 @@ class TestMapCorrectness:
         csdfg(A=A, B=B, C=C)
         np.testing.assert_allclose(C, A + B)
 
-    @_MAP_XFAIL
     def test_map_symbolic_correctness(self):
         """Map with symbolic bounds: compile and run with concrete N."""
         sdfg = _make_python_sdfg('test_sym_corr')
@@ -296,7 +280,6 @@ class TestMapCorrectness:
         csdfg(A=A, B=B, N=N_val)
         np.testing.assert_allclose(B, A + 1)
 
-    @_MAP_XFAIL
     def test_map_symbolic_negative_step_runtime(self):
         """A symbolic map step can be negative at runtime and still iterates correctly."""
         sdfg = _make_python_sdfg('test_symbolic_negative_step_runtime')
@@ -323,36 +306,6 @@ class TestMapCorrectness:
         expected[[5, 3, 1]] = a[[5, 3, 1]]
         np.testing.assert_allclose(b, expected)
 
-    def test_default_schedule_map_executes_as_sequential(self):
-        """Default-schedule maps are normalized to sequential loops in the Python backend."""
-        sdfg = _make_python_sdfg('test_default_schedule_corr')
-        sdfg.add_array('A', [4], dace.float64)
-        sdfg.add_array('B', [4], dace.float64)
-        state = sdfg.add_state('s')
-        map_entry, map_exit = state.add_map('m', {'i': '0:4'})
-        map_entry.map.schedule = ScheduleType.Default
-        tasklet = state.add_tasklet('copy', {'inp'}, {'out'}, 'out = inp + 1')
-        state.add_memlet_path(state.add_read('A'), map_entry, tasklet, dst_conn='inp', memlet=Memlet(data='A', subset='i'))
-        state.add_memlet_path(tasklet, map_exit, state.add_write('B'), src_conn='out', memlet=Memlet(data='B', subset='i'))
-
-        assert map_entry.map.schedule == ScheduleType.Default
-
-        frame = DaCePythonCodeGenerator(sdfg)
-        target = PythonCodeGen(frame, sdfg)
-        target.preprocess(sdfg)
-        assert map_entry.map.schedule == ScheduleType.Sequential
-
-        generated_code = sdfg.generate_code()[0].code
-        assert 'for i in range' in generated_code
-
-        compiled_sdfg = sdfg.compile()
-        a = np.arange(4, dtype=np.float64)
-        b = np.zeros(4, dtype=np.float64)
-        compiled_sdfg(A=a, B=b)
-
-        np.testing.assert_allclose(b, a + 1)
-
-    @_MAP_XFAIL
     def test_map_square_elements(self):
         """Map squaring elements: B[i] = A[i]^2, verify against numpy."""
         N = 10

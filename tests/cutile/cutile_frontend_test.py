@@ -1109,6 +1109,7 @@ def test_frontend_forloop_selfwrite_unmasked_numeric_structure_and_runtime():
 
 
 def test_frontend_forloop_selfwrite_masked_numeric_structure_and_runtime():
+    # TODO: This test ALSO fails because of map fission
     sdfg = frontend_forloop_selfwrite_masked_numeric.to_sdfg(simplify=True)
     count = apply_cutile_pipeline(
         sdfg, validate=True, apply_map_collapse_and_tiling=True, tile_shape=(7, 6)

@@ -11,6 +11,7 @@ a CodeNode (Tasklet or NestedSDFG).
 
 import copy
 from typing import Set, Union, Optional
+import sympy as sp
 
 from dace import data, properties, SDFG
 from dace.sdfg import nodes, SDFGState
@@ -131,6 +132,19 @@ class RemoveIntermediateTransient(pm.SingleStateTransformation):
         # out_edge must reference an outer array, not the intermediate itself
         if out_edge.data.data == access_node.data:
             return False
+
+        # Preserve non-unit affine index semantics (e.g., 2*i, 3*j). Removing
+        # the intermediate in these cases can collapse strided writes into
+        # contiguous coordinates during later simplification/propagation.
+        if isinstance(out_edge.data.dst_subset, subsets.Range):
+            for start, end, _step in out_edge.data.dst_subset:
+                if start != end:
+                    continue
+                expr = sp.sympify(start)
+                for sym in expr.free_symbols:
+                    coeff = sp.simplify(sp.diff(expr, sym))
+                    if coeff not in (-1, 0, 1):
+                        return False
 
         # Validate memlet composition for AccessNode predecessors with non-scalar intermediates
         if isinstance(in_edge.src, nodes.AccessNode):

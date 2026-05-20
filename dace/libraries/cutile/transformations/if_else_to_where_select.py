@@ -1044,6 +1044,11 @@ class IfElseMapToTileWhere(xf.SingleStateTransformation):
             tile_shape=list(tile_shape),
         )
         graph.add_node(compound_node)
+        if getattr(sdfg, 'backend', None) is not None:
+            # TODO: Move to set_cutile_python_scope if not already done
+            from dace import dtypes as _dtypes
+            if sdfg.backend == _dtypes.BackendLanguage.Python:
+                compound_node.implementation = "cutile_python"
 
         # Wire tile transients → compound node inputs
         for outer_name, conn_name in outer_to_conn.items():

@@ -71,6 +71,39 @@ def _defined_type_for(desc: data.Data):
     return dispatcher_mod.DefinedType.Pointer
 
 
+def _is_inside_cutile_scope(cfg: ControlFlowRegion, state_id: int, node: nodes.Node) -> bool:
+    """True if *node* lies inside a CuTile-scheduled map scope.
+
+    cuTile kernels allocate tile transients as Python locals via ct.load /
+    tasklet writes — there should be no module-level numpy.zeros allocation
+    for them.
+    """
+    if state_id is None or state_id < 0:
+        return False
+    try:
+        state = cfg.state(state_id)
+    except Exception:
+        return False
+    scope = state.scope_dict()
+    cur = scope.get(node)
+    while cur is not None:
+        if (isinstance(cur, nodes.MapEntry)
+                and cur.map.schedule == dtypes.ScheduleType.CuTile):
+            return True
+        cur = scope.get(cur)
+    return False
+
+
+def _sdfg_uses_cutile(sdfg: SDFG) -> bool:
+    """True if *sdfg* (or any nested SDFG) contains a CuTile-scheduled map."""
+    found = False
+    for node, _ in sdfg.all_nodes_recursive():
+        if isinstance(node, nodes.MapEntry) and node.map.schedule == dtypes.ScheduleType.CuTile:
+            found = True
+            break
+    return found
+
+
 def _defined_ptype_for(desc: data.Data) -> str:
     if isinstance(desc, data.Scalar):
         return _python_type(desc.dtype)
@@ -111,24 +144,47 @@ class PythonCodeGen(PythonTargetCodeGenerator):
             dtypes.ScheduleType.CPU_Persistent,
             dtypes.ScheduleType.Sequential,
         ]
+        # TODO: Move cutile schedule copy to cutile target?
+        COPY_SCHEDULES = [*SUPPORTED_SCHEDULES, dtypes.ScheduleType.CuTile]
         dispatcher.register_map_dispatcher(
             SUPPORTED_SCHEDULES,
             self)
 
-        cpu_storage = [dtypes.StorageType.CPU_Heap, dtypes.StorageType.Register]
-        for storage in cpu_storage:
+        # Is GPU_Global correct?
+        supported_storage = [dtypes.StorageType.CPU_Heap, dtypes.StorageType.Register, dtypes.StorageType.GPU_Global]
+        for storage in supported_storage:
             dispatcher.register_array_dispatcher(storage, self)
-        for src_storage in cpu_storage:
-            for dst_storage in cpu_storage:
+        for src_storage in supported_storage:
+            for dst_storage in supported_storage:
                 dispatcher.register_copy_dispatcher(src_storage, dst_storage, None, self)
-                for schedule in SUPPORTED_SCHEDULES:
+                for schedule in COPY_SCHEDULES:
                     dispatcher.register_copy_dispatcher(src_storage, dst_storage, schedule, self)
 
     def get_generated_codeobjects(self):
-        return []
+        # Unfortunately we need to redefine some sympy functions so we just load that file as a code object
+        from pathlib import Path
+
+        HERE = Path(__file__).parent
+        file_path = HERE / "sympy_function_redefinitions.py"
+        content = file_path.read_text()
+        
+        from dace.codegen.codeobject import CodeObject
+        
+        code = CodeObject(
+            name="sympy_function_redefinitions",
+            code=content,
+            language="py",
+            target=type(self),
+            title="Sympy Function Redefinitions",
+        )
+        return [code]
 
     def get_includes(self) -> dict[str, list[str]]:
-        return {'frame': ['import numpy', 'from dataclasses import dataclass']}
+        return {'frame': [
+            'import numpy',
+            'from dataclasses import dataclass',
+            "from sympy_function_redefinitions import *",
+            ]}
 
     def preprocess(self, sdfg: SDFG) -> None:
         # TODO: Maybe apply copy-node transformations
@@ -207,18 +263,19 @@ class PythonCodeGen(PythonTargetCodeGenerator):
             members.append(f'{field_name}={value}')
         return f'{_structure_type_name(desc)}({", ".join(members)})'
     
-    def _default_expression(self, desc: data.Data) -> str:
+    def _default_expression(self, desc: data.Data, *, on_gpu: bool = False) -> str:
         """Returns an expression that evaluates to a default-initialized value of the given descriptor's type."""
         if isinstance(desc, data.Structure):
             return self._structure_default_expression(desc)
         if isinstance(desc, data.Array):
-            return self._zeros_expr(desc)
+            return self._zeros_expr(desc, on_gpu=on_gpu)
         if isinstance(desc, data.Scalar):
             return self._scalar_default(desc)
         raise NotImplementedError(f'Unsupported descriptor in Python backend: {type(desc).__name__}')
 
-    def _zeros_expr(self, desc: data.Array) -> str:
-        return f'numpy.zeros({self._shape_expression(desc.shape)}, dtype={_numpy_dtype(desc.dtype)})'
+    def _zeros_expr(self, desc: data.Array, *, on_gpu: bool = False) -> str:
+        module = 'cupy' if on_gpu else 'numpy'
+        return f'{module}.zeros({self._shape_expression(desc.shape)}, dtype={_numpy_dtype(desc.dtype)})'
 
     def _persistent_key(self, sdfg: SDFG, name: str) -> str:
         return f'{sdfg.cfg_id}:{name}'
@@ -438,6 +495,8 @@ class PythonCodeGen(PythonTargetCodeGenerator):
             raise NotImplementedError('References are not supported for the Python backend.')
         if isinstance(nodedesc, data.Stream):
             raise NotImplementedError('Stream descriptors are not supported for the Python backend.')
+        if _is_inside_cutile_scope(cfg, state_id, node):
+            return
 
         root_name = node.data.split('.')[0]
         root_desc = sdfg.arrays[root_name]
@@ -458,7 +517,14 @@ class PythonCodeGen(PythonTargetCodeGenerator):
             raise NotImplementedError('External memory management is not supported in the Python backend.')
 
         desc = update_persistent_desc(nodedesc, sdfg) if is_global else nodedesc
-        init_expr = self._default_expression(desc)
+        # When the SDFG uses cuTile kernels, top-level transients that are
+        # passed between kernel launches must live in GPU memory (cupy) rather
+        # than host memory (numpy). Register-storage transients are still
+        # emitted as numpy because they are never passed to a kernel directly.
+        on_gpu = (isinstance(desc, data.Array)
+                  and desc.storage != dtypes.StorageType.Register
+                  and _sdfg_uses_cutile(sdfg))
+        init_expr = self._default_expression(desc, on_gpu=on_gpu)
 
         if is_global:
             allocation_stream.write(f'global {name}', cfg, state_id)
@@ -485,6 +551,8 @@ class PythonCodeGen(PythonTargetCodeGenerator):
                                  dtypes.AllocationLifetime.External):
             return
         if '.' in node.data:
+            return
+        if _is_inside_cutile_scope(cfg, state_id, node):
             return
         callsite_stream.write(f'del {node.data}', cfg, state_id)
 

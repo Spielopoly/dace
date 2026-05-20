@@ -193,9 +193,21 @@ def _get_num_memset_library_nodes(sdfg: dace.SDFG) -> int:
     return sum(isinstance(node, MemsetLibraryNode) for node, state in sdfg.all_nodes_recursive())
 
 
+# MemsetLibraryNode kept the legacy ``pure`` / ``CPU`` / ``CUDA`` impl names;
+# CopyLibraryNode renamed to ``MappedTasklet`` / ``MemcpyCPU`` / ``MemcpyCUDA1D``.
+# Tests still parametrize on the legacy label and translate per type here.
+_COPY_IMPL_FROM_EXPANSION_TYPE = {
+    "pure": "MappedTasklet",
+    "CPU": "MemcpyCPU",
+    "CUDA": "MemcpyCUDA1D",
+}
+
+
 def _set_lib_node_type(sdfg: dace.SDFG, expansion_type: str):
     for n, g in sdfg.all_nodes_recursive():
-        if isinstance(n, (CopyLibraryNode, MemsetLibraryNode)):
+        if isinstance(n, CopyLibraryNode):
+            n.implementation = _COPY_IMPL_FROM_EXPANSION_TYPE.get(expansion_type, expansion_type)
+        elif isinstance(n, MemsetLibraryNode):
             n.implementation = expansion_type
 
 
@@ -709,6 +721,144 @@ def test_nested_memcpy_with_dimension_change_and_strides(expansion_type, xp, ful
     else:
         for j in range(DIM_SIZE):
             assert xp.allclose(B_IN[0:DIM_SIZE, j], A_IN), f"{j}: {B_IN[0:DIM_SIZE, j] - A_IN}"
+
+
+def test_transpose_map_is_not_lifted_to_memcpy():
+    """Pin: a map whose tasklet body is `_out = _in` but whose in/out
+    memlet subsets permute the map indices is a *transpose*, not a
+    pure copy. The pass must leave it alone — lifting it to a
+    ``CopyLibraryNode`` (which lowers to ``cudaMemcpyAsync``) would
+    silently turn a transpose into a flat memcpy and produce wrong
+    output. Regressed in ``test_persistent_gpu_transpose_regression``.
+    """
+    sdfg = dace.SDFG("transpose_pin")
+    sdfg.add_array("A", [5, 3], dace.float64)
+    sdfg.add_array("AT", [3, 5], dace.float64)
+    state = sdfg.add_state("main")
+    a = state.add_access("A")
+    at = state.add_access("AT")
+    me, mx = state.add_map("transpose_map", {"i": "0:5", "j": "0:3"})
+    t = state.add_tasklet("tr", {"_in"}, {"_out"}, "_out = _in")
+    state.add_memlet_path(a, me, t, dst_conn="_in", memlet=dace.Memlet("A[i, j]"))
+    state.add_memlet_path(t, mx, at, src_conn="_out", memlet=dace.Memlet("AT[j, i]"))
+
+    AssignmentAndCopyKernelToMemsetAndMemcpy().apply_pass(sdfg, {})
+    assert _get_num_memcpy_library_nodes(sdfg) == 0, (
+        "Transpose pattern (in subset [i, j], out subset [j, i]) was incorrectly "
+        "lifted to a CopyLibraryNode — the pass treats permutation as pure copy.")
+
+
+def test_inkernel_memset_is_not_lifted():
+    """Pin: a memset (``scratch[j] = 0``) that sits *inside* a GPU_Device
+    map must NOT be lifted to a ``MemsetLibraryNode``. The libnode expands
+    to ``cudaMemsetAsync``, which is a host-only runtime entry point and
+    cannot be issued from device code. Also, the expansion produces a
+    ``GPU_Device``-scheduled mapped tasklet that, when nested inside
+    another GPU map, fails ``AddThreadBlockMap.can_be_applied`` and
+    breaks ``InferGPUGridAndBlockSize`` downstream. Regressed in the
+    four ``nested_kernel_transient_test`` variants.
+
+    Uses ``simplify=True`` so the inner Sequential map's ``MapEntry ->
+    Tasklet -> MapExit -> AccessNode`` shape is actually present at the
+    top level — with ``simplify=False`` the frontend wraps each map body
+    in a NestedSDFG and the lift pattern never matches even when the
+    precondition is off.
+    """
+
+    @dace.program
+    def kernel_with_inner_memset(A: dace.float64[128, 64] @ dace.StorageType.GPU_Global):
+        for i in dace.map[0:128] @ dace.ScheduleType.GPU_Device:
+            scratch = dace.define_local([64], numpy.float64, storage=dace.StorageType.GPU_Global)
+            for j in dace.map[0:64] @ dace.ScheduleType.Sequential:
+                scratch[j] = 0
+            A[i, :] = scratch
+
+    sdfg = kernel_with_inner_memset.to_sdfg(simplify=True)
+    AssignmentAndCopyKernelToMemsetAndMemcpy().apply_pass(sdfg, {})
+    assert _get_num_memset_library_nodes(sdfg) == 0, (
+        "An in-kernel memset (Sequential map inside GPU_Device) was lifted to a "
+        "MemsetLibraryNode — but cudaMemsetAsync is host-only and cannot run from "
+        "device code. The pass should skip maps nested in any GPU scope.")
+
+
+def test_single_element_memset_is_not_lifted():
+    """Pin: a memset over a single-element array must NOT be lifted.
+
+    The pure expansion of ``MemsetLibraryNode`` collapses every singleton
+    dim (``_make_memset_skeleton``'s ``keep`` filter); a 1-element memset
+    therefore lifts to a mapped tasklet with an empty map, which downstream
+    ``propagate_memlet`` rejects with ``TypeError: object of type 'NoneType'
+    has no len()``. Skip the lift entirely.
+    """
+
+    @dace.program
+    def single_element_zero(A: dace.float64[1]):
+        for i in dace.map[0:1]:
+            A[i] = 0
+
+    sdfg = single_element_zero.to_sdfg(simplify=True)
+    AssignmentAndCopyKernelToMemsetAndMemcpy().apply_pass(sdfg, {})
+    assert _get_num_memset_library_nodes(sdfg) == 0, (
+        "A single-element memset was lifted to a MemsetLibraryNode; the pure "
+        "expansion would collapse to an empty map and crash propagation.")
+
+
+def test_single_element_memcpy_is_not_lifted():
+    """Pin: a memcpy over a single element must NOT be lifted (same family
+    as ``test_single_element_memset_is_not_lifted`` — singleton-collapse in
+    ``CopyLibraryNode``'s pure expansion produces a degenerate map).
+    """
+
+    @dace.program
+    def single_element_copy(A: dace.float64[1], B: dace.float64[1]):
+        for i in dace.map[0:1]:
+            B[i] = A[i]
+
+    sdfg = single_element_copy.to_sdfg(simplify=True)
+    AssignmentAndCopyKernelToMemsetAndMemcpy().apply_pass(sdfg, {})
+    assert _get_num_memcpy_library_nodes(sdfg) == 0, (
+        "A single-element memcpy was lifted to a CopyLibraryNode; the pure "
+        "expansion would collapse to an empty map and crash propagation.")
+
+
+def test_shared_passthrough_connector_blocks_lift():
+    """Pin: when a map_exit's IN_X passthrough is fed by *both* a memset
+    tasklet and a compute tasklet (e.g. a boundary write and a per-thread
+    compute write to the same array), the pass must NOT lift the memset.
+    Lifting would sever the shared ``MapExit OUT_X -> AccessNode`` edge
+    that aggregates both writes; the compute tasklet's data path would be
+    destroyed and downstream MapTiling would observe an OUT_X with no
+    IN_X (and vice-versa). Surfaced by deriche; the validator rejects the
+    post-tile state with ``No match for output connector OUT_y2`` or its
+    counterpart.
+    """
+    sdfg = dace.SDFG("shared_passthrough_pin")
+    sdfg.add_array("A", [10], dace.float64, dace.StorageType.GPU_Global)
+    state = sdfg.add_state("main")
+    a = state.add_access("A")
+    me, mx = state.add_map("kernel", {"i": "0:10"}, schedule=dace.ScheduleType.GPU_Device)
+    # Two tasklets sharing the SAME ``MapExit.IN_A`` passthrough — like
+    # the deriche pattern where a boundary memset and a per-thread
+    # compute both write to a single aggregate ``MapExit OUT_A -> A``
+    # edge. ``add_memlet_path`` auto-renames conflicting connectors, so
+    # build the shared-connector topology with explicit ``add_edge`` /
+    # ``add_in_connector``.
+    t_zero = state.add_tasklet("zero", set(), {"_out"}, "_out = 0")
+    t_compute = state.add_tasklet("compute", set(), {"_out"}, "_out = 3.14")
+    state.add_nedge(me, t_zero, dace.Memlet())
+    state.add_nedge(me, t_compute, dace.Memlet())
+    mx.add_in_connector("IN_A")
+    mx.add_out_connector("OUT_A")
+    state.add_edge(t_zero, "_out", mx, "IN_A", dace.Memlet("A[i]"))
+    state.add_edge(t_compute, "_out", mx, "IN_A", dace.Memlet("A[i]"))
+    state.add_edge(mx, "OUT_A", a, None, dace.Memlet("A[0:10]"))
+
+    AssignmentAndCopyKernelToMemsetAndMemcpy().apply_pass(sdfg, {})
+    assert _get_num_memset_library_nodes(sdfg) == 0, (
+        "Memset over a shared MapExit passthrough connector was lifted to a "
+        "MemsetLibraryNode; this severs the compute tasklet's data path.")
+    # SDFG should still be valid (no orphan connectors / edges left behind).
+    sdfg.validate()
 
 
 if __name__ == "__main__":

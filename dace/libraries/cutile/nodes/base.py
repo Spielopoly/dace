@@ -49,6 +49,20 @@ def op_cpp_expr(op: str, left: str, right: Optional[str] = None) -> str:
         return f"({op}{left})"
     return f"{op}({left})"
 
+def op_python_expression(op: str, left: str, right: Optional[str] = None) -> str:
+    """Return a Python expression string for a binary or unary operation.
+
+    Args:
+        op: Operation symbol or function name (e.g. ``"+"``, ``"abs"``).
+        left: Left/first operand as a Python expression string.
+        right: Right/second operand string, or ``None`` for unary ops.
+
+    Returns:
+        A Python expression string wrapping the operation.
+    """
+    # Happens to be the same as op_cpp_expr
+    return op_cpp_expr(op, left, right)
+
 
 def get_output_connector_name(node: LibraryNode) -> str:
     """Return the single output connector name for *node*.
@@ -160,7 +174,7 @@ def get_tile_strides(desc: DataDesc, ndim: int):
     return desc.strides[-ndim:]
 
 
-def build_stride_decls(array_descs: Dict[str, DataDesc], ndim: int) -> Tuple[str, str, str]:
+def build_stride_decls_cpp(array_descs: Dict[str, DataDesc], ndim: int) -> Tuple[str, str, str]:
     """Build C++ stride, index, and update declaration strings.
 
     Generates three code fragments used inside cuTile C++ expansion templates:
@@ -188,7 +202,7 @@ def build_stride_decls(array_descs: Dict[str, DataDesc], ndim: int) -> Tuple[str
     return stride_decls, index_decls, index_updates
 
 
-def resolve_operands(
+def resolve_operands_cpp(
     constant1: Optional[str],
     constant2: Optional[str],
     is_binary: bool,
@@ -206,6 +220,31 @@ def resolve_operands(
     Returns:
         A 4-tuple ``(left_scalar, right_scalar, left_indexed, right_indexed)``
         with C++ expression strings for both scalar and indexed access forms.
+        ``right_scalar`` and ``right_indexed`` are ``None`` for unary ops.
+    """
+    left_scalar = constant1 if constant1 is not None else "_a"
+    right_scalar = constant2 if constant2 is not None else ("_b" if is_binary else None)
+    left_indexed = constant1 if constant1 is not None else "_a[ia]"
+    right_indexed = constant2 if constant2 is not None else ("_b[ib]" if is_binary else None)
+    return left_scalar, right_scalar, left_indexed, right_indexed
+
+def resolve_operands_python(
+    constant1: Optional[str],
+    constant2: Optional[str],
+    is_binary: bool,
+) -> Tuple[str, Optional[str], str, Optional[str]]:
+    """Return operand strings for scalar and indexed Python code emitting.
+
+    Each position may be a constant literal or a variable name.
+
+    Args:
+        constant1: Left/first constant literal, or ``None`` to use ``_a``.
+        constant2: Right/second constant literal, or ``None`` to use ``_b``
+            (binary) or nothing (unary).
+        is_binary: Whether the operation takes two operands.
+    Returns:
+        A 4-tuple ``(left_scalar, right_scalar, left_indexed, right_indexed)``
+        with Python expression strings for both scalar and indexed access forms.
         ``right_scalar`` and ``right_indexed`` are ``None`` for unary ops.
     """
     left_scalar = constant1 if constant1 is not None else "_a"
@@ -297,7 +336,7 @@ def get_all_input_descs(
     return input_descs, c_desc
 
 
-def build_multi_op_code(
+def build_multi_op_cpp_code(
     expr: sp.Basic,
     input_descs: Dict[str, DataDesc],
     c_desc: DataDesc,
@@ -385,7 +424,6 @@ for (std::size_t i = 0; i < n; ++i) {{
 {val_decls}    {out_conn}[ic] = {cpp_expr_str};
 }}
 """
-
 
 # ── Connector utilities ──────────────────────────────────────────────
 

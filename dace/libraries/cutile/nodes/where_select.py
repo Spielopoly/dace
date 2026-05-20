@@ -257,3 +257,24 @@ for (std::size_t i = 0; i < n; ++i) {{
             code=code,
             language=dtypes.Language.CPP,
         )
+
+
+# ── cuTile Python expansion (``cutile_python``) ───────────────────────────
+
+@library.register_expansion(TileWhereSelectLibraryNode, "cutile_python")
+class ExpandTileWhereSelectCuTilePython(ExpandTransformation):
+    """Expand TileWhereSelectLibraryNode into a Python marker tasklet."""
+
+    environments: list = []
+
+    @staticmethod
+    def expansion(
+        node: TileWhereSelectLibraryNode, state: SDFGState, sdfg: SDFG
+    ) -> nodes.Tasklet:
+        return nodes.Tasklet(
+            label=node.name + "_cutile_py",
+            inputs={"_cond", "_x", "_y"},
+            outputs={"_c"},
+            code="_c = ct.where(_cond, _x, _y)",
+            language=dtypes.Language.Python,
+        )

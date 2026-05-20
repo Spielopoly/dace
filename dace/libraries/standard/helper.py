@@ -8,7 +8,55 @@ import dace
 import copy
 from dace.sdfg import nodes
 
-STREAM_CONN = "stream"
+STREAM_CONN = "__stream"
+
+
+def add_stream_descriptor(sdfg: dace.SDFG, stream_input: Optional[dace.data.Data]):
+    """Add a single-stream Scalar(gpuStream_t) ``stream`` descriptor to the
+    expansion SDFG. The libnode's ``stream`` connector is bound as one
+    ``gpuStream_t`` value regardless of how the parent sources it (e.g. as a
+    slice of ``gpu_streams[id]``)."""
+    if stream_input is None:
+        return
+    sdfg.add_scalar(STREAM_CONN, dace.dtypes.gpuStream_t, storage=dace.dtypes.StorageType.Register, transient=False)
+
+
+def wire_stream_to(sdfg: dace.SDFG, state: dace.SDFGState, target: nodes.Node, target_conn: str,
+                   stream_input: Optional[dace.data.Data]):
+    """Connect the SDFG-level ``stream`` access node to ``target`` on
+    ``target_conn``. No-op when no stream is wired. For map entries the
+    connector is added on the target typed as ``gpuStream_t`` — type-based
+    detection in :func:`has_stream_connector` relies on this so the
+    post-expansion reconnect pass treats the libnode-wired consumer as
+    already-wired and doesn't re-thread a duplicate edge."""
+    if stream_input is None:
+        return
+    stream_access = state.add_access(STREAM_CONN)
+    if isinstance(target, nodes.MapEntry):
+        target.add_in_connector(target_conn, dace.dtypes.gpuStream_t)
+    state.add_edge(stream_access, None, target, target_conn,
+                   dace.memlet.Memlet.from_array(STREAM_CONN, sdfg.arrays[STREAM_CONN]))
+
+
+def wire_stream_through_map(sdfg: dace.SDFG, state: dace.SDFGState, map_entry: nodes.MapEntry, target: nodes.Node,
+                            target_conn: str):
+    """Wire the SDFG-level ``stream`` access node *through* ``map_entry``
+    into ``target.target_conn``: adds ``IN_stream`` / ``OUT_stream``
+    pass-through connectors on the map and the two memlet edges
+    ``stream → MapEntry.IN_stream`` and ``MapEntry.OUT_stream → target``.
+
+    Used when a Sequential map encloses a stream-using consumer and the
+    DaCe convention requires the connector to thread through the scope.
+    Caller must have added the ``target_conn`` in-connector on ``target``."""
+    stream_access = state.add_access(STREAM_CONN)
+    in_conn = f"IN_{STREAM_CONN}"
+    out_conn = f"OUT_{STREAM_CONN}"
+    map_entry.add_in_connector(in_conn)
+    map_entry.add_out_connector(out_conn)
+    state.add_edge(stream_access, None, map_entry, in_conn,
+                   dace.memlet.Memlet.from_array(STREAM_CONN, sdfg.arrays[STREAM_CONN]))
+    state.add_edge(map_entry, out_conn, target, target_conn,
+                   dace.memlet.Memlet.from_array(STREAM_CONN, sdfg.arrays[STREAM_CONN]))
 
 
 def extract_stream_and_dynamic_inputs(
@@ -87,9 +135,7 @@ def add_dynamic_inputs(dynamic_inputs: Dict[str, dace.data.Data], sdfg: dace.SDF
         if isinstance(ndesc, dace.data.Scalar):
             pre_assignments["sym_" + dynamic_input_name] = f"{dynamic_input_name}"
         else:
-            assert ndesc.shape == (1, ) or ndesc.shape == [
-                1,
-            ]
+            assert tuple(ndesc.shape) == (1, )
             pre_assignments["sym_" + dynamic_input_name] = f"{dynamic_input_name}[0]"
 
         new_map_lengths = []
