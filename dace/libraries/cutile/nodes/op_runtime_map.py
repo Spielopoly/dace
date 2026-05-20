@@ -32,8 +32,10 @@ from .base import (
     TileOpBase,
     expr_connectors,
     get_output_connector_name,
-    op_cpp_expr, get_tile_descriptors, resolve_shape_and_scalar_form,
-    build_stride_decls_cpp, resolve_operands_cpp, collect_array_descs,
+    op_cpp_expr, op_python_expression, get_tile_descriptors,
+    resolve_shape_and_scalar_form,
+    build_stride_decls_cpp, resolve_operands_cpp, resolve_operands_python,
+    collect_array_descs,
     get_tile_strides,
     _BINARY_OPS, _UNARY_OPS, SUPPORTED_MASK_DTYPES,
 )
@@ -491,6 +493,27 @@ class ExpandTileRuntimeMaskedOpCuTilePython(ExpandTransformation):
     def expansion(
         node: TileRuntimeMaskedOpLibraryNode, state: SDFGState, sdfg: SDFG
     ) -> nodes.Tasklet:
+        """Expand the node into a cuTile Python tasklet using ``ct.where``.
+
+        Generates a Python expression of the form::
+
+            _out = ct.where(_m, <operation>, _c_in)
+
+        where ``<operation>`` is built using :func:`op_python_expression`
+        with ``ct_prefix=True``.
+
+        Args:
+            node: The :class:`TileRuntimeMaskedOpLibraryNode` to expand.
+            state: The SDFG state containing *node*.
+            sdfg: The SDFG owning the state.
+
+        Returns:
+            A :class:`dace.sdfg.nodes.Tasklet` implementing the masked
+            operation in Python.
+
+        Raises:
+            ValueError: If ``_c_in`` is not connected.
+        """
         out_conn = get_output_connector_name(node)
         a_desc, b_desc, c_desc, m_desc, c_in_desc = get_tile_descriptors(node, state, sdfg)
 
@@ -505,33 +528,20 @@ class ExpandTileRuntimeMaskedOpCuTilePython(ExpandTransformation):
             inputs.add("_a")
         if b_desc is not None:
             inputs.add("_b")
-        if c_in_desc is not None:
-            inputs.add("_c_in")
-
-        fallback = "_c_in"
+        inputs.add("_c_in")
 
         if node.expr is not None:
-            from .base import expr_connectors
             inputs.update(expr_connectors(node.expr))
             inputs.discard(out_conn)
             base_expr = symstr(node.expr, cpp_mode=False)
         else:
-            left = node.constant1 if node.constant1 is not None else "_a"
-            if node.constant2 is None and b_desc is None:
-                # TODO: Extract into utility function as these are used in multiple places
-                if node.op in ("-", "+"):
-                    base_expr = f"({node.op}{left})"
-                elif node.op == "abs":
-                    base_expr = f"abs({left})"
-                elif node.op in ("sin", "cos", "exp", "sqrt", "log", "ceil", "floor"):
-                    base_expr = f"ct.{node.op}({left})"
-                else:
-                    base_expr = f"{node.op}({left})"
-            else:
-                right = node.constant2 if node.constant2 is not None else "_b"
-                base_expr = f"({left} {node.op} {right})"
+            is_binary = (node.constant2 is not None) or (b_desc is not None)
+            left, right, _, _ = resolve_operands_python(
+                node.constant1, node.constant2, is_binary)
+            base_expr = op_python_expression(node.op, left, right,
+                                             ct_prefix=True)
 
-        code = f"{out_conn} = ct.where(_m, {base_expr}, {fallback})"
+        code = f"{out_conn} = ct.where(_m, {base_expr}, _c_in)"
 
         return nodes.Tasklet(
             label=node.name + "_cutile_py",

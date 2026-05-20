@@ -30,7 +30,8 @@ from .base import (
     TileOpBase,
     get_output_connector_name,
     op_cpp_expr, get_tile_descriptors, resolve_shape_and_scalar_form,
-    build_stride_decls_cpp, resolve_operands_cpp, collect_array_descs,
+    build_stride_decls_cpp, resolve_operands_cpp, resolve_operands_python,
+    collect_array_descs,
     get_all_input_descs, build_multi_op_cpp_code, get_tile_strides,
     op_python_expression,
     _BINARY_OPS, _UNARY_OPS,
@@ -239,13 +240,34 @@ class ExpandTileOpCuTilePython(ExpandTransformation):
 
     @staticmethod
     def expansion(node: TileOpLibraryNode, state: SDFGState, sdfg: SDFG) -> nodes.Tasklet:
+        """Expand the node into a cuTile Python tasklet for element-wise operations.
+
+        Emits a single Python expression of the form::
+
+            _out = <operation>
+
+        where ``<operation>`` is built via :func:`op_python_expression` with
+        ``ct_prefix=True`` to emit ``ct.sin``, ``ct.exp``, etc. as required.
+
+        Note: This expansion does not support strides. The cuTile pipeline
+        always generates a masked library node when strides are needed.
+
+        Args:
+            node: The :class:`TileOpLibraryNode` to expand.
+            state: The SDFG state containing *node*.
+            sdfg: The SDFG owning the state.
+
+        Returns:
+            A :class:`dace.sdfg.nodes.Tasklet` implementing the operation
+            in Python.
+        """
         out_conn = get_output_connector_name(node)
         if node.expr is not None:
             # ── Multi-op expression mode ──────────────────────────────────
             input_descs, c_desc = get_all_input_descs(node, state, sdfg)
-            code = symstr(node.expr, cpp_mode=False)
+            code = f"{out_conn} = {symstr(node.expr, cpp_mode=False)}"
             return nodes.Tasklet(
-                label=node.name + "_cutile",
+                label=node.name + "_cutile_py",
                 inputs=set(input_descs.keys()),
                 outputs={out_conn},
                 code=code,
@@ -269,17 +291,17 @@ class ExpandTileOpCuTilePython(ExpandTransformation):
             inputs.add("_b")
 
         # Determine operand values for scalar and indexed forms
-        left_scalar, right_scalar, left_indexed, right_indexed = resolve_operands_cpp(
+        left_scalar, right_scalar, _, _ = resolve_operands_python(
             constant1, constant2, is_binary)
 
-        code = f"{out_conn} = {op_python_expression(op, left_scalar, right_scalar)}"
+        code = f"{out_conn} = {op_python_expression(op, left_scalar, right_scalar, ct_prefix=True)}"
         
         # Note: the Pure expansion can handle strides, but they are not supported in
         # the cuTile expansion. The cutile transformations normally generate a
         # masked library node in those cases so this is also not necessary
 
         return nodes.Tasklet(
-            label=node.name + "_cutile",
+            label=node.name + "_cutile_py",
             inputs=inputs,
             outputs={out_conn},
             code=code,

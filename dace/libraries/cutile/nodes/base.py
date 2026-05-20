@@ -30,6 +30,13 @@ SUPPORTED_MASK_DTYPES = {
     dace.int32, dace.uint32, dace.int64, dace.uint64,
 }
 
+# Unary functions that require the ``ct.`` namespace prefix in cuTile
+# Python tasklets (e.g. ``ct.sin(_a)``).  Built-in Python functions
+# like ``abs`` do NOT need the prefix.
+_CT_PREFIXED_FUNCS = frozenset({
+    "sin", "cos", "exp", "sqrt", "log", "ceil", "floor",
+})
+
 
 def op_cpp_expr(op: str, left: str, right: Optional[str] = None) -> str:
     """Return a C++ expression string for a binary or unary operation.
@@ -49,19 +56,30 @@ def op_cpp_expr(op: str, left: str, right: Optional[str] = None) -> str:
         return f"({op}{left})"
     return f"{op}({left})"
 
-def op_python_expression(op: str, left: str, right: Optional[str] = None) -> str:
+def op_python_expression(op: str, left: str, right: Optional[str] = None,
+                         *, ct_prefix: bool = False) -> str:
     """Return a Python expression string for a binary or unary operation.
 
     Args:
         op: Operation symbol or function name (e.g. ``"+"``, ``"abs"``).
         left: Left/first operand as a Python expression string.
         right: Right/second operand string, or ``None`` for unary ops.
+        ct_prefix: When ``True``, unary math functions listed in
+            :data:`_CT_PREFIXED_FUNCS` are emitted with a ``ct.`` namespace
+            prefix (e.g. ``ct.sin(x)``).  Has no effect on binary infix
+            operators or built-in functions like ``abs``.
 
     Returns:
         A Python expression string wrapping the operation.
     """
-    # Happens to be the same as op_cpp_expr
-    return op_cpp_expr(op, left, right)
+    if right is not None:
+        return f"({left} {op} {right})"
+    # Unary
+    if op in ("-", "+"):
+        return f"({op}{left})"
+    if ct_prefix and op in _CT_PREFIXED_FUNCS:
+        return f"ct.{op}({left})"
+    return f"{op}({left})"
 
 
 def get_output_connector_name(node: LibraryNode) -> str:
@@ -242,6 +260,7 @@ def resolve_operands_python(
         constant2: Right/second constant literal, or ``None`` to use ``_b``
             (binary) or nothing (unary).
         is_binary: Whether the operation takes two operands.
+
     Returns:
         A 4-tuple ``(left_scalar, right_scalar, left_indexed, right_indexed)``
         with Python expression strings for both scalar and indexed access forms.

@@ -29,8 +29,10 @@ from .base import (
     TileOpBase,
     expr_connectors,
     get_output_connector_name,
-    op_cpp_expr, get_tile_descriptors, resolve_shape_and_scalar_form,
-    build_stride_decls_cpp, resolve_operands_cpp, collect_array_descs,
+    op_cpp_expr, op_python_expression, get_tile_descriptors,
+    resolve_shape_and_scalar_form,
+    build_stride_decls_cpp, resolve_operands_cpp, resolve_operands_python,
+    collect_array_descs,
     get_tile_strides,
     _BINARY_OPS, _UNARY_OPS,
 )
@@ -46,6 +48,56 @@ def _sympy_condition_to_cpp(cond: sp.Basic) -> str:
         The equivalent C++ expression string.
     """
     return symstr(cond, cpp_mode=True)
+
+
+def _sympy_condition_to_python(cond: sp.Basic) -> str:
+    """Convert a SymPy boolean/relational expression to a Python string.
+
+    Args:
+        cond: A SymPy boolean or relational expression.
+
+    Returns:
+        The equivalent Python expression string.
+    """
+    return symstr(cond, cpp_mode=False)
+
+
+def _build_coord_tile_code(shape: tuple, ndim: int, used_dims: set) -> str:
+    """Generate Python code lines creating per-dimension coordinate tiles.
+
+    For each dimension index *d* in *used_dims*, emits a line that assigns
+    ``__m{d}`` to a tile whose values are the coordinate along that dimension,
+    broadcast to the full tile *shape*.
+
+    For 1-D tiles a simple ``ct.arange`` suffices; for N-D tiles the range is
+    reshaped to have size 1 on every axis except *d*, then broadcast.
+
+    Args:
+        shape: Full tile shape tuple, e.g. ``(16,)`` or ``(8, 8)``.
+        ndim: Number of dimensions (``len(shape)``).
+        used_dims: Set of dimension indices referenced by the mask condition.
+
+    Returns:
+        A (possibly multi-line) Python code string defining ``__m{d}``
+        variables for each dimension in *used_dims*.
+    """
+    lines = []
+    for d in sorted(used_dims):
+        if ndim == 1:
+            lines.append(
+                f"__m{d} = ct.arange({shape[d]}, dtype=ct.int32)"
+            )
+        else:
+            # Reshape to (1, …, s_d, …, 1) then broadcast to full shape
+            reshape_dims = tuple(shape[d] if i == d else 1 for i in range(ndim))
+            reshape_str = ", ".join(str(x) for x in reshape_dims)
+            shape_str = ", ".join(str(x) for x in shape)
+            lines.append(
+                f"__m{d} = ct.broadcast_to("
+                f"ct.reshape(ct.arange({shape[d]}, dtype=ct.int32), "
+                f"({reshape_str},)), ({shape_str},))"
+            )
+    return "\n".join(lines)
 
 
 @library.node
@@ -470,10 +522,123 @@ class ExpandTileSymbolicMaskedOpCuTilePython(ExpandTransformation):
     def expansion(
         node: TileSymbolicMaskedOpLibraryNode, state: SDFGState, sdfg: SDFG
     ) -> nodes.Tasklet:
-        # TODO: implement
-        raise NotImplementedError(
-            "TileSymbolicMaskedOp cutile_python expansion is not supported; "
-            "symbolic mask scopes must not be lowered to the cuTile Python backend"
+        """Expand the node into a cuTile Python tasklet with a symbolic mask.
+
+        Generates coordinate tiles via ``ct.arange`` for each dimension
+        referenced in ``mask_condition``, evaluates the condition as a
+        boolean tile, and uses ``ct.where`` to conditionally write results.
+
+        Generated code pattern for an *n*-D tile::
+
+            __m0 = ct.broadcast_to(ct.reshape(ct.arange(S0, dtype=ct.int32),
+                                               (S0, 1, …)), (S0, S1, …))
+            …
+            __mask = (<condition string>)
+            _out = ct.where(__mask, <operation>, _c_in)
+
+        For a scalar tile (single element) coordinate variables are set to 0
+        and the assignment uses a Python ternary expression.
+
+        When ``mask_condition`` is ``None``, the operation is applied
+        unconditionally and ``_c_in`` is not required.
+
+        Args:
+            node: The :class:`TileSymbolicMaskedOpLibraryNode` to expand.
+            state: The SDFG state containing *node*.
+            sdfg: The SDFG owning the state.
+
+        Returns:
+            A :class:`dace.sdfg.nodes.Tasklet` implementing the
+            symbolically-masked operation in Python.
+
+        Raises:
+            ValueError: If ``_c_in`` is not connected and a mask condition is
+                present.
+        """
+        out_conn = get_output_connector_name(node)
+        a_desc, b_desc, c_desc, _, c_in_desc = get_tile_descriptors(
+            node, state, sdfg)
+
+        inputs: set[str] = set()
+        if a_desc is not None:
+            inputs.add("_a")
+        if b_desc is not None:
+            inputs.add("_b")
+
+        # ── Build the operation expression ────────────────────────────────
+        if node.expr is not None:
+            expr_inputs = expr_connectors(node.expr)
+            inputs.update(expr_inputs)
+            inputs.discard(out_conn)
+            base_expr = symstr(node.expr, cpp_mode=False)
+        else:
+            is_binary = (node.constant2 is not None) or (b_desc is not None)
+            left, right, _, _ = resolve_operands_python(
+                node.constant1, node.constant2, is_binary)
+            base_expr = op_python_expression(node.op, left, right,
+                                             ct_prefix=True)
+
+        # ── Build the mask condition ──────────────────────────────────────
+        mask_cond_sympy = node.mask_condition
+        if mask_cond_sympy is None:
+            # No mask — apply the operation unconditionally; _c_in is not needed
+            code = f"{out_conn} = {base_expr}"
+        else:
+            if c_in_desc is None:
+                raise ValueError(
+                    "TileSymbolicMaskedOp cutile_python expansion requires "
+                    "'_c_in' to preserve masked-off output lanes"
+                )
+            inputs.add("_c_in")
+
+            ref_desc = a_desc or b_desc or c_desc
+            shape, ndim, use_scalar_form = resolve_shape_and_scalar_form(
+                node, ref_desc)
+            mask_condition_py = _sympy_condition_to_python(mask_cond_sympy)
+
+            if use_scalar_form:
+                # Scalar tile: coordinates are 0, condition is a bool scalar
+                coord_defs = "\n".join(
+                    f"__m{d} = 0" for d in range(ndim)
+                )
+                lines = []
+                if coord_defs:
+                    lines.append(coord_defs)
+                lines.append(f"__mask = ({mask_condition_py})")
+                lines.append(
+                    f"{out_conn} = {base_expr} if __mask else _c_in"
+                )
+                code = "\n".join(lines)
+            else:
+                # Determine which __m{d} symbols appear in the condition
+                used_dims: set[int] = set()
+                for sym in mask_cond_sympy.free_symbols:
+                    name = str(sym)
+                    if name.startswith("__m") and name[3:].isdigit():
+                        d = int(name[3:])
+                        if d >= ndim:
+                            raise ValueError(
+                                f"TileSymbolicMaskedOp '{node.name}': mask_condition "
+                                f"references dimension __m{d} but tile has only {ndim} "
+                                f"dimension(s) (shape={shape})"
+                            )
+                        used_dims.add(d)
+
+                coord_code = _build_coord_tile_code(shape, ndim, used_dims)
+                lines = []
+                if coord_code:
+                    lines.append(coord_code)
+                lines.append(
+                    f"{out_conn} = ct.where({mask_condition_py}, {base_expr}, _c_in)"
+                )
+                code = "\n".join(lines)
+
+        return nodes.Tasklet(
+            label=node.name + "_cutile_py",
+            inputs=inputs,
+            outputs={out_conn},
+            code=code,
+            language=dtypes.Language.Python,
         )
 
 
