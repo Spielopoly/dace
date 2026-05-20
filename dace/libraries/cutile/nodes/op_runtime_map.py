@@ -514,7 +514,7 @@ class ExpandTileRuntimeMaskedOpCuTilePython(ExpandTransformation):
             from .base import expr_connectors
             inputs.update(expr_connectors(node.expr))
             inputs.discard(out_conn)
-            base_expr = str(node.expr)
+            base_expr = symstr(node.expr, cpp_mode=False)
         else:
             left = node.constant1 if node.constant1 is not None else "_a"
             if node.constant2 is None and b_desc is None:

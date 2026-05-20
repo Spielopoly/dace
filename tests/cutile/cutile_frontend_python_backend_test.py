@@ -450,8 +450,8 @@ def test_pipeline_subtraction_runtime_correctness():
 def test_pipeline_symbolic_shape_runtime_correctness():
     """Symbolic-shape add should compile, execute with runtime sizes, and match."""
     rng = np.random.default_rng(45)
-    n_val = np.int32(18)
-    m_val = np.int32(14)
+    n_val = 18
+    m_val = 14
     a_np = rng.random((n_val, m_val)).astype(np.float32)
     b_np = rng.random((n_val, m_val)).astype(np.float32)
 
