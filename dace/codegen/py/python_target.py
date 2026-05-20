@@ -161,10 +161,30 @@ class PythonCodeGen(PythonTargetCodeGenerator):
                     dispatcher.register_copy_dispatcher(src_storage, dst_storage, schedule, self)
 
     def get_generated_codeobjects(self):
-        return []
+        # Unfortunately we need to redefine some sympy functions so we just load that file as a code object
+        from pathlib import Path
+
+        HERE = Path(__file__).parent
+        file_path = HERE / "sympy_function_redefinitions.py"
+        content = file_path.read_text()
+        
+        from dace.codegen.codeobject import CodeObject
+        
+        code = CodeObject(
+            name="sympy_function_redefinitions",
+            code=content,
+            language="py",
+            target=type(self),
+            title="Sympy Function Redefinitions",
+        )
+        return [code]
 
     def get_includes(self) -> dict[str, list[str]]:
-        return {'frame': ['import numpy', 'from dataclasses import dataclass']}
+        return {'frame': [
+            'import numpy',
+            'from dataclasses import dataclass',
+            "from sympy_function_redefinitions import *",
+            ]}
 
     def preprocess(self, sdfg: SDFG) -> None:
         # TODO: Maybe apply copy-node transformations
