@@ -39,6 +39,7 @@ from dace.transformation.interstate.loop_to_map import LoopToMap
 from dace.transformation.passes.split_tasklets import SplitTasklets
 from dace.transformation import pass_pipeline as ppl
 from .remove_intermediate_transient import RemoveIntermediateTransient
+from dace.libraries.cutile.nodes.base import TileNodeBase
 
 
 
@@ -55,7 +56,7 @@ class CuTilePipeline(ppl.Pass):
     CATEGORY: str = 'cuTile'
 
     apply_map_collapse_and_tiling: bool = True  # Controls steps 3/7 (MapCollapse) and 4/9 (MapTiling)
-    tile_shape: Tuple[int, ...] = (16, 16, 16)
+    tile_shape: Tuple[int, ...] = (16, 16, 16, 1)
     validate: bool = True
     validate_all: bool = True
     debug_save_sdfg_steps: bool = False
@@ -258,6 +259,14 @@ def _apply_map_tiling_to_all_maps(sdfg: SDFG,
             if not has_conditional:
                 continue
 
+        # Skip maps whose scope already contains cuTile library nodes
+        # (these have already been tiled and processed by IfElseMapToTileWhere)
+        # TODO: This should probably be implemented differently. Don't check for library nodes
+        # but for already tiled maps or something
+        scope_nodes_for_cutile_check = state.scope_subgraph(map_entry).nodes()
+        if any(isinstance(n, TileNodeBase) for n in scope_nodes_for_cutile_check):
+            continue
+
         # Verify the node is still a valid MapEntry before attempting
         if not isinstance(map_entry, sdfg_nodes.MapEntry):
             continue
@@ -292,7 +301,7 @@ def apply_cutile_pipeline(sdfg: SDFG, *,
                           validate: bool = True,
                           validate_all: bool = True,
                           apply_map_collapse_and_tiling: bool = True,
-                          tile_shape: Tuple[int, ...] = (16, 16, 16),
+                          tile_shape: Tuple[int, ...] = (16, 16, 16, 1),
                           debug_save_sdfg_steps: bool = False) -> int:
     """Apply the full cuTile transformation pipeline to an SDFG.
 

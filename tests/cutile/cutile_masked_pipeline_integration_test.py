@@ -509,7 +509,7 @@ def test_ifelse_symbolic_size_python_backend():
     _pipeline_py(sdfg)
     csdfg = sdfg.compile()
 
-    csdfg(A=cp.asarray(a_np), B=(b_cp := cp.asarray(b_np)), SZ=n)
+    csdfg(_A=cp.asarray(a_np), _B=(b_cp := cp.asarray(b_np)), SZ=n)
     expected = np.where(a_np > 0, b_orig - 1.0, b_orig + 1.0)
     np.testing.assert_allclose(cp.asnumpy(b_cp), expected, rtol=1e-5, atol=1e-6)
 
@@ -673,7 +673,6 @@ def test_symbolic_masked_offset_stride_add_python_backend():
                                 rtol=1e-5, atol=1e-6)
 
 
-@pytest.mark.gpu
 def test_symbolic_masked_stride2_add_validates_sdfg():
     """SDFG with strided map and Python backend must pass validation before compile."""
     sdfg = pybe_strided_i2_add.to_sdfg(simplify=True)

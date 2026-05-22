@@ -179,15 +179,148 @@ def test_cutile_codegen_rejects_symbolic_mask_tasklet():
         _code_of(sdfg)
 
 
-def test_symbolic_mask_cutile_python_expansion_rejected():
+# TODO: The following four tests might become outdated rather quickly
+
+def test_symbolic_mask_no_condition_expands_without_where():
+    """With mask_condition=None, expansion should succeed without ct.where."""
     lib = TileSymbolicMaskedOpLibraryNode("SymMasked", op="+", tile_shape=[16])
     lib.implementation = "cutile_python"
 
-    _expanded_single_tasklet_code(
+    code = _expanded_single_tasklet_code(
         lib,
         {
             "A": ("_a", dace.float32),
             "B": ("_b", dace.float32),
             "Cin": ("_c_in", dace.float32),
         },
+    )
+    # With mask_condition=None, ct.where should not be emitted
+    assert "ct.where" not in code
+    assert "_out" in code or "_a" in code
+
+
+def test_strided_map_shape_resolves_min_max():
+    """Strided maps produce Min/Max in subset.size(); codegen must resolve them to integers.
+
+    A map with range ``0:N:32`` and inner memlet ``A[tile_i:tile_i+32]``
+    yields ``Max(0, -tile_i + Min(N-1, tile_i+31)) - Min(0, ...) + 1`` for
+    the tile size.  The cuTile runtime requires constant integer shape tuples
+    in ``ct.load(..., shape=(...,))``.  This test verifies that substituting
+    the map param with its start value resolves the expression to ``32``.
+    """
+    import re as _re
+
+    sdfg = SDFG("strided_shape_resolve")
+    sdfg.backend = dtypes.BackendLanguage.Python
+    N = dace.symbol("N")
+    sdfg.add_symbol("N", dace.int32)
+    sdfg.add_array("A", shape=[N], dtype=dace.float32)
+    sdfg.add_array("C", shape=[N], dtype=dace.float32)
+
+    state = sdfg.add_state("main")
+    # Outer tiled map: stride-32 steps (as produced by MapTiling)
+    map_entry, map_exit = state.add_map(
+        "tiled", {"tile_i": "0:N:32"}, schedule=dtypes.ScheduleType.CuTile)
+    tasklet = state.add_tasklet("copy", {"_a"}, {"_out"}, "_out = _a")
+    a_read = state.add_read("A")
+    c_write = state.add_write("C")
+
+    # Inner subset: tile_i : min(tile_i+32, N) (strided tile access)
+    state.add_memlet_path(
+        a_read, map_entry, tasklet, dst_conn="_a",
+        memlet=dace.Memlet(f"A[tile_i:Min(tile_i + 32, N)]"))
+    state.add_memlet_path(
+        tasklet, map_exit, c_write, src_conn="_out",
+        memlet=dace.Memlet(f"C[tile_i:Min(tile_i + 32, N)]"))
+    sdfg.validate()
+
+    frame_code = _code_of(sdfg)
+    # Extract the shape argument from the ct.load() call
+    load_match = _re.search(r"ct\.load\(A,.*?shape=\(([^)]*)\)", frame_code)
+    assert load_match is not None, f"No ct.load(A, ...) found in:\n{frame_code}"
+    shape_str = load_match.group(1).strip().rstrip(",").strip()
+    # The shape must be a plain integer (32), not a symbolic Min/Max expression
+    assert shape_str == "32", (
+        f"Expected resolved shape '32', got '{shape_str}'.\n"
+        f"Generated code:\n{frame_code}"
+    )
+
+
+def test_strided_2d_map_shape_resolves():
+    """2-D strided map should resolve both dimensions to constant integers."""
+    import re as _re
+
+    sdfg = SDFG("strided_2d_shape")
+    sdfg.backend = dtypes.BackendLanguage.Python
+    N = dace.symbol("N")
+    M = dace.symbol("M")
+    sdfg.add_symbol("N", dace.int32)
+    sdfg.add_symbol("M", dace.int32)
+    sdfg.add_array("A", shape=[N, M], dtype=dace.float32)
+    sdfg.add_array("C", shape=[N, M], dtype=dace.float32)
+
+    state = sdfg.add_state("main")
+    map_entry, map_exit = state.add_map(
+        "tiled2d",
+        {"tile_i": "0:N:16", "tile_j": "0:M:8"},
+        schedule=dtypes.ScheduleType.CuTile,
+    )
+    tasklet = state.add_tasklet("copy", {"_a"}, {"_out"}, "_out = _a")
+    a_read = state.add_read("A")
+    c_write = state.add_write("C")
+
+    state.add_memlet_path(
+        a_read, map_entry, tasklet, dst_conn="_a",
+        memlet=dace.Memlet(f"A[tile_i:Min(tile_i + 16, N), tile_j:Min(tile_j + 8, M)]"))
+    state.add_memlet_path(
+        tasklet, map_exit, c_write, src_conn="_out",
+        memlet=dace.Memlet(f"C[tile_i:Min(tile_i + 16, N), tile_j:Min(tile_j + 8, M)]"))
+    sdfg.validate()
+
+    frame_code = _code_of(sdfg)
+    load_match = _re.search(r"ct\.load\(A,.*?shape=\(([^)]*)\)", frame_code)
+    assert load_match is not None, f"No ct.load(A, ...) found in:\n{frame_code}"
+    shape_str = load_match.group(1).strip().rstrip(",").strip()
+    # Both dimensions must resolve to plain integers
+    parts = [p.strip() for p in shape_str.split(",")]
+    assert parts == ["16", "8"], (
+        f"Expected resolved shape ['16', '8'], got {parts}.\n"
+        f"Generated code:\n{frame_code}"
+    )
+
+
+def test_non_strided_map_shape_unchanged():
+    """Non-strided (stride-1) maps should continue to produce simple shapes."""
+    import re as _re
+
+    sdfg = SDFG("non_strided_shape")
+    sdfg.backend = dtypes.BackendLanguage.Python
+    sdfg.add_symbol("N", dace.int32)
+    N = dace.symbol("N")
+    sdfg.add_array("A", shape=[N], dtype=dace.float32)
+    sdfg.add_array("C", shape=[N], dtype=dace.float32)
+
+    state = sdfg.add_state("main")
+    map_entry, map_exit = state.add_map(
+        "m", {"i": "0:N"}, schedule=dtypes.ScheduleType.CuTile)
+    tasklet = state.add_tasklet("copy", {"_a"}, {"_out"}, "_out = _a")
+    a_read = state.add_read("A")
+    c_write = state.add_write("C")
+
+    state.add_memlet_path(
+        a_read, map_entry, tasklet, dst_conn="_a",
+        memlet=dace.Memlet("A[i]"))
+    state.add_memlet_path(
+        tasklet, map_exit, c_write, src_conn="_out",
+        memlet=dace.Memlet("C[i]"))
+    sdfg.validate()
+
+    frame_code = _code_of(sdfg)
+    # For a stride-1 map with scalar access, the shape should be 1
+    load_match = _re.search(r"ct\.load\(A,.*?shape=\(([^)]*)\)", frame_code)
+    assert load_match is not None, f"No ct.load(A, ...) found in:\n{frame_code}"
+    shape_str = load_match.group(1).strip().rstrip(",").strip()
+    assert shape_str == "1", (
+        f"Expected shape '1' for scalar access, got '{shape_str}'.\n"
+        f"Generated code:\n{frame_code}"
     )

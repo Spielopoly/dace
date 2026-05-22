@@ -1035,6 +1035,58 @@ class IfElseMapToTileWhere(xf.SingleStateTransformation):
             condition_substitutions[symbol] = sp.Symbol(conn_name)
         node_condition = condition_expression.xreplace(condition_substitutions)
 
+        # ── 7b. Create tile transients for output arrays needed as inputs ──
+        # When a copy branch reads from the output array (identity: C = C),
+        # that array only has an output connector on the NestedSDFG.
+        # We must create a tile transient and wire it from the outer entry
+        # so the compound node can read the original values.
+        missing_outer_names = set(outer_to_conn.keys()) - set(outer_to_tile.keys())
+        for outer_name in sorted(missing_outer_names):
+            tile_name, tile_node = create_tile_transient(
+                sdfg, graph, outer_name, tile_shape
+            )
+            outer_to_tile[outer_name] = (tile_name, tile_node)
+
+            # Derive a staging memlet from the output write-back edge
+            # (inner_exit → outer_exit) for this array.
+            staging_memlet = None
+            for oe in graph.out_edges(inner_exit):
+                if oe.dst is outer_exit and oe.data.data == outer_name:
+                    staging_memlet = copy.deepcopy(oe.data)
+                    break
+
+            if staging_memlet is None:
+                raise ValueError(
+                    f"IfElseMapToTileWhere: cannot find output staging "
+                    f"edge for '{outer_name}' to derive input memlet"
+                )
+
+            # Create a separate read AccessNode for this array.
+            read_access = graph.add_read(outer_name)
+
+            # Add connectors to outer_entry for the read path.
+            in_conn = f"IN_{outer_name}"
+            out_conn = f"OUT_{outer_name}"
+            idx = 0
+            while in_conn in outer_entry.in_connectors:
+                idx += 1
+                in_conn = f"IN_{outer_name}_{idx}"
+                out_conn = f"OUT_{outer_name}_{idx}"
+            outer_entry.add_in_connector(in_conn)
+            outer_entry.add_out_connector(out_conn)
+
+            # Edge: read AccessNode → outer_entry (full-array read)
+            arr_desc = sdfg.arrays[outer_name]
+            graph.add_edge(
+                read_access, None, outer_entry, in_conn,
+                dace.Memlet.from_array(outer_name, arr_desc),
+            )
+
+            # Edge: outer_entry → tile_transient (per-tile staging)
+            graph.add_edge(
+                outer_entry, out_conn, tile_node, None, staging_memlet,
+            )
+
         # ── 8. Create TileIfElseOpLibraryNode ────────────────────────
         compound_node = TileIfElseOpLibraryNode(
             name="TileIfElseOp",

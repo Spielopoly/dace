@@ -861,27 +861,37 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
         return stride
 
     @staticmethod
-    def _build_mask_condition_symbolic(inner_map: nodes.Map) -> sp.Basic:
+    def _build_mask_condition_symbolic(inner_map: nodes.Map,
+                                       outer_map: Optional[nodes.Map] = None) -> sp.Basic:
         """Build a SymPy boolean expression for tile-point validity.
 
         Returns a conjunction of per-dimension predicates using ``__m0``,
-        ``__m1``, … as coordinate symbols.  Each sub-clause handles both
+        ``__m1``, ... as coordinate symbols.  Each sub-clause handles both
         positive and negative step directions (combined with ``Or``).
 
-        For positive step (low = start)::
+        When *outer_map* is provided the mask is "un-skewed": the outer
+        map parameters (``tile_i``, ``tile_j``, ...) are treated as the
+        skew offsets applied by ``MapTiling(skew=True)``.  This ensures
+        that tile coordinate ``__m{d}`` corresponds to the physical
+        array position loaded by ``ct.load``, not the inner-map-local
+        offset.
 
-            __m <= end - start  AND  __m % step == 0
+        For positive step (low = start) with skew offset *s*::
 
-        For negative step (low = end)::
+            __m >= s  AND  (__m - s) <= end - start  AND  (__m - s) % step == 0
 
-            __m <= start - end  AND  (start - end - __m) % (-step) == 0
+        For negative step (low = end) with skew offset *s*::
+
+            __m >= s  AND  (__m - s) <= start - end  AND  (start - end - (__m - s)) % (-step) == 0
 
         Args:
             inner_map: The inner :class:`~dace.sdfg.nodes.Map` whose range
-                encodes the valid coordinate set.
+                encodes the valid coordinate set (after skewing).
+            outer_map: Optional outer (tiled) :class:`~dace.sdfg.nodes.Map`.
+                When given, its parameters are used as skew offsets.
 
         Returns:
-            A SymPy boolean expression over ``__m0``, ``__m1``, … symbols
+            A SymPy boolean expression over ``__m0``, ``__m1``, ... symbols
             that is ``True`` exactly for tile coordinates that correspond to
             points in the original inner-map iteration space.
         """
@@ -893,17 +903,39 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
             end = _ScalarToTileBase._to_sympy_expr(end)
             step = _ScalarToTileBase._to_sympy_expr(step)
 
+            # NOTE: The `start == 0` heuristic below assumes the inner map
+            # was produced by MapTiling(skew=True).  This is safe within the
+            # standard CuTile pipeline, but could misfire if
+            # ScalarToTileMasked is used outside the pipeline on a
+            # hand-crafted SDFG with a naturally 0-based inner map inside
+            # an outer map.  See code review note (2025-05-22).
+            # Skew offset: the outer map parameter for this dimension,
+            # representing the amount subtracted during MapTiling(skew=True).
+            # Only apply the offset when the inner-map start is 0, which
+            # indicates skewing was applied.  When start != 0 the range
+            # already uses absolute indices (no skew occurred).
+            if (outer_map is not None and d < len(outer_map.params)
+                    and start == sp.Integer(0)):
+                skew = sp.Symbol(str(outer_map.params[d]))
+            else:
+                skew = sp.Integer(0)
+
+            # Effective coordinate in the skewed (inner-map) space
+            m_local = m - skew
+
             # Positive-step sub-clause
             cond_pos = sp.And(
                 sp.StrictGreaterThan(step, 0),
-                sp.LessThan(m, end - start + 1),
-                sp.Eq(sp.Mod(m, step), 0),
+                sp.GreaterThan(m, skew),           # m >= skew_offset
+                sp.LessThan(m_local, end - start + 1),
+                sp.Eq(sp.Mod(m_local, step), 0),
             )
             # Negative-step sub-clause
             cond_neg = sp.And(
                 sp.StrictLessThan(step, 0),
-                sp.LessThan(m, start - end + 1),
-                sp.Eq(sp.Mod(start - end - m, -step), 0),
+                sp.GreaterThan(m, skew),           # m >= skew_offset
+                sp.LessThan(m_local, start - end + 1),
+                sp.Eq(sp.Mod(start - end - m_local, -step), 0),
             )
             dim_conds.append(sp.Or(cond_pos, cond_neg))
 
@@ -1022,16 +1054,15 @@ class ScalarToTileMasked(_ScalarToTileBase):
     """
 
     def _has_valid_inner_map_ranges(self) -> bool:
-        """Return ``True`` for non-canonical inner maps with non-zero strides.
+        """Return ``True`` for inner maps with non-zero strides.
 
-        Accepts any map range as long as no dimension has a zero step (which
-        would represent an infinite loop).  Also rejects canonical maps so
-        that :class:`ScalarToTileCanonical` takes priority over them.
+        Accepts any map range as long as no dimension has a zero step
+        (which would represent an infinite loop).  Canonical maps are
+        not explicitly rejected here; :class:`ScalarToTileCanonical`
+        has priority via ``order_by_transformation`` in the pipeline.
 
         Returns:
-            ``True`` if every dimension has a non-zero step and the map is
-            non-canonical (i.e. :class:`ScalarToTileCanonical` would reject
-            it).
+            ``True`` if every dimension has a non-zero step.
         """
         for start, end, step in self._inner_entry.map.range:
             if step == 0:
@@ -1153,7 +1184,7 @@ class ScalarToTileMasked(_ScalarToTileBase):
         """
         super()._configure_library_node()
         condition = self._build_mask_condition_symbolic(
-            self._inner_entry.map)
+            self._inner_entry.map, outer_map=self._outer_entry.map)
         self._library_node.mask_condition = condition
 
     def _add_output_preload(self, data_name: str, inner_to_outer_edge: MultiConnectorEdge[Memlet], tasklet_out_edge: MultiConnectorEdge[Memlet]) -> None:

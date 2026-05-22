@@ -762,11 +762,7 @@ def test_frontend_multi_vadd_pipeline_all_maps_tiled():
         apply_map_collapse_and_tiling=True,
         tile_shape=(3, 3),
     )
-    assert count >= 3
-    assert count >= 3
-    
-    # Should have applied transformations (at least the maps should be tiled)
-    assert count >= 1, f"Expected at least 1 transformation, got {count}"
+    assert count >= 3, f"Expected at least 3 transformations, got {count}"
     
     tileops = _count_lib_nodes_of_type(sdfg, TileOpLibraryNode)
     assert tileops == maps_before_count, (
