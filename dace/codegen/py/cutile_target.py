@@ -95,14 +95,6 @@ def _enclosing_cutile_entry(state: "SDFGState", node: nodes.Node) -> Optional[no
     return None
 
 
-_SYMBOLIC_MASK_GUARD_RE = re.compile(r"__m\d+_guard")
-
-
-def _tasklet_contains_symbolic_mask(node: nodes.Tasklet) -> bool:
-    code = node.code.as_string if node.code is not None else ""
-    return bool(_SYMBOLIC_MASK_GUARD_RE.search(code or ""))
-
-
 def _is_cutile_node(state: "SDFGState", node: nodes.Node) -> bool:
     if isinstance(node, nodes.MapEntry) and node.map.schedule == dtypes.ScheduleType.CuTile:
         return True
@@ -270,11 +262,6 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
                           function_stream, callsite_stream) -> None:
         if node.code.language != dtypes.Language.Python:
             raise NotImplementedError("CuTile backend only supports Python tasklets.")
-        if _tasklet_contains_symbolic_mask(node):
-            raise ValueError(
-                f"CuTile backend cannot lower tasklet '{node.label}' containing a "
-                f"symbolic mask guard marker; symbolic-masked scopes must be "
-                f"expanded before reaching codegen.")
         state = cfg.state(state_id)
         entry = _enclosing_cutile_entry(state, node)
         if entry is None:
