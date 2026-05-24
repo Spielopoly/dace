@@ -324,3 +324,146 @@ def test_non_strided_map_shape_unchanged():
         f"Expected shape '1' for scalar access, got '{shape_str}'.\n"
         f"Generated code:\n{frame_code}"
     )
+
+
+def test_tile_transient_padded_shape_used_for_load():
+    """When a tile transient has a power-of-2 padded shape, ct.load must use
+    the transient descriptor shape, not the memlet subset size.
+
+    This simulates the ScalarToTileMasked pattern where a strided inner map
+    has a non-power-of-2 tile size (e.g. 14) but the transient is padded to
+    the next power of 2 (16).  The memlet still covers only the actual data
+    range (0:13 = 14 elements), but ct.load must emit shape=(16,) because
+    the cuTile runtime requires power-of-2 tile dimensions.
+    """
+    import re as _re
+
+    sdfg = SDFG("padded_tile_transient")
+    sdfg.backend = dtypes.BackendLanguage.Python
+    N = dace.symbol("N")
+    sdfg.add_symbol("N", dace.int32)
+    sdfg.add_array("A", shape=[N], dtype=dace.float32)
+    sdfg.add_array("C", shape=[N], dtype=dace.float32)
+    # Tile transient with power-of-2 padded shape (16, not 14)
+    sdfg.add_transient("tile_A", shape=[16], dtype=dace.float32)
+
+    state = sdfg.add_state("main")
+    map_entry, map_exit = state.add_map(
+        "tiled", {"tile_i": "0:N:14"}, schedule=dtypes.ScheduleType.CuTile)
+    tasklet = state.add_tasklet("copy", {"_a"}, {"_out"}, "_out = _a")
+    a_read = state.add_read("A")
+    c_write = state.add_write("C")
+    tile_a = state.add_access("tile_A")
+
+    # Outer edge: full array -> map entry -> tile transient
+    # add_memlet_path through the map entry automatically creates IN_/OUT_
+    # connectors; then the inner leg lands on the tile transient.
+    state.add_memlet_path(
+        a_read, map_entry, tile_a,
+        memlet=dace.Memlet(f"A[tile_i:Min(tile_i + 14, N)]"))
+    # Tile transient -> tasklet
+    state.add_edge(tile_a, None, tasklet, "_a",
+                   dace.Memlet("tile_A[0:14]"))
+    # Tasklet -> map exit -> output
+    state.add_memlet_path(
+        tasklet, map_exit, c_write, src_conn="_out",
+        memlet=dace.Memlet(f"C[tile_i:Min(tile_i + 14, N)]"))
+    sdfg.validate()
+
+    frame_code = _code_of(sdfg)
+    load_match = _re.search(r"ct\.load\(A,.*?shape=\(([^)]*)\)", frame_code)
+    assert load_match is not None, f"No ct.load(A, ...) found in:\n{frame_code}"
+    shape_str = load_match.group(1).strip().rstrip(",").strip()
+    # Must be 16 (padded descriptor shape), not 14 (memlet subset size)
+    assert shape_str == "16", (
+        f"Expected padded shape '16', got '{shape_str}'.\n"
+        f"Generated code:\n{frame_code}"
+    )
+
+
+def test_tile_transient_2d_padded_shape():
+    """2-D tile transient with padded shape: both dimensions should come from
+    the transient descriptor, not from the memlet subset."""
+    import re as _re
+
+    sdfg = SDFG("padded_2d_tile_transient")
+    sdfg.backend = dtypes.BackendLanguage.Python
+    N = dace.symbol("N")
+    M = dace.symbol("M")
+    sdfg.add_symbol("N", dace.int32)
+    sdfg.add_symbol("M", dace.int32)
+    sdfg.add_array("A", shape=[N, M], dtype=dace.float32)
+    sdfg.add_array("C", shape=[N, M], dtype=dace.float32)
+    # 2-D transient padded to powers of 2: actual tile is (14, 12)
+    # but transient is padded to (16, 16)
+    sdfg.add_transient("tile_A", shape=[16, 16], dtype=dace.float32)
+
+    state = sdfg.add_state("main")
+    map_entry, map_exit = state.add_map(
+        "tiled2d",
+        {"tile_i": "0:N:14", "tile_j": "0:M:12"},
+        schedule=dtypes.ScheduleType.CuTile,
+    )
+    tasklet = state.add_tasklet("copy", {"_a"}, {"_out"}, "_out = _a")
+    a_read = state.add_read("A")
+    c_write = state.add_write("C")
+    tile_a = state.add_access("tile_A")
+
+    state.add_memlet_path(
+        a_read, map_entry, tile_a,
+        memlet=dace.Memlet(f"A[tile_i:Min(tile_i + 14, N), tile_j:Min(tile_j + 12, M)]"))
+    state.add_edge(tile_a, None, tasklet, "_a",
+                   dace.Memlet("tile_A[0:14, 0:12]"))
+    state.add_memlet_path(
+        tasklet, map_exit, c_write, src_conn="_out",
+        memlet=dace.Memlet(f"C[tile_i:Min(tile_i + 14, N), tile_j:Min(tile_j + 12, M)]"))
+    sdfg.validate()
+
+    frame_code = _code_of(sdfg)
+    load_match = _re.search(r"ct\.load\(A,.*?shape=\(([^)]*)\)", frame_code)
+    assert load_match is not None, f"No ct.load(A, ...) found in:\n{frame_code}"
+    shape_str = load_match.group(1).strip().rstrip(",").strip()
+    parts = [p.strip() for p in shape_str.split(",")]
+    assert parts == ["16", "16"], (
+        f"Expected padded shape ['16', '16'], got {parts}.\n"
+        f"Generated code:\n{frame_code}"
+    )
+
+
+def test_no_transient_fallback_to_memlet_subset():
+    """When there is no tile transient (edge goes directly to tasklet),
+    the codegen should still use the memlet subset size (original behavior)."""
+    import re as _re
+
+    sdfg = SDFG("no_transient_fallback")
+    sdfg.backend = dtypes.BackendLanguage.Python
+    N = dace.symbol("N")
+    sdfg.add_symbol("N", dace.int32)
+    sdfg.add_array("A", shape=[N], dtype=dace.float32)
+    sdfg.add_array("C", shape=[N], dtype=dace.float32)
+
+    state = sdfg.add_state("main")
+    map_entry, map_exit = state.add_map(
+        "tiled", {"tile_i": "0:N:32"}, schedule=dtypes.ScheduleType.CuTile)
+    tasklet = state.add_tasklet("copy", {"_a"}, {"_out"}, "_out = _a")
+    a_read = state.add_read("A")
+    c_write = state.add_write("C")
+
+    # Direct edge to tasklet (no tile transient) with strided memlet
+    state.add_memlet_path(
+        a_read, map_entry, tasklet, dst_conn="_a",
+        memlet=dace.Memlet(f"A[tile_i:Min(tile_i + 32, N)]"))
+    state.add_memlet_path(
+        tasklet, map_exit, c_write, src_conn="_out",
+        memlet=dace.Memlet(f"C[tile_i:Min(tile_i + 32, N)]"))
+    sdfg.validate()
+
+    frame_code = _code_of(sdfg)
+    load_match = _re.search(r"ct\.load\(A,.*?shape=\(([^)]*)\)", frame_code)
+    assert load_match is not None, f"No ct.load(A, ...) found in:\n{frame_code}"
+    shape_str = load_match.group(1).strip().rstrip(",").strip()
+    # Without a transient, falls back to memlet subset size resolved to 32
+    assert shape_str == "32", (
+        f"Expected shape '32' from memlet subset, got '{shape_str}'.\n"
+        f"Generated code:\n{frame_code}"
+    )

@@ -260,15 +260,19 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
 
     def _calculate_tile_shape(self) -> tuple[sp.Basic | int, ...]:
         """
-        Tile shape from inner-map range maxima with conservative map-local elimination.
+        Tile shape from inner-map range maxima.
 
-        Both canonical and masked paths use the same base strategy: derive
-        per-dimension extents from inner-map start/end maxima (canonical-like
-        for unit-stride maps),
-        then conservatively maximize away map-local parameters if present.
+        Per dimension, the tile shape is ``Max(start, end) + 1``.  The tile
+        always covers from index 0 up to the largest reachable coordinate,
+        which ensures power-of-2 friendly shapes and avoids ``Min``-based
+        bounding-box arithmetic.
+        
+        If the cutile pipeline is used, starting at 0 is (usually) not a big
+        over-approximation, because Map-Tiling skews the inner maps to start at 0
 
-        This keeps descriptor shapes independent of map-local symbols while
-        remaining a safe over-approximation.
+        When the result still contains map-local parameters, conservative
+        over-approximation is used to eliminate them, keeping descriptor
+        shapes independent of map-local symbols.
         """
         assert isinstance(self._inner_entry.map.range, subsets.Range)
         base_shape: list[sp.Basic] = []
@@ -276,7 +280,7 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
             start_expr = self._to_sympy_expr(start)
             end_expr = self._to_sympy_expr(end)
             base_shape.append(
-                sp.Max(start_expr, end_expr) - sp.Min(start_expr, end_expr) + 1
+                sp.Max(start_expr, end_expr) + 1
             )
 
         local_params = {
@@ -706,13 +710,13 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
     @staticmethod
     def _build_contiguous_outer_subset(tasklet_subset: subsets.Range,
                                        inner_map: nodes.Map) -> subsets.Range:
-        """Lift scalar tasklet accesses to a contiguous outer subset.
+        """Lift scalar tasklet accesses to cover the full tile from 0 to max.
 
         For each accessed dimension, substitutes the inner-map parameter with
-        its min/max reachable values and builds a conservative contiguous range.
-        This converts the scalar index expression(s) used in the inner map to
-        a contiguous outer tile range that covers all points visited by the
-        inner map.
+        bounds ``0`` (low) and ``Max(start, end)`` (high) and builds a
+        contiguous range that covers the full tile footprint starting at
+        index 0.  This matches the tile shape ``Max(start, end) + 1`` used
+        by ``_calculate_tile_shape``.
 
         Args:
             tasklet_subset: The scalar :class:`~dace.subsets.Range` on the
@@ -721,8 +725,8 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
                 bounds are used for substitution.
 
         Returns:
-            A :class:`~dace.subsets.Range` covering all outer-space points
-            reachable from the inner-map iteration.
+            A :class:`~dace.subsets.Range` covering the full tile from
+            index 0 to the maximum reachable coordinate.
 
         Raises:
             TypeError: If *tasklet_subset* is not a
@@ -733,14 +737,11 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
         if not isinstance(tasklet_subset, subsets.Range):
             raise TypeError("Expected range subset on tasklet memlet.")
 
-        # Precompute symbolic min/max bounds for each inner-map parameter so
-        # we can safely evaluate accesses even for reversed iteration ranges.
+        # Tile covers from 0 to Max(start, end) per dimension, matching the
+        # tile shape Max(start, end) + 1.
         param_bounds = {
             str(pname): (
-                sp.Min(
-                    _ScalarToTileBase._to_sympy_expr(start),
-                    _ScalarToTileBase._to_sympy_expr(end),
-                ),
+                sp.Integer(0),
                 sp.Max(
                     _ScalarToTileBase._to_sympy_expr(start),
                     _ScalarToTileBase._to_sympy_expr(end),
@@ -869,20 +870,19 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
         ``__m1``, ... as coordinate symbols.  Each sub-clause handles both
         positive and negative step directions (combined with ``Or``).
 
-        When *outer_map* is provided the mask is "un-skewed": the outer
-        map parameters (``tile_i``, ``tile_j``, ...) are treated as the
-        skew offsets applied by ``MapTiling(skew=True)``.  This ensures
-        that tile coordinate ``__m{d}`` corresponds to the physical
-        array position loaded by ``ct.load``, not the inner-map-local
-        offset.
+        The tile now covers ``0..Max(start, end)`` per dimension, so the
+        mask checks ``m`` against ``start`` and ``end`` directly.
 
-        For positive step (low = start) with skew offset *s*::
+        For positive step::
 
-            __m >= s  AND  (__m - s) <= end - start  AND  (__m - s) % step == 0
+            m >= start  AND  m <= end  AND  (m - start) % step == 0
 
-        For negative step (low = end) with skew offset *s*::
+        For negative step (start > end)::
 
-            __m >= s  AND  (__m - s) <= start - end  AND  (start - end - (__m - s)) % (-step) == 0
+
+            m >= end  AND  m <= start  AND  (start - m) % (-step) == 0
+
+        where ``m = __m{d}``.
 
         Args:
             inner_map: The inner :class:`~dace.sdfg.nodes.Map` whose range
@@ -903,39 +903,21 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
             end = _ScalarToTileBase._to_sympy_expr(end)
             step = _ScalarToTileBase._to_sympy_expr(step)
 
-            # NOTE: The `start == 0` heuristic below assumes the inner map
-            # was produced by MapTiling(skew=True).  This is safe within the
-            # standard CuTile pipeline, but could misfire if
-            # ScalarToTileMasked is used outside the pipeline on a
-            # hand-crafted SDFG with a naturally 0-based inner map inside
-            # an outer map.  See code review note (2025-05-22).
-            # Skew offset: the outer map parameter for this dimension,
-            # representing the amount subtracted during MapTiling(skew=True).
-            # Only apply the offset when the inner-map start is 0, which
-            # indicates skewing was applied.  When start != 0 the range
-            # already uses absolute indices (no skew occurred).
-            if (outer_map is not None and d < len(outer_map.params)
-                    and start == sp.Integer(0)):
-                skew = sp.Symbol(str(outer_map.params[d]))
-            else:
-                skew = sp.Integer(0)
 
-            # Effective coordinate in the skewed (inner-map) space
-            m_local = m - skew
-
-            # Positive-step sub-clause
+            # Positive-step sub-clause: m must lie within [start, end]
+            # and align to the step grid starting at start.
             cond_pos = sp.And(
                 sp.StrictGreaterThan(step, 0),
-                sp.GreaterThan(m, skew),           # m >= skew_offset
-                sp.LessThan(m_local, end - start + 1),
-                sp.Eq(sp.Mod(m_local, step), 0),
+                sp.GreaterThan(m, start),          # m >= start
+                sp.LessThan(m, end),               # m <= end
+                sp.Eq(sp.Mod(m - start, step), 0),
             )
-            # Negative-step sub-clause
+            # Negative-step sub-clause: start > end when step < 0.
             cond_neg = sp.And(
                 sp.StrictLessThan(step, 0),
-                sp.GreaterThan(m, skew),           # m >= skew_offset
-                sp.LessThan(m_local, start - end + 1),
-                sp.Eq(sp.Mod(start - end - m_local, -step), 0),
+                sp.GreaterThan(m, end),            # m >= end
+                sp.LessThan(m, start),             # m <= start
+                sp.Eq(sp.Mod(start - m, -step), 0),
             )
             dim_conds.append(sp.Or(cond_pos, cond_neg))
 
@@ -1151,28 +1133,6 @@ class ScalarToTileMasked(_ScalarToTileBase):
             raise ValueError("ScalarToTileMasked expects tasklet memlets to define a subset")
         load_subset = self._build_contiguous_outer_subset(
             tasklet_subset, self._inner_entry.map)
-
-        # Recover implicit affine strides that may have been compressed to
-        # contiguous map coordinates by earlier preprocessing passes.
-        data_desc = self._sdfg.arrays[cast(str, map_edge.data.data)]
-        if isinstance(tasklet_subset, subsets.Range):
-            scaled_ranges = []
-            for dim, (orig_rng, lifted_rng) in enumerate(zip(tasklet_subset, load_subset)):
-                expr = self._to_sympy_expr(orig_rng[0])
-                data_dim = -1
-                if dim < len(data_desc.shape):
-                    try:
-                        data_dim = int(data_desc.shape[dim])
-                    except TypeError:
-                        data_dim = -1
-                stride_factor = self._infer_implicit_stride_factor(expr, data_dim) if data_dim > 0 else 1
-                if stride_factor > 1:
-                    s, e, st = lifted_rng
-                    scaled_ranges.append((s * stride_factor, e * stride_factor, st * stride_factor))
-                else:
-                    scaled_ranges.append(lifted_rng)
-            load_subset = subsets.Range(scaled_ranges)
-
         return with_primary_subset(map_edge.data, load_subset)
 
     def _configure_library_node(self) -> None:

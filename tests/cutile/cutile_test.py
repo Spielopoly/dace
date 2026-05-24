@@ -2689,5 +2689,238 @@ def test_pipeline_multiple_independent_maps_tiling():
     np.testing.assert_allclose(d, a * 2, rtol=1e-10, atol=1e-12)
 
 
+# ---------------------------------------------------------------------------
+# Skewed-map tile shape tests (ScalarToTileMasked._calculate_tile_shape)
+# ---------------------------------------------------------------------------
+
+def _build_skewed_map_sdfg(
+    outer_step: int,
+    inner_end: int,
+    inner_step: int,
+    name: str,
+    outer_shape: tuple[int, int] = (2, 2),
+    inner_t1: int = 5,
+) -> SDFG:
+    """Build an SDFG that mimics MapTiling(skew=True) output.
+
+    The inner map has range 0:inner_end:inner_step (zero-based, as
+    produced by skewing).  The outer map step is
+    tile_size * abs(inner_step), where tile_size is the original
+    power-of-2 tile parameter.
+
+    Parameters:
+        outer_step: Step of the outer map dimension 0.
+        inner_end: End (inclusive) of the inner map dimension 0.
+        inner_step: Step of the inner map dimension 0.
+        name: SDFG name.
+        outer_shape: Number of outer tiles per dimension (mt, nt).
+        inner_t1: Size of inner map dimension 1 (canonical, step=1).
+    """
+    mt, nt = outer_shape
+    # inner_end is inclusive, so the array dim 2 must hold at least inner_end+1
+    t0 = inner_end + 1
+    t1 = inner_t1
+
+    sdfg = SDFG(name)
+    sdfg.add_array("A", shape=[mt, nt, t0, t1], dtype=dace.float64)
+    sdfg.add_array("B", shape=[mt, nt, t0, t1], dtype=dace.float64)
+    sdfg.add_array("C", shape=[mt, nt, t0, t1], dtype=dace.float64)
+
+    state = sdfg.add_state("main")
+    a_acc = state.add_read("A")
+    b_acc = state.add_read("B")
+    c_acc = state.add_write("C")
+
+    outer_entry, outer_exit = state.add_map(
+        "tile_map",
+        {"i": f"0:{mt}", "j": f"0:{nt}"},
+        schedule=dtypes.ScheduleType.Sequential,
+    )
+    # Override dimension-0 outer step to encode tile_size.
+    outer_entry.map.range[0] = (
+        outer_entry.map.range[0][0],
+        outer_entry.map.range[0][1],
+        outer_step,
+    )
+
+    inner_entry, inner_exit = state.add_map(
+        "elem_map",
+        {"ii": f"0:{inner_end}:{inner_step}", "jj": f"0:{t1 - 1}"},
+        schedule=dtypes.ScheduleType.Sequential,
+    )
+
+    tasklet = state.add_tasklet("add_skewed", {"a", "b"}, {"c"}, "c = a + b")
+
+    state.add_memlet_path(
+        a_acc, outer_entry, inner_entry, tasklet,
+        dst_conn="a", memlet=Memlet("A[i, j, ii, jj]"),
+    )
+    state.add_memlet_path(
+        b_acc, outer_entry, inner_entry, tasklet,
+        dst_conn="b", memlet=Memlet("B[i, j, ii, jj]"),
+    )
+    state.add_memlet_path(
+        tasklet, inner_exit, outer_exit, c_acc,
+        src_conn="c", memlet=Memlet("C[i, j, ii, jj]"),
+    )
+
+    sdfg.validate()
+    return sdfg
+
+
+def _get_tile_transient_shapes(sdfg: SDFG) -> list[tuple]:
+    """Return the shapes of all tile transients (transient arrays) in *sdfg*."""
+    shapes = []
+    for name, desc in sdfg.arrays.items():
+        if desc.transient:
+            shapes.append(tuple(desc.shape))
+    return shapes
+
+
+def test_skewed_map_tile_shape_is_power_of_2():
+    """ScalarToTileMasked should derive power-of-2 tile shape for skewed maps.
+
+    MapTiling(skew=True) on map[2:16:2] with tile_size=16 produces:
+        outer step = 16 * 2 = 32
+        inner range = 0:13:2  (DaCe stores inclusive end = 12)
+    The base _calculate_tile_shape gives Max(0,12)+1=13 (not power of 2).
+    The override should detect start==0 and recover tile_size = 32/2 = 16.
+    """
+    sdfg = _build_skewed_map_sdfg(
+        outer_step=32,  # tile_size=16, inner_step=2 -> 16*2=32
+        inner_end=13,   # DaCe "0:13:2" -> inclusive end=12, values 0,2,4,6,8,10,12
+        inner_step=2,
+        name="test_skewed_tile_shape",
+    )
+
+    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_collapse_and_tiling=False)
+    assert count == 1, f"Expected 1 transformation, got {count}"
+
+    state = sdfg.states()[0]
+    lib_nodes = [n for n in state.nodes() if isinstance(n, nodes.LibraryNode)]
+    assert len(lib_nodes) == 1
+    assert isinstance(lib_nodes[0], TileSymbolicMaskedOpLibraryNode)
+
+    # Check tile transient shapes: dimension 0 should be 16 (power of 2),
+    # NOT 13 (Max(0,12)+1 from base class).
+    tile_shapes = _get_tile_transient_shapes(sdfg)
+    assert len(tile_shapes) > 0
+    for shape in tile_shapes:
+        assert int(shape[0]) == 16, (
+            f"Tile transient dim 0 should be 16 (power of 2), got {shape[0]}"
+        )
+
+
+def test_skewed_map_tile_shape_step_1():
+    """Skewed map with step=1: tile_size should be outer_step/1 = outer_step.
+
+    MapTiling(skew=True) on map[0:16] with tile_size=16 and step=1:
+        outer step = 16 * 1 = 16
+        inner range = 0:16:1  (DaCe stores inclusive end = 15)
+    Base gives Max(0,15)+1=16.  Override gives 16/1=16.  Both agree.
+    """
+    sdfg = _build_skewed_map_sdfg(
+        outer_step=16,  # tile_size=16, inner_step=1 -> 16*1=16
+        inner_end=16,   # DaCe "0:16:1" -> inclusive end=15
+        inner_step=1,
+        name="test_skewed_tile_shape_step1",
+    )
+
+    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_collapse_and_tiling=False)
+    assert count == 1
+
+    tile_shapes = _get_tile_transient_shapes(sdfg)
+    assert len(tile_shapes) > 0
+    for shape in tile_shapes:
+        assert int(shape[0]) == 16, (
+            f"Tile transient dim 0 should be 16, got {shape[0]}"
+        )
+
+
+def test_skewed_map_tile_shape_step_4():
+    """Skewed map with step=4: tile_size=16, outer_step=64, inner 0:12:4.
+
+    DaCe "0:12:4" -> inclusive end=8, values {0,4,8}.
+    Base: Max(0,8)+1=9, Override: 64/4=16.
+    The override should produce tile shape dim 0 = 16.
+    """
+    sdfg = _build_skewed_map_sdfg(
+        outer_step=64,  # tile_size=16, inner_step=4 -> 16*4=64
+        inner_end=12,   # DaCe "0:12:4" -> inclusive end=8, values 0,4,8
+        inner_step=4,
+        name="test_skewed_tile_shape_step4",
+    )
+
+    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_collapse_and_tiling=False)
+    assert count == 1
+
+    tile_shapes = _get_tile_transient_shapes(sdfg)
+    assert len(tile_shapes) > 0
+    for shape in tile_shapes:
+        # Base would give Max(0,8)+1=9, override gives 64/4=16.
+        assert int(shape[0]) == 16, (
+            f"Tile transient dim 0 should be 16 (power of 2), got {shape[0]}"
+        )
+
+
+def test_skewed_map_tile_shape_large_tile_size():
+    """Larger tile_size=32, step=3: outer_step=96, inner 0:32:3.
+
+    DaCe "0:32:3" -> inclusive end=30 (last multiple of 3 before 32).
+    Base: Max(0,30)+1=31 (not power of 2).
+    Override: 96/3=32 (power of 2).
+    """
+    sdfg = _build_skewed_map_sdfg(
+        outer_step=96,  # tile_size=32, inner_step=3 -> 32*3=96
+        inner_end=32,   # DaCe "0:32:3" -> inclusive end=30
+        inner_step=3,
+        name="test_skewed_tile_shape_large",
+    )
+
+    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_collapse_and_tiling=False)
+    assert count == 1
+
+    tile_shapes = _get_tile_transient_shapes(sdfg)
+    assert len(tile_shapes) > 0
+    for shape in tile_shapes:
+        assert int(shape[0]) == 32, (
+            f"Tile transient dim 0 should be 32 (power of 2), got {shape[0]}"
+        )
+
+
+def test_non_skewed_map_not_affected():
+    """Non-skewed maps (start != 0) should NOT be affected by the override.
+
+    The override only activates when inner start == 0. For start=1 (non-skewed),
+    the base class behavior should be preserved.
+    """
+    sdfg = build_runtime_tiled_scalar_noncanonical_binary_sdfg(
+        ii_range="1:6:2",
+        jj_range="1:5",
+        op="+",
+        name="test_non_skewed_unaffected",
+        dtype=dace.float64,
+    )
+
+    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_collapse_and_tiling=False)
+    assert count == 1
+
+    state = sdfg.states()[0]
+    lib_nodes = [n for n in state.nodes() if isinstance(n, nodes.LibraryNode)]
+    assert len(lib_nodes) == 1
+    lib_node = lib_nodes[0]
+    assert isinstance(lib_node, TileSymbolicMaskedOpLibraryNode)
+
+    # For ii_range="1:6:2": DaCe inclusive end=5, Max(1,5)+1=6
+    # (no skew correction since start!=0)
+    # For jj_range="1:5": DaCe inclusive end=4, Max(1,4)+1=5
+    # Verify tile transient shapes match expected bounding-box sizes.
+    tile_shapes = _get_tile_transient_shapes(sdfg)
+    assert len(tile_shapes) > 0
+    for shape in tile_shapes:
+        assert int(shape[0]) == 6, f"Expected dim 0 = 6, got {shape[0]}"
+        assert int(shape[1]) == 5, f"Expected dim 1 = 5, got {shape[1]}"
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

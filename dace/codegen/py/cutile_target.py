@@ -1,6 +1,5 @@
 """Schedule-based cuTile Python code generation target."""
 
-import re
 from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Tuple
 
 import sympy as sp
