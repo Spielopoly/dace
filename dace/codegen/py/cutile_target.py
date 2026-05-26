@@ -346,7 +346,7 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
                 tile_var = inner_dst.data
             else:
                 tile_key = arr
-                tile_var = f"__ct_t{next_idx}"
+                tile_var = f"__dace_ct_t{next_idx}"
                 next_idx += 1
             if tile_key in mapping:
                 continue
@@ -366,42 +366,7 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
             tile_shape = tile_shapes.get(tile_key)
 
             if tile_shape is None:
-                # Fallback: resolve shape from memlet subset (legacy path).
-                inner_subset = None
-                for in_edge in state.in_edges(node):
-                    if in_edge.data is None or in_edge.data.data is None:
-                        continue
-                    inner_dst = self._inner_dst_for_entry_edge(
-                        state, node, in_edge)
-                    if (isinstance(inner_dst, nodes.AccessNode)
-                            and inner_dst.data == tile_key):
-                        inner_subset = _inner_subset_for_entry_edge(
-                            state, node, in_edge)
-                        break
-                    if in_edge.data.data == tile_key:
-                        inner_subset = _inner_subset_for_entry_edge(
-                            state, node, in_edge)
-                        break
-                if inner_subset is not None:
-                    _tile_subs = {
-                        sp.Symbol(p): r[0]
-                        for p, r in zip(node.map.params, node.map.range)}
-                    _sym_subs = {
-                        sp.Symbol(s): sp.Integer(2**31)
-                        for s in sdfg.symbols}
-                    resolved_sizes = []
-                    for s in inner_subset.size():
-                        val = sp.sympify(s).subs(_tile_subs).subs(_sym_subs)
-                        resolved_sizes.append(symstr(val))
-                    shape_str = ", ".join(resolved_sizes)
-                else:
-                    shape_str = ""
-                callsite_stream.write(
-                    f"{tile_var} = ct.load({arr}, "
-                    f"index=({cutile_index},), shape=({shape_str},))",
-                    cfg, state_id,
-                )
-                continue
+                raise RuntimeError(f"Tile shape for {tile_key} could not be resolved.")
 
             if needs_gather:
                 # Non-aligned: use ct.gather with explicit index tiles.
