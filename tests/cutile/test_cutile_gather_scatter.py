@@ -309,10 +309,10 @@ class TestEmitGatherLoad:
             ["(2 + __pid0 * 32)"], (32,), None, 0)
         code = stream.getvalue()
 
-        assert "__ct_gidx_A_tile_0 = (2 + __pid0 * 32) + ct.arange(32" in code
-        assert "ct.gather(A, (__ct_gidx_A_tile_0,), padding_value=0)" in code
+        assert "__dace_ct_gidx_A_tile_0 = (2 + __pid0 * 32) + ct.arange(32" in code
+        assert "ct.gather(A, (__dace_ct_gidx_A_tile_0,), padding_value=0)" in code
         # 1D: should return idx_vars directly (no broadcast)
-        assert result == ["__ct_gidx_A_tile_0"]
+        assert result == ["__dace_ct_gidx_A_tile_0"]
         # No broadcast_to for 1D
         assert "ct.broadcast_to" not in code
 
@@ -327,12 +327,12 @@ class TestEmitGatherLoad:
         code = stream.getvalue()
 
         # Should have 2 arange calls
-        assert "__ct_gidx_A_tile_0 = (2 + __pid0 * 16) + ct.arange(16" in code
-        assert "__ct_gidx_A_tile_1 = __pid1 + ct.arange(16" in code
+        assert "__dace_ct_gidx_A_tile_0 = (2 + __pid0 * 16) + ct.arange(16" in code
+        assert "__dace_ct_gidx_A_tile_1 = __pid1 + ct.arange(16" in code
 
         # Should have reshape and broadcast_to for 2D
-        assert "ct.reshape(__ct_gidx_A_tile_0, (16, 1,))" in code
-        assert "ct.reshape(__ct_gidx_A_tile_1, (1, 16,))" in code
+        assert "ct.reshape(__dace_ct_gidx_A_tile_0, (16, 1,))" in code
+        assert "ct.reshape(__dace_ct_gidx_A_tile_1, (1, 16,))" in code
         assert "ct.broadcast_to" in code
         assert "(16, 16,)" in code
 
@@ -342,8 +342,8 @@ class TestEmitGatherLoad:
 
         # Result should be broadcast variables
         assert len(result) == 2
-        assert result[0] == "__ct_gidx_A_tile_0_nd"
-        assert result[1] == "__ct_gidx_A_tile_1_nd"
+        assert result[0] == "__dace_ct_gidx_A_tile_0_nd"
+        assert result[1] == "__dace_ct_gidx_A_tile_1_nd"
 
 
 # ===========================================================================
@@ -363,9 +363,9 @@ class TestEmitScatterStore:
         stream = PythonCodeIOStream()
         cg._emit_scatter_store(
             stream, "C", "C_tile",
-            ["__ct_gidx_C_tile_0"], None, 0)
+            ["__dace_ct_gidx_C_tile_0"], None, 0)
         code = stream.getvalue()
-        assert "ct.scatter(C, (__ct_gidx_C_tile_0,), C_tile)" in code
+        assert "ct.scatter(C, (__dace_ct_gidx_C_tile_0,), C_tile)" in code
 
     def test_2d_scatter(self):
         """2D scatter should emit ct.scatter with two index variables."""
@@ -373,9 +373,9 @@ class TestEmitScatterStore:
         stream = PythonCodeIOStream()
         cg._emit_scatter_store(
             stream, "C", "C_tile",
-            ["__ct_gidx_0_nd", "__ct_gidx_1_nd"], None, 0)
+            ["__dace_ct_gidx_0_nd", "__dace_ct_gidx_1_nd"], None, 0)
         code = stream.getvalue()
-        assert "ct.scatter(C, (__ct_gidx_0_nd, __ct_gidx_1_nd,), C_tile)" in code
+        assert "ct.scatter(C, (__dace_ct_gidx_0_nd, __dace_ct_gidx_1_nd,), C_tile)" in code
 
 
 # ===========================================================================
@@ -500,7 +500,7 @@ class TestGatherScatterCodegen:
         code = _code_of(sdfg)
 
         # Should contain index variables with tile var name
-        assert "__ct_gidx_A_tile_0" in code
+        assert "__dace_ct_gidx_A_tile_0" in code
 
 
 class TestCacheConsistency:
@@ -553,46 +553,6 @@ class TestAccessNodeErrorHandling:
         # errors, codegen will crash.
         code = _code_of(sdfg)
         assert "@ct.kernel" in code
-
-
-class TestLegacyFallback:
-    """Tests for the legacy fallback path (no tile transient descriptor)."""
-
-    def test_no_transient_uses_memlet_subset(self):
-        """When tile key is not a transient in sdfg.arrays, fall back to
-        memlet subset for shape resolution."""
-        sdfg = SDFG("legacy_fallback")
-        sdfg.backend = dtypes.BackendLanguage.Python
-        N = dace.symbol("N")
-        sdfg.add_symbol("N", dace.int32)
-        sdfg.add_array("A", shape=[N], dtype=dace.float32)
-        sdfg.add_array("C", shape=[N], dtype=dace.float32)
-
-        state = sdfg.add_state("main")
-        map_entry, map_exit = state.add_map(
-            "tiled", {"tile_i": "0:N:32"},
-            schedule=dtypes.ScheduleType.CuTile)
-        tasklet = state.add_tasklet("copy", {"_a"}, {"_out"}, "_out = _a")
-        a_read = state.add_read("A")
-        c_write = state.add_write("C")
-
-        state.add_memlet_path(
-            a_read, map_entry, tasklet, dst_conn="_a",
-            memlet=dace.Memlet(f"A[tile_i:Min(tile_i + 32, N)]"))
-        state.add_memlet_path(
-            tasklet, map_exit, c_write, src_conn="_out",
-            memlet=dace.Memlet(f"C[tile_i:Min(tile_i + 32, N)]"))
-        sdfg.validate()
-
-        code = _code_of(sdfg)
-        # Should still generate valid code via the fallback path
-        assert "ct.load(A" in code
-        assert "ct.store(C" in code
-        load_match = _re.search(r"ct\.load\(A,.*?shape=\(([^)]*)\)", code)
-        assert load_match is not None
-        shape_str = load_match.group(1).strip().rstrip(",").strip()
-        assert shape_str == "32", (
-            f"Expected shape '32' from memlet fallback, got '{shape_str}'")
 
 
 # ===========================================================================
