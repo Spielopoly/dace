@@ -220,6 +220,39 @@ def pybe_strided_offset_add(
         C[i, j] = A[i, j] + B[i, j]
 
 
+@dace.program
+def pybe_strided_offset1_add(
+    A: dace.float32[16, 16],
+    B: dace.float32[16, 16],
+    C: dace.float32[16, 16],
+):
+    """Odd start, stride-2 in i: rows 1,3,5,...,15 get updated."""
+    for i, j in dace.map[1:16:2, 0:16]:
+        C[i, j] = A[i, j] + B[i, j]
+
+
+@dace.program
+def pybe_strided_offset_j_add(
+    A: dace.float32[16, 16],
+    B: dace.float32[16, 16],
+    C: dace.float32[16, 16],
+):
+    """Stride-2 in j with non-zero start: cols 2,4,...,14 get updated."""
+    for i, j in dace.map[0:16, 2:16:2]:
+        C[i, j] = A[i, j] + B[i, j]
+
+
+@dace.program
+def pybe_strided_offset_both_add(
+    A: dace.float32[16, 16],
+    B: dace.float32[16, 16],
+    C: dace.float32[16, 16],
+):
+    """Offset+stride in both dims: rows 2,4,...,14 x cols 1,3,...,15."""
+    for i, j in dace.map[2:16:2, 1:16:2]:
+        C[i, j] = A[i, j] + B[i, j]
+
+
 # ---------------------------------------------------------------------------
 # Section A: TileIfElseOp — Python backend structural tests (no GPU)
 # ---------------------------------------------------------------------------
@@ -572,6 +605,27 @@ class TestSymbolicMaskedPythonBackendStructure:
         sym_count = _count(sdfg, TileSymbolicMaskedOpLibraryNode)
         assert sym_count >= 1
 
+    def test_offset1_stride_produces_symbolic_masked_node(self):
+        """Odd-start offset also generates TileSymbolicMaskedOpLibraryNode."""
+        sdfg = pybe_strided_offset1_add.to_sdfg(simplify=True)
+        _pipeline_py(sdfg, apply_map_collapse_and_tiling=True, tile_shape=(16, 16))
+        sym_count = _count(sdfg, TileSymbolicMaskedOpLibraryNode)
+        assert sym_count >= 1
+
+    def test_offset_j_stride_produces_symbolic_masked_node(self):
+        """Column-dimension offset+stride generates TileSymbolicMaskedOpLibraryNode."""
+        sdfg = pybe_strided_offset_j_add.to_sdfg(simplify=True)
+        _pipeline_py(sdfg, apply_map_collapse_and_tiling=True, tile_shape=(16, 16))
+        sym_count = _count(sdfg, TileSymbolicMaskedOpLibraryNode)
+        assert sym_count >= 1
+
+    def test_offset_both_dims_produces_symbolic_masked_node(self):
+        """Offset+stride in both dims generates TileSymbolicMaskedOpLibraryNode."""
+        sdfg = pybe_strided_offset_both_add.to_sdfg(simplify=True)
+        _pipeline_py(sdfg, apply_map_collapse_and_tiling=True, tile_shape=(16, 16))
+        sym_count = _count(sdfg, TileSymbolicMaskedOpLibraryNode)
+        assert sym_count >= 1
+
 
 # ---------------------------------------------------------------------------
 # Section D: TileSymbolicMaskedOp — Python backend GPU runtime tests
@@ -673,12 +727,110 @@ def test_symbolic_masked_offset_stride_add_python_backend():
                                 rtol=1e-5, atol=1e-6)
 
 
+@pytest.mark.gpu
+def test_masked_offset1_stride2_add_python_backend():
+    """Odd-start offset (start=1, stride=2): rows 1,3,5,...,15 updated."""
+    rng = np.random.default_rng(4005)
+    a_np = rng.random((16, 16)).astype(np.float32)
+    b_np = rng.random((16, 16)).astype(np.float32)
+    c_init = rng.random((16, 16)).astype(np.float32)
+    c_np = c_init.copy()
+
+    sdfg = pybe_strided_offset1_add.to_sdfg(simplify=True)
+    _pipeline_py(sdfg, apply_map_collapse_and_tiling=True, tile_shape=(16, 16))
+    csdfg = sdfg.compile()
+    assert csdfg is not None
+
+    csdfg(A=cp.asarray(a_np), B=cp.asarray(b_np), C=(c_cp := cp.asarray(c_np)))
+    result = cp.asnumpy(c_cp)
+
+    updated_rows = list(range(1, 16, 2))
+    np.testing.assert_allclose(result[updated_rows, :], (a_np + b_np)[updated_rows, :],
+                                rtol=1e-5, atol=1e-6)
+    unchanged_rows = [r for r in range(16) if r not in updated_rows]
+    np.testing.assert_allclose(result[unchanged_rows, :], c_init[unchanged_rows, :],
+                                rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.gpu
+def test_masked_offset_stride_j_dim_python_backend():
+    """Offset+stride in column dimension: cols 2,4,...,14 updated."""
+    rng = np.random.default_rng(4006)
+    a_np = rng.random((16, 16)).astype(np.float32)
+    b_np = rng.random((16, 16)).astype(np.float32)
+    c_init = rng.random((16, 16)).astype(np.float32)
+    c_np = c_init.copy()
+
+    sdfg = pybe_strided_offset_j_add.to_sdfg(simplify=True)
+    _pipeline_py(sdfg, apply_map_collapse_and_tiling=True, tile_shape=(16, 16))
+    csdfg = sdfg.compile()
+    assert csdfg is not None
+
+    csdfg(A=cp.asarray(a_np), B=cp.asarray(b_np), C=(c_cp := cp.asarray(c_np)))
+    result = cp.asnumpy(c_cp)
+
+    updated_cols = list(range(2, 16, 2))
+    np.testing.assert_allclose(result[:, updated_cols], (a_np + b_np)[:, updated_cols],
+                                rtol=1e-5, atol=1e-6)
+    unchanged_cols = [c for c in range(16) if c not in updated_cols]
+    np.testing.assert_allclose(result[:, unchanged_cols], c_init[:, unchanged_cols],
+                                rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.gpu
+def test_masked_offset_stride_both_dims_python_backend():
+    """Offset+stride in both dims: rows 2,4,...,14 x cols 1,3,...,15 updated."""
+    rng = np.random.default_rng(4007)
+    a_np = rng.random((16, 16)).astype(np.float32)
+    b_np = rng.random((16, 16)).astype(np.float32)
+    c_init = rng.random((16, 16)).astype(np.float32)
+    c_np = c_init.copy()
+
+    sdfg = pybe_strided_offset_both_add.to_sdfg(simplify=True)
+    _pipeline_py(sdfg, apply_map_collapse_and_tiling=True, tile_shape=(16, 16))
+    csdfg = sdfg.compile()
+    assert csdfg is not None
+
+    csdfg(A=cp.asarray(a_np), B=cp.asarray(b_np), C=(c_cp := cp.asarray(c_np)))
+    result = cp.asnumpy(c_cp)
+
+    updated_rows = list(range(2, 16, 2))
+    updated_cols = list(range(1, 16, 2))
+    for r in updated_rows:
+        np.testing.assert_allclose(result[r, updated_cols], (a_np + b_np)[r, updated_cols],
+                                    rtol=1e-5, atol=1e-6)
+    for r in range(16):
+        for c in range(16):
+            if r not in updated_rows or c not in updated_cols:
+                np.testing.assert_allclose(result[r, c], c_init[r, c],
+                                            rtol=1e-5, atol=1e-6)
+
+
 def test_symbolic_masked_stride2_add_validates_sdfg():
     """SDFG with strided map and Python backend must pass validation before compile."""
     sdfg = pybe_strided_i2_add.to_sdfg(simplify=True)
     _pipeline_py(sdfg, apply_map_collapse_and_tiling=True, tile_shape=(16, 16))
     sdfg.expand_library_nodes()
     sdfg.validate()
+
+
+def test_offset_stride_codegen_uses_gather():
+    """Offset+stride map generates ct.gather instead of ct.load."""
+    sdfg = pybe_strided_offset_add.to_sdfg(simplify=True)
+    _pipeline_py(sdfg, apply_map_collapse_and_tiling=True, tile_shape=(16, 16))
+    code = _frame_code_of(sdfg)
+    assert "ct.gather(" in code, f"Expected ct.gather in generated code, got:\n{code}"
+    assert "ct.scatter(" in code, f"Expected ct.scatter in generated code, got:\n{code}"
+
+
+def test_zero_start_codegen_uses_load():
+    """Zero-start map generates ct.load, not ct.gather."""
+    sdfg = pybe_strided_i2_add.to_sdfg(simplify=True)
+    _pipeline_py(sdfg, apply_map_collapse_and_tiling=True, tile_shape=(16, 16))
+    code = _frame_code_of(sdfg)
+    assert "ct.load(" in code, f"Expected ct.load in generated code, got:\n{code}"
+    # ct.gather should NOT appear for zero-start maps
+    assert "ct.gather(" not in code, f"Unexpected ct.gather in code for zero-start map"
 
 
 if __name__ == "__main__":

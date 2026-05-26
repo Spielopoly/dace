@@ -709,7 +709,8 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
 
     @staticmethod
     def _build_contiguous_outer_subset(tasklet_subset: subsets.Range,
-                                       inner_map: nodes.Map) -> subsets.Range:
+                                       inner_map: nodes.Map,
+                                       upper_bounds: Optional[dict[str, sp.Basic]] = None) -> subsets.Range:
         """Lift scalar tasklet accesses to cover the full tile from 0 to max.
 
         For each accessed dimension, substitutes the inner-map parameter with
@@ -723,6 +724,11 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
                 tasklet access memlet to lift.
             inner_map: The inner :class:`~dace.sdfg.nodes.Map` whose parameter
                 bounds are used for substitution.
+            upper_bounds: Optional mapping from inner-map parameter names to
+                explicit upper-bound expressions.  When provided, the given
+                value is used instead of ``Max(start, end)`` for the
+                corresponding parameter.  This is used by the masked path to
+                ensure memlets cover the full tile shape.
 
         Returns:
             A :class:`~dace.subsets.Range` covering the full tile from
@@ -737,18 +743,22 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
         if not isinstance(tasklet_subset, subsets.Range):
             raise TypeError("Expected range subset on tasklet memlet.")
 
-        # Tile covers from 0 to Max(start, end) per dimension, matching the
-        # tile shape Max(start, end) + 1.
-        param_bounds = {
-            str(pname): (
-                sp.Integer(0),
-                sp.Max(
+        # Tile covers from 0 to the upper bound per dimension.
+        # When upper_bounds is provided, use the caller-supplied value;
+        # otherwise fall back to Max(start, end) to match the tile shape
+        # Max(start, end) + 1 from _calculate_tile_shape.
+        param_bounds = {}
+        for d, (pname, (start, end, _)) in enumerate(
+                zip(inner_map.params, inner_map.range)):
+            pname_str = str(pname)
+            if upper_bounds is not None and pname_str in upper_bounds:
+                high = upper_bounds[pname_str]
+            else:
+                high = sp.Max(
                     _ScalarToTileBase._to_sympy_expr(start),
                     _ScalarToTileBase._to_sympy_expr(end),
-                ),
-            )
-            for pname, (start, end, _) in zip(inner_map.params, inner_map.range)
-        }
+                )
+            param_bounds[pname_str] = (sp.Integer(0), high)
 
         new_ranges = []
         for rng in tasklet_subset:
@@ -1022,9 +1032,13 @@ class ScalarToTileMasked(_ScalarToTileBase):
     nodes.
 
     Non-canonical ranges (offset starts, negative/strided bounds) are mapped
-    to a bounding tile.  A symbolic condition is embedded directly in the
-    library node and evaluated per element during expansion—no runtime mask
-    array is allocated or filled.
+    to a zero-based tile whose shape is ``Max(start, end) + 1`` per dimension.
+    For skewed maps (produced by ``MapTiling(skew=True)``), the tile shape is
+    extended to ``outer_step / abs(inner_step)`` to recover the original
+    ``tile_size`` parameter, ensuring power-of-2 compatibility with the cuTile
+    Python backend.  A symbolic condition is embedded directly in the library
+    node and evaluated per element during expansion — no runtime mask array is
+    allocated or filled.
 
     Masked-out lanes must preserve their original values.  This is achieved
     by preloading the current output tile into the library node's ``_c_in``
@@ -1034,6 +1048,99 @@ class ScalarToTileMasked(_ScalarToTileBase):
     The library node's ``mask_condition`` property is set to a SymPy expression
     that uses ``__m0``, ``__m1``, … as tile coordinate variables.
     """
+
+    def _calculate_tile_shape(self) -> tuple[sp.Basic | int, ...]:
+        """Tile shape from inner-map range, extended for skewed maps.
+
+        Starts with the base-class shape (``Max(start, end) + 1`` per
+        dimension), then for skewed dimensions (``start == 0``, indicating
+        ``MapTiling(skew=True)`` was applied) extends the tile to
+        ``outer_step / abs(inner_step)``.  This recovers the original
+        ``tile_size`` parameter from ``MapTiling``, which is guaranteed to
+        be a power of 2 when the pipeline requests it.
+
+        The extension is safe because:
+
+        * Load/store memlets still cover only the valid range (from
+          ``_build_contiguous_outer_subset``), so no out-of-bounds memory
+          accesses occur.
+        * The mask condition excludes the extra tile positions.
+        * The extra positions in the tile transient are padding — they are
+          never stored back to global memory.
+        * For the C++ expansion path, the extra positions contain
+          uninitialized memory.  The mask condition excludes them from
+          computation, and the store memlet limits the writeback range,
+          so they do not affect correctness.
+
+        .. warning::
+
+            The ``start == 0`` heuristic for detecting skewed maps is
+            fragile.  It assumes that a zero-based inner-map start implies
+            ``MapTiling(skew=True)`` was applied.  If a user manually
+            constructs a zero-based non-unit-stride map without an outer
+            tiling map, this heuristic would incorrectly try to derive a
+            tile size from the outer map step — but the ``sp.Max`` guard
+            ensures the tile never shrinks, only grows.
+        """
+        base_shape = list(super()._calculate_tile_shape())
+
+        for d, (start, end, step) in enumerate(self._inner_entry.map.range):
+            start_expr = self._to_sympy_expr(start)
+            step_expr = self._to_sympy_expr(step)
+
+            # Detect skewed dimension: start == 0 suggests MapTiling(skew=True)
+            # subtracted the outer map parameter from the original start.
+            if (start_expr == sp.Integer(0)
+                    and d < len(self._outer_entry.map.range)):
+                _, _, outer_step = self._outer_entry.map.range[d]
+                outer_step_expr = self._to_sympy_expr(outer_step)
+                # Recover original tile_size: outer_step = tile_size * abs(inner_step)
+                tile_from_outer = outer_step_expr / sp.Abs(step_expr)
+                if not tile_from_outer.is_Number:
+                    tile_from_outer = sp.simplify(tile_from_outer)
+                # Take the larger of the base shape and derived tile size.
+                # This ensures we never shrink the tile, only extend it.
+                base_shape[d] = sp.Max(base_shape[d], tile_from_outer)
+
+        return tuple(base_shape)
+
+    def _clamp_subset_to_array_bounds(
+        self,
+        subset: subsets.Range,
+        data_name: str,
+    ) -> subsets.Range:
+        """Clamp each dimension's upper bound to the array descriptor's size.
+
+        Global-to-tile staging memlets must stay within array bounds for
+        DaCe validation.  The tile transient may be larger than the
+        remaining array slice (e.g. boundary tiles or non-aligned
+        offsets), so we clamp each range dimension with
+        ``Min(unclamped_upper, array_dim_size - 1)``.
+
+        The cuTile runtime handles actual boundary masking -- loads pad
+        out-of-bounds lanes (``padding_mode``), and stores silently
+        ignore them.
+
+        :param subset: The unclamped :class:`~dace.subsets.Range`.
+        :param data_name: Name of the global array in
+            ``self._sdfg.arrays``.
+        :returns: A new :class:`~dace.subsets.Range` with clamped upper
+            bounds.
+        """
+        desc = self._sdfg.arrays.get(data_name)
+        if desc is None:
+            return subset
+        clamped_ranges: list[tuple[sp.Basic, sp.Basic, sp.Basic]] = []
+        for dim_i, (low, high, step) in enumerate(subset):
+            if dim_i < len(desc.shape):
+                array_max = self._to_sympy_expr(desc.shape[dim_i]) - 1
+                clamped_high = sp.Min(
+                    self._to_sympy_expr(high), array_max
+                )
+                clamped_ranges.append((low, clamped_high, step))
+            else:
+                clamped_ranges.append((low, high, step))
+        return subsets.Range(clamped_ranges)
 
     def _has_valid_inner_map_ranges(self) -> bool:
         """Return ``True`` for inner maps with non-zero strides.
@@ -1114,10 +1221,21 @@ class ScalarToTileMasked(_ScalarToTileBase):
         return self._has_safe_contiguous_subset_bounding()
 
     def _build_memlet(self, map_edge: MultiConnectorEdge[Memlet], tasklet_edge: MultiConnectorEdge[Memlet]) -> Memlet:
-        """Build a contiguous outer-subset memlet covering the inner map's footprint.
+        """Build a Min-clamped contiguous outer-subset memlet for the tile.
 
-        Converts scalar index expression(s) to a contiguous outer tile range
-        that covers all points visited by the inner map.
+        cuTile always loads and stores the entire tile, so memlets must
+        cover the full tile shape -- not just the inner-map's reachable
+        range.  Upper bounds for each inner-map parameter are derived
+        from ``self._tile_shape`` to ensure the memlet and transient
+        agree.
+
+        Because tile shapes may exceed the remaining array extent at
+        boundary tiles (e.g. when the array size is not a multiple of
+        the tile size), the resulting subset is clamped with
+        ``Min(unclamped_upper, array_dim_size - 1)`` via
+        :meth:`_clamp_subset_to_array_bounds`.  This keeps the memlet
+        within array bounds for DaCe validation while the cuTile runtime
+        handles actual boundary masking (load padding, store ignoring).
 
         Args:
             map_edge: The outer-entry-to-inner-entry edge whose ``data.data``
@@ -1126,14 +1244,25 @@ class ScalarToTileMasked(_ScalarToTileBase):
                 scalar index expression to lift.
 
         Returns:
-            A :class:`~dace.Memlet` with a contiguous outer subset.
+            A :class:`~dace.Memlet` with the lifted, Min-clamped contiguous
+            outer subset covering the full tile shape.
         """
         tasklet_subset = primary_memlet_subset(tasklet_edge.data)
         if tasklet_subset is None:
             raise ValueError("ScalarToTileMasked expects tasklet memlets to define a subset")
+
+        # Derive upper bounds from tile shape so memlets cover the full tile.
+        upper_bounds = {
+            str(pname): self._to_sympy_expr(self._tile_shape[d]) - 1
+            for d, pname in enumerate(self._inner_entry.map.params)
+            if d < len(self._tile_shape)
+        }
+
+        data_name = map_edge.data.data
         load_subset = self._build_contiguous_outer_subset(
-            tasklet_subset, self._inner_entry.map)
-        return with_primary_subset(map_edge.data, load_subset)
+            tasklet_subset, self._inner_entry.map, upper_bounds=upper_bounds)
+        clamped_subset = self._clamp_subset_to_array_bounds(load_subset, data_name)
+        return with_primary_subset(map_edge.data, clamped_subset)
 
     def _configure_library_node(self) -> None:
         """Configure the library node and set the symbolic mask condition.
@@ -1154,6 +1283,11 @@ class ScalarToTileMasked(_ScalarToTileBase):
         the output array and feeds them to the library node's ``_c_in``
         connector.  The library node's expansion uses these values for
         masked-out elements (``else { _c[i] = _c_in[i]; }``).
+
+        The preload read memlet is Min-clamped via
+        :meth:`_clamp_subset_to_array_bounds` so that boundary tiles
+        (where the tile extends past the array extent) stay within
+        array bounds for DaCe validation.
 
         Wiring::
 
@@ -1191,8 +1325,16 @@ class ScalarToTileMasked(_ScalarToTileBase):
         tasklet_subset = primary_memlet_subset(tasklet_out_edge.data)
         if tasklet_subset is None:
             raise ValueError("ScalarToTileMasked expects output tasklet memlets to define a subset")
+        # Use tile-shape-derived upper bounds so the preload covers the
+        # full tile -- matching the store memlet built by _build_memlet.
+        upper_bounds = {
+            str(pname): self._to_sympy_expr(self._tile_shape[d]) - 1
+            for d, pname in enumerate(self._inner_entry.map.params)
+            if d < len(self._tile_shape)
+        }
         outer_subset = self._build_contiguous_outer_subset(
-            tasklet_subset, self._inner_entry.map)
+            tasklet_subset, self._inner_entry.map, upper_bounds=upper_bounds)
+        outer_subset = self._clamp_subset_to_array_bounds(outer_subset, data_name)
 
         # 4. Add a new input connector pair on outer_entry.
         conn_base = self._outer_entry.next_connector("preload")

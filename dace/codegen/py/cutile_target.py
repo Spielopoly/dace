@@ -53,6 +53,7 @@ def _map_index_exprs(entry: nodes.MapEntry) -> List[str]:
 
 
 def _ordered_unique(items: Iterable[str]) -> List[str]:
+    # TODO: this is hardly guaranteed to always work
     seen: Dict[str, None] = {}
     for x in items:
         if x not in seen:
@@ -116,7 +117,14 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
     def __init__(self, frame_codegen: "DaCePythonCodeGenerator", sdfg: "SDFG") -> None:
         self._frame = frame_codegen
         self._dispatcher = frame_codegen.dispatcher
-        self._tile_loads_by_entry: Dict[int, Tuple[Dict[str, str], List[str]]] = {}
+        # Cache keyed by MapEntry id(node).  Each value is a tuple of:
+        #   (mapping, map_index_exprs, needs_gather, gather_idx_cache)
+        # where *gather_idx_cache* maps array names to their index-tile
+        # variable lists (used by scatter stores in MapExit).
+        self._tile_loads_by_entry: Dict[
+            int,
+            Tuple[Dict[str, str], List[str], bool, Dict[str, List[str]]]
+        ] = {}
         self._dispatcher.register_map_dispatcher(dtypes.ScheduleType.CuTile, self)
         self._dispatcher.register_node_dispatcher(self, predicate=self._is_in_cutile_scope)
 
@@ -141,6 +149,156 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
     def _is_in_cutile_scope(sdfg: "SDFG", state: "SDFGState", node: nodes.Node) -> bool:
         return _is_cutile_node(state, node)
 
+    @staticmethod
+    def _needs_gather(entry: nodes.MapEntry,
+                      tile_shapes: Dict[str, Tuple[int, ...]],
+                      sdfg: "SDFG") -> bool:
+        """Check if gather/scatter is needed instead of ct.load/ct.store.
+
+        Returns ``True`` if the outer map's start is non-zero or the
+        outer map's step doesn't match the tile transient shape in any
+        dimension.  In those cases, ``ct.load``'s implicit tile grid
+        (``pid * tile_shape``) doesn't align with the actual tile
+        position (``start + pid * step``), so we must use
+        ``ct.gather``/``ct.scatter`` with explicit index computation
+        instead.
+
+        :param entry: The outer :class:`~dace.sdfg.nodes.MapEntry`.
+        :param tile_shapes: Mapping from tile transient name to its
+            shape tuple (resolved to ints).
+        :param sdfg: The SDFG (for symbol resolution).
+        :returns: ``True`` if gather/scatter is needed.
+        """
+        if not tile_shapes:
+            return False
+        # Use the first tile shape to compare (all tiles in the same
+        # scope should have the same tile dimensions).
+        first_shape = next(iter(tile_shapes.values()))
+        for d, (start, _, step) in enumerate(entry.map.range):
+            start_val = sp.sympify(start)
+            step_val = sp.sympify(step)
+            if start_val != 0:
+                return True
+            if d < len(first_shape):
+                tile_dim = first_shape[d]
+                if sp.sympify(step_val) != sp.sympify(tile_dim):
+                    return True
+        return False
+
+    @staticmethod
+    def _resolve_tile_shapes(entry: nodes.MapEntry, state: "SDFGState",
+                             sdfg: "SDFG",
+                             mapping: Dict[str, str]) -> Dict[str, Tuple]:
+        """Get tile shapes from transient descriptors.
+
+        Instead of computing tile shape from memlet subsets (which may
+        be Min-clamped), read the shape from the tile transient's
+        descriptor.  These always have the full power-of-2 tile shape.
+
+        :param entry: The outer MapEntry node.
+        :param state: The SDFG state.
+        :param sdfg: The SDFG.
+        :param mapping: tile_key to tile_var mapping from edge processing.
+        :returns: Mapping from tile_key to shape tuple (resolved to ints).
+        """
+        _tile_subs = {sp.Symbol(p): r[0]
+                      for p, r in zip(entry.map.params, entry.map.range)}
+        _sym_subs = {sp.Symbol(s): sp.Integer(2**31) for s in sdfg.symbols}
+
+        result: Dict[str, Tuple] = {}
+        for tile_key in mapping:
+            if tile_key in sdfg.arrays and sdfg.arrays[tile_key].transient:
+                desc = sdfg.arrays[tile_key]
+                resolved = []
+                for s in desc.shape:
+                    val = sp.sympify(s).subs(_tile_subs).subs(_sym_subs)
+                    resolved.append(
+                        int(val) if val.is_Number else symstr(val))
+                result[tile_key] = tuple(resolved)
+        return result
+
+    def _emit_gather_load(self, callsite_stream: PythonCodeIOStream,
+                          arr: str, tile_var: str,
+                          map_index_exprs: List[str],
+                          tile_shape: Tuple,
+                          cfg: object, state_id: int) -> List[str]:
+        """Emit ``ct.gather`` with computed index tiles for non-aligned loads.
+
+        Generates per-dimension index tiles via ``ct.arange`` and
+        ``ct.broadcast_to``, then calls ``ct.gather`` to load elements
+        at arbitrary global positions.  This handles tiles that don't
+        align with ``ct.load``'s implicit grid.
+
+        :param callsite_stream: Code output stream.
+        :param arr: Global array variable name.
+        :param tile_var: Destination tile variable name.
+        :param map_index_exprs: Per-dimension map variable expressions
+            (e.g. ``["(2 + __pid0 * 32)"]``).
+        :param tile_shape: Tile shape tuple (resolved to ints).
+        :param cfg: The control flow graph.
+        :param state_id: The state ID.
+        :returns: List of index variable names (for reuse by scatter store).
+        """
+        ndim = len(tile_shape)
+        idx_vars: List[str] = []
+
+        for d in range(ndim):
+            idx_var = f"__ct_gidx_{tile_var}_{d}"
+            callsite_stream.write(
+                f"{idx_var} = {map_index_exprs[d]} + "
+                f"ct.arange({tile_shape[d]}, dtype=ct.int32)",
+                cfg, state_id)
+            idx_vars.append(idx_var)
+
+        if ndim > 1:
+            broadcast_vars: List[str] = []
+            shape_str = ", ".join(str(s) for s in tile_shape)
+            for d, idx_var in enumerate(idx_vars):
+                reshape_dims = tuple(
+                    tile_shape[d] if i == d else 1
+                    for i in range(ndim))
+                reshape_str = ", ".join(str(x) for x in reshape_dims)
+                bcast_var = f"{idx_var}_nd"
+                callsite_stream.write(
+                    f"{bcast_var} = ct.broadcast_to("
+                    f"ct.reshape({idx_var}, ({reshape_str},)), "
+                    f"({shape_str},))",
+                    cfg, state_id)
+                broadcast_vars.append(bcast_var)
+            indices_str = ", ".join(broadcast_vars)
+        else:
+            indices_str = idx_vars[0]
+            broadcast_vars = idx_vars
+
+        callsite_stream.write(
+            f"{tile_var} = ct.gather({arr}, ({indices_str},), "
+            f"padding_value=0)",
+            cfg, state_id)
+
+        return broadcast_vars if ndim > 1 else idx_vars
+
+    def _emit_scatter_store(self, callsite_stream: PythonCodeIOStream,
+                            arr: str, tile_expr: str,
+                            gather_idx_vars: List[str],
+                            cfg: object, state_id: int) -> None:
+        """Emit ``ct.scatter`` with precomputed index tiles.
+
+        Reuses the index tile variables generated by
+        :meth:`_emit_gather_load` to scatter tile elements back to
+        the global array at the correct positions.
+
+        :param callsite_stream: Code output stream.
+        :param arr: Global array variable name.
+        :param tile_expr: Tile expression to store.
+        :param gather_idx_vars: Index variable names from gather load.
+        :param cfg: The control flow graph.
+        :param state_id: The state ID.
+        """
+        indices_str = ", ".join(gather_idx_vars)
+        callsite_stream.write(
+            f"ct.scatter({arr}, ({indices_str},), {tile_expr})",
+            cfg, state_id)
+
     def generate_node(self, sdfg: "SDFG", cfg: object, dfg: object, state_id: int,
                       node: nodes.Node, function_stream: PythonCodeIOStream,
                       callsite_stream: PythonCodeIOStream) -> None:
@@ -164,7 +322,10 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
         for var, expr in zip(node.map.params, map_index_exprs):
             callsite_stream.write(f"{var} = {expr}", cfg, state_id)
 
+        # --- Build tile_key -> tile_var mapping from input edges ---
         mapping: Dict[str, str] = {}
+        # Track which global array feeds each tile_key (for gather loads).
+        tile_key_to_arr: Dict[str, str] = {}
         next_idx = 0
         for in_edge in state.in_edges(node):
             if in_edge.data is None or in_edge.data.data is None:
@@ -187,29 +348,75 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
             if tile_key in mapping:
                 continue
             mapping[tile_key] = tile_var
-            inner_subset = _inner_subset_for_entry_edge(state, node, in_edge)
-            # Resolve symbolic Min/Max in tile sizes by substituting map
-            # params with their start values.  All tiles (except boundary
-            # tiles, handled by the cuTile runtime) have the same shape,
-            # so evaluating at the first tile position yields the correct
-            # constant tile dimensions.  After that, any remaining free
-            # symbols (e.g. array-size symbols like N) are sent to +inf
-            # so that Min(tile_size, N) collapses to tile_size — the
-            # cuTile runtime handles boundary masking for the last tile.
-            _tile_subs = {sp.Symbol(p): r[0]
-                          for p, r in zip(node.map.params, node.map.range)}
-            _sym_subs = {sp.Symbol(s): sp.oo for s in sdfg.symbols}
-            resolved_sizes = []
-            for s in inner_subset.size():
-                val = sp.sympify(s).subs(_tile_subs).subs(_sym_subs)
-                resolved_sizes.append(symstr(val))
-            shape = ", ".join(resolved_sizes)
-            callsite_stream.write(
-                f"{tile_var} = ct.load({arr}, index=({cutile_index},), shape=({shape},))",
-                cfg, state_id,
-            )
+            tile_key_to_arr[tile_key] = arr
 
-        self._tile_loads_by_entry[id(node)] = (mapping, map_index_exprs)
+        # --- Resolve tile shapes from transient descriptors ---
+        tile_shapes = self._resolve_tile_shapes(node, state, sdfg, mapping)
+
+        # --- Check alignment to decide ct.load vs ct.gather ---
+        needs_gather = self._needs_gather(node, tile_shapes, sdfg)
+
+        # --- Emit loads for each tile ---
+        gather_idx_cache: Dict[str, List[str]] = {}
+        for tile_key, tile_var in mapping.items():
+            arr = tile_key_to_arr[tile_key]
+            tile_shape = tile_shapes.get(tile_key)
+
+            if tile_shape is None:
+                # Fallback: resolve shape from memlet subset (legacy path).
+                inner_subset = None
+                for in_edge in state.in_edges(node):
+                    if in_edge.data is None or in_edge.data.data is None:
+                        continue
+                    inner_dst = self._inner_dst_for_entry_edge(
+                        state, node, in_edge)
+                    if (isinstance(inner_dst, nodes.AccessNode)
+                            and inner_dst.data == tile_key):
+                        inner_subset = _inner_subset_for_entry_edge(
+                            state, node, in_edge)
+                        break
+                    if in_edge.data.data == tile_key:
+                        inner_subset = _inner_subset_for_entry_edge(
+                            state, node, in_edge)
+                        break
+                if inner_subset is not None:
+                    _tile_subs = {
+                        sp.Symbol(p): r[0]
+                        for p, r in zip(node.map.params, node.map.range)}
+                    _sym_subs = {
+                        sp.Symbol(s): sp.Integer(2**31)
+                        for s in sdfg.symbols}
+                    resolved_sizes = []
+                    for s in inner_subset.size():
+                        val = sp.sympify(s).subs(_tile_subs).subs(_sym_subs)
+                        resolved_sizes.append(symstr(val))
+                    shape_str = ", ".join(resolved_sizes)
+                else:
+                    shape_str = ""
+                callsite_stream.write(
+                    f"{tile_var} = ct.load({arr}, "
+                    f"index=({cutile_index},), shape=({shape_str},))",
+                    cfg, state_id,
+                )
+                continue
+
+            if needs_gather:
+                # Non-aligned: use ct.gather with explicit index tiles.
+                idx_vars = self._emit_gather_load(
+                    callsite_stream, arr, tile_var,
+                    map_index_exprs, tile_shape, cfg, state_id)
+                gather_idx_cache[arr] = idx_vars
+            else:
+                # Aligned: use ct.load with tile-coordinate indices.
+                shape_str = ", ".join(str(s) for s in tile_shape)
+                callsite_stream.write(
+                    f"{tile_var} = ct.load({arr}, "
+                    f"index=({cutile_index},), shape=({shape_str},))",
+                    cfg, state_id,
+                )
+
+        self._tile_loads_by_entry[id(node)] = (
+            mapping, map_index_exprs, needs_gather, gather_idx_cache)
 
     @staticmethod
     def _inner_dst_for_entry_edge(state: "SDFGState", entry: nodes.MapEntry, in_edge):
@@ -226,7 +433,12 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
         entry = state.entry_node(node)
         cutile_index = ", ".join(f"__pid{d}" for d in range(len(entry.map.range)))
 
-        seen = set()
+        # Retrieve alignment info from MapEntry processing.
+        cache_entry = self._tile_loads_by_entry.get(id(entry))
+        needs_gather = cache_entry[2] if cache_entry is not None else False
+        gather_idx_cache = cache_entry[3] if cache_entry is not None else {}
+
+        seen: set = set()
         for in_edge in state.in_edges(node):
             if in_edge.dst_conn is None or not in_edge.dst_conn.startswith("IN_"):
                 continue
@@ -244,10 +456,59 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
                 if arr in seen:
                     continue
                 seen.add(arr)
-                callsite_stream.write(
-                    f"ct.store({arr}, index=({cutile_index},), tile={tile_expr})",
-                    cfg, state_id,
-                )
+                if needs_gather and arr in gather_idx_cache:
+                    # Non-aligned: use ct.scatter with precomputed index
+                    # tiles from the gather load phase.
+                    self._emit_scatter_store(
+                        callsite_stream, arr, tile_expr,
+                        gather_idx_cache[arr], cfg, state_id)
+                elif needs_gather:
+                    # Non-aligned but no cached indices for this array
+                    # (output-only array not loaded via gather).
+                    # Try to reuse index tiles from any cached input
+                    # (all tiles in the same scope share the same grid).
+                    if gather_idx_cache:
+                        reused_idx = next(iter(gather_idx_cache.values()))
+                        self._emit_scatter_store(
+                            callsite_stream, arr, tile_expr,
+                            reused_idx, cfg, state_id)
+                    else:
+                        # Build index tiles on the fly using the map
+                        # expressions and the tile transient's shape.
+                        map_index_exprs = (
+                            cache_entry[1]
+                            if cache_entry is not None else [])
+                        # Look up the tile transient from the inner
+                        # edge source (e.g. C_tile).
+                        tile_trans = tile_expr
+                        tile_shapes = self._resolve_tile_shapes(
+                            entry, state, sdfg,
+                            {tile_trans: tile_trans})
+                        tile_shape = tile_shapes.get(tile_trans)
+                        if tile_shape is not None:
+                            idx_vars = self._emit_gather_load(
+                                callsite_stream, arr,
+                                f"__ct_scatter_{arr}",
+                                map_index_exprs, tile_shape,
+                                cfg, state_id)
+                            self._emit_scatter_store(
+                                callsite_stream, arr, tile_expr,
+                                idx_vars, cfg, state_id)
+                        else:
+                            # Last-resort fallback: use ct.store.
+                            callsite_stream.write(
+                                f"ct.store({arr}, "
+                                f"index=({cutile_index},), "
+                                f"tile={tile_expr})",
+                                cfg, state_id,
+                            )
+                else:
+                    # Aligned: use ct.store with tile-coordinate indices.
+                    callsite_stream.write(
+                        f"ct.store({arr}, index=({cutile_index},), "
+                        f"tile={tile_expr})",
+                        cfg, state_id,
+                    )
 
     @staticmethod
     def _tile_expr_for_exit_in_edge(in_edge) -> Optional[str]:
@@ -265,7 +526,7 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
         entry = _enclosing_cutile_entry(state, node)
         if entry is None:
             raise RuntimeError("CuTile tasklet handler invoked outside a CuTile scope.")
-        mapping, _ = self._tile_loads_by_entry[id(entry)]
+        mapping = self._tile_loads_by_entry[id(entry)][0]
 
         init_code = codeblock_to_python(node.code_init).strip()
         if init_code:
@@ -322,6 +583,18 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
         # Internal transient access nodes inside a cuTile kernel are pure
         # Python locals — no code needed. ct.load / ct.store are handled at
         # the MapEntry / MapExit boundary.
+        #
+        # Note: access-to-access copies (AccessNode -> AccessNode) within a
+        # CuTile scope should be handled by library nodes, not direct copies.
+        # We do not error here because the current pipeline may produce valid
+        # patterns (e.g. staging edges) that flow through AccessNodes without
+        # requiring explicit copy codegen.
+        state = cfg.state(state_id)
+        for out_edge in state.out_edges(node):
+            if isinstance(out_edge.dst, nodes.AccessNode):
+                # Potential access-to-access copy — currently allowed but
+                # may indicate a missing library node expansion.
+                pass
         return
 
     def _generate_NestedSDFG(self, sdfg: "SDFG", cfg: object, dfg: object,
