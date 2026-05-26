@@ -58,7 +58,7 @@ def _ordered_unique(items: Iterable[str]) -> List[str]:
     for x in items:
         if x not in seen:
             seen[x] = None
-    return list(seen.keys())
+    return sorted(list(seen.keys()))
 
 
 def _collect_free_symbols(entry: nodes.MapEntry, dfg_scope, sdfg: "SDFG") -> List[str]:
@@ -77,6 +77,7 @@ def _outer_endpoint(state: "SDFGState", edge, downstream: bool = False):
 
 
 def _inner_subset_for_entry_edge(state: "SDFGState", entry: nodes.MapEntry, in_edge):
+    # TODO: avoid hard coded values
     if in_edge.dst_conn and in_edge.dst_conn.startswith("IN_"):
         outer_conn = "OUT_" + in_edge.dst_conn[len("IN_"):]
         for out_edge in state.out_edges_by_connector(entry, outer_conn):
@@ -169,6 +170,7 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
         :param sdfg: The SDFG (for symbol resolution).
         :returns: ``True`` if gather/scatter is needed.
         """
+        # TODO: complete redesign: if we need gather should not be checked at map scope but for each individual load / store
         if not tile_shapes:
             return False
         # Use the first tile shape to compare (all tiles in the same
@@ -217,8 +219,10 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
                 result[tile_key] = tuple(resolved)
         return result
 
-    def _emit_gather_load(self, callsite_stream: PythonCodeIOStream,
-                          arr: str, tile_var: str,
+    def _emit_gather_load(self,
+                          callsite_stream: PythonCodeIOStream,
+                          arr: str,
+                          tile_var: str,
                           map_index_exprs: List[str],
                           tile_shape: Tuple,
                           cfg: object, state_id: int) -> List[str]:
@@ -227,7 +231,8 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
         Generates per-dimension index tiles via ``ct.arange`` and
         ``ct.broadcast_to``, then calls ``ct.gather`` to load elements
         at arbitrary global positions.  This handles tiles that don't
-        align with ``ct.load``'s implicit grid.
+        align with ``ct.load``'s implicit grid for examples strided maps
+        or maps with non-zero start.
 
         :param callsite_stream: Code output stream.
         :param arr: Global array variable name.
@@ -243,10 +248,9 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
         idx_vars: List[str] = []
 
         for d in range(ndim):
-            idx_var = f"__ct_gidx_{tile_var}_{d}"
+            idx_var = f"__dace_ct_gidx_{tile_var}_{d}"
             callsite_stream.write(
-                f"{idx_var} = {map_index_exprs[d]} + "
-                f"ct.arange({tile_shape[d]}, dtype=ct.int32)",
+                f"{idx_var} = {map_index_exprs[d]} + ct.arange({tile_shape[d]}, dtype=ct.int32)",
                 cfg, state_id)
             idx_vars.append(idx_var)
 
@@ -305,8 +309,7 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
         method = getattr(self, f"_generate_{type(node).__name__}", None)
         if method is None:
             raise NotImplementedError(
-                f"CuTile backend has no handler for {type(node).__name__}; "
-                f"extend CuTilePythonCodeGen with a _generate_{type(node).__name__} method.")
+                f"CuTile backend has no handler for {type(node).__name__}.")
         method(sdfg, cfg, dfg, state_id, node, function_stream, callsite_stream)
 
     def _generate_MapEntry(self, sdfg, cfg, dfg, state_id, node: nodes.MapEntry,
@@ -768,6 +771,9 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
         function_stream.write("")
 
         padded_grid = (grid_exprs + ["1", "1", "1"])[:3]
+        if len(grid_exprs) > 3:
+            # TODO: support >3D grids by flattening extra dimensions into the 3D grid or via multiple kernel launches.
+            raise NotImplementedError("CuTile backend does not support >3D grids yet.")
         grid_tuple = f"({', '.join(padded_grid)})"
         deduped_arrays = list(dict.fromkeys(input_arrays + output_arrays))
         launch_args = ([_array_runtime_name(sdfg, n) for n in deduped_arrays]
