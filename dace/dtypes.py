@@ -38,6 +38,7 @@ class StorageType(ExtensibleAttributeEnum):
     CPU_ThreadLocal = auto()  #: Thread-local host memory
     GPU_Global = auto()  #: GPU global memory
     GPU_Shared = auto()  #: On-GPU shared memory
+    CuTile_Tile = auto()  #: cuTile tile register (tile-level data inside a cuTile kernel)
     SVE_Register = auto()  #: SVE register
     Snitch_TCDM = auto()  #: Cluster-private memory
     Snitch_L2 = auto()  #: External memory
@@ -203,7 +204,7 @@ SCOPEDEFAULT_STORAGE = {
     ScheduleType.SVE_Map: StorageType.CPU_Heap,
     ScheduleType.Snitch: StorageType.Snitch_TCDM,
     ScheduleType.GPU_Warp: StorageType.Register,
-    ScheduleType.CuTile: StorageType.GPU_Global,
+    ScheduleType.CuTile: StorageType.CuTile_Tile,
 }
 
 # Maps from ScheduleType to default ScheduleType for sub-scopes
@@ -234,6 +235,7 @@ STORAGEDEFAULT_SCHEDULE = {
     StorageType.GPU_Global: ScheduleType.GPU_Device,
     StorageType.GPU_Shared: ScheduleType.GPU_ThreadBlock,
     StorageType.SVE_Register: ScheduleType.SVE_Map,
+    StorageType.CuTile_Tile: ScheduleType.CuTile,
 }
 
 # Translation of types to C types
@@ -1532,6 +1534,8 @@ def can_access(schedule: ScheduleType, storage: StorageType):
             ScheduleType.GPU_ThreadBlock_Dynamic,
     ]:
         return storage in [StorageType.GPU_Global, StorageType.GPU_Shared, StorageType.CPU_Pinned]
+    elif schedule == ScheduleType.CuTile:
+        return storage in [StorageType.CuTile_Tile, StorageType.GPU_Global, StorageType.CPU_Pinned]
     elif schedule in [ScheduleType.Default, ScheduleType.CPU_Multicore, ScheduleType.CPU_Persistent]:
         return storage in [
             StorageType.Default, StorageType.CPU_Heap, StorageType.CPU_Pinned, StorageType.CPU_ThreadLocal
@@ -1575,6 +1579,10 @@ def can_allocate(storage: StorageType, schedule: ScheduleType):
             ScheduleType.GPU_Device, ScheduleType.GPU_ThreadBlock, ScheduleType.GPU_ThreadBlock_Dynamic,
             ScheduleType.GPU_Persistent
         ]
+
+    # cuTile tile-level memory
+    if storage == StorageType.CuTile_Tile:
+        return schedule == ScheduleType.CuTile
 
     # The rest (Registers) can be allocated everywhere
     return True

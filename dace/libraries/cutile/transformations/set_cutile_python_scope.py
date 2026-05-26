@@ -80,3 +80,8 @@ class SetCuTilePythonScope(xf.SingleStateTransformation):
         for node in scope.nodes():
             if isinstance(node, nodes.LibraryNode) and self._is_supported_cutile_library_node(node):
                 node.implementation = "cutile_python"
+            elif isinstance(node, nodes.AccessNode):
+                desc = sdfg.arrays.get(node.data)
+                if desc is not None and desc.transient:
+                    if desc.storage == dtypes.StorageType.Default:
+                        desc.storage = dtypes.StorageType.CuTile_Tile

@@ -62,26 +62,27 @@ def _frame_code_of(sdfg: dace.SDFG) -> str:
 def test_frontend_add_python_backend_codegen():
     sdfg = frontend_add.to_sdfg(simplify=True)
     sdfg.backend = dtypes.BackendLanguage.Python
-    _set_cutile_schedule(sdfg)
+    apply_cutile_pipeline(sdfg)
     assert _all_map_schedules(sdfg)
-    assert all(s == dtypes.ScheduleType.CuTile for s in _all_map_schedules(sdfg))
+    assert any(s == dtypes.ScheduleType.CuTile for s in _all_map_schedules(sdfg))
 
     frame_code = _frame_code_of(sdfg)
     assert "@ct.kernel" in frame_code
     assert "ct.launch" in frame_code
-    assert "__ct_t" in frame_code
+    assert "ct.load" in frame_code
 
 
 def test_frontend_selfadd_python_backend_codegen():
     sdfg = frontend_selfadd.to_sdfg(simplify=True)
     sdfg.backend = dtypes.BackendLanguage.Python
-    _set_cutile_schedule(sdfg)
+    apply_cutile_pipeline(sdfg)
 
     frame_code = _frame_code_of(sdfg)
     assert "@ct.kernel" in frame_code
     assert "ct.launch" in frame_code
-    # self-add should reference the same input tile variable multiple times
-    assert frame_code.count("__ct_t") >= 2
+    # Self-add: A is loaded once (deduplicated) and stored to C
+    assert "ct.load(A," in frame_code
+    assert "ct.store(C," in frame_code
 
 
 def test_frontend_add_without_cutile_schedule_no_cutile_codegen():

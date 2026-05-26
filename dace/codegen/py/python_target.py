@@ -144,8 +144,7 @@ class PythonCodeGen(PythonTargetCodeGenerator):
             dtypes.ScheduleType.CPU_Persistent,
             dtypes.ScheduleType.Sequential,
         ]
-        # TODO: Move cutile schedule copy to cutile target?
-        COPY_SCHEDULES = [*SUPPORTED_SCHEDULES, dtypes.ScheduleType.CuTile]
+        COPY_SCHEDULES = [*SUPPORTED_SCHEDULES]
         dispatcher.register_map_dispatcher(
             SUPPORTED_SCHEDULES,
             self)
