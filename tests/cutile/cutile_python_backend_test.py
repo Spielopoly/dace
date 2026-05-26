@@ -421,9 +421,6 @@ def test_tile_transient_2d_padded_shape():
 
     frame_code = _code_of(sdfg)
     
-    with open("generated_code.py", "w") as f:  # For debugging
-        f.write(frame_code)
-    
     load_match = _re.search(r"ct\.gather\(A,.*?shape=\(([^)]*)\)", frame_code)
     assert load_match is not None, f"No ct.gather(A, ...) found in:\n{frame_code}"
     shape_str = load_match.group(1).strip().rstrip(",").strip()
