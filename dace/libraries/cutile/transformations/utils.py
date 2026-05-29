@@ -143,10 +143,12 @@ def memlet_with_primary_subset(data_name: str,
     memlet = Memlet(data=data_name)
     if data_on_src is True:
         memlet._is_data_src = True
-        memlet.src_subset = primary_subset
+        # Deep-copy so each memlet owns its subset object; sharing a single
+        # Range across memlets fails SDFG validation's duplicate-subset check.
+        memlet.src_subset = copy.deepcopy(primary_subset)
     elif data_on_src is False:
         memlet._is_data_src = False
-        memlet.dst_subset = primary_subset
+        memlet.dst_subset = copy.deepcopy(primary_subset)
     else:
         memlet.src_subset = copy.deepcopy(primary_subset)
         memlet.dst_subset = copy.deepcopy(primary_subset)
