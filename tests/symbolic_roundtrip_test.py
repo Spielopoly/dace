@@ -213,6 +213,29 @@ def test_boolean_preserved_and_distinct_from_int():
     assert _roundtrip('True', cpp_mode=True) == 'true'
 
 
+def _truth_set(expr, lo=0, hi=6):
+    import itertools
+    syms = sorted(expr.free_symbols, key=str)
+    return {vals for vals in itertools.product(range(lo, hi), repeat=len(syms))
+            if bool(expr.subs(dict(zip(syms, vals))))}
+
+
+def test_boolean_serialize_symbolic_roundtrip():
+    # ``serialize_symbolic`` prints boolean And/Or with the ``&``/``|`` operators;
+    # ``deserialize_symbolic`` must parse those back (regression: the operator
+    # forms previously raised ``KeyError: ast.BitAnd`` on deserialization).
+    a, b, c = sympy.symbols('a b c')
+    for expr in (
+            sympy.And(a >= 1, b <= 4),
+            sympy.Or(a > 2, b < 1),
+            sympy.And(sympy.Or(a >= 1, b >= 1), c <= 3),
+            sympy.And(a >= 1, sympy.Eq(sympy.Mod(b, 2), 0)),
+    ):
+        s = symbolic.serialize_symbolic(expr)
+        back = symbolic.deserialize_symbolic(s)
+        assert _truth_set(expr) == _truth_set(back), (expr, s, back)
+
+
 def test_map_range_array_bound_is_hoisted():
     # An array access in a map-range bound must be hoisted to a dynamic-map-input symbol:
     # the range then carries a symbol (not a raw Subscript) and the array is wired as a

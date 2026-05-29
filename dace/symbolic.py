@@ -1739,6 +1739,12 @@ class _SerializedSymbolicParser(ast.NodeVisitor):
         ast.Pow: _binop_pow,
         ast.Mod: _binop_mod,
         ast.FloorDiv: lambda a, b: int_floor(a, b),
+        # Boolean ``And``/``Or`` are printed by the serializer using the ``&``
+        # and ``|`` operators (DaCe's bitwise functions serialize as explicit
+        # ``bitwise_and(...)``/``bitwise_or(...)`` calls instead), so the bare
+        # operators unambiguously denote boolean conjunction/disjunction here.
+        ast.BitAnd: lambda a, b: AND(a, b),
+        ast.BitOr: lambda a, b: OR(a, b),
     }
     _unaryops = {
         ast.UAdd: lambda a: +a,

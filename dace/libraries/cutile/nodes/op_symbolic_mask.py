@@ -22,7 +22,7 @@ from dace import dtypes, properties
 from dace import library
 from dace.sdfg import SDFG, SDFGState
 from dace.sdfg import nodes
-from dace.symbolic import symstr
+from dace.symbolic import symstr, serialize_symbolic, deserialize_symbolic
 from dace.transformation.transformation import ExpandTransformation
 from ..op_registry import TaskletType, MaskType, register_op
 from .base import (
@@ -129,6 +129,14 @@ class TileSymbolicMaskedOpLibraryNode(TileOpBase):
         dtype=sp.Basic,
         default=None,
         allow_none=True,
+        # ``mask_condition`` is a SymPy *boolean* (e.g. ``And``/``Or``), which is
+        # an ``sp.Basic`` but not an ``sp.Expr``, so the idiomatic
+        # ``SymbolicProperty`` (Expr-only) cannot hold it.  The generic
+        # serializer also does not round-trip symbolic values stored in a plain
+        # Property, so route (de)serialization through the symbolic helpers
+        # explicitly.
+        to_json=lambda v: serialize_symbolic(v) if v is not None else None,
+        from_json=lambda v, sdfg=None: deserialize_symbolic(v) if v is not None else None,
         desc=(
             "SymPy boolean expression using __m0, __m1, … symbols as "
             "per-dimension tile coordinates (0-based).  None means "

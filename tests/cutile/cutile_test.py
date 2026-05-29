@@ -1659,6 +1659,65 @@ def test_noncanonical_symbolic_positive_step_runtime():
         np.testing.assert_allclose(c, c_expected, rtol=0.0, atol=1e-12)
 
 
+def _mask_truth_set(expr, lo=0, hi=8):
+    """Truth table of a boolean SymPy mask over a small integer cube."""
+    import itertools
+    import sympy as sp
+    syms = sorted(expr.free_symbols, key=str)
+    out = set()
+    for vals in itertools.product(range(lo, hi), repeat=len(syms)):
+        if bool(expr.subs(dict(zip(syms, vals)))):
+            out.add(vals)
+    return out
+
+
+def test_symbolic_mask_condition_survives_json_roundtrip():
+    """A masked tile op's symbolic ``mask_condition`` must round-trip through
+    SDFG JSON (de)serialization and still produce correct results.
+
+    Regression test: SymPy boolean masks (``And``/``Or``) are stored in a plain
+    ``Property`` and printed by the serializer using ``&``/``|``.  The symbolic
+    deserializer must understand those operators, and the property must route
+    (de)serialization through the symbolic helpers, otherwise reloading any
+    saved masked cuTile SDFG fails.
+    """
+    sdfg = build_runtime_tiled_scalar_noncanonical_binary_sdfg(
+        ii_range="1:6:2",
+        jj_range="1:5",
+        op="+",
+        name="tile_add_masked_serde",
+        dtype=dace.float64,
+    )
+    count = apply_cutile_pipeline(sdfg, validate=True, apply_map_collapse_and_tiling=False)
+    assert count == 1
+
+    state = sdfg.states()[0]
+    lib = next(n for n in state.nodes() if isinstance(n, TileSymbolicMaskedOpLibraryNode))
+    orig_mask = lib.mask_condition
+    assert orig_mask is not None
+
+    # Round-trip through JSON.
+    sdfg2 = SDFG.from_json(sdfg.to_json())
+    state2 = sdfg2.states()[0]
+    lib2 = next(n for n in state2.nodes() if isinstance(n, TileSymbolicMaskedOpLibraryNode))
+    rt_mask = lib2.mask_condition
+    assert rt_mask is not None
+    # Logically identical (serializer may normalize, e.g. simplify Mod(x, 1)).
+    assert _mask_truth_set(orig_mask) == _mask_truth_set(rt_mask)
+
+    # The reloaded SDFG must still expand, compile, and compute correctly.
+    sdfg2.expand_library_nodes()
+    sdfg2.validate()
+    shape = (2, 2, 6, 5)
+    rng = np.random.default_rng(8484)
+    a = rng.uniform(-10.0, 10.0, size=shape).astype(np.float64)
+    b = rng.uniform(-10.0, 10.0, size=shape).astype(np.float64)
+    c = rng.uniform(-5.0, 5.0, size=shape).astype(np.float64)
+    c_expected = _expected_noncanonical_binary(a, b, c, range(1, 6, 2), range(1, 5, 1), np.add)
+    sdfg2(A=a, B=b, C=c)
+    np.testing.assert_allclose(c, c_expected, rtol=0.0, atol=1e-12)
+
+
 # ---------------------------------------------------------------------------
 # Masked add tests
 # ---------------------------------------------------------------------------
