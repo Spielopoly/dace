@@ -201,7 +201,7 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
 
         The canonical child rejects non-zero starts and non-unit strides;
         the masked child rejects zero strides but accepts everything else
-        (including reversed and offset ranges).
+        (offset starts and non-unit positive strides).
         """
         ...
 
@@ -262,11 +262,12 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
         """
         Tile shape from inner-map range maxima.
 
-        Per dimension, the tile shape is ``Max(start, end) + 1``.  The tile
-        always covers from index 0 up to the largest reachable coordinate,
-        which ensures power-of-2 friendly shapes and avoids ``Min``-based
-        bounding-box arithmetic.
-        
+        Per dimension, the tile shape is ``end + 1``.  Maps always use a
+        positive step (descending maps are rejected by SDFG validation), so
+        the inclusive ``end`` is the largest reachable coordinate and the tile
+        covers from index 0 up to it.  This ensures power-of-2 friendly shapes
+        and avoids bounding-box arithmetic.
+
         If the cutile pipeline is used, starting at 0 is (usually) not a big
         over-approximation, because Map-Tiling skews the inner maps to start at 0
 
@@ -276,12 +277,9 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
         """
         assert isinstance(self._inner_entry.map.range, subsets.Range)
         base_shape: list[sp.Basic] = []
-        for start, end, _ in self._inner_entry.map.range:
-            start_expr = self._to_sympy_expr(start)
+        for _start, end, _ in self._inner_entry.map.range:
             end_expr = self._to_sympy_expr(end)
-            base_shape.append(
-                sp.Max(start_expr, end_expr) + 1
-            )
+            base_shape.append(end_expr + 1)
 
         local_params = {
             str(pname) for pname in self._outer_entry.map.params
@@ -336,16 +334,17 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
         return any(str(symbol) in symbol_names for symbol in sym_expr.free_symbols)
 
     def _collect_local_map_parameter_bounds(self) -> dict[str, tuple[sp.Basic, sp.Basic]]:
-        """Collect conservative ``(low, high)`` bounds for inner/outer map params."""
+        """Collect conservative ``(low, high)`` bounds for inner/outer map params.
+
+        Maps always use a positive step, so ``start`` is the lower bound and
+        the inclusive ``end`` is the upper bound directly.
+        """
         bounds: dict[str, tuple[sp.Basic, sp.Basic]] = {}
         for map_node in (self._outer_entry.map, self._inner_entry.map):
             for pname, (start, end, _) in zip(map_node.params, map_node.range):
                 start_expr = self._to_sympy_expr(start)
                 end_expr = self._to_sympy_expr(end)
-                bounds[str(pname)] = (
-                    sp.Min(start_expr, end_expr),
-                    sp.Max(start_expr, end_expr),
-                )
+                bounds[str(pname)] = (start_expr, end_expr)
         return bounds
 
     @staticmethod
@@ -714,10 +713,10 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
         """Lift scalar tasklet accesses to cover the full tile from 0 to max.
 
         For each accessed dimension, substitutes the inner-map parameter with
-        bounds ``0`` (low) and ``Max(start, end)`` (high) and builds a
-        contiguous range that covers the full tile footprint starting at
-        index 0.  This matches the tile shape ``Max(start, end) + 1`` used
-        by ``_calculate_tile_shape``.
+        bounds ``0`` (low) and ``end`` (high) and builds a contiguous range
+        that covers the full tile footprint starting at index 0.  Maps always
+        use a positive step, so the inclusive ``end`` is the high bound; this
+        matches the tile shape ``end + 1`` used by ``_calculate_tile_shape``.
 
         Args:
             tasklet_subset: The scalar :class:`~dace.subsets.Range` on the
@@ -726,7 +725,7 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
                 bounds are used for substitution.
             upper_bounds: Optional mapping from inner-map parameter names to
                 explicit upper-bound expressions.  When provided, the given
-                value is used instead of ``Max(start, end)`` for the
+                value is used instead of the inclusive ``end`` for the
                 corresponding parameter.  This is used by the masked path to
                 ensure memlets cover the full tile shape.
 
@@ -745,8 +744,9 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
 
         # Tile covers from 0 to the upper bound per dimension.
         # When upper_bounds is provided, use the caller-supplied value;
-        # otherwise fall back to Max(start, end) to match the tile shape
-        # Max(start, end) + 1 from _calculate_tile_shape.
+        # otherwise fall back to the inclusive ``end`` (maps use a positive
+        # step, so end is the high bound) to match the tile shape
+        # ``end + 1`` from _calculate_tile_shape.
         param_bounds = {}
         for d, (pname, (start, end, _)) in enumerate(
                 zip(inner_map.params, inner_map.range)):
@@ -754,10 +754,7 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
             if upper_bounds is not None and pname_str in upper_bounds:
                 high = upper_bounds[pname_str]
             else:
-                high = sp.Max(
-                    _ScalarToTileBase._to_sympy_expr(start),
-                    _ScalarToTileBase._to_sympy_expr(end),
-                )
+                high = _ScalarToTileBase._to_sympy_expr(end)
             param_bounds[pname_str] = (sp.Integer(0), high)
 
         new_ranges = []
@@ -806,14 +803,19 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
         return subsets.Range(new_ranges)
 
     def _map_param_bounds(self) -> dict[str, tuple[sp.Basic, sp.Basic]]:
-        """Return symbolic min/max bounds for inner and outer map parameters."""
+        """Return symbolic min/max bounds for inner and outer map parameters.
+
+        Maps always use a positive step (descending maps are rejected by SDFG
+        validation), so ``start`` is the lower bound and the inclusive ``end``
+        is the upper bound directly.
+        """
         bounds: dict[str, tuple[sp.Basic, sp.Basic]] = {}
         for params, rng in ((self._inner_entry.map.params, self._inner_entry.map.range),
                             (self._outer_entry.map.params, self._outer_entry.map.range)):
             for pname, (start, end, _step) in zip(params, rng):
                 s = self._to_sympy_expr(start)
                 e = self._to_sympy_expr(end)
-                bounds[str(pname)] = (sp.Min(s, e), sp.Max(s, e))
+                bounds[str(pname)] = (s, e)
         return bounds
 
     def _expr_uses_outer_map_param(self, expr: sp.Basic) -> bool:
@@ -877,22 +879,15 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
         """Build a SymPy boolean expression for tile-point validity.
 
         Returns a conjunction of per-dimension predicates using ``__m0``,
-        ``__m1``, ... as coordinate symbols.  Each sub-clause handles both
-        positive and negative step directions (combined with ``Or``).
-
-        The tile now covers ``0..Max(start, end)`` per dimension, so the
-        mask checks ``m`` against ``start`` and ``end`` directly.
-
-        For positive step::
+        ``__m1``, ... as coordinate symbols.  Maps always use a positive step
+        (descending maps are rejected by SDFG validation; symbolic steps carry
+        a runtime ``step > 0`` assertion), so each dimension has a single
+        predicate::
 
             m >= start  AND  m <= end  AND  (m - start) % step == 0
 
-        For negative step (start > end)::
-
-
-            m >= end  AND  m <= start  AND  (start - m) % (-step) == 0
-
-        where ``m = __m{d}``.
+        where ``m = __m{d}``.  The tile covers ``0..end`` per dimension, so the
+        mask checks ``m`` against ``start`` and ``end`` directly.
 
         Args:
             inner_map: The inner :class:`~dace.sdfg.nodes.Map` whose range
@@ -913,23 +908,13 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
             end = _ScalarToTileBase._to_sympy_expr(end)
             step = _ScalarToTileBase._to_sympy_expr(step)
 
-
-            # Positive-step sub-clause: m must lie within [start, end]
-            # and align to the step grid starting at start.
-            cond_pos = sp.And(
-                sp.StrictGreaterThan(step, 0),
+            # m must lie within [start, end] and align to the step grid
+            # starting at start.
+            dim_conds.append(sp.And(
                 sp.GreaterThan(m, start),          # m >= start
                 sp.LessThan(m, end),               # m <= end
                 sp.Eq(sp.Mod(m - start, step), 0),
-            )
-            # Negative-step sub-clause: start > end when step < 0.
-            cond_neg = sp.And(
-                sp.StrictLessThan(step, 0),
-                sp.GreaterThan(m, end),            # m >= end
-                sp.LessThan(m, start),             # m <= start
-                sp.Eq(sp.Mod(start - m, -step), 0),
-            )
-            dim_conds.append(sp.Or(cond_pos, cond_neg))
+            ))
 
         if not dim_conds:
             return sp.true
@@ -1031,11 +1016,11 @@ class ScalarToTileMasked(_ScalarToTileBase):
     Lower non-canonical scalar inner maps to symbolic-masked cuTile library
     nodes.
 
-    Non-canonical ranges (offset starts, negative/strided bounds) are mapped
-    to a zero-based tile whose shape is ``Max(start, end) + 1`` per dimension.
-    For skewed maps (produced by ``MapTiling(skew=True)``), the tile shape is
-    extended to ``outer_step / abs(inner_step)`` to recover the original
-    ``tile_size`` parameter, ensuring power-of-2 compatibility with the cuTile
+    Non-canonical ranges (offset starts, strided bounds) are mapped to a
+    zero-based tile whose shape is ``end + 1`` per dimension.  For skewed maps
+    (produced by ``MapTiling(skew=True)``), the tile shape is extended to
+    ``outer_step / inner_step`` to recover the original ``tile_size``
+    parameter, ensuring power-of-2 compatibility with the cuTile
     Python backend.  A symbolic condition is embedded directly in the library
     node and evaluated per element during expansion — no runtime mask array is
     allocated or filled.
@@ -1052,12 +1037,11 @@ class ScalarToTileMasked(_ScalarToTileBase):
     def _calculate_tile_shape(self) -> tuple[sp.Basic | int, ...]:
         """Tile shape from inner-map range, extended for skewed maps.
 
-        Starts with the base-class shape (``Max(start, end) + 1`` per
-        dimension), then for skewed dimensions (``start == 0``, indicating
-        ``MapTiling(skew=True)`` was applied) extends the tile to
-        ``outer_step / abs(inner_step)``.  This recovers the original
-        ``tile_size`` parameter from ``MapTiling``, which is guaranteed to
-        be a power of 2 when the pipeline requests it.
+        Starts with the base-class shape (``end + 1`` per dimension), then for
+        skewed dimensions (``start == 0``, indicating ``MapTiling(skew=True)``
+        was applied) extends the tile to ``outer_step / inner_step``.  This
+        recovers the original ``tile_size`` parameter from ``MapTiling``, which
+        is guaranteed to be a power of 2 when the pipeline requests it.
 
         The extension is safe because:
 
@@ -1094,8 +1078,9 @@ class ScalarToTileMasked(_ScalarToTileBase):
                     and d < len(self._outer_entry.map.range)):
                 _, _, outer_step = self._outer_entry.map.range[d]
                 outer_step_expr = self._to_sympy_expr(outer_step)
-                # Recover original tile_size: outer_step = tile_size * abs(inner_step)
-                tile_from_outer = outer_step_expr / sp.Abs(step_expr)
+                # Recover original tile_size: outer_step = tile_size * inner_step
+                # (inner_step is always positive; descending maps are rejected).
+                tile_from_outer = outer_step_expr / step_expr
                 if not tile_from_outer.is_Number:
                     tile_from_outer = sp.simplify(tile_from_outer)
                 # Take the larger of the base shape and derived tile size.
