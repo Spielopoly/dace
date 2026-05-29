@@ -1590,13 +1590,13 @@ def test_noncanonical_add_runtime_numeric_correctness():
     np.testing.assert_allclose(c, c_expected, rtol=0.0, atol=1e-12)
 
 
-def test_noncanonical_subtract_runtime_numeric_correctness_negative_step():
-    """Non-canonical subtract with reverse traversal should use masked subtract semantics."""
+def test_noncanonical_subtract_runtime_numeric_correctness_strided():
+    """Non-canonical strided subtract should use masked subtract semantics."""
     sdfg = build_runtime_tiled_scalar_noncanonical_binary_sdfg(
-        ii_range="5:0:-2",
+        ii_range="1:6:2",
         jj_range="1:5",
         op="-",
-        name="tile_subtract_runtime_noncanonical_negative",
+        name="tile_subtract_runtime_noncanonical_strided",
         dtype=dace.float64,
     )
 
@@ -1618,14 +1618,19 @@ def test_noncanonical_subtract_runtime_numeric_correctness_negative_step():
     a = rng.uniform(-10.0, 10.0, size=shape).astype(np.float64)
     b = rng.uniform(-10.0, 10.0, size=shape).astype(np.float64)
     c = rng.uniform(-5.0, 5.0, size=shape).astype(np.float64)
-    c_expected = _expected_noncanonical_binary(a, b, c, range(5, 0, -2), range(1, 5, 1), np.subtract)
+    c_expected = _expected_noncanonical_binary(a, b, c, range(1, 6, 2), range(1, 5, 1), np.subtract)
 
     sdfg(A=a, B=b, C=c)
     np.testing.assert_allclose(c, c_expected, rtol=0.0, atol=1e-12)
 
 
-def test_noncanonical_symbolic_unknown_sign_step_runtime():
-    """Unknown-sign symbolic step should work for both positive and negative runtime values."""
+def test_noncanonical_symbolic_positive_step_runtime():
+    """Symbolic (positive) step should work for different positive runtime values.
+
+    Maps must use a positive step (descending maps are rejected by SDFG
+    validation; symbolic steps carry a runtime ``step > 0`` assertion), so only
+    positive runtime step values are exercised here.
+    """
     sdfg = build_runtime_tiled_scalar_noncanonical_binary_sdfg(
         ii_range="1:6:S",
         jj_range="1:5",
@@ -1645,7 +1650,7 @@ def test_noncanonical_symbolic_unknown_sign_step_runtime():
     a = rng.uniform(-10.0, 10.0, size=shape).astype(np.float64)
     b = rng.uniform(-10.0, 10.0, size=shape).astype(np.float64)
 
-    for step_value in (2, -2):
+    for step_value in (1, 2, 4):
         c = rng.uniform(-5.0, 5.0, size=shape).astype(np.float64)
         c_expected = _expected_noncanonical_binary(
             a, b, c, range(1, 6, step_value), range(1, 5, 1), np.add
