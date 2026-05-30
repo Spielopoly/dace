@@ -255,11 +255,11 @@ def validate_sdfg(sdfg: 'dace.sdfg.SDFG', references: Set[int] = None, **context
 
         # Check the names of data descriptors and co.
         seen_names: Set[str] = set()
-        for obj_names in [sdfg.arrays.keys(), sdfg.symbols.keys(), sdfg._rdistrarrays.keys(), sdfg._subarrays.keys()]:
+        for obj_names in [sdfg.arrays.keys(), sdfg.symbols.keys()]:
             if not seen_names.isdisjoint(obj_names):
                 raise InvalidSDFGError(
                     f'Found duplicated names: "{seen_names.intersection(obj_names)}". Please ensure '
-                    'that the names of symbols, data descriptors, subarrays and rdistarrays are unique.', sdfg, None)
+                    'that the names of symbols and data descriptors are unique.', sdfg, None)
             seen_names.update(obj_names)
 
         # Ensure that there is a mentioning of constants in either the array or symbol.
@@ -688,6 +688,15 @@ def validate_state(state: 'dace.sdfg.SDFGState',
                 'rather than using multiple references to the same one', sdfg, state_id, eid)
         references.add(id(e.data))
 
+        for subset in (e.data.subset, e.data.other_subset):
+            if subset is None:
+                continue
+            if id(subset) in references:
+                raise InvalidSDFGEdgeError(
+                    f'Duplicate subset detected in memlet "{e.data}". Please copy objects '
+                    'rather than using multiple references to the same one', sdfg, state_id, eid)
+            references.add(id(subset))
+
         # Edge validation
         try:
             e.data.validate(sdfg, state)
@@ -1033,8 +1042,7 @@ class InvalidSDFGInterstateEdgeError(InvalidSDFGError):
     def __str__(self):
         if self.edge_id is not None:
             e = self.sdfg.edges()[self.edge_id]
-            edgestr = ' (at edge "%s" (%s -> %s)' % (
-                e.data.label,
+            edgestr = ' (at edge %s -> %s)' % (
                 str(e.src),
                 str(e.dst),
             )
