@@ -288,7 +288,7 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
         if not local_params:
             return tuple(base_shape)
 
-        parameter_bounds = self._collect_local_map_parameter_bounds()
+        parameter_bounds = self._map_param_bounds()
         descriptor_shape: list[sp.Basic] = []
 
         for extent in base_shape:
@@ -332,20 +332,6 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
         """Return whether *expr* references any symbol in *symbol_names*."""
         sym_expr = _ScalarToTileBase._to_sympy_expr(expr)
         return any(str(symbol) in symbol_names for symbol in sym_expr.free_symbols)
-
-    def _collect_local_map_parameter_bounds(self) -> dict[str, tuple[sp.Basic, sp.Basic]]:
-        """Collect conservative ``(low, high)`` bounds for inner/outer map params.
-
-        Maps always use a positive step, so ``start`` is the lower bound and
-        the inclusive ``end`` is the upper bound directly.
-        """
-        bounds: dict[str, tuple[sp.Basic, sp.Basic]] = {}
-        for map_node in (self._outer_entry.map, self._inner_entry.map):
-            for pname, (start, end, _) in zip(map_node.params, map_node.range):
-                start_expr = self._to_sympy_expr(start)
-                end_expr = self._to_sympy_expr(end)
-                bounds[str(pname)] = (start_expr, end_expr)
-        return bounds
 
     @staticmethod
     def _eliminate_local_map_parameters(expr: sp.Basic,
@@ -874,8 +860,7 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
         return stride
 
     @staticmethod
-    def _build_mask_condition_symbolic(inner_map: nodes.Map,
-                                       outer_map: Optional[nodes.Map] = None) -> sp.Basic:
+    def _build_mask_condition_symbolic(inner_map: nodes.Map) -> sp.Basic:
         """Build a SymPy boolean expression for tile-point validity.
 
         Returns a conjunction of per-dimension predicates using ``__m0``,
@@ -892,8 +877,6 @@ class _ScalarToTileBase(xf.SingleStateTransformation, abc.ABC):
         Args:
             inner_map: The inner :class:`~dace.sdfg.nodes.Map` whose range
                 encodes the valid coordinate set (after skewing).
-            outer_map: Optional outer (tiled) :class:`~dace.sdfg.nodes.Map`.
-                When given, its parameters are used as skew offsets.
 
         Returns:
             A SymPy boolean expression over ``__m0``, ``__m1``, ... symbols
@@ -1257,8 +1240,7 @@ class ScalarToTileMasked(_ScalarToTileBase):
         on the library node.
         """
         super()._configure_library_node()
-        condition = self._build_mask_condition_symbolic(
-            self._inner_entry.map, outer_map=self._outer_entry.map)
+        condition = self._build_mask_condition_symbolic(self._inner_entry.map)
         self._library_node.mask_condition = condition
 
     def _add_output_preload(self, data_name: str, inner_to_outer_edge: MultiConnectorEdge[Memlet], tasklet_out_edge: MultiConnectorEdge[Memlet]) -> None:
