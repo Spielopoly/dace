@@ -110,12 +110,12 @@ class ExpandTileLoadPure(ExpandTransformation):
 class ExpandTileLoadCutile(ExpandTransformation):
     """``cuda.tile``-Python expansion of :class:`TileLoad`.
 
-    Emits ``ct.load(__src, index=(__pid0, ...), shape=(W_0, ...),
+    Emits ``ct.load(_src, index=(__pid0, ...), shape=(W_0, ...),
     padding_mode=...)`` — the contiguous block-tile read used by the
     reference cuTile kernels. ``ct.load`` has no ``mask=`` parameter
     (L-load-nomask), so mask gating is applied at the store side
     (:class:`TileStore` cutile via ``ct.scatter``) and ``has_mask`` does
-    **not** add a ``__mask`` input here (the load body never reads it).
+    **not** add a ``_mask`` input here (the load body never reads it).
     The padding mode is selectable via :attr:`TileLoad.pad_mode` so the
     OOB tail of the last tile reads as the right identity for the
     downstream consumer (e.g. ``+inf`` ahead of a ``min`` reduction).
@@ -144,17 +144,22 @@ class ExpandTileLoadCutile(ExpandTransformation):
         shape_tuple = ", ".join(str(w) for w in widths)
         index_tuple = ", ".join(f"__pid{k}" for k in range(K))
         lines = [f"__pid{k} = ct.bid({k})" for k in range(K)]
-        lines.append(f"__output = ct.load(__src, index=({index_tuple},), shape=({shape_tuple},),"
+        lines.append(f"_dst = ct.load(_src, index=({index_tuple},), shape=({shape_tuple},),"
                      f" padding_mode={pad_mode})")
-        # L-load-nomask: the load never reads a per-lane mask, so even with
-        # has_mask=True we must NOT declare a dangling __mask input — the
-        # mask is consumed downstream at the store/scatter.
-        inputs = {"__src"}
+        # L-load-nomask: the cuTile load body never reads a per-lane
+        # mask (masking is applied downstream at the store/scatter).
+        # However, when has_mask=True the lib node has a _mask connector
+        # with an incoming edge; ExpandTransformation.apply() remaps all
+        # edges to the new tasklet, so we must declare _mask to keep the
+        # SDFG valid (it is simply unused in the load body).
+        inputs = {"_src"}
+        if node.has_mask:
+            inputs.add("_mask")
         return nodes.Tasklet(
             label=f"{node.label}_cutile",
             inputs={c: None
                     for c in inputs},
-            outputs={"__output": None},
+            outputs={"_dst": None},
             code="\n".join(lines),
             language=dace.dtypes.Language.Python,
         )

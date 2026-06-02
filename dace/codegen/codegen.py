@@ -243,8 +243,17 @@ def generate_code(sdfg: SDFG, validate=True) -> List[CodeObject]:
     from dace.codegen.targets import cpu
     if sdfg.backend == dtypes.BackendLanguage.Python:
         from dace.codegen.py.python_target import PythonCodeGen
+        from dace.codegen.py.target import PythonTargetCodeGenerator
         default_target = PythonCodeGen
         targets = {'cpu': default_target(frame, sdfg)}
+
+        # Instantiate Python target extensions (e.g., CuTilePythonCodeGen)
+        # Skip default_target to avoid double-instantiation (it's already in targets as 'cpu').
+        targets.update({
+            v['name']: k(frame, sdfg)
+            for k, v in PythonTargetCodeGenerator.extensions().items()
+            if k is not default_target and v['name'] not in targets
+        })
     else:
         default_target = cpu.CPUCodeGen
         for k, v in TargetCodeGenerator.extensions().items():

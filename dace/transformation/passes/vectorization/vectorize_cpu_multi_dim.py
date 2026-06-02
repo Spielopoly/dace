@@ -63,7 +63,7 @@ from dace.transformation.passes.vectorization.utils.name_schemes import (
 
 # "AUTO" resolves to the host's best ISA at expansion time (see
 # dace.libraries.tileops._dispatch.detect_host_isa); the others pin one backend.
-_VALID_ISAS = ("AUTO", "AVX512", "AVX2", "ARM_SVE", "ARM_NEON", "SCALAR")
+_VALID_ISAS = ("AUTO", "AVX512", "AVX2", "ARM_SVE", "ARM_NEON", "SCALAR", "CUTILE")
 
 #: Convergence cap for the per-NSDFG ``RefineNestedAccess`` re-check loop (one
 #: application already refines every candidate; the cap guards against a

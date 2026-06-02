@@ -86,19 +86,19 @@ class ExpandTileMergePure(ExpandTransformation):
 class ExpandTileMergeCutile(ExpandTransformation):
     """``cuda.tile``-Python expansion of :class:`TileMerge`.
 
-    Primary (CI default): ``__output = ct.where(__cond, __then,
-    __else)`` — the cuTile select primitive. The surrounding iteration
-    mask is applied at the downstream ``ct.scatter`` store, not at the
-    select (matching the reference cuTile kernels).
+    Primary (CI default): ``_o = ct.where(_cond, _t, _e)`` — the cuTile
+    select primitive. The surrounding iteration mask is applied at the
+    downstream ``ct.scatter`` store, not at the select (matching the
+    reference cuTile kernels).
 
     Fallback (``ct.where`` known absent): an arithmetic blend
-    ``__m = __cond.astype(__then.dtype); __output = __m * __then +
-    (1.0 - __m) * __else``. This is exact for the ``0.0`` / ``1.0`` (or
-    ``bool``) condition encoding, but ``0.0 * inf = NaN`` would leak a
-    non-finite *unselected* lane into the result. So the fallback is
-    emitted only for an **integer** output dtype; a float output with
-    possibly-non-finite branches raises ``NotImplementedError`` because
-    cuTile offers no other confirmed safe select.
+    ``__m = _cond.astype(_t.dtype); _o = __m * _t + (1.0 - __m) * _e``.
+    This is exact for the ``0.0`` / ``1.0`` (or ``bool``) condition
+    encoding, but ``0.0 * inf = NaN`` would leak a non-finite *unselected*
+    lane into the result. So the fallback is emitted only for an
+    **integer** output dtype; a float output with possibly-non-finite
+    branches raises ``NotImplementedError`` because cuTile offers no other
+    confirmed safe select.
     """
 
     environments = []
@@ -122,7 +122,7 @@ class ExpandTileMergeCutile(ExpandTransformation):
         # emit the documented ct.where default; only an explicit False forces
         # the arithmetic fallback / raise.
         if _CT_HAS_WHERE is not False:
-            body = "__output = ct.where(__cond, __then, __else)"
+            body = "_o = ct.where(_cond, _t, _e)"
         else:
             out_edge = next(e for e in parent_state.out_edges(node) if e.src_conn == "_o")
             out_dtype = parent_sdfg.arrays[out_edge.data.data].dtype
@@ -133,16 +133,21 @@ class ExpandTileMergeCutile(ExpandTransformation):
                 raise NotImplementedError(f"{node.label}: cuTile select without ct.where cannot safely blend "
                                           f"possibly-non-finite branches (0.0 * inf = NaN) for float output "
                                           f"{out_dtype}; verify ct.where in the installed cuda-tile package.")
-            body = ("__m = __cond.astype(__then.dtype)\n"
-                    "__output = __m * __then + (1.0 - __m) * __else")
+            body = ("__m = _cond.astype(_t.dtype)\n"
+                    "_o = __m * _t + (1.0 - __m) * _e")
+        inputs = {"_cond", "_t", "_e"}
+        # The cuTile select does not use the iteration mask (masking is
+        # applied at the store via ct.scatter), but when has_mask=True
+        # the lib node has a _mask connector with an incoming edge.
+        # ExpandTransformation.apply() remaps all edges to the new
+        # tasklet, so we must declare _mask to keep the SDFG valid.
+        if node.has_mask:
+            inputs.add("_mask")
         return nodes.Tasklet(
             label=f"{node.label}_cutile",
-            inputs={
-                "__cond": None,
-                "__then": None,
-                "__else": None
-            },
-            outputs={"__output": None},
+            inputs={c: None
+                    for c in inputs},
+            outputs={"_o": None},
             code=body,
             language=dace.dtypes.Language.Python,
         )

@@ -164,14 +164,14 @@ class ExpandTileReducePure(ExpandTransformation):
 class ExpandTileReduceCutile(ExpandTransformation):
     """``cuda.tile``-Python expansion of :class:`TileReduce`.
 
-    Unmasked (``has_mask=False``): ``__output = ct.sum(__src, axis=...)``
+    Unmasked (``has_mask=False``): ``_dst = ct.sum(_src, axis=...)``
     (or ``ct.prod`` / ``ct.min`` / ``ct.max``).
 
     Masked (``has_mask=True``): cuTile reductions take no ``mask=`` /
     valid-region argument (L-reduce-nomask), so the inactive lanes must
     be pre-set to the op's identity (``+`` → 0, ``*`` → 1, ``min`` →
     ``+inf``, ``max`` → ``-inf``) before reducing. Primary form uses
-    ``ct.where(__mask, __src, IDENT)``; the ``__mask`` input is genuinely
+    ``ct.where(_mask, _src, IDENT)``; the ``_mask`` input is genuinely
     consumed (fixing the prior dead-connector bug). When ``ct.where`` is
     known absent, ``+`` / ``*`` fall back to an arithmetic blend, while
     masked ``min`` / ``max`` raise ``NotImplementedError`` (the
@@ -197,13 +197,13 @@ class ExpandTileReduceCutile(ExpandTransformation):
         axis_kw = "" if node.axis is None else f", axis={node.axis}"
 
         if not node.has_mask:
-            body = f"__output = {fn}(__src{axis_kw})"
-            inputs = {"__src"}
+            body = f"_dst = {fn}(_src{axis_kw})"
+            inputs = {"_src"}
             return nodes.Tasklet(
                 label=f"{node.label}_cutile",
                 inputs={c: None
                         for c in inputs},
-                outputs={"__output": None},
+                outputs={"_dst": None},
                 code=body,
                 language=dace.dtypes.Language.Python,
             )
@@ -215,36 +215,36 @@ class ExpandTileReduceCutile(ExpandTransformation):
         # the arithmetic fallback / raise.
         if _CT_HAS_WHERE is not False:
             lines = [
-                f"__masked_src = ct.where(__mask, __src, {ident})",
-                f"__output = {fn}(__masked_src{axis_kw})",
+                f"_masked_src = ct.where(_mask, _src, {ident})",
+                f"_dst = {fn}(_masked_src{axis_kw})",
             ]
         elif node.op == "+":
             # 0 is the + identity, so zeroing inactive lanes is exact.
             lines = [
-                "__m = __mask.astype(__src.dtype)",
-                f"__output = ct.sum(__m * __src{axis_kw})",
+                "_m = _mask.astype(_src.dtype)",
+                f"_dst = ct.sum(_m * _src{axis_kw})",
             ]
         elif node.op == "*":
             # 1 is the * identity: blend src in active lanes, 1 in inactive.
             lines = [
-                "__m = __mask.astype(__src.dtype)",
-                f"__output = ct.prod(__m * __src + (1.0 - __m){axis_kw})",
+                "_m = _mask.astype(_src.dtype)",
+                f"_dst = ct.prod(_m * _src + (1.0 - _m){axis_kw})",
             ]
         else:
             # L-reduce-nomask: masked min/max needs ct.where to inject ±inf;
-            # the arithmetic blend __src*__m + IDENT*(1-__m) yields NaN when a
+            # the arithmetic blend _src*_m + IDENT*(1-_m) yields NaN when a
             # masked lane already holds inf (inf * 0). No safe lowering.
             raise NotImplementedError(f"{node.label}: masked {node.op!r} tile reduction needs ct.where to inject "
                                       f"±inf into masked lanes; cuTile reductions take no mask (L-reduce-nomask) "
                                       f"and the arithmetic blend is unsafe for non-finite data. Verify ct.where in "
                                       f"the installed cuda-tile package.")
         body = "\n".join(lines)
-        inputs = {"__src", "__mask"}
+        inputs = {"_src", "_mask"}
         return nodes.Tasklet(
             label=f"{node.label}_cutile",
             inputs={c: None
                     for c in inputs},
-            outputs={"__output": None},
+            outputs={"_dst": None},
             code=body,
             language=dace.dtypes.Language.Python,
         )

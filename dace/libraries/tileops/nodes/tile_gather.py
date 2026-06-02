@@ -88,10 +88,10 @@ class ExpandTileGatherPure(ExpandTransformation):
 class ExpandTileGatherCutile(ExpandTransformation):
     """``cuda.tile``-Python expansion of :class:`TileGather`.
 
-    Emits ``ct.gather(__src, (__idx_0, __idx_1, ...), mask=__mask,
+    Emits ``ct.gather(_src, (_idx_0, _idx_1, ...), mask=_mask,
     padding_value=<pad_value>)`` — the per-source-dim index-tile tuple
     form used by the reference cuTile kernels. For a 1D source the call
-    becomes ``ct.gather(__src, __idx_0, ...)`` (single index tile, not a
+    becomes ``ct.gather(_src, _idx_0, ...)`` (single index tile, not a
     tuple — matches the ``manual_cutile_simple`` example). ``ct.gather``'s
     ``padding_value`` is an arbitrary scalar (unlike ``ct.load``'s enum),
     so :attr:`TileGather.pad_value` can install any reduction identity
@@ -117,28 +117,28 @@ class ExpandTileGatherCutile(ExpandTransformation):
         src_ndim = node.source_ndim
         # ct.gather has no per-lane stride: a non-unit index_strides cannot be
         # lowered to a single ct.gather over the index tile (the pure / ISA
-        # paths read __idx[c*lane], which cuTile's gather does not express).
+        # paths read _idx[c*lane], which cuTile's gather does not express).
         if any(s != 1 for s in node.index_strides):
             raise NotImplementedError(f"{node.label}: TileGather cutile lowering cannot express non-unit "
                                       f"index_strides={tuple(node.index_strides)!r}; ct.gather indexes the "
                                       f"index tile directly (no per-lane stride). Pre-gather the strided "
                                       f"index window into a contiguous index tile before this node.")
         if src_ndim == 1:
-            idx_arg = "__idx_0"
+            idx_arg = "_idx_0"
         else:
-            idx_tuple = ", ".join(f"__idx_{k}" for k in range(src_ndim))
+            idx_tuple = ", ".join(f"_idx_{k}" for k in range(src_ndim))
             idx_arg = f"({idx_tuple})"
         pad_arg = f"padding_value={node.pad_value}"
-        mask_arg = f", mask=__mask, {pad_arg}" if node.has_mask else f", {pad_arg}"
-        body = f"__output = ct.gather(__src, {idx_arg}{mask_arg})"
-        inputs = {"__src"} | {f"__idx_{k}" for k in range(src_ndim)}
+        mask_arg = f", mask=_mask, {pad_arg}" if node.has_mask else f", {pad_arg}"
+        body = f"_dst = ct.gather(_src, {idx_arg}{mask_arg})"
+        inputs = {"_src"} | {f"_idx_{k}" for k in range(src_ndim)}
         if node.has_mask:
-            inputs.add("__mask")
+            inputs.add("_mask")
         return nodes.Tasklet(
             label=f"{node.label}_cutile",
             inputs={c: None
                     for c in inputs},
-            outputs={"__output": None},
+            outputs={"_dst": None},
             code=body,
             language=dace.dtypes.Language.Python,
         )

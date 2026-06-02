@@ -929,6 +929,19 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
                 rhs: Optional[str] = None
                 if isinstance(edge.src, nodes.AccessNode):
                     rhs = edge.src.data
+                elif isinstance(edge.src, (nodes.MapEntry, nodes.ConsumeEntry)):
+                    # Trace through the scope entry to find the actual array name.
+                    # The inner connector (e.g. "OUT_A") maps to the outer
+                    # connector ("IN_A") which receives from the real AccessNode.
+                    inner_conn = edge.src_conn  # e.g., "OUT_A"
+                    outer_conn = _matching_outer_connector(inner_conn) if inner_conn else None
+                    if outer_conn:
+                        for outer_edge in state.in_edges_by_connector(edge.src, outer_conn):
+                            if isinstance(outer_edge.src, nodes.AccessNode):
+                                rhs = outer_edge.src.data
+                                break
+                    if rhs is None and edge.src_conn is not None:
+                        rhs = edge.src_conn  # fallback
                 elif edge.src_conn is not None:
                     rhs = edge.src_conn
                 if rhs is None:
@@ -938,6 +951,42 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
                 self._dispatcher.defined_vars.add(
                     edge.dst_conn, dispatcher_mod.DefinedType.Scalar, "object")
 
+            # Pre-bind output connectors that trace to actual (global) arrays.
+            # This is needed for in-place operations like ct.scatter(_dst, ...)
+            # where _dst must be bound to the global array before the body runs.
+            # We must NOT pre-bind outputs that go to tile-local AccessNodes
+            # (Register or CuTile_Tile storage) because those variables don't
+            # exist yet -- they are created by the tasklet body.
+            _LOCAL_STORAGES = {
+                dtypes.StorageType.Register,
+                dtypes.StorageType.CuTile_Tile,
+            }
+            _prebind_outputs: set = set()
+            for edge in state.out_edges(node):
+                if not edge.src_conn:
+                    continue
+                dst_name: Optional[str] = None
+                if isinstance(edge.dst, nodes.AccessNode):
+                    # Check if this is a local tile variable -- skip pre-bind
+                    dst_desc = sdfg.arrays.get(edge.dst.data)
+                    if dst_desc is not None and dst_desc.storage in _LOCAL_STORAGES:
+                        continue
+                    dst_name = edge.dst.data
+                elif isinstance(edge.dst, (nodes.MapExit, nodes.ConsumeExit)):
+                    inner_conn = edge.dst_conn
+                    outer_conn = _matching_inner_connector(inner_conn) if inner_conn else None
+                    if outer_conn:
+                        for outer_edge in state.out_edges_by_connector(edge.dst, outer_conn):
+                            if isinstance(outer_edge.dst, nodes.AccessNode):
+                                dst_name = outer_edge.dst.data
+                                break
+                if dst_name and dst_name != edge.src_conn:
+                    callsite_stream.write(
+                        f"{edge.src_conn} = {dst_name}", cfg, state_id)
+                    self._dispatcher.defined_vars.add(
+                        edge.src_conn, dispatcher_mod.DefinedType.Scalar, "object")
+                    _prebind_outputs.add(edge.src_conn)
+
             # Emit tasklet body
             callsite_stream.write(
                 f"\n####### Tasklet: {node.label}\n\n", cfg, state_id)
@@ -946,18 +995,42 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
             callsite_stream.write(
                 f"\n####### End of tasklet: {node.label}\n\n", cfg, state_id)
 
-            # Bind outputs to downstream tile AccessNodes
+            # Bind outputs to downstream tile AccessNodes or through MapExit.
+            # Skip connectors that were already pre-bound above — the in-place
+            # operation (e.g. ct.scatter) already modified the array directly.
             for edge in state.out_edges(node):
                 if not edge.src_conn:
                     continue
                 if isinstance(edge.dst, nodes.AccessNode):
                     if edge.dst.data == edge.src_conn:
                         continue
+                    if edge.src_conn in _prebind_outputs:
+                        continue
                     callsite_stream.write(
                         f"{edge.dst.data} = {edge.src_conn}", cfg, state_id)
                     self._dispatcher.defined_vars.add(
                         edge.dst.data, dispatcher_mod.DefinedType.Scalar,
                         "object")
+                elif isinstance(edge.dst, (nodes.MapExit, nodes.ConsumeExit)):
+                    # Trace through the scope exit to find the actual
+                    # destination array.  The inner connector (e.g. "IN_C")
+                    # maps to the outer connector ("OUT_C") which feeds
+                    # the real AccessNode.
+                    inner_conn = edge.dst_conn  # e.g., "IN_C"
+                    outer_conn = _matching_inner_connector(inner_conn) if inner_conn else None
+                    if outer_conn:
+                        for outer_edge in state.out_edges_by_connector(edge.dst, outer_conn):
+                            if isinstance(outer_edge.dst, nodes.AccessNode):
+                                dst_name = outer_edge.dst.data
+                                if dst_name != edge.src_conn:
+                                    if edge.src_conn in _prebind_outputs:
+                                        break
+                                    callsite_stream.write(
+                                        f"{dst_name} = {edge.src_conn}", cfg, state_id)
+                                    self._dispatcher.defined_vars.add(
+                                        dst_name, dispatcher_mod.DefinedType.Scalar,
+                                        "object")
+                                break
         finally:
             self._dispatcher.defined_vars.exit_scope(node)
 

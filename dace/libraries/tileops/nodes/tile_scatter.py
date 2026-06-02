@@ -69,7 +69,7 @@ class ExpandTileScatterPure(ExpandTransformation):
 class ExpandTileScatterCutile(ExpandTransformation):
     """``cuda.tile``-Python expansion of :class:`TileScatter`.
 
-    Emits ``ct.scatter(__output, (__idx_0, ...), __src, mask=__mask)``
+    Emits ``ct.scatter(_dst, (_idx_0, ...), _src, mask=_mask)``
     — the cuTile pattern from ``manual_cutile_masked.py``.
     """
 
@@ -86,20 +86,20 @@ class ExpandTileScatterCutile(ExpandTransformation):
         """
         dst_ndim = node.dest_ndim
         if dst_ndim == 1:
-            idx_arg = "__idx_0"
+            idx_arg = "_idx_0"
         else:
-            idx_tuple = ", ".join(f"__idx_{k}" for k in range(dst_ndim))
+            idx_tuple = ", ".join(f"_idx_{k}" for k in range(dst_ndim))
             idx_arg = f"({idx_tuple})"
-        mask_arg = ", mask=__mask" if node.has_mask else ""
-        body = f"ct.scatter(__output, {idx_arg}, __src{mask_arg})"
-        inputs = {"__src"} | {f"__idx_{k}" for k in range(dst_ndim)}
+        mask_arg = ", mask=_mask" if node.has_mask else ""
+        body = f"ct.scatter(_dst, {idx_arg}, _src{mask_arg})"
+        inputs = {"_src"} | {f"_idx_{k}" for k in range(dst_ndim)}
         if node.has_mask:
-            inputs.add("__mask")
+            inputs.add("_mask")
         return nodes.Tasklet(
             label=f"{node.label}_cutile",
             inputs={c: None
                     for c in inputs},
-            outputs={"__output": None},
+            outputs={"_dst": None},
             code=body,
             language=dace.dtypes.Language.Python,
         )

@@ -80,7 +80,7 @@ class ExpandTileMaskGenCutile(ExpandTransformation):
             lines.append(f"__offsets{k} = ct.arange({w}, dtype=ct.int32)")
             lines.append(f"__mask{k} = __offsets{k} + __pid{k} * {w} < ({ub})")
         if K == 1:
-            lines.append("__output = __mask0")
+            lines.append("_o = __mask0")
         else:
             terms = []
             for k in range(K):
@@ -88,11 +88,11 @@ class ExpandTileMaskGenCutile(ExpandTransformation):
                 slc[k] = ":"
                 slc_str = "[" + ", ".join(slc) + "]"
                 terms.append(f"ct.broadcast_to(__mask{k}{slc_str}, ({shape_tuple}))")
-            lines.append("__output = " + " & ".join(terms))
+            lines.append("_o = " + " & ".join(terms))
         return nodes.Tasklet(
             label=f"{node.label}_cutile",
             inputs=set(),
-            outputs={"__output": None},
+            outputs={"_o": None},
             code="\n".join(lines),
             language=dace.dtypes.Language.Python,
         )

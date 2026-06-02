@@ -10,6 +10,11 @@ masked.py`` documents: ``__pid<k> = ct.bid(k)`` preamble,
 element-wise op for binops (mask applied at store), and
 ``ct.scatter`` for masked stores with per-lane indices.
 
+The cutile expansion tasklets use the same connector names as the
+library nodes themselves: ``_src``, ``_dst``, ``_a``, ``_b``, ``_c``,
+``_cond``, ``_t``, ``_e``, ``_o``, ``_mask``, ``_idx_<k>`` (matching
+the pure expansions).
+
 These tests check that calling the expansion produces a Python
 tasklet whose body parses as valid Python and contains the expected
 ``ct.*`` call shape. The cuTile-Python runtime is NOT executed
@@ -82,7 +87,7 @@ def test_tile_load_cutile_emits_block_id_and_ct_load_with_padding():
     body, lang = _expand_cutile(TileLoad(name="L", widths=(8, )))
     _assert_parses_as_python(body)
     assert "__pid0 = ct.bid(0)" in body
-    assert "ct.load(__src, index=(__pid0,)" in body
+    assert "ct.load(_src, index=(__pid0,)" in body
     assert "shape=(8,)" in body
     assert "padding_mode=ct.PaddingMode.ZERO" in body
     assert lang == dace.dtypes.Language.Python
@@ -106,36 +111,40 @@ def test_tile_load_cutile_pos_inf_pad_mode():
     assert "ct.PaddingMode.ZERO" not in body
 
 
-def test_tile_load_cutile_masked_drops_dangling_mask_input():
-    """``has_mask=True`` must NOT add a dead ``__mask`` input or reference it
-    (L-load-nomask: ``ct.load`` has no mask; gating is deferred to the store)."""
+def test_tile_load_cutile_masked_does_not_reference_mask_in_body():
+    """``has_mask=True`` must NOT reference ``_mask`` in the body
+    (L-load-nomask: ``ct.load`` has no mask; gating is deferred to the store).
+    However, ``_mask`` IS declared as an input connector so that
+    ``ExpandTransformation.apply()`` can safely remap the mask edge from
+    the lib node to the expanded tasklet without leaving a dangling edge."""
     tasklet = _expand_cutile_tasklet(TileLoad(name="L", widths=(8, ), has_mask=True))
     body = tasklet.code.as_string
     _assert_parses_as_python(body)
-    assert "__mask" not in body
-    assert "__mask" not in tasklet.in_connectors
+    assert "_mask" not in body
+    # _mask is in connectors (for edge-remapping safety) but unused in body
+    assert "_mask" in tasklet.in_connectors
     assert "padding_mode=ct.PaddingMode.ZERO" in body
 
 
 def test_tile_store_cutile_unmasked_emits_ct_store():
-    """Unmasked TileStore: ``ct.store(__output, index=(__pid0,), tile=__src)``."""
+    """Unmasked TileStore: ``ct.store(_dst, index=(__pid0,), tile=_src)``."""
     body, _ = _expand_cutile(TileStore(name="S", widths=(8, )))
     _assert_parses_as_python(body)
     assert "__pid0 = ct.bid(0)" in body
-    assert "ct.store(__output, index=(__pid0,)" in body
-    assert "tile=__src" in body
+    assert "ct.store(_dst, index=(__pid0,)" in body
+    assert "tile=_src" in body
     assert "ct.scatter" not in body
 
 
 def test_tile_store_cutile_masked_emits_ct_scatter_with_arange_indices():
-    """Masked TileStore: ``ct.scatter(__output, (__idx0,), __src, mask=__mask)``
+    """Masked TileStore: ``ct.scatter(_dst, (__idx0,), _src, mask=_mask)``
     with per-lane indices ``__idx_k = ct.arange(W_k) + __pid_k * W_k``."""
     body, _ = _expand_cutile(TileStore(name="S", widths=(8, ), has_mask=True))
     _assert_parses_as_python(body)
     assert "__pid0 = ct.bid(0)" in body
     assert "ct.arange(8, dtype=ct.int32)" in body
     assert "__pid0 * 8" in body
-    assert "ct.scatter(__output, (__idx0,), __src, mask=__mask)" in body
+    assert "ct.scatter(_dst, (__idx0,), _src, mask=_mask)" in body
 
 
 def test_tile_store_cutile_K2_masked_scatter_has_two_idx_tiles():
@@ -146,7 +155,7 @@ def test_tile_store_cutile_K2_masked_scatter_has_two_idx_tiles():
     assert "ct.arange(8, dtype=ct.int32)" in body
     assert "__pid0 * 4" in body
     assert "__pid1 * 8" in body
-    assert "ct.scatter(__output, (__idx0, __idx1), __src, mask=__mask)" in body
+    assert "ct.scatter(_dst, (__idx0, __idx1), _src, mask=_mask)" in body
 
 
 def test_tile_binop_cutile_emits_bare_elementwise_op():
@@ -154,17 +163,17 @@ def test_tile_binop_cutile_emits_bare_elementwise_op():
     (mask is applied at the scatter store, not at the binop)."""
     body, _ = _expand_cutile(TileBinop(name="B", widths=(8, ), op="+"))
     _assert_parses_as_python(body)
-    assert "__rhs1 + __rhs2" in body
+    assert "_a + _b" in body
     assert "ct.where" not in body
 
 
 def test_tile_binop_cutile_masked_still_bare_op():
     """Masked TileBinop does NOT wrap with ``ct.where`` — mask flows to the
-    store. ``has_mask=True`` drops the ``__mask`` input on the cutile body
+    store. ``has_mask=True`` drops the ``_mask`` input on the cutile body
     because the binop never reads it."""
     body, _ = _expand_cutile(TileBinop(name="B", widths=(8, ), op="*", has_mask=True))
     _assert_parses_as_python(body)
-    assert "__rhs1 * __rhs2" in body
+    assert "_a * _b" in body
     assert "ct.where" not in body
 
 
@@ -179,7 +188,7 @@ def test_tile_binop_cutile_uses_ct_minimum_for_min():
     """``min`` op routes to ``ct.minimum``."""
     body, _ = _expand_cutile(TileBinop(name="B", widths=(4, 8), op="min"))
     _assert_parses_as_python(body)
-    assert "ct.minimum(__rhs1, __rhs2)" in body
+    assert "ct.minimum(_a, _b)" in body
 
 
 def test_tile_mask_gen_cutile_1d_uses_arange_and_bid():
@@ -191,7 +200,7 @@ def test_tile_mask_gen_cutile_1d_uses_arange_and_bid():
     assert "ct.arange(8, dtype=ct.int32)" in body
     assert "__pid0 * 8" in body
     assert "N_ub" in body
-    assert "__output = __mask0" in body
+    assert "_o = __mask0" in body
     assert "&" not in body
 
 
@@ -212,23 +221,23 @@ def test_tile_gather_cutile_1d_unmasked_emits_padding_value():
     """1D unmasked gather: single index tile + ``padding_value=0`` (no mask)."""
     body, lang = _expand_cutile(TileGather(name="G", widths=(8, )))
     _assert_parses_as_python(body)
-    assert "ct.gather(__src, __idx_0, padding_value=0)" in body
+    assert "ct.gather(_src, _idx_0, padding_value=0)" in body
     assert "mask=" not in body
     assert lang == dace.dtypes.Language.Python
 
 
 def test_tile_gather_cutile_1d_masked_emits_mask_and_padding_value():
-    """1D masked gather: ``mask=__mask, padding_value=0``."""
+    """1D masked gather: ``mask=_mask, padding_value=0``."""
     body, _ = _expand_cutile(TileGather(name="G", widths=(8, ), has_mask=True))
     _assert_parses_as_python(body)
-    assert "ct.gather(__src, __idx_0, mask=__mask, padding_value=0)" in body
+    assert "ct.gather(_src, _idx_0, mask=_mask, padding_value=0)" in body
 
 
 def test_tile_gather_cutile_2d_masked_uses_index_tuple():
-    """2D-source masked gather uses the ``(__idx_0, __idx_1)`` tuple form."""
+    """2D-source masked gather uses the ``(_idx_0, _idx_1)`` tuple form."""
     body, _ = _expand_cutile(TileGather(name="G", widths=(8, ), source_ndim=2, has_mask=True))
     _assert_parses_as_python(body)
-    assert "ct.gather(__src, (__idx_0, __idx_1), mask=__mask, padding_value=0)" in body
+    assert "ct.gather(_src, (_idx_0, _idx_1), mask=_mask, padding_value=0)" in body
 
 
 def test_tile_gather_cutile_pad_value_emitted():
@@ -247,53 +256,53 @@ def test_tile_gather_cutile_nonunit_index_strides_raises():
 
 
 def test_tile_reduce_cutile_unmasked_full_and_axis():
-    """Unmasked reduction emits ``ct.sum(__src)`` / ``ct.sum(__src, axis=1)``."""
+    """Unmasked reduction emits ``ct.sum(_src)`` / ``ct.sum(_src, axis=1)``."""
     full, _ = _expand_cutile(TileReduce(name="R", widths=(8, ), op="+"))
     _assert_parses_as_python(full)
-    assert "__output = ct.sum(__src)" in full
+    assert "_dst = ct.sum(_src)" in full
 
     axed, _ = _expand_cutile(TileReduce(name="R", widths=(4, 8), op="+", axis=1))
     _assert_parses_as_python(axed)
-    assert "ct.sum(__src, axis=1)" in axed
+    assert "ct.sum(_src, axis=1)" in axed
 
 
 def test_tile_reduce_cutile_unmasked_max_uses_ct_max():
     """``op='max'`` routes to ``ct.max``."""
     body, _ = _expand_cutile(TileReduce(name="R", widths=(8, ), op="max"))
     _assert_parses_as_python(body)
-    assert "__output = ct.max(__src)" in body
+    assert "_dst = ct.max(_src)" in body
 
 
 def test_tile_reduce_cutile_masked_sum_preselects_identity_via_where():
     """Masked ``+`` reduction (primary, ct.where assumed present on CI) must
-    pre-select the identity ``0`` into masked lanes and consume ``__mask``."""
+    pre-select the identity ``0`` into masked lanes and consume ``_mask``."""
     tasklet = _expand_cutile_tasklet(TileReduce(name="R", widths=(4, 8), op="+", axis=1, has_mask=True))
     body = tasklet.code.as_string
     _assert_parses_as_python(body)
-    assert "ct.where(__mask, __src, 0)" in body
-    assert "ct.sum(__masked_src, axis=1)" in body
-    # The previously-dead __mask input is now genuinely consumed.
-    assert "__mask" in tasklet.in_connectors
+    assert "ct.where(_mask, _src, 0)" in body
+    assert "ct.sum(_masked_src, axis=1)" in body
+    # The previously-dead _mask input is now genuinely consumed.
+    assert "_mask" in tasklet.in_connectors
 
 
 def test_tile_reduce_cutile_masked_min_preselects_pos_inf_via_where():
     """Masked ``min`` reduction pre-selects ``+inf`` into masked lanes."""
     body, _ = _expand_cutile(TileReduce(name="R", widths=(8, ), op="min", has_mask=True))
     _assert_parses_as_python(body)
-    assert "ct.where(__mask, __src, float('inf'))" in body
-    assert "ct.min(__masked_src)" in body
+    assert "ct.where(_mask, _src, float('inf'))" in body
+    assert "ct.min(_masked_src)" in body
 
 
 def test_tile_reduce_cutile_masked_sum_fallback_blend(monkeypatch):
     """With ``ct.where`` known absent, masked ``+`` falls back to the
-    arithmetic blend ``__m * __src`` reduced by ``ct.sum``."""
+    arithmetic blend ``_m * _src`` reduced by ``ct.sum``."""
     monkeypatch.setattr(_tile_reduce_mod, "_CT_HAS_WHERE", False)
     body, _ = _expand_cutile(TileReduce(name="R", widths=(8, ), op="+", has_mask=True))
     _assert_parses_as_python(body)
     assert "ct.where" not in body
-    assert "__mask.astype(__src.dtype)" in body
+    assert "_mask.astype(_src.dtype)" in body
     # DaCe's Python tasklet pipeline re-parens binop rhs on unparse.
-    assert "ct.sum((__m * __src))" in body
+    assert "ct.sum((_m * _src))" in body
 
 
 def test_tile_reduce_cutile_masked_prod_fallback_blend(monkeypatch):
@@ -302,7 +311,7 @@ def test_tile_reduce_cutile_masked_prod_fallback_blend(monkeypatch):
     body, _ = _expand_cutile(TileReduce(name="R", widths=(8, ), op="*", has_mask=True))
     _assert_parses_as_python(body)
     # DaCe's Python tasklet pipeline re-parens binop subexpressions on unparse.
-    assert "ct.prod(((__m * __src) + (1.0 - __m)))" in body
+    assert "ct.prod(((_m * _src) + (1.0 - _m)))" in body
 
 
 def test_tile_reduce_cutile_masked_min_without_where_raises(monkeypatch):
@@ -316,10 +325,10 @@ def test_tile_reduce_cutile_masked_min_without_where_raises(monkeypatch):
 
 
 def test_tile_merge_cutile_primary_emits_ct_where():
-    """Primary (CI default) TileMerge body is ``ct.where(__cond, __then, __else)``."""
+    """Primary (CI default) TileMerge body is ``ct.where(_cond, _t, _e)``."""
     body, lang = _expand_cutile(TileMerge(name="M", widths=(8, )))
     _assert_parses_as_python(body)
-    assert body == "__output = ct.where(__cond, __then, __else)"
+    assert body == "_o = ct.where(_cond, _t, _e)"
     assert lang == dace.dtypes.Language.Python
 
 
@@ -330,9 +339,9 @@ def test_tile_merge_cutile_fallback_arith_blend_for_int(monkeypatch):
     body, _ = _expand_merge_cutile_with_dtype(TileMerge(name="M", widths=(8, )), dace.int32)
     _assert_parses_as_python(body)
     assert "ct.where" not in body
-    assert "__cond.astype(__then.dtype)" in body
-    assert "__m * __then" in body
-    assert "* __else" in body
+    assert "_cond.astype(_t.dtype)" in body
+    assert "__m * _t" in body
+    assert "* _e" in body
 
 
 def test_tile_merge_cutile_fallback_float_raises(monkeypatch):

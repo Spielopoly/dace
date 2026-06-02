@@ -218,34 +218,38 @@ class ExpandTileBinopCutile(ExpandTransformation):
         :returns: A Python-language tasklet with the element-wise body.
         """
 
-        def _cutile_operand(kind, tile_conn, scalar_conn, expr):
+        def _cutile_operand(kind, conn, expr):
             """cuTile operand reference: inline expr for Symbol, the
-            tile connector for Tile, the scalar connector (broadcasts
-            NumPy-style) for Scalar."""
+            connector for Tile or Scalar (broadcasts NumPy-style)."""
             if kind == _SYMBOL:
                 return expr
-            if kind == _TILE:
-                return tile_conn
-            return scalar_conn
+            return conn
 
-        lhs = _cutile_operand(node.kind_a, "__rhs1", "__const1", node.expr_a)
-        rhs = _cutile_operand(node.kind_b, "__rhs2", "__const2", node.expr_b)
+        lhs = _cutile_operand(node.kind_a, "_a", node.expr_a)
+        rhs = _cutile_operand(node.kind_b, "_b", node.expr_b)
         rhs_expr = _CUTE_OP_EXPR[node.op].format(lhs=lhs, rhs=rhs)
-        body = f"__output = {rhs_expr}"
+        body = f"_c = {rhs_expr}"
         inputs = set()
         if node.kind_a == _TILE:
-            inputs.add("__rhs1")
+            inputs.add("_a")
         elif node.kind_a == _SCALAR:
-            inputs.add("__const1")
+            inputs.add("_a")
         if node.kind_b == _TILE:
-            inputs.add("__rhs2")
+            inputs.add("_b")
         elif node.kind_b == _SCALAR:
-            inputs.add("__const2")
+            inputs.add("_b")
+        # The cuTile binop does not use the mask (masking is applied at
+        # the store via ct.scatter), but when has_mask=True the lib node
+        # has a _mask connector with an incoming edge.
+        # ExpandTransformation.apply() remaps all edges to the new
+        # tasklet, so we must declare _mask to keep the SDFG valid.
+        if node.has_mask:
+            inputs.add("_mask")
         return nodes.Tasklet(
             label=f"{node.label}_cutile",
             inputs={c: None
                     for c in inputs},
-            outputs={"__output": None},
+            outputs={"_c": None},
             code=body,
             language=dace.dtypes.Language.Python,
         )

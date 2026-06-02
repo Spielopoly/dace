@@ -83,9 +83,9 @@ class ExpandTileStoreCutile(ExpandTransformation):
 
     Two emission shapes, matching the reference cuTile kernels:
 
-    * Unmasked: ``ct.store(__output, index=(__pid0, ...), tile=__src)``
+    * Unmasked: ``ct.store(_dst, index=(__pid0, ...), tile=_src)``
       — contiguous block-tile store.
-    * Masked: ``ct.scatter(__output, (idx_0, ...), __src, mask=__mask)``
+    * Masked: ``ct.scatter(_dst, (idx_0, ...), _src, mask=_mask)``
       with per-lane indices ``idx_k = ct.arange(W_k) + __pid_k * W_k``,
       so OOB lanes at the tile tail are skipped per the iteration mask.
     """
@@ -109,17 +109,17 @@ class ExpandTileStoreCutile(ExpandTransformation):
             for k, w in enumerate(widths):
                 lines.append(f"__idx{k} = ct.arange({w}, dtype=ct.int32) + __pid{k} * {w}")
             idx_tuple = ", ".join(f"__idx{k}" for k in range(K))
-            lines.append(f"ct.scatter(__output, ({idx_tuple},), __src, mask=__mask)")
+            lines.append(f"ct.scatter(_dst, ({idx_tuple},), _src, mask=_mask)")
         else:
             index_tuple = ", ".join(f"__pid{k}" for k in range(K))
             shape_tuple = ", ".join(str(w) for w in widths)
-            lines.append(f"ct.store(__output, index=({index_tuple},), tile=__src)")
-        inputs = {"__src"} | ({"__mask"} if node.has_mask else set())
+            lines.append(f"ct.store(_dst, index=({index_tuple},), tile=_src)")
+        inputs = {"_src"} | ({"_mask"} if node.has_mask else set())
         return nodes.Tasklet(
             label=f"{node.label}_cutile",
             inputs={c: None
                     for c in inputs},
-            outputs={"__output": None},
+            outputs={"_dst": None},
             code="\n".join(lines),
             language=dace.dtypes.Language.Python,
         )
