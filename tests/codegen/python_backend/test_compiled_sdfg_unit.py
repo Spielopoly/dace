@@ -1,0 +1,243 @@
+# Copyright 2019-2026 ETH Zurich and the DaCe authors. All rights reserved.
+"""Unit tests for PythonCompiledSDFG and compile_python_sdfg."""
+
+import pytest
+import numpy as np
+
+import dace
+from dace.codegen.py.compiled_sdfg import PythonCompiledSDFG, compile_python_sdfg
+from dace.codegen.codeobject import CodeObject
+
+
+def _make_sdfg(name: str = "test_func") -> dace.SDFG:
+    """Create a minimal SDFG with the given name."""
+    sdfg = dace.SDFG(name)
+    sdfg.backend = dace.dtypes.BackendLanguage.Python
+    state = sdfg.add_state("init")
+    return sdfg
+
+
+# ---------------------------------------------------------------------------
+# PythonCompiledSDFG.__init__
+# ---------------------------------------------------------------------------
+
+def test_init_success():
+    """Valid code defining the expected function → function extracted."""
+    sdfg = _make_sdfg("my_func")
+    code = "def my_func(x):\n    return x + 1\n"
+    csdfg = PythonCompiledSDFG(sdfg, code)
+    assert csdfg._func is not None
+    assert callable(csdfg._func)
+
+
+def test_init_missing_function():
+    """Code without matching function → RuntimeError."""
+    sdfg = _make_sdfg("expected_name")
+    code = "def wrong_name():\n    pass\n"
+    with pytest.raises(RuntimeError, match="does not define function 'expected_name'"):
+        PythonCompiledSDFG(sdfg, code)
+
+
+# ---------------------------------------------------------------------------
+# Properties
+# ---------------------------------------------------------------------------
+
+def test_sdfg_property():
+    """.sdfg returns the original SDFG."""
+    sdfg = _make_sdfg("f")
+    code = "def f(): pass\n"
+    csdfg = PythonCompiledSDFG(sdfg, code)
+    assert csdfg.sdfg is sdfg
+
+
+def test_code_property():
+    """.code returns the code string."""
+    sdfg = _make_sdfg("f")
+    code = "def f(): pass\n"
+    csdfg = PythonCompiledSDFG(sdfg, code)
+    assert csdfg.code == code
+
+
+def test_finalize_allows_reinitialize():
+    """finalize tears down runtime state so a later call reinitializes it."""
+    sdfg = _make_sdfg("lifecycle")
+    code = (
+        "init_calls = []\n"
+        "exit_calls = []\n"
+        "def __dace_init_lifecycle(value):\n"
+        "    init_calls.append(value)\n"
+        "def __dace_exit_lifecycle():\n"
+        "    exit_calls.append(len(init_calls))\n"
+        "def lifecycle(value):\n"
+        "    return len(init_calls), len(exit_calls)\n"
+    )
+    csdfg = PythonCompiledSDFG(sdfg, code)
+
+    assert csdfg(1) == (1, 0)
+    csdfg.finalize()
+    assert csdfg._namespace['exit_calls'] == [1]
+
+    assert csdfg(2) == (2, 1)
+    csdfg.finalize()
+    assert csdfg._namespace['init_calls'] == [1, 2]
+    assert csdfg._namespace['exit_calls'] == [1, 2]
+
+
+# ---------------------------------------------------------------------------
+# __call__
+# ---------------------------------------------------------------------------
+
+def test_call_with_args():
+    """__call__ passes positional args correctly."""
+    sdfg = _make_sdfg("add")
+    code = "def add(a, b):\n    return a + b\n"
+    csdfg = PythonCompiledSDFG(sdfg, code)
+    assert csdfg(2, 3) == 5
+
+
+def test_call_with_kwargs():
+    """__call__ passes keyword args correctly."""
+    sdfg = _make_sdfg("add")
+    code = "def add(a, b):\n    return a + b\n"
+    csdfg = PythonCompiledSDFG(sdfg, code)
+    assert csdfg(a=10, b=20) == 30
+
+
+def test_call_with_return_value():
+    """__call__ returns function result."""
+    sdfg = _make_sdfg("get_val")
+    code = "def get_val():\n    return 42\n"
+    csdfg = PythonCompiledSDFG(sdfg, code)
+    assert csdfg() == 42
+
+
+# ---------------------------------------------------------------------------
+# __del__
+# ---------------------------------------------------------------------------
+
+def test_del_no_crash():
+    """Delete PythonCompiledSDFG without error."""
+    sdfg = _make_sdfg("f")
+    code = "def f(): pass\n"
+    csdfg = PythonCompiledSDFG(sdfg, code)
+    del csdfg  # should not raise
+
+
+# ---------------------------------------------------------------------------
+# compile_python_sdfg
+# ---------------------------------------------------------------------------
+
+def test_compile_python_sdfg_empty_code_objects():
+    """Empty list → RuntimeError."""
+    sdfg = _make_sdfg("f")
+    with pytest.raises(RuntimeError, match="No code objects generated"):
+        compile_python_sdfg(sdfg, [])
+
+
+def test_compile_python_sdfg_success():
+    """Full pipeline: create SDFG, generate code, compile, verify PythonCompiledSDFG returned."""
+    sdfg = dace.SDFG("compile_test")
+    sdfg.backend = dace.dtypes.BackendLanguage.Python
+    sdfg.add_array("A", [1], dace.float64)
+    sdfg.add_array("B", [1], dace.float64)
+    state = sdfg.add_state("compute")
+    a_node = state.add_access("A")
+    b_node = state.add_access("B")
+    tasklet = state.add_tasklet("add1", {"a"}, {"b"}, "b = a + 1")
+    state.add_edge(a_node, None, tasklet, "a", dace.Memlet("A[0]"))
+    state.add_edge(tasklet, "b", b_node, None, dace.Memlet("B[0]"))
+
+    code_objects = sdfg.generate_code()
+    csdfg = compile_python_sdfg(sdfg, code_objects)
+
+    assert isinstance(csdfg, PythonCompiledSDFG)
+    A = np.array([5.0], dtype=np.float64)
+    B = np.array([0.0], dtype=np.float64)
+    csdfg(A=A, B=B)
+    np.testing.assert_array_equal(B, [6.0])
+
+
+def test_compile_python_sdfg_auxiliary_module_importable():
+    """Linkable auxiliary code objects are resolvable via the import hook."""
+    sdfg = _make_sdfg("my_fn")
+    co_aux = CodeObject(
+        name="my_helper",
+        code="HELPER_VALUE = 42\n",
+        language="Python",
+        target=None,
+        title="Helper",
+        linkable=True,
+    )
+    co_frame = CodeObject(
+        name="my_fn",
+        code="from my_helper import HELPER_VALUE\ndef my_fn():\n    return HELPER_VALUE\n",
+        language="Python",
+        target=None,
+        title="Frame",
+    )
+    csdfg = compile_python_sdfg(sdfg, [co_frame, co_aux])
+    assert csdfg() == 42
+
+
+def test_compile_python_sdfg_does_not_touch_sys_modules():
+    """Auxiliary modules are resolved without ever being placed in sys.modules."""
+    import sys
+    sdfg = _make_sdfg("clean_fn")
+    co_aux = CodeObject(
+        name="clean_aux_module",
+        code="AUX = 99\n",
+        language="Python",
+        target=None,
+        title="Aux",
+        linkable=True,
+    )
+    co_frame = CodeObject(
+        name="clean_fn",
+        code="from clean_aux_module import AUX\ndef clean_fn():\n    return AUX\n",
+        language="Python",
+        target=None,
+        title="Frame",
+    )
+    assert "clean_aux_module" not in sys.modules
+    csdfg = compile_python_sdfg(sdfg, [co_frame, co_aux])
+    assert csdfg() == 99
+    assert "clean_aux_module" not in sys.modules
+    csdfg.finalize()
+    assert "clean_aux_module" not in sys.modules
+
+
+def test_compile_python_sdfg_non_linkable_not_imported():
+    """Non-linkable code objects are excluded from the import hook."""
+    sdfg = _make_sdfg("fn")
+    co_frame = CodeObject(
+        name="fn",
+        code="def fn():\n    return 1\n",
+        language="Python",
+        target=None,
+        title="Frame",
+    )
+    co_nonlinkable = CodeObject(
+        name="sample_main_module",
+        code="SHOULD_NOT_EXIST = True\n",
+        language="Python",
+        target=None,
+        title="SampleMain",
+        linkable=False,
+    )
+    csdfg = compile_python_sdfg(sdfg, [co_frame, co_nonlinkable])
+    assert csdfg() == 1
+    assert "sample_main_module" not in csdfg._aux_modules
+
+
+def test_compile_python_sdfg_stdlib_imports_still_work():
+    """Imports of stdlib modules fall through to the real importer."""
+    sdfg = _make_sdfg("uses_stdlib")
+    co_frame = CodeObject(
+        name="uses_stdlib",
+        code="import math\ndef uses_stdlib():\n    return math.floor(3.7)\n",
+        language="Python",
+        target=None,
+        title="Frame",
+    )
+    csdfg = compile_python_sdfg(sdfg, [co_frame])
+    assert csdfg() == 3

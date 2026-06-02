@@ -16,6 +16,10 @@ from enum import auto, Enum
 from dace.attr_enum import ExtensibleAttributeEnum
 from dace.registry import undefined_safe_enum
 
+if TYPE_CHECKING:
+    from dace.codegen.py.prettycode import PythonCodeIOStream
+    from dace.sdfg.state import ControlFlowRegion
+
 
 @undefined_safe_enum
 class DeviceType(ExtensibleAttributeEnum):
@@ -35,6 +39,7 @@ class StorageType(ExtensibleAttributeEnum):
     CPU_ThreadLocal = auto()  #: Thread-local host memory
     GPU_Global = auto()  #: GPU global memory
     GPU_Shared = auto()  #: On-GPU shared memory
+    CuTile_Tile = auto()  #: cuTile tile register (tile-level data inside a cuTile kernel)
     SVE_Register = auto()  #: SVE register
     Snitch_TCDM = auto()  #: Cluster-private memory
     Snitch_L2 = auto()  #: External memory
@@ -63,9 +68,12 @@ class ScheduleType(ExtensibleAttributeEnum):
     GPU_ThreadBlock = auto()  #: Thread-block code
     GPU_ThreadBlock_Dynamic = auto()  #: Allows rescheduling work within a block
     GPU_Persistent = auto()
+    GPU_Warp = auto()
 
     Snitch = auto()
     Snitch_Multicore = auto()
+
+    CuTile = auto()
 
 
 # A subset of GPU schedule types
@@ -146,6 +154,11 @@ class Language(ExtensibleAttributeEnum):
     SystemVerilog = auto()
     MLIR = auto()
 
+class BackendLanguage(ExtensibleAttributeEnum):
+    """ Available programming languages for code generation. """
+    CPP = auto()
+    Python = auto()
+
 
 @undefined_safe_enum
 class InstrumentationType(ExtensibleAttributeEnum):
@@ -190,7 +203,9 @@ SCOPEDEFAULT_STORAGE = {
     ScheduleType.GPU_ThreadBlock: StorageType.Register,
     ScheduleType.GPU_ThreadBlock_Dynamic: StorageType.Register,
     ScheduleType.SVE_Map: StorageType.CPU_Heap,
-    ScheduleType.Snitch: StorageType.Snitch_TCDM
+    ScheduleType.Snitch: StorageType.Snitch_TCDM,
+    ScheduleType.GPU_Warp: StorageType.Register,
+    ScheduleType.CuTile: StorageType.CuTile_Tile,
 }
 
 # Maps from ScheduleType to default ScheduleType for sub-scopes
@@ -207,7 +222,9 @@ SCOPEDEFAULT_SCHEDULE = {
     ScheduleType.GPU_ThreadBlock_Dynamic: ScheduleType.Sequential,
     ScheduleType.SVE_Map: ScheduleType.Sequential,
     ScheduleType.Snitch: ScheduleType.Snitch,
-    ScheduleType.Snitch_Multicore: ScheduleType.Snitch_Multicore
+    ScheduleType.Snitch_Multicore: ScheduleType.Snitch_Multicore,
+    ScheduleType.GPU_Warp: ScheduleType.Sequential,
+    ScheduleType.CuTile: ScheduleType.Sequential,
 }
 
 # Maps from StorageType to a preferred ScheduleType for helping determine schedules.
@@ -219,6 +236,7 @@ STORAGEDEFAULT_SCHEDULE = {
     StorageType.GPU_Global: ScheduleType.GPU_Device,
     StorageType.GPU_Shared: ScheduleType.GPU_ThreadBlock,
     StorageType.SVE_Register: ScheduleType.SVE_Map,
+    StorageType.CuTile_Tile: ScheduleType.CuTile,
 }
 
 # Translation of types to C types
@@ -244,6 +262,55 @@ _CTYPES = {
     numpy.float64: "double",
     numpy.complex64: "dace::complex64",
     numpy.complex128: "dace::complex128",
+}
+
+# Translation of types to python or numpy types
+PYTHON_TYPES = {
+    None: "None",
+    int: "int",
+    float: "float",
+    complex: "complex",
+    bool: "bool",
+    numpy.bool_: "numpy.bool_",
+    numpy.int8: "numpy.int8",
+    numpy.int16: "numpy.int16",
+    numpy.int32: "numpy.int32",
+    numpy.int64: "numpy.int64",
+    numpy.intc: "numpy.intc",
+    numpy.uint8: "numpy.uint8",
+    numpy.uint16: "numpy.uint16",
+    numpy.uint32: "numpy.uint32",
+    numpy.uint64: "numpy.uint64",
+    numpy.uintc: "numpy.uintc",
+    numpy.float16: "numpy.float16",
+    numpy.float32: "numpy.float32",
+    numpy.float64: "numpy.float64",
+    numpy.complex64: "numpy.complex64",
+    numpy.complex128: "numpy.complex128",
+}
+
+NUMPY_TYPES = {
+    None: "None",
+    int: "numpy.int64",
+    float: "numpy.float64",
+    complex: "numpy.complex128",
+    bool: "numpy.bool_",
+    numpy.bool_: "numpy.bool_",
+    numpy.int8: "numpy.int8",
+    numpy.int16: "numpy.int16",
+    numpy.int32: "numpy.int32",
+    numpy.int64: "numpy.int64",
+    numpy.intc: "numpy.intc",
+    numpy.uint8: "numpy.uint8",
+    numpy.uint16: "numpy.uint16",
+    numpy.uint32: "numpy.uint32",
+    numpy.uint64: "numpy.uint64",
+    numpy.uintc: "numpy.uintc",
+    numpy.float16: "numpy.float16",
+    numpy.float32: "numpy.float32",
+    numpy.float64: "numpy.float64",
+    numpy.complex64: "numpy.complex64",
+    numpy.complex128: "numpy.complex128",
 }
 
 # Translation of types to ctypes types
@@ -805,6 +872,14 @@ class struct(typeclass):
             typ='\n'.join(["    %s %s;" % (t.ctype, tname) for tname, t in self._data.items()]),
         )
 
+    def emit_python_definition(self, code_stream: 'PythonCodeIOStream', cfg: 'ControlFlowRegion | None'=None, state_id: int | None=None, node_id: int | None=None):
+        class_definition = f"@dataclass\nclass {self.name}:"
+        code_stream.write(class_definition, cfg, state_id, node_id)
+        with code_stream.indented():
+            for tname, t in self._data.items():
+                type_annotation = PYTHON_TYPES[t.type]
+                code_stream.write(f"{tname}: {type_annotation}", cfg, state_id, node_id)
+
 
 class pyobject(opaque):
     """
@@ -1198,6 +1273,7 @@ if TYPE_CHECKING:
     class string(_DaCeArray, npt.NDArray[numpy.str_]): ...
     class vector(_DaCeArray, npt.NDArray[numpy.void]): ...
     class MPI_Request(_DaCeArray, npt.NDArray[numpy.void]): ...
+    class gpuStream_t(_DaCeArray, npt.NDArray[numpy.void]): ...
     # yapf: enable
 else:
     # Runtime definitions
@@ -1218,6 +1294,7 @@ else:
     complex128 = typeclass(numpy.complex128)
     string = stringtype()
     MPI_Request = opaque('MPI_Request')
+    gpuStream_t = opaque('gpuStream_t')
 
 _bool = bool
 
@@ -1519,6 +1596,8 @@ def can_access(schedule: ScheduleType, storage: StorageType):
             ScheduleType.GPU_ThreadBlock_Dynamic,
     ]:
         return storage in [StorageType.GPU_Global, StorageType.GPU_Shared, StorageType.CPU_Pinned]
+    elif schedule == ScheduleType.CuTile:
+        return storage in [StorageType.CuTile_Tile, StorageType.GPU_Global, StorageType.CPU_Pinned]
     elif schedule in [ScheduleType.Default, ScheduleType.CPU_Multicore, ScheduleType.CPU_Persistent]:
         return storage in [
             StorageType.Default, StorageType.CPU_Heap, StorageType.CPU_Pinned, StorageType.CPU_ThreadLocal
@@ -1562,6 +1641,11 @@ def can_allocate(storage: StorageType, schedule: ScheduleType):
             ScheduleType.GPU_Device, ScheduleType.GPU_ThreadBlock, ScheduleType.GPU_ThreadBlock_Dynamic,
             ScheduleType.GPU_Persistent
         ]
+
+
+    # cuTile tile-level memory
+    if storage == StorageType.CuTile_Tile:
+        return schedule == ScheduleType.CuTile
 
     # The rest (Registers) can be allocated everywhere
     return True

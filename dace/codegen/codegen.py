@@ -1,5 +1,6 @@
 # Copyright 2019-2026 ETH Zurich and the DaCe authors. All rights reserved.
 import functools
+import json
 from typing import List
 
 import dace
@@ -8,6 +9,7 @@ from dace import data
 from dace import config
 from dace.sdfg import SDFG
 from dace.codegen.targets import framecode
+from dace.codegen.py import framecode as pyframecode
 from dace.codegen.codeobject import CodeObject
 from dace.codegen import exceptions as exc
 from dace.config import Config
@@ -222,7 +224,14 @@ def generate_code(sdfg: SDFG, validate=True) -> List[CodeObject]:
     infer_types.infer_connector_types(sdfg)
     infer_types.set_default_schedule_and_storage_types(sdfg, None)
 
-    frame = framecode.DaCeCodeGenerator(sdfg)
+    # Select frame code generator based on backend
+    match sdfg.backend:
+        case dtypes.BackendLanguage.CPP:
+            frame = framecode.DaCeCodeGenerator(sdfg)
+        case dtypes.BackendLanguage.Python:
+            frame = pyframecode.DaCePythonCodeGenerator(sdfg)
+        case _:
+            raise ValueError(f"Unsupported backend: {sdfg.backend}")
 
     # Test for undefined symbols in SDFG arguments
     if "?" in frame.arglist.keys():
@@ -232,18 +241,23 @@ def generate_code(sdfg: SDFG, validate=True) -> List[CodeObject]:
     # Instantiate CPU first (as it is used by the other code generators)
     # TODO: Refactor the parts used by other code generators out of CPU
     from dace.codegen.targets import cpu
-    default_target = cpu.CPUCodeGen
-    for k, v in TargetCodeGenerator.extensions().items():
-        # If another target has already been registered as CPU, use it instead
-        if v['name'] == 'cpu':
-            default_target = k
-    targets = {'cpu': default_target(frame, sdfg)}
+    if sdfg.backend == dtypes.BackendLanguage.Python:
+        from dace.codegen.py.python_target import PythonCodeGen
+        default_target = PythonCodeGen
+        targets = {'cpu': default_target(frame, sdfg)}
+    else:
+        default_target = cpu.CPUCodeGen
+        for k, v in TargetCodeGenerator.extensions().items():
+            # If another target has already been registered as CPU, use it instead
+            if v['name'] == 'cpu':
+                default_target = k
+        targets = {'cpu': default_target(frame, sdfg)}
 
-    # Instantiate the rest of the targets
-    targets.update({
-        v['name']: k(frame, sdfg)
-        for k, v in TargetCodeGenerator.extensions().items() if v['name'] not in targets
-    })
+        # Instantiate the rest of the targets
+        targets.update({
+            v['name']: k(frame, sdfg)
+            for k, v in TargetCodeGenerator.extensions().items() if v['name'] not in targets
+        })
 
     # Query all code generation targets and instrumentation providers in SDFG
     _get_codegen_targets(sdfg, frame)
@@ -262,15 +276,27 @@ def generate_code(sdfg: SDFG, validate=True) -> List[CodeObject]:
 
     # Generate frame code (and the rest of the code)
     (global_code, frame_code, used_targets, used_environments) = frame.generate_code(sdfg, None)
-    target_objects = [
-        CodeObject(sdfg.name,
-                   global_code + frame_code,
-                   'cpp',
-                   cpu.CPUCodeGen,
-                   'Frame',
-                   environments=used_environments,
-                   sdfg=sdfg)
-    ]
+
+    if sdfg.backend == dtypes.BackendLanguage.Python:
+        target_objects = [
+            CodeObject(sdfg.name,
+                       global_code + frame_code,
+                       'py',
+                       default_target,
+                       'Frame',
+                       environments=used_environments,
+                       sdfg=sdfg)
+        ]
+    else:
+        target_objects = [
+            CodeObject(sdfg.name,
+                       global_code + frame_code,
+                       'cpp',
+                       cpu.CPUCodeGen,
+                       'Frame',
+                       environments=used_environments,
+                       sdfg=sdfg)
+        ]
 
     # Create code objects for each target
     for tgt in used_targets:
@@ -279,29 +305,30 @@ def generate_code(sdfg: SDFG, validate=True) -> List[CodeObject]:
     # Ensure that no new targets were dynamically added
     assert frame._dispatcher.used_targets == (frame.targets - {frame})
 
-    # add a header file for calling the SDFG
-    dummy = CodeObject(sdfg.name,
-                       generate_headers(sdfg, frame),
-                       'h',
-                       cpu.CPUCodeGen,
-                       'CallHeader',
-                       target_type='../../include',
-                       linkable=False)
-    target_objects.append(dummy)
+    if sdfg.backend == dtypes.BackendLanguage.CPP:
+        # add a header file for calling the SDFG
+        dummy = CodeObject(sdfg.name,
+                           generate_headers(sdfg, frame),
+                           'h',
+                           cpu.CPUCodeGen,
+                           'CallHeader',
+                           target_type='../../include',
+                           linkable=False)
+        target_objects.append(dummy)
 
-    for env in dace.library.get_environments_and_dependencies(used_environments):
-        if hasattr(env, "codeobjects"):
-            target_objects.extend(env.codeobjects)
+        for env in dace.library.get_environments_and_dependencies(used_environments):
+            if hasattr(env, "codeobjects"):
+                target_objects.extend(env.codeobjects)
 
-    # add a dummy main function to show how to call the SDFG
-    dummy = CodeObject(sdfg.name + "_main",
-                       generate_dummy(sdfg, frame),
-                       'cpp',
-                       cpu.CPUCodeGen,
-                       'SampleMain',
-                       target_type='../../sample',
-                       linkable=False)
-    target_objects.append(dummy)
+        # add a dummy main function to show how to call the SDFG
+        dummy = CodeObject(sdfg.name + "_main",
+                           generate_dummy(sdfg, frame),
+                           'cpp',
+                           cpu.CPUCodeGen,
+                           'SampleMain',
+                           target_type='../../sample',
+                           linkable=False)
+        target_objects.append(dummy)
 
     return target_objects
 
