@@ -955,7 +955,7 @@ class SDFG(ControlFlowRegion):
             raise ValueError(f'Invalid action "{action}".')
 
     def set_global_code(self,
-                        code: 'str | CodeBlock' = '',
+                        code: 'str | CodeBlock',
                         location: 'str | None' = 'frame',
                         language: 'dtypes.Language | None' = None):
         """
@@ -972,7 +972,7 @@ class SDFG(ControlFlowRegion):
         self._update_code(self.global_code, code, location, 'set', language)
 
     def set_init_code(self,
-                      code: 'str | CodeBlock' = '',
+                      code: 'str | CodeBlock',
                       location: 'str | None' = 'frame',
                       language: 'dtypes.Language | None' = None):
         """
@@ -989,7 +989,7 @@ class SDFG(ControlFlowRegion):
         self._update_code(self.init_code, code, location, 'set', language)
 
     def set_exit_code(self,
-                      code: 'str | CodeBlock' = '',
+                      code: 'str | CodeBlock',
                       location: 'str | None' = 'frame',
                       language: 'dtypes.Language | None' = None):
         """
@@ -1006,7 +1006,7 @@ class SDFG(ControlFlowRegion):
         self._update_code(self.exit_code, code, location, 'set', language)
 
     def append_global_code(self,
-                           code: 'str | CodeBlock' = '',
+                           code: 'str | CodeBlock',
                            location: 'str | None' = 'frame',
                            language: 'dtypes.Language | None' = None):
         """
@@ -1023,7 +1023,7 @@ class SDFG(ControlFlowRegion):
         self._update_code(self.global_code, code, location, 'append', language)
 
     def append_init_code(self,
-                         code: 'str | CodeBlock' = '',
+                         code: 'str | CodeBlock',
                          location: 'str | None' = 'frame',
                          language: 'dtypes.Language | None' = None):
         """
@@ -1040,7 +1040,7 @@ class SDFG(ControlFlowRegion):
         self._update_code(self.init_code, code, location, 'append', language)
 
     def append_exit_code(self,
-                         code: 'str | CodeBlock' = '',
+                         code: 'str | CodeBlock',
                          location: 'str | None' = 'frame',
                          language: 'dtypes.Language | None' = None):
         """
@@ -1057,7 +1057,7 @@ class SDFG(ControlFlowRegion):
         self._update_code(self.exit_code, code, location, 'append', language)
 
     def prepend_exit_code(self,
-                          code: 'str | CodeBlock' = '',
+                          code: 'str | CodeBlock',
                           location: 'str | None' = 'frame',
                           language: 'dtypes.Language | None' = None):
         """

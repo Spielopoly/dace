@@ -68,7 +68,6 @@ class ScheduleType(ExtensibleAttributeEnum):
     GPU_ThreadBlock = auto()  #: Thread-block code
     GPU_ThreadBlock_Dynamic = auto()  #: Allows rescheduling work within a block
     GPU_Persistent = auto()
-    GPU_Warp = auto()
 
     Snitch = auto()
     Snitch_Multicore = auto()
@@ -204,7 +203,6 @@ SCOPEDEFAULT_STORAGE = {
     ScheduleType.GPU_ThreadBlock_Dynamic: StorageType.Register,
     ScheduleType.SVE_Map: StorageType.CPU_Heap,
     ScheduleType.Snitch: StorageType.Snitch_TCDM,
-    ScheduleType.GPU_Warp: StorageType.Register,
     ScheduleType.CuTile: StorageType.CuTile_Tile,
 }
 
@@ -223,7 +221,6 @@ SCOPEDEFAULT_SCHEDULE = {
     ScheduleType.SVE_Map: ScheduleType.Sequential,
     ScheduleType.Snitch: ScheduleType.Snitch,
     ScheduleType.Snitch_Multicore: ScheduleType.Snitch_Multicore,
-    ScheduleType.GPU_Warp: ScheduleType.Sequential,
     ScheduleType.CuTile: ScheduleType.Sequential,
 }
 
@@ -1273,7 +1270,6 @@ if TYPE_CHECKING:
     class string(_DaCeArray, npt.NDArray[numpy.str_]): ...
     class vector(_DaCeArray, npt.NDArray[numpy.void]): ...
     class MPI_Request(_DaCeArray, npt.NDArray[numpy.void]): ...
-    class gpuStream_t(_DaCeArray, npt.NDArray[numpy.void]): ...
     # yapf: enable
 else:
     # Runtime definitions
@@ -1294,7 +1290,6 @@ else:
     complex128 = typeclass(numpy.complex128)
     string = stringtype()
     MPI_Request = opaque('MPI_Request')
-    gpuStream_t = opaque('gpuStream_t')
 
 _bool = bool
 

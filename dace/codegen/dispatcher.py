@@ -8,16 +8,17 @@ from dace.codegen.prettycode import CodeIOStream
 from dace.codegen.py.prettycode import PythonCodeIOStream
 from dace import attr_enum, config, data as dt, dtypes, nodes
 from dace.memlet import Memlet
-from dace.codegen import prettycode
 from dace.codegen import target
-from dace.codegen import exceptions as cgx
 from dace.sdfg import utils as sdutil, SDFG, SDFGState, ScopeSubgraphView
 from dace.sdfg.graph import MultiConnectorEdge
 from enum import auto
 from typing import Callable, Dict, List, Optional, Set, Tuple, Union
 
 from dace.sdfg.state import ControlFlowRegion, StateSubgraphView
+from typing import TYPE_CHECKING
 
+if TYPE_CHECKING:
+    IOStream = CodeIOStream | PythonCodeIOStream
 
 class DefinedType(attr_enum.ExtensibleAttributeEnum):
     """ Data types for `DefinedMemlets`.
@@ -29,7 +30,6 @@ class DefinedType(attr_enum.ExtensibleAttributeEnum):
     Object = auto()  # An object moved by reference
     Stream = auto()  # A stream object moved by reference and accessed via a push/pop API
     StreamArray = auto()  # An array of Streams
-    GPUStream = auto()  # A GPU stream object
 
 
 class DefinedMemlets:
@@ -379,7 +379,7 @@ class TargetDispatcher(object):
 
         return self._generic_state_dispatcher
 
-    def dispatch_state(self, state: SDFGState, function_stream: CodeIOStream, callsite_stream: CodeIOStream) -> None:
+    def dispatch_state(self, state: SDFGState, function_stream: "IOStream", callsite_stream: "IOStream") -> None:
         """ Dispatches a code generator for an SDFG state. """
 
         self.defined_vars.enter_scope(state)
@@ -392,8 +392,8 @@ class TargetDispatcher(object):
                           cfg: ControlFlowRegion,
                           dfg: StateSubgraphView,
                           state_id: int,
-                          function_stream: CodeIOStream,
-                          callsite_stream: CodeIOStream,
+                          function_stream: "IOStream",
+                          callsite_stream: "IOStream",
                           skip_entry_node: bool = False,
                           skip_exit_node: bool = False):
         """ Dispatches a code generator for a scope subgraph of an
@@ -441,7 +441,7 @@ class TargetDispatcher(object):
             return self._generic_node_dispatcher
 
     def dispatch_node(self, sdfg: SDFG, cfg: ControlFlowRegion, dfg: StateSubgraphView, state_id: int, node: nodes.Node,
-                      function_stream: CodeIOStream, callsite_stream: CodeIOStream):
+                      function_stream: "IOStream", callsite_stream: "IOStream"):
         """ Dispatches a code generator for a single node. """
 
         # If this node depends on any environments, register this for
@@ -460,8 +460,8 @@ class TargetDispatcher(object):
         return self._map_dispatchers[schedule]
 
     def dispatch_scope(self, map_schedule: dtypes.ScheduleType, sdfg: SDFG, cfg: ControlFlowRegion,
-                       sub_dfg: StateSubgraphView, state_id: int, function_stream: CodeIOStream,
-                       callsite_stream: CodeIOStream) -> None:
+                       sub_dfg: StateSubgraphView, state_id: int, function_stream: "IOStream",
+                       callsite_stream: "IOStream") -> None:
         """ Dispatches a code generator function for a scope in an SDFG
             state. """
 
@@ -482,19 +482,19 @@ class TargetDispatcher(object):
                           state_id: int,
                           node: nodes.AccessNode,
                           datadesc: dt.Data,
-                          function_stream: prettycode.CodeIOStream,
-                          callsite_stream: prettycode.CodeIOStream,
+                          function_stream: "IOStream",
+                          callsite_stream: "IOStream",
                           declare: bool = True,
                           allocate: bool = True) -> None:
         """ Dispatches a code generator for data allocation. """
         self._used_targets.add(self._array_dispatchers[datadesc.storage])
 
         if datadesc.lifetime == dtypes.AllocationLifetime.Persistent:
-            declaration_stream = CodeIOStream()
+            declaration_stream = self._get_code_io_stream_class(sdfg)()
             callsite_stream = self.frame._initcode
         elif datadesc.lifetime == dtypes.AllocationLifetime.External:
-            declaration_stream = CodeIOStream()
-            callsite_stream = CodeIOStream()
+            declaration_stream = self._get_code_io_stream_class(sdfg)()
+            callsite_stream = self._get_code_io_stream_class(sdfg)()
         else:
             declaration_stream = callsite_stream
 
@@ -507,8 +507,8 @@ class TargetDispatcher(object):
                                                                      callsite_stream)
 
     def dispatch_deallocate(self, sdfg: SDFG, cfg: ControlFlowRegion, dfg: ScopeSubgraphView, state_id: int,
-                            node: nodes.AccessNode, datadesc: dt.Data, function_stream: prettycode.CodeIOStream,
-                            callsite_stream: prettycode.CodeIOStream) -> None:
+                            node: nodes.AccessNode, datadesc: dt.Data, function_stream: "IOStream",
+                            callsite_stream: "IOStream") -> None:
         """ Dispatches a code generator for a data deallocation. """
         self._used_targets.add(self._array_dispatchers[datadesc.storage])
 
@@ -600,8 +600,8 @@ class TargetDispatcher(object):
         return target
 
     def dispatch_copy(self, src_node: nodes.Node, dst_node: nodes.Node, edge: MultiConnectorEdge[Memlet], sdfg: SDFG,
-                      cfg: ControlFlowRegion, dfg: StateSubgraphView, state_id: int, function_stream: CodeIOStream,
-                      output_stream: CodeIOStream) -> None:
+                      cfg: ControlFlowRegion, dfg: StateSubgraphView, state_id: int, function_stream: "IOStream",
+                      output_stream: "IOStream") -> None:
         """ Dispatches a code generator for a memory copy operation. """
         if edge.data.is_empty():
             return
@@ -617,7 +617,7 @@ class TargetDispatcher(object):
     # Dispatches definition code for a memlet that is outgoing from a tasklet
     def dispatch_output_definition(self, src_node: nodes.Node, dst_node: nodes.Node, edge, sdfg: SDFG,
                                    cfg: ControlFlowRegion, dfg: StateSubgraphView, state_id: int,
-                                   function_stream: CodeIOStream, output_stream: CodeIOStream) -> None:
+                                   function_stream: "IOStream", output_stream: "IOStream") -> None:
         """
         Dispatches a code generator for an output memlet definition in a tasklet.
         """

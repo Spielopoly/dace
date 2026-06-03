@@ -228,45 +228,44 @@ def generate_code(sdfg: SDFG, validate=True) -> List[CodeObject]:
     match sdfg.backend:
         case dtypes.BackendLanguage.CPP:
             frame = framecode.DaCeCodeGenerator(sdfg)
+            target_code_generator_cls = TargetCodeGenerator
         case dtypes.BackendLanguage.Python:
             frame = pyframecode.DaCePythonCodeGenerator(sdfg)
+            target_code_generator_cls = PythonTargetCodeGenerator
         case _:
-            raise ValueError(f"Unsupported backend: {sdfg.backend}")
+            raise exc.CodegenError(f"Unsupported backend language '{sdfg.backend}' for SDFG '{sdfg.name}'")
 
     # Test for undefined symbols in SDFG arguments
     if "?" in frame.arglist.keys():
         raise exc.CodegenError("SDFG '%s' has undefined symbols in its arguments. "
                                "Please ensure all symbols are defined before generating code." % sdfg.name)
 
-    # Instantiate CPU first (as it is used by the other code generators)
-    # TODO: Refactor the parts used by other code generators out of CPU
-    from dace.codegen.targets import cpu
-    if sdfg.backend == dtypes.BackendLanguage.Python:
-        from dace.codegen.py.python_target import PythonCodeGen
-        from dace.codegen.py.target import PythonTargetCodeGenerator
-        default_target = PythonCodeGen
-        targets = {'cpu': default_target(frame, sdfg)}
 
-        # Instantiate Python target extensions (e.g., CuTilePythonCodeGen)
-        # Skip default_target to avoid double-instantiation (it's already in targets as 'cpu').
-        targets.update({
-            v['name']: k(frame, sdfg)
-            for k, v in PythonTargetCodeGenerator.extensions().items()
-            if k is not default_target and v['name'] not in targets
-        })
+    if sdfg.backend == dtypes.BackendLanguage.Python:
+        from dace.codegen.py import python_target
+        
+        default_target = python_target.PythonCodeGen
+        for k, v in target_code_generator_cls.extensions().items():
+            # If another target has already been registered as Python, use it instead
+            if v['name'] == 'python':
+                default_target = k
+        targets = {'python': default_target(frame, sdfg)}
     else:
+        # Instantiate CPU first (as it is used by the other code generators)
+        # TODO: Refactor the parts used by other code generators out of CPU
+        from dace.codegen.targets import cpu
         default_target = cpu.CPUCodeGen
-        for k, v in TargetCodeGenerator.extensions().items():
+        for k, v in target_code_generator_cls.extensions().items():
             # If another target has already been registered as CPU, use it instead
             if v['name'] == 'cpu':
                 default_target = k
         targets = {'cpu': default_target(frame, sdfg)}
 
-        # Instantiate the rest of the targets
-        targets.update({
-            v['name']: k(frame, sdfg)
-            for k, v in TargetCodeGenerator.extensions().items() if v['name'] not in targets
-        })
+    # Instantiate the rest of the targets
+    targets.update({
+        v['name']: k(frame, sdfg)
+        for k, v in target_code_generator_cls.extensions().items() if v['name'] not in targets
+    })
 
     # Query all code generation targets and instrumentation providers in SDFG
     _get_codegen_targets(sdfg, frame)
@@ -293,27 +292,28 @@ def generate_code(sdfg: SDFG, validate=True) -> List[CodeObject]:
 
     # Generate frame code (and the rest of the code)
     (global_code, frame_code, used_targets, used_environments) = frame.generate_code(sdfg, None)
-
-    if sdfg.backend == dtypes.BackendLanguage.Python:
+    if sdfg.backend == dtypes.BackendLanguage.CPP:
         target_objects = [
             CodeObject(sdfg.name,
-                       global_code + frame_code,
-                       'py',
-                       default_target,
-                       'Frame',
-                       environments=used_environments,
-                       sdfg=sdfg)
+                    global_code + frame_code,
+                    'cpp',
+                    cpu.CPUCodeGen,
+                    'Frame',
+                    environments=used_environments,
+                    sdfg=sdfg)
+        ]
+    elif sdfg.backend == dtypes.BackendLanguage.Python:
+        target_objects = [
+            CodeObject(sdfg.name,
+                    global_code + frame_code,
+                    'py',
+                    python_target.PythonCodeGen,
+                    'Frame',
+                    environments=used_environments,
+                    sdfg=sdfg)
         ]
     else:
-        target_objects = [
-            CodeObject(sdfg.name,
-                       global_code + frame_code,
-                       'cpp',
-                       cpu.CPUCodeGen,
-                       'Frame',
-                       environments=used_environments,
-                       sdfg=sdfg)
-        ]
+        raise NotImplementedError(f"Unsupported backend language '{sdfg.backend}' for SDFG '{sdfg.name}'")
 
     # Create code objects for each target
     for tgt in used_targets:
