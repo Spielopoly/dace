@@ -448,6 +448,11 @@ class DaCePythonCodeGenerator(object):
 
         callsite_stream.write('\n', cfg=cfg, state_id=sid)
 
+        # Invoke all instrumentation providers
+        for instr in self._dispatcher.instrumentation.values():
+            if instr is not None:
+                instr.on_state_begin(sdfg, cfg, state, callsite_stream, global_stream)
+
         #####################
         # Create dataflow graph for state's children.
 
@@ -482,6 +487,11 @@ class DaCePythonCodeGenerator(object):
         if generate_state_footer:
             # Emit internal transient array deallocation
             self.deallocate_arrays_in_scope(sdfg, state.parent_graph, state, global_stream, callsite_stream)
+
+            # Invoke all instrumentation providers
+            for instr in self._dispatcher.instrumentation.values():
+                if instr is not None:
+                    instr.on_state_end(sdfg, cfg, state, callsite_stream, global_stream)
 
     def generate_states(self, sdfg: SDFG, global_stream: PythonCodeIOStream, callsite_stream: PythonCodeIOStream) -> Set[SDFGState]:
         states_generated = set()
@@ -894,6 +904,11 @@ class DaCePythonCodeGenerator(object):
         # TODO: Check if this is correct for python
         self.allocate_arrays_in_scope(sdfg, sdfg, sdfg, global_stream, callsite_stream)
 
+        # Invoke all instrumentation providers
+        for instr in self._dispatcher.instrumentation.values():
+            if instr is not None:
+                instr.on_sdfg_begin(sdfg, callsite_stream, global_stream, self)
+
         # Define constants as top-level-allocated
         # TODO: Check if this is correct for python
         for cname, (ctype, _) in sdfg.constants_prop.items():
@@ -959,6 +974,11 @@ class DaCePythonCodeGenerator(object):
 
         # Deallocate transients
         self.deallocate_arrays_in_scope(sdfg, sdfg, sdfg, global_stream, callsite_stream)
+
+        # Invoke all instrumentation providers
+        for instr in self._dispatcher.instrumentation.values():
+            if instr is not None:
+                instr.on_sdfg_end(sdfg, callsite_stream, global_stream)
 
         # Now that we have all the information about dependencies, generate
         # header and footer

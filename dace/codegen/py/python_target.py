@@ -884,6 +884,14 @@ class PythonCodeGen(PythonTargetCodeGenerator):
                 continue
             callsite_stream.write(f'{edge.dst_conn} = {self._read_expr(sdfg, edge.data)}', cfg, state_id)
 
+        # Instrumentation: Pre-scope (before for-loop headers)
+        if node.map.instrument != dtypes.InstrumentationType.No_Instrumentation:
+            for instr in self._dispatcher.instrumentation.values():
+                if instr is not None:
+                    instr.on_scope_entry(sdfg, cfg, state_dfg, node,
+                                         callsite_stream, callsite_stream,
+                                         function_stream)
+
         for current_range, variable in zip(node.map.range, node.map.params):
             begin, end, step = current_range
             callsite_stream.write(self._map_range_statement(str(variable), _python_expr(begin), _python_expr(end),
@@ -903,6 +911,15 @@ class PythonCodeGen(PythonTargetCodeGenerator):
         if hasattr(self._frame, 'deallocate_arrays_in_scope'):
             self._frame.deallocate_arrays_in_scope(sdfg, cfg, map_node, function_stream, callsite_stream)
         callsite_stream.dedent(len(map_node.map.range))
+
+        # Instrumentation: Post-scope (after all for-loop iterations complete)
+        if map_node.map.instrument != dtypes.InstrumentationType.No_Instrumentation:
+            state_dfg = cfg.state(state_id)
+            for instr in self._dispatcher.instrumentation.values():
+                if instr is not None:
+                    instr.on_scope_exit(sdfg, cfg, state_dfg, node,
+                                        callsite_stream, callsite_stream,
+                                        function_stream)
 
     def _generate_ConsumeEntry(self, sdfg: SDFG, cfg: ControlFlowRegion, dfg, state_id: int,
                                node: nodes.ConsumeEntry, function_stream: PythonCodeIOStream,

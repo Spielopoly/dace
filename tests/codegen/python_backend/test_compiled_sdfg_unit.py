@@ -241,3 +241,152 @@ def test_compile_python_sdfg_stdlib_imports_still_work():
     )
     csdfg = compile_python_sdfg(sdfg, [co_frame])
     assert csdfg() == 3
+
+
+# ---------------------------------------------------------------------------
+# Profiler compatibility (do_not_execute, _libhandle, _cfunc)
+# ---------------------------------------------------------------------------
+
+def test_do_not_execute_default():
+    """do_not_execute defaults to False."""
+    sdfg = _make_sdfg("f")
+    code = "def f(): return 42\n"
+    csdfg = PythonCompiledSDFG(sdfg, code)
+    assert csdfg.do_not_execute is False
+
+
+def test_libhandle_default():
+    """_libhandle defaults to None."""
+    sdfg = _make_sdfg("f")
+    code = "def f(): return 42\n"
+    csdfg = PythonCompiledSDFG(sdfg, code)
+    assert csdfg._libhandle is None
+
+
+def test_do_not_execute_skips_execution():
+    """When do_not_execute is True, __call__ initializes but does not run the function."""
+    call_log = []
+    sdfg = _make_sdfg("tracked")
+    code = (
+        "call_log = []\n"
+        "def tracked():\n"
+        "    call_log.append('called')\n"
+        "    return 99\n"
+    )
+    csdfg = PythonCompiledSDFG(sdfg, code)
+    # Inject the same log list so we can inspect it
+    csdfg._namespace['call_log'] = call_log
+
+    csdfg.do_not_execute = True
+    result = csdfg()
+    assert result is None
+    assert call_log == []  # Function was NOT called
+
+
+def test_do_not_execute_still_initializes():
+    """When do_not_execute is True, __call__ still runs initialization."""
+    sdfg = _make_sdfg("init_test")
+    code = (
+        "init_count = [0]\n"
+        "def __dace_init_init_test():\n"
+        "    init_count[0] += 1\n"
+        "def init_test():\n"
+        "    return init_count[0]\n"
+    )
+    csdfg = PythonCompiledSDFG(sdfg, code)
+    csdfg.do_not_execute = True
+    csdfg()
+    # Initialization should have happened
+    assert csdfg._initialized is True
+    assert csdfg._namespace['init_count'][0] == 1
+
+
+def test_do_not_execute_toggle():
+    """do_not_execute can be toggled on and off, matching profiler save/restore pattern."""
+    sdfg = _make_sdfg("toggle")
+    code = "def toggle(x):\n    return x * 2\n"
+    csdfg = PythonCompiledSDFG(sdfg, code)
+
+    # Normal call
+    assert csdfg(5) == 10
+
+    # Save old value, set True (as profiler does)
+    old_dne = csdfg.do_not_execute
+    csdfg.do_not_execute = True
+    result = csdfg(5)
+    assert result is None
+
+    # Restore (as profiler does)
+    csdfg.do_not_execute = old_dne
+    assert csdfg(5) == 10
+
+
+def test_cfunc_returns_callable():
+    """_cfunc returns a callable."""
+    sdfg = _make_sdfg("f")
+    code = "def f(x):\n    return x + 1\n"
+    csdfg = PythonCompiledSDFG(sdfg, code)
+    assert callable(csdfg._cfunc)
+
+
+def test_cfunc_ignores_handle():
+    """_cfunc ignores the first argument (handle), passes the rest through."""
+    sdfg = _make_sdfg("add")
+    code = "def add(a, b):\n    return a + b\n"
+    csdfg = PythonCompiledSDFG(sdfg, code)
+    # Call with None as handle (matching Python backend _libhandle)
+    assert csdfg._cfunc(None, 3, 7) == 10
+
+
+def test_cfunc_ignores_handle_with_kwargs():
+    """_cfunc passes kwargs through correctly."""
+    sdfg = _make_sdfg("add")
+    code = "def add(a, b):\n    return a + b\n"
+    csdfg = PythonCompiledSDFG(sdfg, code)
+    assert csdfg._cfunc(None, a=10, b=20) == 30
+
+
+def test_cfunc_with_no_args():
+    """_cfunc works with handle-only call (no additional args)."""
+    sdfg = _make_sdfg("noop")
+    code = "def noop():\n    return 'done'\n"
+    csdfg = PythonCompiledSDFG(sdfg, code)
+    assert csdfg._cfunc(None) == 'done'
+
+
+def test_cfunc_with_libhandle():
+    """_cfunc(csdfg._libhandle, *args) works -- the profiler's calling convention."""
+    sdfg = _make_sdfg("mul")
+    code = "def mul(a, b):\n    return a * b\n"
+    csdfg = PythonCompiledSDFG(sdfg, code)
+    result = csdfg._cfunc(csdfg._libhandle, 6, 7)
+    assert result == 42
+
+
+def test_profiler_interface_complete():
+    """PythonCompiledSDFG exposes all attributes the CompiledSDFGProfiler needs."""
+    sdfg = _make_sdfg("profiled")
+    code = "def profiled(x):\n    return x\n"
+    csdfg = PythonCompiledSDFG(sdfg, code)
+
+    # The profiler accesses these attributes:
+    assert hasattr(csdfg, '_cfunc')
+    assert hasattr(csdfg, '_libhandle')
+    assert hasattr(csdfg, 'do_not_execute')
+    assert hasattr(csdfg, 'sdfg')
+
+    # Simulate exactly what CompiledSDFGProfiler does:
+    #   compiled_sdfg._cfunc(compiled_sdfg._libhandle, *args)
+    args = (42,)
+    result = csdfg._cfunc(csdfg._libhandle, *args)
+    assert result == 42
+
+    #   old_dne = compiled_sdfg.do_not_execute
+    #   compiled_sdfg.do_not_execute = True
+    old_dne = csdfg.do_not_execute
+    csdfg.do_not_execute = True
+    assert csdfg() is None  # call should be suppressed
+
+    #   compiled_sdfg.do_not_execute = old_dne
+    csdfg.do_not_execute = old_dne
+    assert csdfg(42) == 42  # back to normal

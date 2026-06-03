@@ -93,6 +93,18 @@ class PythonCompiledSDFG:
         self._init = self._namespace.get(f'__dace_init_{func_name}')
         self._exit = self._namespace.get(f'__dace_exit_{func_name}')
 
+        # Create cached cfunc wrapper for profiler compatibility
+        func = self._func
+        def _cfunc_wrapper(_handle, *args, **kwargs):
+            return func(*args, **kwargs)
+        self._cfunc_cached = _cfunc_wrapper
+
+        # Profiler compatibility: these attributes mirror the C++ CompiledSDFG
+        # interface so that CompiledSDFGProfiler (and similar tools like
+        # npbench) can use the same code path for both backends.
+        self.do_not_execute: bool = False
+        self._libhandle = None
+
     @property
     def sdfg(self):
         return self._sdfg
@@ -100,6 +112,22 @@ class PythonCompiledSDFG:
     @property
     def code(self) -> str:
         return self._code
+
+    @property
+    def _cfunc(self):
+        """Return a callable compatible with the C++ CompiledSDFG interface.
+
+        The C++ backend exposes ``_cfunc`` as a ctypes function pointer whose
+        first argument is ``_libhandle`` (a ``ctypes.c_void_p``).  Profiling
+        tools such as ``CompiledSDFGProfiler`` call
+        ``compiled_sdfg._cfunc(compiled_sdfg._libhandle, *args)`` to bypass
+        the normal ``__call__`` path.
+
+        This property returns a cached thin wrapper around ``self._func``
+        that accepts (and ignores) the leading handle argument so the same
+        calling convention works for the Python backend.
+        """
+        return self._cfunc_cached
 
     def initialize(self, *args, **kwargs):
         if self._initialized:
@@ -124,6 +152,8 @@ class PythonCompiledSDFG:
 
     def __call__(self, *args, **kwargs):
         self.initialize(*args, **kwargs)
+        if self.do_not_execute:
+            return
         return self._func(*args, **kwargs)
 
     def __del__(self):
