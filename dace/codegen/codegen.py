@@ -162,6 +162,7 @@ def generate_code(sdfg: SDFG, validate=True) -> List[CodeObject]:
     :return: List of code objects that correspond to files to compile.
     """
     from dace.codegen.target import TargetCodeGenerator  # Avoid import loop
+    from dace.codegen.py.target import PythonTargetCodeGenerator  # Avoid import loop
 
     # Before compiling, validate SDFG correctness
     if validate:
