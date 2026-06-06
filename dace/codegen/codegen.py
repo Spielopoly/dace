@@ -281,14 +281,6 @@ def generate_code(sdfg: SDFG, validate=True) -> List[CodeObject]:
         for k, v in frame._dispatcher.instrumentation.items()
     }
 
-    # For the Python backend, swap TimerProvider with PythonTimerProvider
-    if sdfg.backend == dtypes.BackendLanguage.Python:
-        from dace.codegen.instrumentation.timer import TimerProvider
-        from dace.codegen.instrumentation.py_timer import PythonTimerProvider
-        for k, v in list(frame._dispatcher.instrumentation.items()):
-            if isinstance(v, TimerProvider):
-                frame._dispatcher.instrumentation[k] = PythonTimerProvider()
-
     # NOTE: THE SDFG IS ASSUMED TO BE FROZEN (not change) FROM THIS POINT ONWARDS
 
     # Generate frame code (and the rest of the code)

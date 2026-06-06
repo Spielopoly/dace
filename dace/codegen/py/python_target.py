@@ -652,6 +652,17 @@ class PythonCodeGen(PythonTargetCodeGenerator):
         state_dfg = cfg.state(state_id)
         self._dispatcher.defined_vars.enter_scope(node)
 
+        # Instrumentation: node begin (before reading inputs). The node hooks are
+        # intentionally emitted INSIDE the enclosing map-loop body, so an N-trip
+        # map produces N node timing events -- matching the C++ TimerProvider,
+        # where the tasklet body and its timing also live inside the loop.
+        if node.instrument != dtypes.InstrumentationType.No_Instrumentation:
+            for instr in self._dispatcher.instrumentation.values():
+                if instr is not None:
+                    instr.on_node_begin(sdfg, cfg, state_dfg, node,
+                                        callsite_stream, callsite_stream,
+                                        function_stream)
+
         for edge in state_dfg.in_edges(node):
             if not edge.dst_conn:
                 continue
@@ -677,6 +688,14 @@ class PythonCodeGen(PythonTargetCodeGenerator):
                 raise NotImplementedError('Code-to-code memlets not supported in the Python backend.')
             # TODO: Involve self._dispatcher.dispatch_copy instead?
             self._emit_memlet_write(sdfg, edge.data, edge.src_conn, callsite_stream, cfg, state_id)
+
+        # Instrumentation: node end (after writing outputs)
+        if node.instrument != dtypes.InstrumentationType.No_Instrumentation:
+            for instr in self._dispatcher.instrumentation.values():
+                if instr is not None:
+                    instr.on_node_end(sdfg, cfg, state_dfg, node,
+                                      callsite_stream, callsite_stream,
+                                      function_stream)
 
         self._dispatcher.defined_vars.exit_scope(node)
 

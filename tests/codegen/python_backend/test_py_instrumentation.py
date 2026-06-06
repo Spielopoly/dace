@@ -69,21 +69,6 @@ def _make_scale_sdfg(name: str, size: int = 20):
 class TestPythonTimerProviderUnit:
     """Unit tests for PythonTimerProvider internals."""
 
-    def test_ensure_timer_compiled_returns_path(self):
-        """The shared library should compile successfully and return a path."""
-        lib_path = PythonTimerProvider._ensure_timer_compiled()
-        # lib_path may be empty string on systems without g++
-        if lib_path:
-            assert os.path.isfile(lib_path)
-            assert lib_path.endswith('.so')
-
-    def test_ensure_timer_compiled_caches(self):
-        """Calling _ensure_timer_compiled twice should return the same path
-        (cached)."""
-        path1 = PythonTimerProvider._ensure_timer_compiled()
-        path2 = PythonTimerProvider._ensure_timer_compiled()
-        assert path1 == path2
-
     def test_idstr_sdfg_level(self):
         """_idstr with (sdfg, None, None) should return just the cfg_id."""
         provider = PythonTimerProvider()
@@ -138,7 +123,7 @@ class TestPythonTimerProviderUnit:
         """on_sdfg_begin should emit ctypes-based timer setup."""
         provider = PythonTimerProvider()
         sdfg = dace.SDFG('test_setup')
-        sdfg.instrument = dtypes.InstrumentationType.Timer
+        sdfg.instrument = dtypes.InstrumentationType.PythonTimer
 
         global_stream = PythonCodeIOStream()
         local_stream = PythonCodeIOStream()
@@ -182,7 +167,7 @@ class TestPythonTimerIntegration:
         """Instrumenting the entire SDFG should produce a valid report."""
         sdfg, state, me = _make_add_sdfg('test_sdfg_timer')
         sdfg.backend = dtypes.BackendLanguage.Python
-        sdfg.instrument = dtypes.InstrumentationType.Timer
+        sdfg.instrument = dtypes.InstrumentationType.PythonTimer
 
         compiled = sdfg.compile()
 
@@ -211,7 +196,7 @@ class TestPythonTimerIntegration:
         sdfg.backend = dtypes.BackendLanguage.Python
 
         # Instrument the state
-        state.instrument = dtypes.InstrumentationType.Timer
+        state.instrument = dtypes.InstrumentationType.PythonTimer
 
         compiled = sdfg.compile()
 
@@ -234,7 +219,7 @@ class TestPythonTimerIntegration:
         """Instrumenting a map scope should time the for-loop execution."""
         sdfg, state, me = _make_scale_sdfg('test_map_timer')
 
-        me.map.instrument = dtypes.InstrumentationType.Timer
+        me.map.instrument = dtypes.InstrumentationType.PythonTimer
         sdfg.backend = dtypes.BackendLanguage.Python
 
         compiled = sdfg.compile()
@@ -254,9 +239,9 @@ class TestPythonTimerIntegration:
         """SDFG, state, and map all instrumented simultaneously."""
         sdfg, state, me = _make_add_sdfg('test_all_levels', size=16)
 
-        sdfg.instrument = dtypes.InstrumentationType.Timer
-        state.instrument = dtypes.InstrumentationType.Timer
-        me.map.instrument = dtypes.InstrumentationType.Timer
+        sdfg.instrument = dtypes.InstrumentationType.PythonTimer
+        state.instrument = dtypes.InstrumentationType.PythonTimer
+        me.map.instrument = dtypes.InstrumentationType.PythonTimer
 
         sdfg.backend = dtypes.BackendLanguage.Python
         compiled = sdfg.compile()
@@ -294,8 +279,8 @@ class TestPythonTimerIntegration:
         state.add_memlet_path(b, me, t, dst_conn='y', memlet=dace.Memlet('B[i]'))
         state.add_memlet_path(t, mx, c, src_conn='z', memlet=dace.Memlet('C[i]'))
 
-        sdfg.instrument = dtypes.InstrumentationType.Timer
-        me.map.instrument = dtypes.InstrumentationType.Timer
+        sdfg.instrument = dtypes.InstrumentationType.PythonTimer
+        me.map.instrument = dtypes.InstrumentationType.PythonTimer
 
         sdfg.backend = dtypes.BackendLanguage.Python
         compiled = sdfg.compile()
@@ -316,7 +301,7 @@ class TestPythonTimerIntegration:
         """Check that the generated JSON report matches the Chrome Tracing format."""
         sdfg, state, me = _make_add_sdfg('test_json_format', size=4)
         sdfg.backend = dtypes.BackendLanguage.Python
-        sdfg.instrument = dtypes.InstrumentationType.Timer
+        sdfg.instrument = dtypes.InstrumentationType.PythonTimer
 
         compiled = sdfg.compile()
         a = np.ones(4, dtype=np.float64)
@@ -375,7 +360,7 @@ class TestPythonTimerIntegration:
         """Running an instrumented SDFG twice should produce two reports."""
         sdfg, state, me = _make_add_sdfg('test_multi_run', size=3)
         sdfg.backend = dtypes.BackendLanguage.Python
-        sdfg.instrument = dtypes.InstrumentationType.Timer
+        sdfg.instrument = dtypes.InstrumentationType.PythonTimer
 
         # Clear old reports
         try:
@@ -410,7 +395,7 @@ class TestPythonTimerIntegration:
         state.add_memlet_path(a, me, t, dst_conn='inp', memlet=dace.Memlet('A[i, j]'))
         state.add_memlet_path(t, mx, b, src_conn='out', memlet=dace.Memlet('B[i, j]'))
 
-        me.map.instrument = dtypes.InstrumentationType.Timer
+        me.map.instrument = dtypes.InstrumentationType.PythonTimer
 
         sdfg.backend = dtypes.BackendLanguage.Python
         compiled = sdfg.compile()
@@ -429,7 +414,7 @@ class TestPythonTimerIntegration:
         """The report's sdfgHash should match the SDFG's hash."""
         sdfg, state, me = _make_add_sdfg('test_hash', size=6)
         sdfg.backend = dtypes.BackendLanguage.Python
-        sdfg.instrument = dtypes.InstrumentationType.Timer
+        sdfg.instrument = dtypes.InstrumentationType.PythonTimer
 
         compiled = sdfg.compile()
         a = np.ones(6, dtype=np.float64)
@@ -449,9 +434,9 @@ class TestPythonTimerIntegration:
         """All event durations should be non-negative."""
         sdfg, state, me = _make_add_sdfg('test_dur_pos', size=100)
         sdfg.backend = dtypes.BackendLanguage.Python
-        sdfg.instrument = dtypes.InstrumentationType.Timer
-        state.instrument = dtypes.InstrumentationType.Timer
-        me.map.instrument = dtypes.InstrumentationType.Timer
+        sdfg.instrument = dtypes.InstrumentationType.PythonTimer
+        state.instrument = dtypes.InstrumentationType.PythonTimer
+        me.map.instrument = dtypes.InstrumentationType.PythonTimer
 
         compiled = sdfg.compile()
         a = np.random.rand(100)
@@ -467,9 +452,9 @@ class TestPythonTimerIntegration:
         """Events should have valid UUID components matching the SDFG structure."""
         sdfg, state, me = _make_add_sdfg('test_uuids', size=8)
         sdfg.backend = dtypes.BackendLanguage.Python
-        sdfg.instrument = dtypes.InstrumentationType.Timer
-        state.instrument = dtypes.InstrumentationType.Timer
-        me.map.instrument = dtypes.InstrumentationType.Timer
+        sdfg.instrument = dtypes.InstrumentationType.PythonTimer
+        state.instrument = dtypes.InstrumentationType.PythonTimer
+        me.map.instrument = dtypes.InstrumentationType.PythonTimer
 
         compiled = sdfg.compile()
         a = np.ones(8, dtype=np.float64)
@@ -491,7 +476,7 @@ class TestPythonTimerIntegration:
         b = np.ones(10, dtype=np.float64) * 2
         c = np.zeros(10, dtype=np.float64)
 
-        with dace.instrument(dtypes.InstrumentationType.Timer,
+        with dace.instrument(dtypes.InstrumentationType.PythonTimer,
                              filter='*',
                              annotate_maps=True,
                              annotate_states=True,
@@ -518,7 +503,7 @@ class TestPythonTimerCodegen:
         """The generated Python source should contain timer-related code."""
         sdfg, state, me = _make_add_sdfg('test_codegen_timer', size=5)
         sdfg.backend = dtypes.BackendLanguage.Python
-        sdfg.instrument = dtypes.InstrumentationType.Timer
+        sdfg.instrument = dtypes.InstrumentationType.PythonTimer
 
         code_objects = sdfg.generate_code()
         source = code_objects[0].clean_code
@@ -532,7 +517,7 @@ class TestPythonTimerCodegen:
     def test_map_timer_code_emitted(self):
         """Map scope instrumentation should emit timer code around for-loops."""
         sdfg, state, me = _make_scale_sdfg('test_map_codegen')
-        me.map.instrument = dtypes.InstrumentationType.Timer
+        me.map.instrument = dtypes.InstrumentationType.PythonTimer
         sdfg.backend = dtypes.BackendLanguage.Python
 
         code_objects = sdfg.generate_code()
@@ -546,7 +531,7 @@ class TestPythonTimerCodegen:
     def test_state_timer_code_emitted(self):
         """State instrumentation should emit timer code."""
         sdfg, state, me = _make_add_sdfg('test_state_codegen', size=5)
-        state.instrument = dtypes.InstrumentationType.Timer
+        state.instrument = dtypes.InstrumentationType.PythonTimer
         sdfg.backend = dtypes.BackendLanguage.Python
 
         code_objects = sdfg.generate_code()
@@ -567,38 +552,6 @@ class TestPythonTimerCodegen:
 
         assert '__dace_tbegin_' not in source
         assert '__dace_tend_' not in source
-
-
-# ---------------------------------------------------------------------------
-# Fallback timer test
-# ---------------------------------------------------------------------------
-
-
-class TestPythonTimerFallback:
-    """Test the Python-based fallback timer."""
-
-    def test_fallback_timer_code_path(self):
-        """When the C++ library is unavailable, the fallback should work."""
-        provider = PythonTimerProvider()
-        sdfg = dace.SDFG('test_fallback')
-        sdfg.instrument = dtypes.InstrumentationType.Timer
-
-        # Simulate fallback by temporarily making _ensure_timer_compiled
-        # return empty.  We must retrieve the raw descriptor via __dict__
-        # so that the restore puts back a proper staticmethod (accessing
-        # it via the class unwraps the staticmethod descriptor).
-        original_descriptor = PythonTimerProvider.__dict__['_ensure_timer_compiled']
-        PythonTimerProvider._ensure_timer_compiled = staticmethod(lambda: '')
-        try:
-            global_stream = PythonCodeIOStream()
-            local_stream = PythonCodeIOStream()
-            provider.on_sdfg_begin(sdfg, local_stream, global_stream, None)
-
-            global_code = global_stream.getvalue()
-            assert 'perf_counter_ns' in global_code
-            assert '__dace_timer_us' in global_code
-        finally:
-            PythonTimerProvider._ensure_timer_compiled = original_descriptor
 
 
 # ---------------------------------------------------------------------------
@@ -632,8 +585,8 @@ class TestPythonTimerIntegrationExpanded:
                                     memlet=dace.Memlet('Y[i]'))
 
         # Instrument the inner state and map
-        inner_state.instrument = dtypes.InstrumentationType.Timer
-        me.map.instrument = dtypes.InstrumentationType.Timer
+        inner_state.instrument = dtypes.InstrumentationType.PythonTimer
+        me.map.instrument = dtypes.InstrumentationType.PythonTimer
 
         outer_state = outer.add_state('outer_state')
         nested_node = outer_state.add_nested_sdfg(inner, {'X'}, {'Y'})
@@ -645,7 +598,7 @@ class TestPythonTimerIntegrationExpanded:
                              dace.Memlet('B[0:10]'))
 
         outer.backend = dtypes.BackendLanguage.Python
-        outer.instrument = dtypes.InstrumentationType.Timer
+        outer.instrument = dtypes.InstrumentationType.PythonTimer
 
         compiled = outer.compile()
         a = np.arange(10, dtype=np.float64)
@@ -677,7 +630,7 @@ class TestPythonTimerIntegrationExpanded:
                               memlet=dace.Memlet('A[i]'))
         state.add_memlet_path(t1, mx1, b, src_conn='y',
                               memlet=dace.Memlet('B[i]'))
-        me1.map.instrument = dtypes.InstrumentationType.Timer
+        me1.map.instrument = dtypes.InstrumentationType.PythonTimer
 
         # Map 2: C = A + 1 (NOT instrumented)
         a2 = state.add_access('A')
@@ -713,8 +666,8 @@ class TestPythonTimerIntegrationExpanded:
         size = 10007  # Prime number, non-power-of-2
         sdfg, state, me = _make_add_sdfg('test_large_array', size=size)
         sdfg.backend = dtypes.BackendLanguage.Python
-        sdfg.instrument = dtypes.InstrumentationType.Timer
-        me.map.instrument = dtypes.InstrumentationType.Timer
+        sdfg.instrument = dtypes.InstrumentationType.PythonTimer
+        me.map.instrument = dtypes.InstrumentationType.PythonTimer
 
         compiled = sdfg.compile()
         a = np.random.rand(size)
@@ -748,7 +701,7 @@ class TestPythonTimerIntegrationExpanded:
                            memlet=dace.Memlet('A[i]'))
         s0.add_memlet_path(t0, mx0, b0, src_conn='y',
                            memlet=dace.Memlet('B[i]'))
-        s0.instrument = dtypes.InstrumentationType.Timer
+        s0.instrument = dtypes.InstrumentationType.PythonTimer
 
         # State 1: C = B + 1 (NOT instrumented)
         s1 = sdfg.add_state('compute_c')
@@ -796,7 +749,7 @@ class TestPythonTimerIntegrationExpanded:
         state.add_memlet_path(t, mx, a_out, src_conn='y',
                               memlet=dace.Memlet('A[i]'))
 
-        me.map.instrument = dtypes.InstrumentationType.Timer
+        me.map.instrument = dtypes.InstrumentationType.PythonTimer
         sdfg.backend = dtypes.BackendLanguage.Python
         compiled = sdfg.compile()
 
@@ -813,8 +766,8 @@ class TestPythonTimerIntegrationExpanded:
     def test_mixed_state_and_map_instrumentation(self):
         """State instrumented AND map in that state also instrumented."""
         sdfg, state, me = _make_scale_sdfg('test_mixed_state_map', size=12)
-        state.instrument = dtypes.InstrumentationType.Timer
-        me.map.instrument = dtypes.InstrumentationType.Timer
+        state.instrument = dtypes.InstrumentationType.PythonTimer
+        me.map.instrument = dtypes.InstrumentationType.PythonTimer
 
         sdfg.backend = dtypes.BackendLanguage.Python
         compiled = sdfg.compile()
@@ -836,7 +789,7 @@ class TestPythonTimerIntegrationExpanded:
         """Test that str(report) produces meaningful output."""
         sdfg, state, me = _make_add_sdfg('test_str_report', size=4)
         sdfg.backend = dtypes.BackendLanguage.Python
-        sdfg.instrument = dtypes.InstrumentationType.Timer
+        sdfg.instrument = dtypes.InstrumentationType.PythonTimer
 
         compiled = sdfg.compile()
         a = np.ones(4, dtype=np.float64)
@@ -856,8 +809,8 @@ class TestPythonTimerIntegrationExpanded:
         """Test that report.as_csv() returns valid CSV strings."""
         sdfg, state, me = _make_add_sdfg('test_csv_report', size=6)
         sdfg.backend = dtypes.BackendLanguage.Python
-        sdfg.instrument = dtypes.InstrumentationType.Timer
-        me.map.instrument = dtypes.InstrumentationType.Timer
+        sdfg.instrument = dtypes.InstrumentationType.PythonTimer
+        me.map.instrument = dtypes.InstrumentationType.PythonTimer
 
         compiled = sdfg.compile()
         a = np.ones(6, dtype=np.float64)
@@ -874,23 +827,6 @@ class TestPythonTimerIntegrationExpanded:
         assert len(lines) >= 2  # Header + at least one data row
         assert 'MinMS' in lines[0]
         assert 'MeanMS' in lines[0]
-
-    def test_timer_library_loading(self):
-        """Verify the ctypes library can be loaded and called."""
-        lib_path = PythonTimerProvider._ensure_timer_compiled()
-        if not lib_path:
-            pytest.skip('g++ not available for timer compilation')
-
-        import ctypes
-        lib = ctypes.CDLL(lib_path)
-        lib.timer_us.restype = ctypes.c_ulonglong
-
-        t1 = lib.timer_us()
-        t2 = lib.timer_us()
-
-        assert isinstance(t1, int)
-        assert isinstance(t2, int)
-        assert t2 >= t1
 
     def test_two_maps_in_one_state_both_instrumented(self):
         """Two maps in the same state, both instrumented."""
@@ -910,7 +846,7 @@ class TestPythonTimerIntegrationExpanded:
                               memlet=dace.Memlet('A[i]'))
         state.add_memlet_path(t1, mx1, b1, src_conn='y',
                               memlet=dace.Memlet('B[i]'))
-        me1.map.instrument = dtypes.InstrumentationType.Timer
+        me1.map.instrument = dtypes.InstrumentationType.PythonTimer
 
         # Map 2: C = A + 10
         a2 = state.add_access('A')
@@ -921,7 +857,7 @@ class TestPythonTimerIntegrationExpanded:
                               memlet=dace.Memlet('A[j]'))
         state.add_memlet_path(t2, mx2, c1, src_conn='y',
                               memlet=dace.Memlet('C[j]'))
-        me2.map.instrument = dtypes.InstrumentationType.Timer
+        me2.map.instrument = dtypes.InstrumentationType.PythonTimer
 
         sdfg.backend = dtypes.BackendLanguage.Python
         compiled = sdfg.compile()
@@ -951,7 +887,7 @@ class TestPythonTimerIntegrationExpanded:
 
         sdfg = add_arrays.to_sdfg(simplify=False)
         sdfg.backend = dtypes.BackendLanguage.Python
-        sdfg.instrument = dtypes.InstrumentationType.Timer
+        sdfg.instrument = dtypes.InstrumentationType.PythonTimer
 
         compiled = sdfg.compile()
         a = np.ones(10, dtype=np.float64)
@@ -981,8 +917,8 @@ class TestPythonTimerIntegrationExpanded:
         state.add_memlet_path(t, mx, b, src_conn='y',
                               memlet=dace.Memlet('B[i]'))
 
-        me.map.instrument = dtypes.InstrumentationType.Timer
-        sdfg.instrument = dtypes.InstrumentationType.Timer
+        me.map.instrument = dtypes.InstrumentationType.PythonTimer
+        sdfg.instrument = dtypes.InstrumentationType.PythonTimer
         sdfg.backend = dtypes.BackendLanguage.Python
 
         compiled = sdfg.compile()
@@ -999,9 +935,9 @@ class TestPythonTimerIntegrationExpanded:
     def test_report_event_count_matches_structure(self):
         """All three levels instrumented: exactly 3 events expected."""
         sdfg, state, me = _make_add_sdfg('test_event_count', size=4)
-        sdfg.instrument = dtypes.InstrumentationType.Timer
-        state.instrument = dtypes.InstrumentationType.Timer
-        me.map.instrument = dtypes.InstrumentationType.Timer
+        sdfg.instrument = dtypes.InstrumentationType.PythonTimer
+        state.instrument = dtypes.InstrumentationType.PythonTimer
+        me.map.instrument = dtypes.InstrumentationType.PythonTimer
 
         sdfg.backend = dtypes.BackendLanguage.Python
 
@@ -1025,7 +961,7 @@ class TestPythonTimerIntegrationExpanded:
         import tempfile
 
         sdfg, state, me = _make_add_sdfg('test_save_reload', size=6)
-        sdfg.instrument = dtypes.InstrumentationType.Timer
+        sdfg.instrument = dtypes.InstrumentationType.PythonTimer
         sdfg.backend = dtypes.BackendLanguage.Python
 
         compiled = sdfg.compile()
@@ -1065,7 +1001,7 @@ class TestPythonTimerIntegrationExpanded:
         state.add_memlet_path(t, mx, b, src_conn='y',
                               memlet=dace.Memlet('B[i, j, k]'))
 
-        me.map.instrument = dtypes.InstrumentationType.Timer
+        me.map.instrument = dtypes.InstrumentationType.PythonTimer
         sdfg.backend = dtypes.BackendLanguage.Python
 
         compiled = sdfg.compile()
@@ -1082,8 +1018,8 @@ class TestPythonTimerIntegrationExpanded:
     def test_single_element_array(self):
         """Edge case: array of size 1."""
         sdfg, state, me = _make_add_sdfg('test_single_elem', size=1)
-        sdfg.instrument = dtypes.InstrumentationType.Timer
-        me.map.instrument = dtypes.InstrumentationType.Timer
+        sdfg.instrument = dtypes.InstrumentationType.PythonTimer
+        me.map.instrument = dtypes.InstrumentationType.PythonTimer
         sdfg.backend = dtypes.BackendLanguage.Python
 
         compiled = sdfg.compile()
@@ -1101,9 +1037,9 @@ class TestPythonTimerIntegrationExpanded:
     def test_timer_monotonicity(self):
         """Timestamps should be monotonically non-decreasing within a report."""
         sdfg, state, me = _make_add_sdfg('test_mono', size=50)
-        sdfg.instrument = dtypes.InstrumentationType.Timer
-        state.instrument = dtypes.InstrumentationType.Timer
-        me.map.instrument = dtypes.InstrumentationType.Timer
+        sdfg.instrument = dtypes.InstrumentationType.PythonTimer
+        state.instrument = dtypes.InstrumentationType.PythonTimer
+        me.map.instrument = dtypes.InstrumentationType.PythonTimer
         sdfg.backend = dtypes.BackendLanguage.Python
 
         compiled = sdfg.compile()
@@ -1121,7 +1057,7 @@ class TestPythonTimerIntegrationExpanded:
     def test_report_durations_dict(self):
         """The report.durations dict should be properly populated."""
         sdfg, state, me = _make_add_sdfg('test_durations_dict', size=8)
-        sdfg.instrument = dtypes.InstrumentationType.Timer
+        sdfg.instrument = dtypes.InstrumentationType.PythonTimer
         sdfg.backend = dtypes.BackendLanguage.Python
 
         compiled = sdfg.compile()
@@ -1178,7 +1114,7 @@ class TestPythonTimerIntegrationExpanded:
         state.add_memlet_path(t, mx, b, src_conn='y',
                               memlet=dace.Memlet('A[i]'))
 
-        me.map.instrument = dtypes.InstrumentationType.Timer
+        me.map.instrument = dtypes.InstrumentationType.PythonTimer
 
         outer_stream = PythonCodeIOStream()
         inner_stream = PythonCodeIOStream()
@@ -1202,7 +1138,7 @@ class TestPythonTimerIntegrationExpanded:
         provider = PythonTimerProvider()
         sdfg = dace.SDFG('test_state_emit')
         state = sdfg.add_state('s0')
-        state.instrument = dtypes.InstrumentationType.Timer
+        state.instrument = dtypes.InstrumentationType.PythonTimer
 
         local_stream = PythonCodeIOStream()
         global_stream = PythonCodeIOStream()
@@ -1221,7 +1157,7 @@ class TestPythonTimerIntegrationExpanded:
         """on_sdfg_end should emit report-writing code for top-level SDFG."""
         provider = PythonTimerProvider()
         sdfg = dace.SDFG('test_report_emit')
-        sdfg.instrument = dtypes.InstrumentationType.Timer
+        sdfg.instrument = dtypes.InstrumentationType.PythonTimer
 
         local_stream = PythonCodeIOStream()
         global_stream = PythonCodeIOStream()
@@ -1239,7 +1175,7 @@ class TestPythonTimerIntegrationExpanded:
         provider = PythonTimerProvider()
         outer = dace.SDFG('test_nested_no_report')
         inner = dace.SDFG('inner')
-        inner.instrument = dtypes.InstrumentationType.Timer
+        inner.instrument = dtypes.InstrumentationType.PythonTimer
 
         # Set up parent relationship
         outer.add_array('A', [1], dace.float64)
@@ -1280,7 +1216,7 @@ class TestPythonTimerIntegrationExpanded:
         state.add_memlet_path(t, mx, b, src_conn='y',
                               memlet=dace.Memlet('B[i]'))
 
-        me.map.instrument = dtypes.InstrumentationType.Timer
+        me.map.instrument = dtypes.InstrumentationType.PythonTimer
         sdfg.backend = dtypes.BackendLanguage.Python
 
         compiled = sdfg.compile()
@@ -1308,7 +1244,7 @@ class TestPythonTimerIntegrationExpanded:
         state.add_memlet_path(t, mx, b, src_conn='y',
                               memlet=dace.Memlet('B[i]'))
 
-        me.map.instrument = dtypes.InstrumentationType.Timer
+        me.map.instrument = dtypes.InstrumentationType.PythonTimer
         sdfg.backend = dtypes.BackendLanguage.Python
 
         compiled = sdfg.compile()
@@ -1343,8 +1279,8 @@ class TestPythonTimerIntegrationExpanded:
         state.add_memlet_path(t, mx, b, src_conn='y',
                               memlet=dace.Memlet('B[i, j]'))
 
-        sdfg.instrument = dtypes.InstrumentationType.Timer
-        me.map.instrument = dtypes.InstrumentationType.Timer
+        sdfg.instrument = dtypes.InstrumentationType.PythonTimer
+        me.map.instrument = dtypes.InstrumentationType.PythonTimer
         sdfg.backend = dtypes.BackendLanguage.Python
 
         compiled = sdfg.compile()
@@ -1372,9 +1308,9 @@ class TestPythonTimerCodegenExpanded:
         """Timer setup code should only appear once in global stream even
         when multiple SDFGs are instrumented."""
         sdfg, state, me = _make_add_sdfg('test_no_dup_setup', size=4)
-        sdfg.instrument = dtypes.InstrumentationType.Timer
-        state.instrument = dtypes.InstrumentationType.Timer
-        me.map.instrument = dtypes.InstrumentationType.Timer
+        sdfg.instrument = dtypes.InstrumentationType.PythonTimer
+        state.instrument = dtypes.InstrumentationType.PythonTimer
+        me.map.instrument = dtypes.InstrumentationType.PythonTimer
         sdfg.backend = dtypes.BackendLanguage.Python
 
         code_objects = sdfg.generate_code()
@@ -1390,7 +1326,7 @@ class TestPythonTimerCodegenExpanded:
     def test_codegen_report_filename_format(self):
         """Generated code should use 'report-{timestamp}.json' format."""
         sdfg, state, me = _make_add_sdfg('test_report_fmt', size=4)
-        sdfg.instrument = dtypes.InstrumentationType.Timer
+        sdfg.instrument = dtypes.InstrumentationType.PythonTimer
         sdfg.backend = dtypes.BackendLanguage.Python
 
         code_objects = sdfg.generate_code()
@@ -1402,7 +1338,7 @@ class TestPythonTimerCodegenExpanded:
     def test_codegen_events_list_structure(self):
         """Generated event append code should include correct fields."""
         sdfg, state, me = _make_add_sdfg('test_event_fields', size=4)
-        sdfg.instrument = dtypes.InstrumentationType.Timer
+        sdfg.instrument = dtypes.InstrumentationType.PythonTimer
         sdfg.backend = dtypes.BackendLanguage.Python
 
         code_objects = sdfg.generate_code()

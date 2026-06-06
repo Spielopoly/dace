@@ -905,6 +905,10 @@ class DaCePythonCodeGenerator(object):
         self.allocate_arrays_in_scope(sdfg, sdfg, sdfg, global_stream, callsite_stream)
 
         # Invoke all instrumentation providers
+        # TODO: Only on_sdfg_begin/on_sdfg_end (and state/scope/node hooks) are
+        # dispatched here. The on_sdfg_init_* / on_sdfg_exit_* lifecycle hooks
+        # are not (see _build_lifecycle_functions); add them when porting
+        # non-Timer instrumentation providers to the Python backend.
         for instr in self._dispatcher.instrumentation.values():
             if instr is not None:
                 instr.on_sdfg_begin(sdfg, callsite_stream, global_stream, self)
@@ -1066,6 +1070,16 @@ class DaCePythonCodeGenerator(object):
         return helper.getvalue()
 
     def _build_lifecycle_functions(self, sdfg: SDFG, params: str) -> str:
+        # TODO: Dispatch the on_sdfg_init_* / on_sdfg_exit_* instrumentation
+        # provider hooks here, analogous to the C++ frame code's __dace_init /
+        # __dace_exit generation (see dace/codegen/targets/framecode.py). They
+        # are currently NOT invoked for the Python backend. This is a no-op for
+        # the Timer / PythonTimer providers (which do not implement them), but is
+        # required to port other instrumentation providers (PAPI, LIKWID, GPU
+        # events) to the Python backend. When added, PythonTimerProvider's
+        # false-mode report save -- currently written straight into self._exitcode
+        # from on_sdfg_end -- should move into on_sdfg_exit_end and receive the
+        # exit-code stream as a hook argument.
         init_sources: List[str] = []
         if self._initcode.getvalue().strip():
             init_sources.append(self._initcode.getvalue().strip())

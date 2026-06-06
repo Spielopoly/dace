@@ -913,6 +913,11 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
             raise RuntimeError(
                 "CuTile tasklet handler invoked outside a CuTile scope.")
 
+        if node.instrument != dtypes.InstrumentationType.No_Instrumentation:
+            raise RuntimeError(
+                "Node-level instrumentation is not supported inside cuTile kernels; "
+                "instrument the enclosing cuTile map (kernel) instead.")
+
         init_code = codeblock_to_python(node.code_init).strip()
         if init_code:
             self._frame._initcode.write(init_code, sdfg)
@@ -1249,8 +1254,34 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
                        + free_syms)
         args_tuple = (f"({', '.join(launch_args)},)" if len(launch_args) == 1
                       else f"({', '.join(launch_args)})")
+        instrumented = (entry.map.instrument
+                        != dtypes.InstrumentationType.No_Instrumentation)
+
+        # Instrumentation: kernel-scope begin (before launch)
+        if instrumented:
+            for instr in self._dispatcher.instrumentation.values():
+                if instr is not None:
+                    instr.on_scope_entry(sdfg, cfg, state, entry,
+                                         callsite_stream, callsite_stream,
+                                         function_stream)
+
         callsite_stream.write(
             f"ct.launch(cupy.cuda.get_current_stream(), {grid_tuple}, "
             f"{kernel_name}, {args_tuple})",
             cfg, state_id,
         )
+
+        # Always synchronize so the kernel completes before the host
+        # continues (and before any timing measurement ends).
+        callsite_stream.write(
+            "cupy.cuda.get_current_stream().synchronize()", cfg, state_id)
+
+        # Instrumentation: kernel-scope end (after synchronize). The exit node
+        # is passed so the provider resolves the matching entry node (and thus
+        # the matching timer-variable id) via ``state.entry_node(exit)``.
+        if instrumented:
+            for instr in self._dispatcher.instrumentation.values():
+                if instr is not None:
+                    instr.on_scope_exit(sdfg, cfg, state, exit_node,
+                                        callsite_stream, callsite_stream,
+                                        function_stream)

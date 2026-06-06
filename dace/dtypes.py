@@ -165,6 +165,7 @@ class InstrumentationType(ExtensibleAttributeEnum):
 
     No_Instrumentation = auto()
     Timer = auto()
+    PythonTimer = auto()
     PAPI_Counters = auto()
     LIKWID_CPU = auto()
     LIKWID_GPU = auto()
