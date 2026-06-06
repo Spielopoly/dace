@@ -136,3 +136,38 @@ def test_tile_reduce_pure_smoke_2d_axis_1():
     DST = np.zeros(W0)
     sdfg(SRC=SRC, DST=DST)
     np.testing.assert_allclose(DST, SRC.sum(axis=1), rtol=1e-12, atol=1e-12)
+
+
+def test_tile_gather_scalar_idx_no_subscript():
+    """A ``Scalar`` ``_idx_<k>`` source (loop-invariant index — the
+    canonical form after ``ConvertLengthOneArraysToScalars`` runs early
+    in the K-dim orchestrator) must produce ``_idx_<k>`` without any
+    subscript: DaCe passes Scalars by value, so ``_idx_<k>[0]`` would
+    be a compile error (can't subscript a non-array). Reading the
+    scalar directly broadcasts it across every lane."""
+    import dace
+    import numpy as np
+    from dace.libraries.tileops import TileGather
+
+    sdfg = dace.SDFG("gather_scalar_idx_by_value")
+    sdfg.add_array("SRC", (10, ), dace.float64)
+    sdfg.add_array("DST", (8, ), dace.float64)
+    sdfg.add_scalar("IDX", dace.int64)
+    state = sdfg.add_state("main")
+    s, d, ix = state.add_access("SRC"), state.add_access("DST"), state.add_access("IDX")
+    g = TileGather(name="g", widths=(8, ), source_ndim=1)
+    state.add_node(g)
+    state.add_edge(s, None, g, "_src", dace.Memlet("SRC[0:10]"))
+    state.add_edge(ix, None, g, "_idx_0", dace.Memlet("IDX[0]"))
+    state.add_edge(g, "_dst", d, None, dace.Memlet("DST[0:8]"))
+    sdfg.expand_library_nodes()
+    tasklet_bodies = [
+        n.code.as_string for n, _ in sdfg.all_nodes_recursive() if isinstance(n, dace.nodes.Tasklet)
+    ]
+    assert not any("_idx_0[" in b for b in tasklet_bodies), tasklet_bodies
+
+    # End-to-end: every lane reads SRC[IDX].
+    SRC = np.arange(10, dtype=np.float64)
+    DST = np.zeros(8)
+    sdfg(SRC=SRC, DST=DST, IDX=np.int64(3))
+    np.testing.assert_array_equal(DST, np.full(8, SRC[3]))

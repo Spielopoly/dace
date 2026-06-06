@@ -29,6 +29,7 @@ from dace import properties
 from dace.transformation import pass_pipeline as ppl
 from dace.transformation.passes.clean_access_node_to_scalar_slice_to_tasklet_pattern import (
     CleanAccessNodeToScalarSliceToTaskletPattern, )
+from dace.transformation.passes.length_one_array_scalar_conversion import (ConvertLengthOneArraysToScalars, )
 from dace.transformation.passes.vectorization.emit_tile_ops import EmitTileOps
 from dace.transformation.passes.vectorization.generate_tile_iteration_mask import (
     GenerateTileIterationMask, )
@@ -39,11 +40,12 @@ from dace.transformation.passes.vectorization.resolve_other_subset_an_edges impo
     ResolveOtherSubsetANEdges, )
 from dace.transformation.passes.vectorization.promote_nsdfg_body_to_tiles import (
     PromoteNSDFGBodyToTiles, )
-from dace.transformation.passes.vectorization.same_write_set_if_else_to_merge_cfg import (
-    SameWriteSetIfElseToMergeCFG, )
+from dace.transformation.passes.vectorization.same_write_set_if_else_to_ite_cfg import (
+    SameWriteSetIfElseToITECFG, )
 from dace.transformation.passes.vectorization.branch_normalization import BranchNormalization
 from dace.transformation.passes.split_tasklets import SplitTasklets
 from dace.transformation.passes.eliminate_branches import EliminateBranches
+from dace.transformation.passes.vectorization.lower_ite_to_fp_factor import LowerITEToFpFactor
 from dace.transformation.passes.vectorization.lower_interstate_conditional_assignments_to_tasklets import (
     LowerInterstateConditionalAssignmentsToTasklets, )
 from dace.transformation.passes.vectorization.tasklet_preprocessing_passes import (
@@ -54,6 +56,7 @@ from dace.transformation.passes.vectorization.tasklet_preprocessing_passes impor
 )
 from dace.transformation.passes.vectorization.remove_empty_states import RemoveEmptyStates
 from dace.transformation.passes.remove_redundant_assignment_tasklets import RemoveRedundantAssignmentTasklets
+from dace.transformation.passes.insert_assign_tasklets_at_map_boundary import InsertAssignTaskletsAtMapBoundary
 from dace.transformation.passes.vectorization.stage_global_array_through_scalars import (
     StageGlobalArrayThroughScalars, )
 from dace.transformation.passes.vectorization.stride_map_by_tile_widths import (
@@ -251,7 +254,18 @@ class VectorizeCPUMultiDim(ppl.Pipeline):
         # original tile-dependent array access directly, not a length-1 scalar
         # slice (which ``EmitTileOps`` would mis-classify as a Scalar broadcast).
         # Mirrors the run-at-front placement on the 1D path.
-        passes = [NormalizeWCRSource(), CleanAccessNodeToScalarSliceToTaskletPattern()]
+        # Run ``ConvertLengthOneArraysToScalars`` early so any length-1
+        # boundary array (e.g. cloudsc ``z1`` minted by the python frontend
+        # with shape ``(1,)``) becomes a true ``Scalar``. The K-dim descent
+        # then has a clean signal — ``Scalar`` source ⇒ loop-invariant
+        # broadcast, NOT to be widened — instead of a heuristic over the
+        # parent array shape. Recursive (transient-only on nested SDFGs
+        # so the body-NSDFG signature is unchanged).
+        passes = [
+            ConvertLengthOneArraysToScalars(recursive=True, transient_only=False),
+            NormalizeWCRSource(),
+            CleanAccessNodeToScalarSliceToTaskletPattern(),
+        ]
         if branch_mode == "fp_factor":
             # FP-factor branch lowering (the legacy front): collapse a
             # same-write-set if/else to ``a = c*x + (1-c)*y`` arithmetic,
@@ -272,26 +286,40 @@ class VectorizeCPUMultiDim(ppl.Pipeline):
             # branches, anything with ``if a[i] < 0`` etc.) is left with a
             # ``ConditionalBlock`` that ``PromoteNSDFGBodyToTiles`` now
             # refuses loudly.
+            # fp_factor lowering canonicalises every same-write-set
+            # ``ConditionalBlock`` to ``ITE(c, t, e)`` tasklets FIRST (same
+            # path the merge mode takes), then folds those ITE calls into
+            # the FP-factor arithmetic form ``c * t + (1 - c) * e`` via
+            # :class:`LowerITEToFpFactor`. Without this lowering, the
+            # descent later refuses every kernel that still carries a
+            # ``ConditionalBlock`` (cloudsc_one fp_factor regressions).
+            # ``EliminateBranches`` runs LAST as a safety net for the
+            # residual disjoint-write / single-arm shapes; ``permissive``
+            # is preserved because some kernels (e.g. cloudsc_tidy_branch)
+            # rely on it accepting map-param-conditional shapes.
             _eb = EliminateBranches()
             _eb.permissive = True
             passes += [
+                SameWriteSetIfElseToITECFG(),
+                BranchNormalization(),
+                LowerITEToFpFactor(),
                 _eb,
                 LowerInterstateConditionalAssignmentsToTasklets(),
             ]
         else:
             # Merge branch lowering: rewrite a same-write-set ``if/else`` into
             # compute-then / compute-else / apply-merge dataflow states carrying
-            # ``merge(c, t, e)`` tasklets. Flattens the ConditionalBlock so
-            # PromoteNSDFGBodyToTiles can descend; the merge tasklets lower to a
+            # ``ITE(c, t, e)`` tasklets. Flattens the ConditionalBlock so
+            # PromoteNSDFGBodyToTiles can descend; the ITE tasklets lower to a
             # per-lane TileMerge select (the K-dim analogue of the 1D
             # ``vector_select`` blend), gated by the tile map's iteration mask.
-            # SameWriteSetIfElseToMergeCFG handles two-arm same-write-set
-            # if/else by emitting per-target merge tasklets; the residual
+            # SameWriteSetIfElseToITECFG handles two-arm same-write-set
+            # if/else by emitting per-target ITE tasklets; the residual
             # BranchNormalization flattens any remaining single-arm /
             # disjoint-write two-arm ConditionalBlocks (and recurses through
             # nested ones via the fix-point loop) so the descent sees pure
             # dataflow.
-            passes += [SameWriteSetIfElseToMergeCFG(), BranchNormalization()]
+            passes += [SameWriteSetIfElseToITECFG(), BranchNormalization()]
         # Full prep, run BEFORE tiling exactly as the legacy 1D pipeline
         # (vectorize_cpu.py) does, so the tile path handles the same kernels:
         #   * RemoveEmptyStates / RemoveRedundantAssignmentTasklets — clean up
@@ -308,17 +336,21 @@ class VectorizeCPUMultiDim(ppl.Pipeline):
         #   * RemoveMathCall — drop the ``math.`` prefix the power expansion emits
         #     so ``math.exp``/``math.log`` match TileUnop's ``exp``/``log``.
         # (``WCRToAugAssign``, ``LoopToMap``, ``RefineNestedAccess`` and
-        # ``MapCollapse`` run in ``apply_pass``. ``InlineSDFGs`` and
-        # ``InsertAssignTaskletsAtMapBoundary`` are intentionally NOT run:
-        # InlineSDFGs would flatten the body NSDFGs ``PromoteNSDFGBodyToTiles``
-        # descends into; InsertAssignTaskletsAtMapBoundary perturbs the gather /
-        # strided staging edges.)
+        # ``MapCollapse`` run in ``apply_pass``. ``InlineSDFGs`` is
+        # intentionally NOT run: it would flatten the body NSDFGs
+        # ``PromoteNSDFGBodyToTiles`` descends into.)
+        # ``InsertAssignTaskletsAtMapBoundary`` emits semantically-transparent
+        # ``_out = _in`` staging tasklets at map boundaries; ``EmitTileOps``
+        # lifts each into a ``TileLoad`` (stage-in direction) or ``TileStore``
+        # (stage-out direction). Runs AFTER ``SplitTasklets`` so the staged
+        # tasklets are single-op.
         passes += [
             RemoveRedundantAssignmentTasklets(),
             RemoveFPTypeCasts(),
             RemoveIntTypeCasts(),
             PowerOperatorExpansion(),
             SplitTasklets(),
+            InsertAssignTaskletsAtMapBoundary(),
             RemoveMathCall(),
             # Stage every ``Tasklet -> global-array -> Tasklet`` hop through
             # transient scalars (the cloudsc zsolqa / zqlhs reuse). A global

@@ -17,6 +17,7 @@ import dace
 import pytest
 
 from dace.libraries.tileops import TileGather
+from dace.transformation.passes.vectorization.emit_tile_ops import _is_assign_tasklet
 from dace.transformation.passes.vectorization.vectorize_cpu_multi_dim import VectorizeCPUMultiDim
 
 NB = dace.symbol("NB")
@@ -42,19 +43,22 @@ def _icon_zekinh_gather(
 
 
 def _count_tasklets(sdfg: dace.SDFG) -> int:
-    return sum(1 for n, _ in sdfg.all_nodes_recursive() if isinstance(n, dace.nodes.Tasklet))
+    """Count tasklets the descent did NOT lower to lib nodes.
+
+    Trivial ``_out = _in`` assign tasklets are LEFT in place by the descent
+    (``_promote_internal_assigns`` is a no-op per user directive: collapsing
+    them into AN -> AN would silently drop source-side coordinates). These
+    are semantically fine -- they lower to a one-element copy at codegen --
+    so the test asserts only "no NON-assign raw tasklets" rather than
+    "zero tasklets total"."""
+    return sum(1 for n, _ in sdfg.all_nodes_recursive()
+               if isinstance(n, dace.nodes.Tasklet) and not _is_assign_tasklet(n))
 
 
 def _count_tile_gathers(sdfg: dace.SDFG) -> int:
     return sum(1 for n, _ in sdfg.all_nodes_recursive() if isinstance(n, TileGather))
 
 
-@pytest.mark.xfail(strict=True,
-                   reason=("ICON zekinh exercises K=2 + mixed-gather + 1-D source broadcast "
-                           "(``e_bln_slice[0, 0]`` jk-independent lookup). Same descent gap as "
-                           "the K=2 broadcast/gather composition in test_kdim_broadcasts.py. "
-                           "Tracked as the next slice — needs partial-binding TileLoad + "
-                           "TileGather composition."))
 def test_icon_zekinh_descent_to_tile_only():
     """The mixed-gather ICON kernel lowers to zero raw Tasklets at K=2.
 

@@ -20,6 +20,8 @@ from dace.symbolic import DaceSympyPrinter
 
 from dace.transformation.passes.vectorization.utils.name_schemes import LaneIdScheme
 from dace.transformation.passes.vectorization.utils.lane_fanout import outside_index_param_coeff
+from dace.transformation.passes.vectorization.utils.symbolic_polymorphism import (atoms_of, free_symbol_names,
+                                                                                  free_symbols, is_integer)
 
 
 def assert_symbols_in_parent_map_symbols(missing_symbols: Set[str], state: dace.SDFGState,
@@ -34,17 +36,10 @@ def assert_symbols_in_parent_map_symbols(missing_symbols: Set[str], state: dace.
     :raises AssertionError: If a symbol is not found in the loop scopes.
     """
 
-    def validate_and_strip(strings):
-        valid = []
-        for s in strings:
-            match = re.fullmatch(r'([A-Za-z_]\w*?)(\d+)$', s)
-            assert match, f"No match in {strings} for a variable name"
-            name, num = match.groups()
-            valid.append((name, int(num)))
-        return valid
-
-    stripped_symbols = validate_and_strip(missing_symbols)
-    loop_vars = {var for var, int_id in stripped_symbols}
+    # Peel every lane chunk via the canonical helper so legacy
+    # ``<base>_laneid_<n>`` and Option B ``<base>_lane<d>id_<n>`` names
+    # both reduce to the bare base.
+    loop_vars = {LaneIdScheme.base_of(s) for s in missing_symbols}
 
     sdict = state.scope_dict()
     first_parent_map = sdict[nsdfg]
@@ -62,7 +57,6 @@ def assert_symbols_in_parent_map_symbols(missing_symbols: Set[str], state: dace.
             loop_symbols.add(map_or_loop.loop_variable)
 
     for loop_var in loop_vars:
-        loop_var = loop_var[:-len("_laneid_")] if loop_var.endswith("_laneid_") else loop_var
         assert loop_var in loop_symbols or loop_var in nsdfg.symbol_mapping, (
             f"{loop_var} not in parent-scope loop_symbols={loop_symbols} and not in "
             f"nsdfg.symbol_mapping={set(nsdfg.symbol_mapping.keys())}")
@@ -176,7 +170,7 @@ def expand_interstate_assignments_to_lanes(inner_sdfg: dace.SDFG, nsdfg_node: da
         for k, v in plain_assignments.items():
             original_v_expr = dace.symbolic.SymExpr(v)
             for i in range(vector_width):
-                new_k = LaneIdScheme.make(k, i)
+                new_k = LaneIdScheme.make_dim(k, 0, i)
                 v_expr = dace.symbolic.SymExpr(v)
 
                 # Lane-variance is carried by the free symbols of the assignment
@@ -218,7 +212,7 @@ def expand_interstate_assignments_to_lanes(inner_sdfg: dace.SDFG, nsdfg_node: da
                             raise AssertionError(
                                 f"vector_map_param {vector_map_param!r} appeared in non_map_free_syms; "
                                 f"upstream filtering is broken")
-                        lane_sym = LaneIdScheme.make(free_sym_str, i)
+                        lane_sym = LaneIdScheme.make_dim(free_sym_str, 0, i)
                         v_expr = v_expr.subs(free_sym, lane_sym)
                         if lane_sym not in inner_sdfg.symbols:
                             inner_sdfg.add_symbol(lane_sym, inner_sdfg.symbols.get(free_sym_str, dace.float64))
@@ -253,7 +247,7 @@ def expand_interstate_assignments_to_lanes(inner_sdfg: dace.SDFG, nsdfg_node: da
                                 need = c * (vector_width - 1) + 1
                                 total = inner_desc.total_size
                                 total_simpl = dace.symbolic.simplify(total - need)
-                                if getattr(total_simpl, "is_Integer", False) and int(total_simpl) < 0:
+                                if is_integer(total_simpl) and int(total_simpl) < 0:
                                     raise RuntimeError(f"Lane fan-out for '{free_sym_str}': inner connector size "
                                                        f"{total} < required strided span {need} (stride c={c}, "
                                                        f"W={vector_width}); the NSDFG-input window and the inner "
@@ -322,7 +316,7 @@ def _widen_index_connector_to_tile(inner_sdfg: dace.SDFG, nsdfg_node: dace.nodes
             continue
         new_ranges = []
         for (b, e, s) in oe.data.subset:
-            b_syms = b.free_symbols if hasattr(b, "free_symbols") else set()
+            b_syms = free_symbols(b)
             if sym in b_syms:
                 coeff = b.coeff(sym)
                 affine = sym not in (b - coeff * sym).free_symbols
@@ -385,6 +379,8 @@ def fan_out_tile_gather_index_symbols(inner_sdfg: dace.SDFG, nsdfg_node: dace.no
         # where the outer is 3-dim, num_elements 1; widening to ``(W,)``
         # would invalidate downstream multi-dim gather emission).
         outer_extent_one = {}
+        outer_has_tile_var = {}
+        iter_var_sym = dace.symbolic.pystr_to_symbolic(tile_iter_var)
         for oe in parent_state.in_edges(nsdfg_node):
             if oe.dst_conn is None or oe.data is None or oe.data.subset is None:
                 continue
@@ -395,6 +391,20 @@ def fan_out_tile_gather_index_symbols(inner_sdfg: dace.SDFG, nsdfg_node: dace.no
                 outer_extent_one[oe.dst_conn] = one_elem and one_dim
             except (TypeError, AttributeError):
                 outer_extent_one[oe.dst_conn] = False
+            # Tile-var-dep guard (mirror of :func:`fan_out_tile_gather_index_symbols_kd`):
+            # a length-1 outer subset whose begin has NO tile-var dependency is
+            # a loop-invariant scalar (cloudsc's ``zqx[z1, j+1, i+1]`` z1 — a
+            # scalar parameter passed via a single-element boundary). Widening
+            # it to a ``(W,)`` tile would create per-lane reads ``z1[0..W-1]``
+            # past the 1-element source → OOB / segfault. Skip widening so the
+            # downstream gather/scatter classifier treats it as a Scalar
+            # broadcast.
+            any_tv = False
+            for (b, _e, _s) in oe.data.subset:
+                if iter_var_sym in free_symbols(b):
+                    any_tv = True
+                    break
+            outer_has_tile_var[oe.dst_conn] = any_tv
         for k, v in plain.items():
             v_expr = dace.symbolic.SymExpr(v)
             # The assignment reaches the connector either as a bare symbol
@@ -408,7 +418,7 @@ def fan_out_tile_gather_index_symbols(inner_sdfg: dace.SDFG, nsdfg_node: dace.no
             idx_conns = sorted({
                 s
                 for s in referenced if s in nsdfg_node.in_connectors and not inner_sdfg.arrays[s].transient
-                and outer_extent_one.get(s, False)
+                and outer_extent_one.get(s, False) and outer_has_tile_var.get(s, False)
             })
             if not idx_conns:
                 new_assignments[k] = v
@@ -425,7 +435,7 @@ def fan_out_tile_gather_index_symbols(inner_sdfg: dace.SDFG, nsdfg_node: dace.no
             # subscript index ``0`` -> ``lane`` substitution is what produces
             # the per-lane read ``c[lane]``. Detect each case per connector.
             from dace.symbolic import Subscript
-            subscript_bases = {str(node.args[0]) for node in v_expr.atoms(Subscript) if hasattr(v_expr, 'atoms')}
+            subscript_bases = {str(node.args[0]) for node in atoms_of(v_expr, Subscript)}
             for lane in range(vector_width):
                 lane_expr = v_expr
                 for c in idx_conns:
@@ -438,7 +448,7 @@ def fan_out_tile_gather_index_symbols(inner_sdfg: dace.SDFG, nsdfg_node: dace.no
                         # Bare symbol form: substitute the symbol with ``c(lane)``.
                         lane_expr = lane_expr.subs(sympy.Symbol(c), dace.symbolic.SymExpr(f"{c}({lane})"))
                 lane_v = DaceSympyPrinter(set(inner_sdfg.arrays.keys())).doprint(lane_expr)
-                new_assignments[LaneIdScheme.make(k, lane)] = lane_v
+                new_assignments[LaneIdScheme.make_dim(k, 0, lane)] = lane_v
                 if lane == 0:
                     new_assignments[k] = lane_v
         edge.data.assignments = new_assignments
@@ -490,7 +500,7 @@ def _widen_index_connector_to_tile_kd(inner_sdfg: dace.SDFG, nsdfg_node: dace.no
         inner_shape = []
         inner_strides = []
         for d, (b, e, s) in enumerate(oe.data.subset):
-            b_syms = b.free_symbols if hasattr(b, "free_symbols") else set()
+            b_syms = free_symbols(b)
             iv_match_idx = None
             for p, isym in enumerate(iter_syms):
                 if isym in b_syms:
@@ -577,7 +587,7 @@ def fan_out_tile_gather_index_symbols_kd(inner_sdfg: dace.SDFG, nsdfg_node: dace
             continue
         any_tv = False
         for (b, _e, _s) in oe.data.subset:
-            fs = {str(x) for x in getattr(b, "free_symbols", set())}
+            fs = free_symbol_names(b)
             if fs & iter_var_set:
                 any_tv = True
                 break
@@ -615,8 +625,7 @@ def fan_out_tile_gather_index_symbols_kd(inner_sdfg: dace.SDFG, nsdfg_node: dace
             # ``__sym = c[0, 0, ..., 0]``; subscript-form ``__sym = c[0]``
             # gets its single index extended to K zeros.
             from dace.symbolic import Subscript
-            subscript_bases = {str(node.args[0])
-                               for node in v_expr.atoms(Subscript)} if hasattr(v_expr, 'atoms') else set()
+            subscript_bases = {str(node.args[0]) for node in atoms_of(v_expr, Subscript)}
             base_expr = v_expr
             for c in idx_conns:
                 arr_shape = inner_sdfg.arrays[c].shape

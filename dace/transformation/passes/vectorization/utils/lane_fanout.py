@@ -19,6 +19,7 @@ from dace.sdfg import nodes
 from dace.sdfg.state import ConditionalBlock, LoopRegion
 
 from dace.transformation.passes.vectorization.utils.name_schemes import LaneIdScheme, PackedNameScheme
+from dace.transformation.passes.vectorization.utils.symbolic_polymorphism import is_integer
 
 _ASSIGN_LABEL_RE = re.compile(r"^(?:assign|a)_(\d+)$")
 
@@ -407,14 +408,14 @@ def outside_index_param_coeff(inner_sdfg: SDFG, idxarr: str, vector_length: int)
         if dace.symbolic.simplify(s - 1) != 0:
             return None
         c_expr = b_sym.coeff(param_sym)
-        if not getattr(c_expr, "is_Integer", False) or int(c_expr) < 1:
+        if not is_integer(c_expr) or int(c_expr) < 1:
             return None
         c = int(c_expr)
         # The window must hold every touched element ``begin + c*k``,
         # k=0..W-1 (over-coverage is safe; the strided read only hits
         # positions 0, c, ..., c*(W-1)).
         span = dace.symbolic.simplify(e_sym - b_sym + 1 - (c * (vector_length - 1) + 1))
-        if not (getattr(span, "is_Integer", False) and int(span) >= 0):
+        if not (is_integer(span) and int(span) >= 0):
             return None
         coeff = c
     return coeff
@@ -474,7 +475,7 @@ def _recognize_laneid_index_slice(
     idx_exprs: List[dace.symbolic.SymbolicType] = []
     laneid_syms: List[str] = []
     for k in range(vector_length):
-        sym = LaneIdScheme.make(base_name, k)
+        sym = LaneIdScheme.make_dim(base_name, 0, k)
         rhs_set = asg.get(sym)
         # The laneid symbol must be bound by exactly one RHS reading
         # ``<idxarr>[<expr_k>]`` with the same array across all lanes.
@@ -509,7 +510,7 @@ def _recognize_laneid_index_slice(
         stride = 1
     else:
         delta = dace.symbolic.simplify(idx_exprs[1] - begin_expr)
-        if not (getattr(delta, "is_Integer", False) and int(delta) >= 1):
+        if not (is_integer(delta) and int(delta) >= 1):
             return None
         stride = int(delta)
         for k in range(vector_length):
@@ -698,8 +699,7 @@ def detect_lane_fanout_apply(sdfg: SDFG,
             # through an ``_idx`` connector instead of W interstate-edge
             # symbols.
             idxarr_match: Optional[Tuple[str, dace.symbolic.SymbolicType, int, List[str]]] = None
-            if (pattern == "contiguous" and collapse_laneid_index_loads
-                    and intrinsic_template_idxarr is not None):
+            if (pattern == "contiguous" and collapse_laneid_index_loads and intrinsic_template_idxarr is not None):
                 idxarr_match = _recognize_laneid_index_slice(state, idx_data_and_subset, vector_length)
 
             if pattern == "contiguous" and idxarr_match is not None:
@@ -779,8 +779,7 @@ def detect_lane_fanout_apply(sdfg: SDFG,
                     # the intrinsic strides into it via ``_idx[l*stride]``).
                     # ``stride == 1`` reduces to the W-wide window.
                     idx_end = begin_expr + idx_stride * (vector_length - 1)
-                    idx_memlet = dace.memlet.Memlet(data=idxarr,
-                                                    subset=dace.subsets.Range([(begin_expr, idx_end, 1)]))
+                    idx_memlet = dace.memlet.Memlet(data=idxarr, subset=dace.subsets.Range([(begin_expr, idx_end, 1)]))
                     state.add_edge(idx_an, None, t1, "_idx", idx_memlet)
                     # The fan tasklets that read the laneid symbols were
                     # just removed; drop those now-dead symbols and their
@@ -820,16 +819,17 @@ def detect_lane_fanout_apply(sdfg: SDFG,
     for state in sdfg.all_states():
         for node in state.nodes():
             if isinstance(node, nodes.NestedSDFG):
-                found += detect_lane_fanout_apply(node.sdfg,
-                                                  direction=direction,
-                                                  pattern=pattern,
-                                                  intrinsic_template=intrinsic_template,
-                                                  intrinsic_tasklet_name=intrinsic_tasklet_name,
-                                                  intrinsic_template_masked=intrinsic_template_masked,
-                                                  skip_unmasked=skip_unmasked,
-                                                  collapse_laneid_index_loads=collapse_laneid_index_loads,
-                                                  intrinsic_template_idxarr=intrinsic_template_idxarr,
-                                                  intrinsic_template_idxarr_masked=intrinsic_template_idxarr_masked,
-                                                  intrinsic_template_idxarr_conv=intrinsic_template_idxarr_conv,
-                                                  intrinsic_template_idxarr_conv_masked=intrinsic_template_idxarr_conv_masked)
+                found += detect_lane_fanout_apply(
+                    node.sdfg,
+                    direction=direction,
+                    pattern=pattern,
+                    intrinsic_template=intrinsic_template,
+                    intrinsic_tasklet_name=intrinsic_tasklet_name,
+                    intrinsic_template_masked=intrinsic_template_masked,
+                    skip_unmasked=skip_unmasked,
+                    collapse_laneid_index_loads=collapse_laneid_index_loads,
+                    intrinsic_template_idxarr=intrinsic_template_idxarr,
+                    intrinsic_template_idxarr_masked=intrinsic_template_idxarr_masked,
+                    intrinsic_template_idxarr_conv=intrinsic_template_idxarr_conv,
+                    intrinsic_template_idxarr_conv_masked=intrinsic_template_idxarr_conv_masked)
     return found

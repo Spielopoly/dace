@@ -13,6 +13,7 @@ import sympy
 
 import dace
 from dace.transformation.passes.vectorization.utils.lane_access import LaneAccessKind, classify_lane_access
+from dace.transformation.passes.vectorization.utils.symbolic_polymorphism import free_symbol_names
 
 
 def to_ints(sym_epxr: dace.symbolic.SymExpr) -> typing.Union[int, None]:
@@ -215,7 +216,7 @@ def collect_vectorizable_arrays(sdfg: dace.SDFG, parent_nsdfg_node: dace.nodes.N
             del all_accesses_to_arrays[arr_name]
             continue
         # ``_cond_*`` bool transients are emitted by BranchNormalization /
-        # SameWriteSetIfElseToMergeCFG to carry per-lane condition results.
+        # SameWriteSetIfElseToITECFG to carry per-lane condition results.
         # After ``replace_arrays_with_new_shape`` reshapes them to ``(W,)``
         # and their memlets are rewritten to ``[0:W-1]``, the point-access
         # ``b == e`` assert below would trip — exclude them, same as the
@@ -363,11 +364,7 @@ def collect_vectorizable_arrays(sdfg: dace.SDFG, parent_nsdfg_node: dace.nodes.N
             for i, (b, e, s) in enumerate(access_subset):
                 if i == stride_one_dim:
                     continue
-                free_syms = set()
-                if hasattr(b, "free_syms"):
-                    free_syms = {str(s) for s in b.free_syms}
-                if hasattr(b, "free_symbols"):
-                    free_syms = {str(s) for s in b.free_symbols}
+                free_syms = free_symbol_names(b)
 
                 if free_syms != set():
                     for free_sym in free_syms:

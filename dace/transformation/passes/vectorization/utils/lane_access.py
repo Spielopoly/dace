@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from typing import List, Optional, Sequence
 
 import dace
+from dace.transformation.passes.vectorization.utils.symbolic_polymorphism import free_symbol_names
 
 
 class LaneAccessKind(enum.Enum):
@@ -98,7 +99,7 @@ class LaneAccess:
 
 
 def _has_param(expr, lane_param: str) -> bool:
-    return hasattr(expr, "free_symbols") and any(str(s) == lane_param for s in expr.free_symbols)
+    return lane_param in free_symbol_names(expr)
 
 
 def _index_step(begin, lane_param: str) -> Optional[int]:
@@ -148,7 +149,9 @@ def classify_lane_access(subset, array_strides: Sequence, lane_param: str) -> La
                 ok = False
                 break
             mem = mem + step_d * strides[d]
-        return LaneAccess(LaneAccessKind.DIAGONAL, lane_dim=None, inter_lane_stride=None,
+        return LaneAccess(LaneAccessKind.DIAGONAL,
+                          lane_dim=None,
+                          inter_lane_stride=None,
                           memory_stride=(mem if ok else None))
 
     d = param_dims[0]
@@ -162,5 +165,7 @@ def classify_lane_access(subset, array_strides: Sequence, lane_param: str) -> La
     # multiplicative factor (step == 1); otherwise strided.
     if step == 1:
         return LaneAccess(LaneAccessKind.CONTIGUOUS, lane_dim=d, inter_lane_stride=1, memory_stride=1)
-    return LaneAccess(LaneAccessKind.STRIDED, lane_dim=d, inter_lane_stride=step,
+    return LaneAccess(LaneAccessKind.STRIDED,
+                      lane_dim=d,
+                      inter_lane_stride=step,
                       memory_stride=(step if step is not None else None))

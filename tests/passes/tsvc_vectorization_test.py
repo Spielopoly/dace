@@ -39,8 +39,8 @@ def _matrix():
     ``@dace.program``), so each kernel is passed as ``(program, TSVCKernel)``;
     the kernel record travels through as ``kt[1]``. IDs use the short kernel name.
     """
-    params = (build_tsvc_matrix([(k.program, k) for k in _G1D], (64, 65))[0] +
-              build_tsvc_matrix([(k.program, k) for k in _G2D], (16, 17))[0])
+    params = (build_tsvc_matrix([(k.program, k) for k in _G1D],
+                                (64, 65))[0] + build_tsvc_matrix([(k.program, k) for k in _G2D], (16, 17))[0])
     # param = (program, kernel, remainder_strategy, branch_mode, LEN)
     ids = [f"{p[1].name}-{p[2]}-{p[3]}-{p[4]}" for p in params]
     return params, ids
@@ -76,13 +76,14 @@ def test_tsvc_vectorization(program, kernel, remainder_strategy, branch_mode, le
     else:
         branch_kwargs = dict(use_fp_factor=False, branch_normalization=True)
 
-    try:
-        VectorizeCPU(vector_width=8,
-                     fail_on_unvectorizable=False,
-                     remainder_strategy=remainder_strategy,
-                     **branch_kwargs).apply_pass(vsdfg, {})
-    except NotImplementedError as ex:
-        pytest.skip(f"vectorize NotImplementedError on {kernel.name}: {ex}")
+    # NotImplementedError propagates as a real test failure (per design
+    # directive: an unsupported kernel pattern must surface, never silently
+    # skip). Configuration-mismatch skips happen UPSTREAM in the
+    # parametrize matrix.
+    VectorizeCPU(vector_width=8,
+                 fail_on_unvectorizable=False,
+                 remainder_strategy=remainder_strategy,
+                 **branch_kwargs).apply_pass(vsdfg, {})
 
     c_ref = sdfg.compile()
     c_vec = vsdfg.compile()

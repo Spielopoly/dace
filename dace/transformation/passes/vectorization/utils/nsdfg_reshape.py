@@ -22,6 +22,7 @@ from dace import SDFGState
 
 from dace.transformation.passes.vectorization.utils.code_rewrite import drop_dims
 from dace.transformation.passes.vectorization.utils.name_schemes import PackedNameScheme, VecNameScheme
+from dace.transformation.passes.vectorization.utils.symbolic_polymorphism import free_symbols
 
 _ITER_MASK_PREFIX = "_iter_mask"
 
@@ -163,9 +164,18 @@ def _is_trivial_exact_vlen_copy(subset, arr: dace.data.Array, vector_width: int,
     return True
 
 
-def emit_staging_copy(state: SDFGState, src: dace.nodes.Node, src_conn, dst: dace.nodes.Node, dst_conn,
-                      real_memlet: dace.memlet.Memlet, buf_name: str, vector_width: int, direction: str, *,
-                      mask_name: Optional[str] = None, gate_extent: bool = False) -> None:
+def emit_staging_copy(state: SDFGState,
+                      src: dace.nodes.Node,
+                      src_conn,
+                      dst: dace.nodes.Node,
+                      dst_conn,
+                      real_memlet: dace.memlet.Memlet,
+                      buf_name: str,
+                      vector_width: int,
+                      direction: str,
+                      *,
+                      mask_name: Optional[str] = None,
+                      gate_extent: bool = False) -> None:
     """Splice one staging copy between a real array and a W-wide buffer.
 
     The single emitter behind every vector-staging boundary copy
@@ -217,10 +227,10 @@ def emit_staging_copy(state: SDFGState, src: dace.nodes.Node, src_conn, dst: dac
         # and replicate to every lane. Never a W-wide read of a 1-element
         # source.
         t = state.add_tasklet(name=f"_stage_in_bcast_{buf_name}",
-                               inputs={"_in"},
-                               outputs={"_out"},
-                               code=f"for (int _l = 0; _l < {W}; ++_l) {{ _out[_l] = _in; }}",
-                               language=dace.dtypes.Language.CPP)
+                              inputs={"_in"},
+                              outputs={"_out"},
+                              code=f"for (int _l = 0; _l < {W}; ++_l) {{ _out[_l] = _in; }}",
+                              language=dace.dtypes.Language.CPP)
         state.add_edge(src, src_conn, t, "_in", dace.memlet.Memlet(f"{real_memlet.data}[0]"))
         state.add_edge(t, "_out", dst, dst_conn, dace.memlet.Memlet(f"{buf_name}[0:{W}]"))
         return
@@ -463,7 +473,9 @@ def _raise_on_expansion_rebuild_mismatch(connector_name: str,
         per_dim_growth = []
         for orig_d, new_d in zip(original_shape, new_shape):
             orig_int = _int_or_none(orig_d)
-            diff = _int_or_none(new_d - orig_d) if hasattr(new_d, "__sub__") else None
+            # ``shape`` entries are always int or sympy Expr -- both expose
+            # ``__sub__``; no defensive guard required.
+            diff = _int_or_none(new_d - orig_d)
             per_dim_growth.append(diff)
             if diff is not None and diff > 0 and (orig_int is None or orig_int > 1):
                 expands_real_dim = True
@@ -904,7 +916,7 @@ def _setup_strided_inside_nsdfg(state: dace.SDFGState,
     inner_sdfg.add_array(name=inner_conn,
                          shape=tuple(bbox_shape),
                          dtype=orig_arr.dtype,
-                         storage=getattr(prev_arr, "storage", orig_arr.storage),
+                         storage=prev_arr.storage,
                          transient=False,
                          find_new_name=False,
                          may_alias=False)
@@ -1099,7 +1111,7 @@ def _setup_multi_element_strided_inside_nsdfg(state: dace.SDFGState, nsdfg_node:
     inner_sdfg.add_array(name=inner_conn,
                          shape=tuple(bbox_shape),
                          dtype=orig_arr.dtype,
-                         storage=getattr(prev_arr, "storage", orig_arr.storage),
+                         storage=prev_arr.storage,
                          transient=False,
                          find_new_name=False,
                          may_alias=False)
@@ -1400,11 +1412,12 @@ def _process_edges(state: dace.SDFGState, nsdfg_node: dace.nodes.NestedSDFG, mov
                     begins = [e.data.subset[d][0] for d, _ in wide_dims]
                     sym_by_name = {}
                     for beg in begins:
-                        if not hasattr(beg, "free_symbols"):
+                        beg_syms = free_symbols(beg)
+                        if not beg_syms:
                             shared_syms_by_name = set()
                             break
                         bnames = set()
-                        for sym in beg.free_symbols:
+                        for sym in beg_syms:
                             sym_by_name.setdefault(str(sym), sym)
                             bnames.add(str(sym))
                         shared_syms_by_name = bnames if shared_syms_by_name is None else shared_syms_by_name & bnames
@@ -1503,8 +1516,16 @@ def _process_edges(state: dace.SDFGState, nsdfg_node: dace.nodes.NestedSDFG, mov
             if direction == "in":
                 # src --[orig, copy_subset]--> an --[vec_from_array]--> nsdfg
                 if masked:
-                    emit_staging_copy(state, e.src, e.src_conn, an, None, orig_memlet, vector_dataname, vector_width,
-                                      "in", gate_extent=True)
+                    emit_staging_copy(state,
+                                      e.src,
+                                      e.src_conn,
+                                      an,
+                                      None,
+                                      orig_memlet,
+                                      vector_dataname,
+                                      vector_width,
+                                      "in",
+                                      gate_extent=True)
                 else:
                     state.add_edge(e.src, e.src_conn, an, None, orig_memlet)
                 state.add_edge(an, None, e.dst, e.dst_conn, vec_memlet)
@@ -1515,8 +1536,16 @@ def _process_edges(state: dace.SDFGState, nsdfg_node: dace.nodes.NestedSDFG, mov
                 assert len(set(state.out_edges_by_connector(nsdfg_node, e.src_conn))) == 0
                 state.add_edge(e.src, e.src_conn, an, None, vec_memlet)
                 if masked:
-                    emit_staging_copy(state, an, None, e.dst, e.dst_conn, orig_memlet, vector_dataname, vector_width,
-                                      "out", gate_extent=True)
+                    emit_staging_copy(state,
+                                      an,
+                                      None,
+                                      e.dst,
+                                      e.dst_conn,
+                                      orig_memlet,
+                                      vector_dataname,
+                                      vector_width,
+                                      "out",
+                                      gate_extent=True)
                 else:
                     state.add_edge(an, None, e.dst, e.dst_conn, orig_memlet)
 
@@ -1815,11 +1844,27 @@ def add_copies_before_and_after_nsdfg(
         # ``_iter_mask`` (if any) is in scope and gates each lane.
         mask_name = _iter_mask_name(target_state.sdfg)
         if direction == "in":
-            emit_staging_copy(target_state, orig_access, None, v_access, None, orig_memlet, vec_name, vector_width,
-                              "in", mask_name=mask_name)
+            emit_staging_copy(target_state,
+                              orig_access,
+                              None,
+                              v_access,
+                              None,
+                              orig_memlet,
+                              vec_name,
+                              vector_width,
+                              "in",
+                              mask_name=mask_name)
         else:
-            emit_staging_copy(target_state, v_access, None, orig_access, None, orig_memlet, vec_name, vector_width,
-                              "out", mask_name=mask_name)
+            emit_staging_copy(target_state,
+                              v_access,
+                              None,
+                              orig_access,
+                              None,
+                              orig_memlet,
+                              vec_name,
+                              vector_width,
+                              "out",
+                              mask_name=mask_name)
 
     def _emit_fused_union_copy(target_state, unmovable_name, vec_name, union_subset, direction):
         """Splice ONE shared-buffer staging copy for a fused unmovable array.
@@ -1866,9 +1911,9 @@ def add_copies_before_and_after_nsdfg(
             # silently OOB / un-gated when both are requested together.
             vec_arr_name, union_subset = fused_arrays[unmovable_arr_name]
             if unmovable_arr_name in read_set:
-                copy_in_state = find_copy_in_state(inner_sdfg, nsdfg_node,
-                                                   {str(s)
-                                                    for s in union_subset.free_symbols}, unmovable_arr_name)
+                copy_in_state = find_copy_in_state(inner_sdfg, nsdfg_node, {str(s)
+                                                                            for s in union_subset.free_symbols},
+                                                   unmovable_arr_name)
                 if _iter_mask_name(copy_in_state.sdfg) is not None:
                     raise NotImplementedError(
                         "fuse_overlapping_loads with a masked remainder is not supported yet: the shared "

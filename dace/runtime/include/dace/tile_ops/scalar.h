@@ -83,7 +83,7 @@ inline void tile_binop(T* __restrict__ out, const T* __restrict__ a, const T* __
 }
 
 // Per-lane unary op. Op codes (single char):
-//   ``n`` neg(-a)  ``a`` abs  ``e`` exp  ``l`` log  ``s`` sqrt
+//   ``n`` neg(-a)  ``!`` not(!a)  ``a`` abs  ``e`` exp  ``l`` log  ``s`` sqrt
 //   ``S`` sin      ``C`` cos  ``f`` floor ``c`` ceil ``t`` tanh
 // Transcendentals have no portable SIMD intrinsic, so every backend shares this
 // vectorize-hinted lane loop (the compiler auto-vectorises neg/abs/sqrt and
@@ -91,6 +91,7 @@ inline void tile_binop(T* __restrict__ out, const T* __restrict__ a, const T* __
 template <typename T, char Op>
 inline T tile_unop_apply(T a) {
   if constexpr (Op == 'n') return -a;
+  else if constexpr (Op == '!') return T(!a);
   else if constexpr (Op == 'a') return std::abs(a);
   else if constexpr (Op == 'e') return std::exp(a);
   else if constexpr (Op == 'l') return std::log(a);
@@ -136,6 +137,31 @@ inline void tile_load(T* __restrict__ dst, const T* __restrict__ src, const bool
   _dace_tile_vectorize(VLEN) for (int i = 0; i < VLEN; ++i) {
     if constexpr (Masked) dst[i] = mask[i] ? src[i * stride] : T(0);
     else dst[i] = src[i * stride];
+  }
+}
+
+// Forward-declare ``tile_load_value`` (defined further down with the
+// VLEN==1 polymorphism block) so the by-value ``Src`` overload below can
+// reference it. Definitions are visible at instantiation time.
+template <typename T> inline T tile_load_value(const T& x) noexcept;
+template <typename T> inline T tile_load_value(const T* x) noexcept;
+template <typename T, std::size_t N> inline T tile_load_value(const T (&x)[N]) noexcept;
+
+// VLEN>1 ``tile_load`` with a by-value ``src`` (Scalar / Symbol operand
+// codegen materialises as ``T _src = expr;``). SFINAE keeps this binding
+// off the contiguous ``T* src`` overload above; ``Src&&`` accepts any of
+// ``T``, ``T&``, ``T[N]``. ``stride`` is unused for a broadcast but kept
+// in the signature for call-site uniformity with the pointer form -- the
+// caller emits one ``tile_load<T, VLEN, Masked>(_dst, _src, mask, stride)``
+// for every tile load and the runtime picks pointer-strided vs by-value
+// broadcast through overload resolution.
+template <typename T, int VLEN, bool Masked, typename Src>
+inline std::enable_if_t<(VLEN > 1) && !std::is_pointer_v<std::remove_reference_t<Src>>, void>
+tile_load(T* __restrict__ dst, Src&& src, const bool* __restrict__ mask, std::int64_t /*stride*/ = 1) {
+  const T sv = tile_load_value<T>(src);
+  _dace_tile_vectorize(VLEN) for (int i = 0; i < VLEN; ++i) {
+    if constexpr (Masked) dst[i] = mask[i] ? sv : T(0);
+    else dst[i] = sv;
   }
 }
 

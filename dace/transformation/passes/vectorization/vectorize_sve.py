@@ -49,6 +49,8 @@ from dace.transformation import pass_pipeline as ppl
 from dace.transformation.dataflow.tiling import MapTiling
 from dace.transformation.dataflow.map_for_loop import MapToForLoop
 from dace.transformation.dataflow.map_expansion import MapExpansion
+from dace.transformation.passes.clean_tasklet_to_scalar_slice_to_access_node_pattern import CleanTaskletToScalarSliceToAccessNodePattern
+from dace.transformation.passes.clean_access_node_to_scalar_slice_to_tasklet_pattern import CleanAccessNodeToScalarSliceToTaskletPattern
 from dace.transformation.passes.vectorization.nest_innermost_map_body import NestInnermostMapBodyIntoNSDFG
 from dace.transformation.passes.vectorization.generate_iteration_mask import GenerateIterationMask
 from dace.transformation.passes.vectorization.for_loop_to_masked_while import ForLoopToMaskedWhile
@@ -125,7 +127,7 @@ class SveStyleFinalize(ppl.Pass):
                 if e.data.data not in state.sdfg.arrays:
                     continue
                 arr = state.sdfg.arrays[e.data.data]
-                strides = getattr(arr, "strides", None)
+                strides = arr.strides
                 if not strides:
                     continue
                 try:
@@ -257,6 +259,9 @@ class SveStyleFinalize(ppl.Pass):
                                       f"the first-cut SVE chain threads a single captured global_ub. Split the kernel "
                                       f"or restrict via apply_on_maps.")
         global_ub = gubs.pop()
+
+        CleanAccessNodeToScalarSliceToTaskletPattern().apply_pass(sdfg, {})
+        CleanTaskletToScalarSliceToAccessNodePattern().apply_pass(sdfg, {})
 
         # 1. Tile only TRUE 1D maps (no MapEntry scope-parent) into
         #    a clean divisible per-core block. Multi-dim maps from
@@ -460,8 +465,11 @@ class SveStyleVariableFinalize(ppl.Pass):
         # Topological order — each binop's outputs flow forward.
         from collections import deque
         order = []
-        in_deg = {tk: sum(1 for ie in state.in_edges(tk) if isinstance(ie.src, dace.nodes.AccessNode)
-                          and ie.src in body_nodes) for tk in tasklets}
+        in_deg = {
+            tk: sum(1 for ie in state.in_edges(tk)
+                    if isinstance(ie.src, dace.nodes.AccessNode) and ie.src in body_nodes)
+            for tk in tasklets
+        }
         q = deque(tk for tk in tasklets if in_deg[tk] == 0)
         while q:
             tk = q.popleft()
@@ -635,8 +643,10 @@ class SveStyleVariableFinalize(ppl.Pass):
         out_conn = "_out"
         # Emit SVE body. ``acc`` holds the running result; after the
         # first step it's reused across the chain.
-        sve_lines = ["int i = 0;", f"while (i < (int)({global_ub})) {{",
-                     f"    svbool_t pg = svwhilelt_b64(i, (int64_t)({global_ub}));"]
+        sve_lines = [
+            "int i = 0;", f"while (i < (int)({global_ub})) {{",
+            f"    svbool_t pg = svwhilelt_b64(i, (int64_t)({global_ub}));"
+        ]
         # Pre-load every outer input lane once. For long chains this is
         # the simplest correct emission (the compiler can hoist loads
         # if it likes); a more aggressive version would only load as
@@ -733,8 +743,7 @@ class SveStyleVariableFinalize(ppl.Pass):
         tasklets = [n for n in cst.nodes() if isinstance(n, dace.nodes.Tasklet)]
         mult = next((t for t in tasklets if t.code.as_string.strip().rstrip(";").strip() == "__out = (__in1 * __in2)"),
                     None)
-        augassign = next(
-            (t for t in tasklets if "augassign" in t.label and "+" in t.code.as_string), None)
+        augassign = next((t for t in tasklets if "augassign" in t.label and "+" in t.code.as_string), None)
         if mult is None or augassign is None:
             return None
         # Identify which outer arrays the NSDFG's input connectors map
@@ -882,10 +891,9 @@ class SveStyleVariableFinalize(ppl.Pass):
                 self._emit_sve_while_chain(g, n, chain_info)
                 applied += 1
                 continue
-            raise NotImplementedError(
-                f"sve_style='variable' recogniser supports: (1) SpMV-shape reduction "
-                f"(NSDFG body with augassign over gather, after WCRToAugAssign), or "
-                f"(2) linear chain of single-binop float64 1D element-wise tasklets "
-                f"(axpy, triad, longer chains, or copy). Map {n.label!r} in state "
-                f"{g.label!r} did not match either.")
+            raise NotImplementedError(f"sve_style='variable' recogniser supports: (1) SpMV-shape reduction "
+                                      f"(NSDFG body with augassign over gather, after WCRToAugAssign), or "
+                                      f"(2) linear chain of single-binop float64 1D element-wise tasklets "
+                                      f"(axpy, triad, longer chains, or copy). Map {n.label!r} in state "
+                                      f"{g.label!r} did not match either.")
         return applied or None

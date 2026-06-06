@@ -824,6 +824,19 @@ class EmitTileOps(ppl.Pass):
                 # the outer scalar (acc) and drop the reduction.
                 if nxt[0].data is not None and nxt[0].data.wcr is not None:
                     return edge, intermediates
+                # Same reduction signal one assign-tasklet removed:
+                # ``AccessNode -> assign_tasklet -[wcr]-> MapExit``. After
+                # ``InsertAssignTaskletsAtMapBoundary`` splits the stage-out
+                # edge, the WCR rides on the post-tasklet edge instead of
+                # the pre-tasklet one — stop here so the caller's WCR
+                # detector still sees the Scalar AccessNode as the
+                # reduction target.
+                two_hop = nxt[0].dst
+                if (isinstance(two_hop, dace.nodes.Tasklet) and two_hop in assign_set):
+                    two_hop_out = list(state.out_edges(two_hop))
+                    if (len(two_hop_out) == 1 and two_hop_out[0].data is not None
+                            and two_hop_out[0].data.wcr is not None):
+                        return edge, intermediates
                 intermediates.append(dst)
                 edge = nxt[0]
                 continue
@@ -959,6 +972,13 @@ class EmitTileOps(ppl.Pass):
             # the scatter/affine-index shape for K>=2 is not yet wired.
             expr = _lane_index_expr(token, spec.iter_vars) or token
             return "Symbol", expr
+        if len(in_edges) == 0:
+            # Loop-invariant SDFG symbol read as a free symbol (no in-edge
+            # connector): the tasklet body references ``S`` directly via
+            # the surrounding scope's symbol_mapping. Broadcast it inline
+            # the same way numeric literals are handled — every lane sees
+            # the same kernel-level value. Covers TSVC ``a[i] = a[i] + b[i] * S``.
+            return "Symbol", token
         if len(in_edges) != 1:
             raise NotImplementedError(f"EmitTileOps: tasklet {tasklet.label!r} operand {token!r} has "
                                       f"{len(in_edges)} in-edges")
@@ -1255,6 +1275,21 @@ class EmitTileOps(ppl.Pass):
                 out_data, out_access = self._emit_one_binop(state, t, spec, tile_map, mask_name)
             tile_map[out_data] = (out_access.data, out_access)
             final_edge, inters = self._walk_through_assigns(state, out_e[0], assign_tasklets)
+            # Alias every AccessNode crossed while walking forward through
+            # assign tasklets onto the source tile. The chain shape is
+            # ``binop_out -> AN -> assign -> AN -> ... -> [non-assign|MapExit]``;
+            # downstream consumers (e.g. a ``combine_branch_values`` binop
+            # that reads the renamed downstream AccessNode) then resolve via
+            # :meth:`_resolve_operand` to the existing tile instead of
+            # emitting a fresh ``TileLoad`` against an AccessNode whose only
+            # producer is the in-arm ``_out = _in`` assign -- whose codegen
+            # against tile-shaped pointer connectors is a pointer
+            # reassignment of a local, leaving the destination array at its
+            # initial ``{0}`` (cloud_fraction ``ZICEFRAC`` 99%-wrong-rate
+            # regression).
+            for an_inter in inters:
+                if isinstance(an_inter, dace.nodes.AccessNode):
+                    tile_map[an_inter.data] = (out_access.data, out_access)
             all_intermediates |= set(inters)
             if isinstance(final_edge.dst, dace.nodes.MapExit):
                 stores.append((out_access, final_edge))
