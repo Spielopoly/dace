@@ -214,6 +214,8 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
                  sdfg: "SDFG") -> None:
         self._frame = frame_codegen
         self._dispatcher = frame_codegen.dispatcher
+        #: Tracks already-generated nested functions by position key to avoid duplicates.
+        self._generated_nested_functions: Dict[str, str] = {}
         # Register as the handler for CuTile map scopes.
         self._dispatcher.register_map_dispatcher(dtypes.ScheduleType.CuTile, self)
         # Register as node handler for all nodes inside CuTile scopes.
@@ -1040,21 +1042,20 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
             self._dispatcher.defined_vars.exit_scope(node)
 
     # ------------------------------------------------------------------
-    # NestedSDFG
+    # NestedSDFG — generate as module-level function with return values
     # ------------------------------------------------------------------
 
     def _generate_NestedSDFG(self, sdfg: "SDFG", cfg: object, dfg: object,
                              state_id: int, node: nodes.NestedSDFG,
                              function_stream: PythonCodeIOStream,
                              callsite_stream: PythonCodeIOStream) -> None:
-        """Inline a NestedSDFG produced by library-node expansion.
+        """Generate a module-level function for a NestedSDFG and emit a call.
 
-        Library-node expansions (e.g. :class:`TileIfElseOpLibraryNode`)
-        return an SDFG that the framework wraps in a
-        :class:`~dace.sdfg.nodes.NestedSDFG`.  Rather than generating a
-        separate function call, this handler *inlines* the nested graph
-        by binding connectors to the surrounding tile variables and
-        emitting the inner Tasklet code directly.
+        Tiles are immutable in cuTile, so output connectors are
+        *returned* from the generated function rather than passed as
+        mutable arguments.  The function is emitted to
+        *function_stream* (module level, before the ``@ct.kernel``)
+        and then called at *callsite_stream*.
 
         :param sdfg: The SDFG.
         :param cfg: The control flow graph.
@@ -1065,94 +1066,270 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
         :param callsite_stream: Stream for call-site code.
         """
         state = cfg.state(state_id)
-        self._inline_nsdfg(state, node, function_stream,
-                           callsite_stream, state_id, cfg)
+        inner_sdfg = node.sdfg
 
-    def _inline_nsdfg(self, containing_state: "SDFGState",
-                      nsdfg_node: nodes.NestedSDFG,
-                      function_stream: PythonCodeIOStream,
-                      callsite_stream: PythonCodeIOStream,
-                      state_id: int, cfg: object) -> None:
-        """Recursively inline a NestedSDFG into the call-site stream.
-
-        :param containing_state: The state that contains *nsdfg_node*.
-        :param nsdfg_node: The :class:`~dace.sdfg.nodes.NestedSDFG` to
-            inline.
-        :param function_stream: Stream for top-level function code.
-        :param callsite_stream: Stream for call-site (inline) code.
-        :param state_id: State ID in the parent CFG.
-        :param cfg: Parent control-flow region.
-        """
-        inner_sdfg = nsdfg_node.sdfg
-        # Ensure every library node inside has been expanded.
+        # Expand any library nodes inside before generating code.
         inner_sdfg.expand_library_nodes(recursive=True)
 
+        # Determine a unique function name based on position in the graph.
+        func_name = (
+            f"__dace_nested_{inner_sdfg.name}_{cfg.cfg_id}_"
+            f"{state_id}_{state.node_id(node)}"
+        )
+
+        # Determine input connectors (sorted, only those with edges).
+        input_conns: List[str] = sorted(
+            {e.dst_conn for e in state.in_edges(node) if e.dst_conn is not None}
+        )
+
+        # Determine output connectors (sorted, only those with edges).
+        output_conns: List[str] = sorted(
+            {e.src_conn for e in state.out_edges(node) if e.src_conn is not None}
+        )
+
+        # Determine symbols needed at runtime.
+        symbol_names = self._nsdfg_runtime_symbols(node)
+
+        # Generate the function definition (if not already generated).
+        position_key = func_name
+        if position_key not in self._generated_nested_functions:
+            self._generate_nsdfg_function(
+                node, state, function_stream, state_id, cfg,
+                func_name, input_conns, output_conns, symbol_names,
+            )
+            self._generated_nested_functions[position_key] = func_name
+
+        # --- Emit the call site ---
+        # Build argument list: input variable names + symbol expressions.
+        call_args: List[str] = []
+        for conn_name in input_conns:
+            call_args.append(self._resolve_nsdfg_input_var(state, node, conn_name))
+        for sym_name in symbol_names:
+            mapping_expr = node.symbol_mapping.get(sym_name)
+            if mapping_expr is not None:
+                call_args.append(symstr(mapping_expr))
+            else:
+                call_args.append(sym_name)
+
+        args_str = ", ".join(call_args)
+
+        # Build LHS for output assignment.
+        if len(output_conns) == 0:
+            callsite_stream.write(f"{func_name}({args_str})", cfg, state_id)
+        elif len(output_conns) == 1:
+            out_var = self._resolve_nsdfg_output_var(state, node, output_conns[0])
+            callsite_stream.write(f"{out_var} = {func_name}({args_str})", cfg, state_id)
+        else:
+            out_vars = [
+                self._resolve_nsdfg_output_var(state, node, c)
+                for c in output_conns
+            ]
+            lhs = ", ".join(out_vars)
+            callsite_stream.write(f"{lhs} = {func_name}({args_str})", cfg, state_id)
+
+    # ------------------------------------------------------------------
+    # NestedSDFG helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _nsdfg_runtime_symbols(node: nodes.NestedSDFG) -> List[str]:
+        """Return sorted list of symbol names that must be passed at runtime.
+
+        Symbols that are free in the inner SDFG and not constants are
+        included.
+
+        :param node: The NestedSDFG node.
+        :returns: Sorted list of symbol names.
+        """
+        inner_sdfg = node.sdfg
+        free_symbols = set(
+            str(s)
+            for s in inner_sdfg.used_symbols(all_symbols=False, keep_defined_in_mapping=True)
+        )
+        return [
+            sym_name for sym_name in sorted(node.symbol_mapping.keys())
+            if sym_name in free_symbols and sym_name not in inner_sdfg.constants
+        ]
+
+    @staticmethod
+    def _resolve_nsdfg_input_var(state: "SDFGState", node: nodes.NestedSDFG,
+                                 conn_name: str) -> str:
+        """Resolve the variable name for a NestedSDFG input connector at the call site.
+
+        Traces edges to find the actual source variable name.
+
+        :param state: The containing state.
+        :param node: The NestedSDFG node.
+        :param conn_name: The input connector name.
+        :returns: The variable name to pass as argument.
+        """
+        for edge in state.in_edges(node):
+            if edge.dst_conn == conn_name:
+                if isinstance(edge.src, nodes.AccessNode):
+                    return edge.src.data
+                elif edge.src_conn is not None:
+                    # Through a MapEntry — trace to the outer edge.
+                    if isinstance(edge.src, nodes.MapEntry):
+                        outer_conn = _matching_outer_connector(edge.src_conn)
+                        for outer_edge in state.in_edges_by_connector(edge.src, outer_conn):
+                            if isinstance(outer_edge.src, nodes.AccessNode):
+                                return outer_edge.src.data
+                    return edge.src_conn
+        return conn_name  # fallback: use connector name itself
+
+    @staticmethod
+    def _resolve_nsdfg_output_var(state: "SDFGState", node: nodes.NestedSDFG,
+                                  conn_name: str) -> str:
+        """Resolve the variable name for a NestedSDFG output connector at the call site.
+
+        Traces edges to find the actual destination variable name.
+
+        :param state: The containing state.
+        :param node: The NestedSDFG node.
+        :param conn_name: The output connector name.
+        :returns: The variable name to assign the return value to.
+        """
+        for edge in state.out_edges(node):
+            if edge.src_conn == conn_name:
+                if isinstance(edge.dst, nodes.AccessNode):
+                    return edge.dst.data
+                elif edge.dst_conn is not None:
+                    # Through a MapExit — trace to the outer edge.
+                    if isinstance(edge.dst, nodes.MapExit):
+                        outer_conn = _matching_inner_connector(edge.dst_conn)
+                        for outer_edge in state.out_edges_by_connector(edge.dst, outer_conn):
+                            if isinstance(outer_edge.dst, nodes.AccessNode):
+                                return outer_edge.dst.data
+                    return edge.dst_conn
+        return conn_name  # fallback: use connector name itself
+
+    def _generate_nsdfg_function(self, nsdfg_node: nodes.NestedSDFG,
+                                 containing_state: "SDFGState",
+                                 function_stream: PythonCodeIOStream,
+                                 state_id: int, cfg: object,
+                                 func_name: str,
+                                 input_conns: List[str],
+                                 output_conns: List[str],
+                                 symbol_names: List[str]) -> None:
+        """Generate the module-level function definition for a NestedSDFG.
+
+        The function takes input connectors and symbols as parameters
+        and returns output connectors.  The body is generated by
+        walking the inner SDFG's states.
+
+        :param nsdfg_node: The NestedSDFG node.
+        :param containing_state: The state containing the NestedSDFG.
+        :param function_stream: Stream to emit the function definition into.
+        :param state_id: State ID in the parent CFG.
+        :param cfg: Parent control-flow region.
+        :param func_name: The generated function name.
+        :param input_conns: Sorted input connector names (function parameters).
+        :param output_conns: Sorted output connector names (return values).
+        :param symbol_names: Sorted symbol names (additional function parameters).
+        """
+        inner_sdfg = nsdfg_node.sdfg
+        params = input_conns + symbol_names
+        params_str = ", ".join(params)
+
+        # Build the function body in a temporary stream.
+        body_stream = PythonCodeIOStream()
         states = inner_sdfg.states()
         if len(states) > 1:
             raise NotImplementedError(
-                "CuTile _inline_nsdfg does not support multi-state "
-                "NestedSDFGs; library node expansions must produce a "
-                "single-state SDFG."
+                "CuTile NestedSDFG code generation only supports single-state "
+                f"inner SDFGs, but '{inner_sdfg.name}' has {len(states)} states. "
+                "Multi-state support requires control_flow_region_to_code integration."
+            )
+        for inner_state in states:
+            self._generate_nsdfg_state(
+                inner_state, inner_sdfg, function_stream,
+                body_stream, state_id, cfg,
             )
 
-        # -- bind input connectors --
-        for edge in containing_state.in_edges(nsdfg_node):
-            if edge.dst_conn is None:
-                continue
-            if isinstance(edge.src, nodes.AccessNode):
-                src = edge.src.data
-            elif edge.src_conn is not None:
-                src = edge.src_conn
+        # Emit return statement.
+        if output_conns:
+            ret_str = ", ".join(output_conns)
+            body_stream.write(f"return {ret_str}")
+
+        # Write the function to function_stream.
+        function_stream.write("")
+        function_stream.write(f"def {func_name}({params_str}):")
+        with function_stream.indented():
+            body_code = body_stream.getvalue()
+            if body_code.strip():
+                function_stream.write(body_code.rstrip("\n"))
             else:
-                continue
-            if edge.dst_conn != src:
-                callsite_stream.write(f"{edge.dst_conn} = {src}",
-                                      cfg, state_id)
+                function_stream.write("pass")
+        function_stream.write("")
 
-        # -- emit inner state(s) --
-        for inner_state in states:
-            for inner_node in sdutil.dfs_topological_sort(inner_state):
-                if isinstance(inner_node, nodes.Tasklet):
-                    self._emit_inline_tasklet(
-                        inner_state, inner_node,
-                        callsite_stream, state_id, cfg)
-                elif isinstance(inner_node, nodes.NestedSDFG):
-                    # Recurse for expansions-within-expansions.
-                    self._inline_nsdfg(
-                        inner_state, inner_node, function_stream,
-                        callsite_stream, state_id, cfg)
-                # AccessNode -> Python local; no code needed.
+    def _generate_nsdfg_state(self, inner_state: "SDFGState",
+                              inner_sdfg: "SDFG",
+                              function_stream: PythonCodeIOStream,
+                              body_stream: PythonCodeIOStream,
+                              state_id: int, cfg: object) -> None:
+        """Generate code for a single state inside a NestedSDFG function body.
 
-        # -- bind output connectors --
-        for edge in containing_state.out_edges(nsdfg_node):
-            if edge.src_conn is None:
-                continue
-            if isinstance(edge.dst, nodes.AccessNode):
-                dst = edge.dst.data
-            elif edge.dst_conn is not None:
-                dst = edge.dst_conn
-            else:
-                continue
-            if edge.src_conn != dst:
-                callsite_stream.write(f"{dst} = {edge.src_conn}",
-                                      cfg, state_id)
+        Walks nodes in topological order, emitting code for Tasklets,
+        recursive NestedSDFGs, and inner map scopes.  AccessNodes for
+        tile/register locals need no explicit code.
 
-    def _emit_inline_tasklet(self, inner_state: "SDFGState",
-                             tasklet: nodes.Tasklet,
-                             callsite_stream: PythonCodeIOStream,
-                             state_id: int, cfg: object) -> None:
-        """Emit code for a Tasklet inside an inlined NestedSDFG.
-
-        Binds input edges, emits the tasklet body, then binds outputs
-        to downstream :class:`~dace.sdfg.nodes.AccessNode` locals.
-
-        :param inner_state: The inner SDFG state containing the tasklet.
-        :param tasklet: The Tasklet node.
-        :param callsite_stream: Stream for call-site code.
-        :param state_id: The state ID in the parent CFG.
-        :param cfg: The parent control-flow region.
+        :param inner_state: The inner SDFG state.
+        :param inner_sdfg: The inner SDFG.
+        :param function_stream: Stream for module-level code (for recursive NestedSDFGs).
+        :param body_stream: Stream for the function body.
+        :param state_id: State ID in the parent CFG.
+        :param cfg: Parent control-flow region.
         """
-        # Bind inputs
+        scope_dict = inner_state.scope_dict()
+        for inner_node in sdutil.dfs_topological_sort(inner_state):
+            # Only process top-level nodes (not inside an inner map).
+            if scope_dict[inner_node] is not None:
+                continue
+
+            if isinstance(inner_node, nodes.Tasklet):
+                self._emit_nsdfg_tasklet(inner_state, inner_node, body_stream,
+                                         state_id, cfg)
+            elif isinstance(inner_node, nodes.NestedSDFG):
+                self._emit_nsdfg_nested_call(
+                    inner_state, inner_node, inner_sdfg,
+                    function_stream, body_stream, state_id, cfg)
+            elif isinstance(inner_node, nodes.MapEntry):
+                self._generate_nsdfg_map_scope(
+                    inner_state, inner_node, inner_sdfg,
+                    function_stream, body_stream, state_id, cfg)
+            # AccessNodes: tile/register locals are Python locals, no code needed.
+
+    def _emit_nsdfg_tasklet(self, inner_state: "SDFGState",
+                            tasklet: nodes.Tasklet,
+                            body_stream: PythonCodeIOStream,
+                            state_id: int, cfg: object) -> None:
+        """Emit code for a Tasklet inside a NestedSDFG function.
+
+        Binds input connectors, emits the tasklet body, then binds
+        output connectors to their downstream AccessNode local names.
+
+        :param inner_state: The state containing the tasklet.
+        :param tasklet: The Tasklet node.
+        :param body_stream: Stream for the function body code.
+        :param state_id: The state ID in the parent CFG.
+        :param cfg: Parent control-flow region.
+        """
+        # Reject non-Python tasklets.
+        if tasklet.code.language != dtypes.Language.Python:
+            raise NotImplementedError(
+                "CuTile NestedSDFG backend only supports Python tasklets, "
+                f"but tasklet '{tasklet.label}' uses "
+                f"{tasklet.code.language.name}.")
+
+        # Handle init/exit code blocks.
+        init_code = codeblock_to_python(tasklet.code_init).strip()
+        if init_code:
+            self._frame._initcode.write(init_code)
+        exit_code = codeblock_to_python(tasklet.code_exit).strip()
+        if exit_code:
+            self._frame._exitcode.write(exit_code)
+
+        # Bind inputs.
         for edge in inner_state.in_edges(tasklet):
             if edge.dst_conn is None:
                 continue
@@ -1163,23 +1340,155 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
             else:
                 continue
             if edge.dst_conn != src:
-                callsite_stream.write(f"{edge.dst_conn} = {src}",
-                                      cfg, state_id)
+                body_stream.write(f"{edge.dst_conn} = {src}")
 
-        # Emit tasklet body
+        # Emit tasklet body.
         code = codeblock_to_python(tasklet.code).strip()
         if code:
-            callsite_stream.write(code, cfg, state_id)
+            body_stream.write(code)
 
-        # Bind outputs to access-node locals
+        # Bind outputs to downstream AccessNode locals.
         for edge in inner_state.out_edges(tasklet):
             if edge.src_conn is None:
                 continue
             if (isinstance(edge.dst, nodes.AccessNode)
                     and edge.dst.data != edge.src_conn):
-                callsite_stream.write(
-                    f"{edge.dst.data} = {edge.src_conn}",
-                    cfg, state_id)
+                body_stream.write(f"{edge.dst.data} = {edge.src_conn}")
+
+    def _emit_nsdfg_nested_call(self, inner_state: "SDFGState",
+                                nested_node: nodes.NestedSDFG,
+                                parent_sdfg: "SDFG",
+                                function_stream: PythonCodeIOStream,
+                                body_stream: PythonCodeIOStream,
+                                state_id: int, cfg: object) -> None:
+        """Handle a recursive NestedSDFG inside a NestedSDFG function.
+
+        Generates another module-level function and emits the call in
+        the current function body.
+
+        :param inner_state: The state containing the nested node.
+        :param nested_node: The recursive NestedSDFG node.
+        :param parent_sdfg: The parent (inner) SDFG.
+        :param function_stream: Stream for module-level code.
+        :param body_stream: Stream for the current function body.
+        :param state_id: State ID in the parent CFG.
+        :param cfg: Parent control-flow region.
+        """
+        nested_sdfg = nested_node.sdfg
+        nested_sdfg.expand_library_nodes(recursive=True)
+
+        # Build function name.
+        func_name = (
+            f"__dace_nested_{nested_sdfg.name}_inner_"
+            f"{inner_state.block_id}_{inner_state.node_id(nested_node)}"
+        )
+
+        # Determine connectors.
+        input_conns: List[str] = sorted(
+            {e.dst_conn for e in inner_state.in_edges(nested_node)
+             if e.dst_conn is not None}
+        )
+        output_conns: List[str] = sorted(
+            {e.src_conn for e in inner_state.out_edges(nested_node)
+             if e.src_conn is not None}
+        )
+        symbol_names = self._nsdfg_runtime_symbols(nested_node)
+
+        # Generate the function if not already done.
+        position_key = func_name
+        if position_key not in self._generated_nested_functions:
+            self._generate_nsdfg_function(
+                nested_node, inner_state, function_stream, state_id, cfg,
+                func_name, input_conns, output_conns, symbol_names,
+            )
+            self._generated_nested_functions[position_key] = func_name
+
+        # Build call arguments.
+        call_args: List[str] = []
+        for conn_name in input_conns:
+            call_args.append(
+                self._resolve_nsdfg_input_var(inner_state, nested_node, conn_name))
+        for sym_name in symbol_names:
+            mapping_expr = nested_node.symbol_mapping.get(sym_name)
+            if mapping_expr is not None:
+                call_args.append(symstr(mapping_expr))
+            else:
+                call_args.append(sym_name)
+
+        args_str = ", ".join(call_args)
+
+        # Emit call.
+        if len(output_conns) == 0:
+            body_stream.write(f"{func_name}({args_str})")
+        elif len(output_conns) == 1:
+            out_var = self._resolve_nsdfg_output_var(
+                inner_state, nested_node, output_conns[0])
+            body_stream.write(f"{out_var} = {func_name}({args_str})")
+        else:
+            out_vars = [
+                self._resolve_nsdfg_output_var(inner_state, nested_node, c)
+                for c in output_conns
+            ]
+            lhs = ", ".join(out_vars)
+            body_stream.write(f"{lhs} = {func_name}({args_str})")
+
+    def _generate_nsdfg_map_scope(self, inner_state: "SDFGState",
+                                  entry: nodes.MapEntry,
+                                  inner_sdfg: "SDFG",
+                                  function_stream: PythonCodeIOStream,
+                                  body_stream: PythonCodeIOStream,
+                                  state_id: int, cfg: object) -> None:
+        """Generate a sequential for-loop for an inner map scope.
+
+        Maps inside NestedSDFGs (e.g. from pure tileops expansion) are
+        emitted as Python for-loops.
+
+        :param inner_state: The state containing the map.
+        :param entry: The MapEntry node.
+        :param inner_sdfg: The inner SDFG.
+        :param function_stream: Stream for module-level code (for recursive NestedSDFGs).
+        :param body_stream: Stream for the function body.
+        :param state_id: State ID in the parent CFG.
+        :param cfg: Parent control-flow region.
+        """
+        # Emit for-loop headers (one per map dimension).
+        for param, (start, end, step) in zip(entry.map.params, entry.map.range):
+            start_s = symstr(start)
+            end_s = symstr(end + 1)
+            step_s = symstr(step)
+            if step_s == "1":
+                body_stream.write(f"for {param} in range({start_s}, {end_s}):")
+            else:
+                body_stream.write(f"for {param} in range({start_s}, {end_s}, {step_s}):")
+            body_stream.indent()
+
+        # Get scope children and process them in topological order.
+        scope_children = inner_state.scope_children()
+        children = scope_children.get(entry, [])
+        scope_child_set = set(children)
+        try:
+            for child in sdutil.dfs_topological_sort(inner_state, sources=children):
+                if child not in scope_child_set:
+                    continue
+                if isinstance(child, nodes.Tasklet):
+                    self._emit_nsdfg_tasklet(inner_state, child, body_stream,
+                                             state_id, cfg)
+                elif isinstance(child, nodes.NestedSDFG):
+                    self._emit_nsdfg_nested_call(
+                        inner_state, child, inner_sdfg,
+                        function_stream, body_stream, state_id, cfg)
+                elif isinstance(child, nodes.MapEntry):
+                    # Nested inner map — recurse.
+                    self._generate_nsdfg_map_scope(
+                        inner_state, child, inner_sdfg,
+                        function_stream, body_stream, state_id, cfg)
+                elif isinstance(child, nodes.MapExit):
+                    pass  # No-op; loop closing handled by dedent.
+                # AccessNodes: no code needed (Python locals).
+        finally:
+            # Close for-loop indentation (one dedent per dimension).
+            for _ in entry.map.params:
+                body_stream.dedent()
 
     # ------------------------------------------------------------------
     # Scope generation (kernel wrapper + launch)
