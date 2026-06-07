@@ -761,10 +761,6 @@ class PythonCodeGen(PythonTargetCodeGenerator):
                     arg_expr = _bind_bridge(connector_name, memlet, desc, is_input)
             elif self._is_singleton_buffer_desc(desc) and isinstance(outer_desc, data.Scalar):
                 arg_expr = _bind_bridge(connector_name, memlet, desc, is_input)
-            elif isinstance(desc, data.Array) and desc.storage == dtypes.StorageType.CuTile_Tile:
-                # CuTile_Tile arrays are opaque tile objects — pass by variable
-                # name without view/subset expressions.
-                arg_expr = self._runtime_data_name(sdfg, memlet.data)
             elif isinstance(desc, data.Array):
                 arg_expr = self._nested_view_expr(sdfg, memlet.data, memlet.subset)
             else:
