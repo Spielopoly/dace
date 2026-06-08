@@ -5,6 +5,8 @@ The refactored _generate_NestedSDFG generates separate module-level
 functions (with return values) instead of inlining.  Tiles are immutable
 in cuTile, so output connectors must be returned, not passed as arguments.
 """
+import ast
+
 import pytest
 
 import dace
@@ -13,7 +15,7 @@ from dace.codegen import dispatcher as dispatcher_mod
 from dace.codegen.py.prettycode import PythonCodeIOStream
 from dace.codegen.py.cutile_target import CuTilePythonCodeGen
 from dace.dtypes import ScheduleType, StorageType, Language
-from dace.sdfg import nodes, SDFG
+from dace.sdfg import SDFG
 from dace.memlet import Memlet
 
 
@@ -626,7 +628,6 @@ class TestNestedSDFGCodeValidity:
 
     def test_simple_binop_function_is_valid_python(self):
         """The generated function should be parseable Python."""
-        import ast
         sdfg, state, nsdfg = _build_simple_binop_nested_sdfg()
         func_code, call_code = _generate_nested_code(sdfg, state, nsdfg)
         # Try parsing the function code
@@ -634,35 +635,30 @@ class TestNestedSDFGCodeValidity:
 
     def test_unop_function_is_valid_python(self):
         """The generated unop function should be parseable Python."""
-        import ast
         sdfg, state, nsdfg = _build_unop_nested_sdfg()
         func_code, call_code = _generate_nested_code(sdfg, state, nsdfg)
         ast.parse(func_code)
 
     def test_multi_output_function_is_valid_python(self):
         """The multi-output function should be parseable Python."""
-        import ast
         sdfg, state, nsdfg = _build_multi_output_nested_sdfg()
         func_code, call_code = _generate_nested_code(sdfg, state, nsdfg)
         ast.parse(func_code)
 
     def test_symbol_function_is_valid_python(self):
         """The symbol-passing function should be parseable Python."""
-        import ast
         sdfg, state, nsdfg = _build_symbol_passing_nested_sdfg()
         func_code, call_code = _generate_nested_code(sdfg, state, nsdfg)
         ast.parse(func_code)
 
     def test_recursive_function_is_valid_python(self):
         """The recursive NestedSDFG functions should be parseable Python."""
-        import ast
         sdfg, state, nsdfg = _build_recursive_nested_sdfg()
         func_code, call_code = _generate_nested_code(sdfg, state, nsdfg)
         ast.parse(func_code)
 
     def test_call_site_is_valid_python(self):
         """The call site code should be parseable Python."""
-        import ast
         sdfg, state, nsdfg = _build_simple_binop_nested_sdfg()
         func_code, call_code = _generate_nested_code(sdfg, state, nsdfg)
         ast.parse(call_code)
@@ -760,9 +756,9 @@ def _build_inner_map_nested_sdfg(name: str = "inner_map_nsdfg"):
 
 
 def _build_multi_state_nested_sdfg(name: str = "multi_state_nsdfg"):
-    """Build a NestedSDFG with two states (should raise NotImplementedError).
+    """Build a NestedSDFG with two states (empty first, compute second).
 
-    Inner SDFG has state1 -> state2 with an interstate edge.
+    Inner SDFG has state1 (empty) -> state2 (copy tasklet).
     """
     sdfg = _make_cutile_python_sdfg(name)
     sdfg.add_array("A", [16], dace.float64, storage=StorageType.GPU_Global)
@@ -815,6 +811,318 @@ def _build_multi_state_nested_sdfg(name: str = "multi_state_nsdfg"):
     return sdfg, state, nsdfg
 
 
+def _build_two_state_compute_nested_sdfg(name: str = "two_state_compute_nsdfg"):
+    """Build a NestedSDFG with two states, both having computation.
+
+    Inner SDFG:
+        state1: tmp = inp * 2 (via tasklet)
+        state2: out = tmp + 1 (via tasklet)
+    Unconditional edge from state1 -> state2.
+    """
+    sdfg = _make_cutile_python_sdfg(name)
+    sdfg.add_array("A", [16], dace.float64, storage=StorageType.GPU_Global)
+    sdfg.add_array("B", [16], dace.float64, storage=StorageType.GPU_Global)
+    sdfg.add_array("_tile_a", [16], dace.float64,
+                   storage=StorageType.CuTile_Tile, transient=True)
+    sdfg.add_array("_tile_out", [16], dace.float64,
+                   storage=StorageType.CuTile_Tile, transient=True)
+
+    state = sdfg.add_state("main")
+    me, mx = state.add_map("cutile_map", {"tile_i": "0:1"},
+                           schedule=ScheduleType.CuTile)
+
+    a_node = state.add_read("A")
+    b_node = state.add_write("B")
+    tile_a = state.add_access("_tile_a")
+    tile_out = state.add_access("_tile_out")
+
+    # Build inner nested SDFG with 2 compute states
+    inner_sdfg = SDFG("two_compute")
+    inner_sdfg.add_array("inp", [16], dace.float64,
+                         storage=StorageType.CuTile_Tile)
+    inner_sdfg.add_array("tmp", [16], dace.float64,
+                         storage=StorageType.CuTile_Tile, transient=True)
+    inner_sdfg.add_array("out", [16], dace.float64,
+                         storage=StorageType.CuTile_Tile)
+
+    state1 = inner_sdfg.add_state("multiply")
+    state2 = inner_sdfg.add_state("add_one")
+    inner_sdfg.add_edge(state1, state2, dace.InterstateEdge())
+
+    # state1: tmp = inp * 2
+    s1_inp = state1.add_read("inp")
+    s1_tmp = state1.add_write("tmp")
+    t1 = state1.add_tasklet("mul2", {"_x"}, {"_out"}, "_out = _x * 2",
+                            language=Language.Python)
+    state1.add_edge(s1_inp, None, t1, "_x",
+                    Memlet(data="inp", subset="0:16"))
+    state1.add_edge(t1, "_out", s1_tmp, None,
+                    Memlet(data="tmp", subset="0:16"))
+
+    # state2: out = tmp + 1
+    s2_tmp = state2.add_read("tmp")
+    s2_out = state2.add_write("out")
+    t2 = state2.add_tasklet("add1", {"_x"}, {"_out"}, "_out = _x + 1",
+                            language=Language.Python)
+    state2.add_edge(s2_tmp, None, t2, "_x",
+                    Memlet(data="tmp", subset="0:16"))
+    state2.add_edge(t2, "_out", s2_out, None,
+                    Memlet(data="out", subset="0:16"))
+
+    nsdfg = state.add_nested_sdfg(inner_sdfg, {"inp"}, {"out"})
+
+    state.add_memlet_path(a_node, me, tile_a,
+                          memlet=Memlet(data="A", subset="0:16"))
+    state.add_edge(tile_a, None, nsdfg, "inp",
+                   Memlet(data="_tile_a", subset="0:16"))
+    state.add_edge(nsdfg, "out", tile_out, None,
+                   Memlet(data="_tile_out", subset="0:16"))
+    state.add_memlet_path(tile_out, mx, b_node,
+                          memlet=Memlet(data="B", subset="0:16"))
+
+    return sdfg, state, nsdfg
+
+
+def _build_interstate_assignment_nsdfg(name: str = "interstate_assign_nsdfg"):
+    """Build a NestedSDFG with an interstate assignment.
+
+    Inner SDFG:
+        state1 (empty) --[k = 42]--> state2: out = inp + k
+    The symbol k is set by the interstate edge assignment.
+    """
+    sdfg = _make_cutile_python_sdfg(name)
+    sdfg.add_array("A", [16], dace.float64, storage=StorageType.GPU_Global)
+    sdfg.add_array("B", [16], dace.float64, storage=StorageType.GPU_Global)
+    sdfg.add_array("_tile_a", [16], dace.float64,
+                   storage=StorageType.CuTile_Tile, transient=True)
+    sdfg.add_array("_tile_out", [16], dace.float64,
+                   storage=StorageType.CuTile_Tile, transient=True)
+
+    state = sdfg.add_state("main")
+    me, mx = state.add_map("cutile_map", {"tile_i": "0:1"},
+                           schedule=ScheduleType.CuTile)
+
+    a_node = state.add_read("A")
+    b_node = state.add_write("B")
+    tile_a = state.add_access("_tile_a")
+    tile_out = state.add_access("_tile_out")
+
+    # Build inner nested SDFG with interstate assignment
+    inner_sdfg = SDFG("assign_k")
+    inner_sdfg.add_symbol("k", dace.int64)
+    inner_sdfg.add_array("inp", [16], dace.float64,
+                         storage=StorageType.CuTile_Tile)
+    inner_sdfg.add_array("out", [16], dace.float64,
+                         storage=StorageType.CuTile_Tile)
+
+    state1 = inner_sdfg.add_state("init")
+    state2 = inner_sdfg.add_state("compute")
+    inner_sdfg.add_edge(state1, state2,
+                        dace.InterstateEdge(assignments={"k": "42"}))
+
+    # state2: out = inp + k
+    s2_inp = state2.add_read("inp")
+    s2_out = state2.add_write("out")
+    t = state2.add_tasklet("add_k", {"_x"}, {"_out"}, "_out = _x + k",
+                           language=Language.Python)
+    state2.add_edge(s2_inp, None, t, "_x",
+                    Memlet(data="inp", subset="0:16"))
+    state2.add_edge(t, "_out", s2_out, None,
+                    Memlet(data="out", subset="0:16"))
+
+    nsdfg = state.add_nested_sdfg(inner_sdfg, {"inp"}, {"out"},
+                                  symbol_mapping={"k": 0})
+
+    state.add_memlet_path(a_node, me, tile_a,
+                          memlet=Memlet(data="A", subset="0:16"))
+    state.add_edge(tile_a, None, nsdfg, "inp",
+                   Memlet(data="_tile_a", subset="0:16"))
+    state.add_edge(nsdfg, "out", tile_out, None,
+                   Memlet(data="_tile_out", subset="0:16"))
+    state.add_memlet_path(tile_out, mx, b_node,
+                          memlet=Memlet(data="B", subset="0:16"))
+
+    return sdfg, state, nsdfg
+
+
+def _build_three_state_chain_nsdfg(name: str = "three_state_chain_nsdfg"):
+    """Build a NestedSDFG with three states in sequence.
+
+    Inner SDFG:
+        state1: t1 = inp + 1
+        state2: t2 = t1 * 2
+        state3: out = t2 - 3
+    Transients: t1, t2.
+    """
+    sdfg = _make_cutile_python_sdfg(name)
+    sdfg.add_array("A", [16], dace.float64, storage=StorageType.GPU_Global)
+    sdfg.add_array("B", [16], dace.float64, storage=StorageType.GPU_Global)
+    sdfg.add_array("_tile_a", [16], dace.float64,
+                   storage=StorageType.CuTile_Tile, transient=True)
+    sdfg.add_array("_tile_out", [16], dace.float64,
+                   storage=StorageType.CuTile_Tile, transient=True)
+
+    state = sdfg.add_state("main")
+    me, mx = state.add_map("cutile_map", {"tile_i": "0:1"},
+                           schedule=ScheduleType.CuTile)
+
+    a_node = state.add_read("A")
+    b_node = state.add_write("B")
+    tile_a = state.add_access("_tile_a")
+    tile_out = state.add_access("_tile_out")
+
+    # Build inner nested SDFG with 3 states
+    inner_sdfg = SDFG("chain_three")
+    inner_sdfg.add_array("inp", [16], dace.float64,
+                         storage=StorageType.CuTile_Tile)
+    inner_sdfg.add_array("t1", [16], dace.float64,
+                         storage=StorageType.CuTile_Tile, transient=True)
+    inner_sdfg.add_array("t2", [16], dace.float64,
+                         storage=StorageType.CuTile_Tile, transient=True)
+    inner_sdfg.add_array("out", [16], dace.float64,
+                         storage=StorageType.CuTile_Tile)
+
+    s1 = inner_sdfg.add_state("add_one")
+    s2 = inner_sdfg.add_state("mul_two")
+    s3 = inner_sdfg.add_state("sub_three")
+    inner_sdfg.add_edge(s1, s2, dace.InterstateEdge())
+    inner_sdfg.add_edge(s2, s3, dace.InterstateEdge())
+
+    # state1: t1 = inp + 1
+    s1_inp = s1.add_read("inp")
+    s1_t1 = s1.add_write("t1")
+    t1 = s1.add_tasklet("add1", {"_x"}, {"_out"}, "_out = _x + 1",
+                         language=Language.Python)
+    s1.add_edge(s1_inp, None, t1, "_x",
+                Memlet(data="inp", subset="0:16"))
+    s1.add_edge(t1, "_out", s1_t1, None,
+                Memlet(data="t1", subset="0:16"))
+
+    # state2: t2 = t1 * 2
+    s2_t1 = s2.add_read("t1")
+    s2_t2 = s2.add_write("t2")
+    t2 = s2.add_tasklet("mul2", {"_x"}, {"_out"}, "_out = _x * 2",
+                         language=Language.Python)
+    s2.add_edge(s2_t1, None, t2, "_x",
+                Memlet(data="t1", subset="0:16"))
+    s2.add_edge(t2, "_out", s2_t2, None,
+                Memlet(data="t2", subset="0:16"))
+
+    # state3: out = t2 - 3
+    s3_t2 = s3.add_read("t2")
+    s3_out = s3.add_write("out")
+    t3 = s3.add_tasklet("sub3", {"_x"}, {"_out"}, "_out = _x - 3",
+                         language=Language.Python)
+    s3.add_edge(s3_t2, None, t3, "_x",
+                Memlet(data="t2", subset="0:16"))
+    s3.add_edge(t3, "_out", s3_out, None,
+                Memlet(data="out", subset="0:16"))
+
+    nsdfg = state.add_nested_sdfg(inner_sdfg, {"inp"}, {"out"})
+
+    state.add_memlet_path(a_node, me, tile_a,
+                          memlet=Memlet(data="A", subset="0:16"))
+    state.add_edge(tile_a, None, nsdfg, "inp",
+                   Memlet(data="_tile_a", subset="0:16"))
+    state.add_edge(nsdfg, "out", tile_out, None,
+                   Memlet(data="_tile_out", subset="0:16"))
+    state.add_memlet_path(tile_out, mx, b_node,
+                          memlet=Memlet(data="B", subset="0:16"))
+
+    return sdfg, state, nsdfg
+
+
+def _build_conditional_nested_sdfg(name: str = "conditional_nsdfg"):
+    """Build a NestedSDFG with conditional branching inside.
+
+    Inner SDFG (4 states):
+        init (empty) --[cond_val > 0]--> branch_a: out = inp * 2
+        init (empty) --[Not(cond_val > 0)]--> branch_b: out = inp + 1
+        branch_a --> merge (empty)
+        branch_b --> merge (empty)
+
+    The symbol ``cond_val`` is passed from the outer SDFG and controls
+    which branch executes.
+    """
+    sdfg = _make_cutile_python_sdfg(name)
+    sdfg.add_symbol("cond_val", dace.int32)
+    sdfg.add_array("A", [16], dace.float64, storage=StorageType.GPU_Global)
+    sdfg.add_array("B", [16], dace.float64, storage=StorageType.GPU_Global)
+    sdfg.add_array("_tile_a", [16], dace.float64,
+                   storage=StorageType.CuTile_Tile, transient=True)
+    sdfg.add_array("_tile_out", [16], dace.float64,
+                   storage=StorageType.CuTile_Tile, transient=True)
+
+    state = sdfg.add_state("main")
+    me, mx = state.add_map("cutile_map", {"tile_i": "0:1"},
+                           schedule=ScheduleType.CuTile)
+
+    a_node = state.add_read("A")
+    b_node = state.add_write("B")
+    tile_a = state.add_access("_tile_a")
+    tile_out = state.add_access("_tile_out")
+
+    # Build inner nested SDFG with conditional branching
+    inner_sdfg = SDFG("cond_branch")
+    inner_sdfg.add_symbol("cond_val", dace.int32)
+    inner_sdfg.add_array("inp", [16], dace.float64,
+                         storage=StorageType.CuTile_Tile)
+    inner_sdfg.add_array("out", [16], dace.float64,
+                         storage=StorageType.CuTile_Tile)
+
+    s_init = inner_sdfg.add_state("init")
+    s_branch_a = inner_sdfg.add_state("branch_a")
+    s_branch_b = inner_sdfg.add_state("branch_b")
+    s_merge = inner_sdfg.add_state("merge")
+
+    # Conditional edges from init
+    inner_sdfg.add_edge(
+        s_init, s_branch_a,
+        dace.InterstateEdge(condition="cond_val > 0"),
+    )
+    inner_sdfg.add_edge(
+        s_init, s_branch_b,
+        dace.InterstateEdge(condition="not (cond_val > 0)"),
+    )
+    # Unconditional edges to merge
+    inner_sdfg.add_edge(s_branch_a, s_merge, dace.InterstateEdge())
+    inner_sdfg.add_edge(s_branch_b, s_merge, dace.InterstateEdge())
+
+    # branch_a: out = inp * 2
+    ba_inp = s_branch_a.add_read("inp")
+    ba_out = s_branch_a.add_write("out")
+    ta = s_branch_a.add_tasklet("mul2", {"_x"}, {"_out"}, "_out = _x * 2",
+                                language=Language.Python)
+    s_branch_a.add_edge(ba_inp, None, ta, "_x",
+                        Memlet(data="inp", subset="0:16"))
+    s_branch_a.add_edge(ta, "_out", ba_out, None,
+                        Memlet(data="out", subset="0:16"))
+
+    # branch_b: out = inp + 1
+    bb_inp = s_branch_b.add_read("inp")
+    bb_out = s_branch_b.add_write("out")
+    tb = s_branch_b.add_tasklet("add1", {"_x"}, {"_out"}, "_out = _x + 1",
+                                language=Language.Python)
+    s_branch_b.add_edge(bb_inp, None, tb, "_x",
+                        Memlet(data="inp", subset="0:16"))
+    s_branch_b.add_edge(tb, "_out", bb_out, None,
+                        Memlet(data="out", subset="0:16"))
+
+    nsdfg = state.add_nested_sdfg(inner_sdfg, {"inp"}, {"out"},
+                                  symbol_mapping={"cond_val": dace.symbol("cond_val")})
+
+    state.add_memlet_path(a_node, me, tile_a,
+                          memlet=Memlet(data="A", subset="0:16"))
+    state.add_edge(tile_a, None, nsdfg, "inp",
+                   Memlet(data="_tile_a", subset="0:16"))
+    state.add_edge(nsdfg, "out", tile_out, None,
+                   Memlet(data="_tile_out", subset="0:16"))
+    state.add_memlet_path(tile_out, mx, b_node,
+                          memlet=Memlet(data="B", subset="0:16"))
+
+    return sdfg, state, nsdfg
+
+
 # =============================================================================
 # Tests: Inner map scope
 # =============================================================================
@@ -839,31 +1147,184 @@ class TestNestedSDFGInnerMapScope:
 
     def test_inner_map_valid_python(self):
         """The generated code with an inner map should be parseable Python."""
-        import ast
         sdfg, state, nsdfg = _build_inner_map_nested_sdfg()
         func_code, call_code = _generate_nested_code(sdfg, state, nsdfg)
         ast.parse(func_code)
 
 
 # =============================================================================
-# Tests: Multi-state guard
+# Tests: Multi-state NestedSDFGs
 # =============================================================================
 
 
-class TestNestedSDFGMultiStateGuard:
-    """Test that multi-state NestedSDFGs raise NotImplementedError."""
+class TestNestedSDFGMultiState:
+    """Test multi-state NestedSDFGs generate correct code."""
 
-    def test_multi_state_raises_not_implemented(self):
-        """A NestedSDFG with 2 states should raise NotImplementedError."""
+    def test_two_state_empty_first_valid_python(self):
+        """Existing multi-state SDFG (empty state1 + compute state2) generates valid Python."""
         sdfg, state, nsdfg = _build_multi_state_nested_sdfg()
-        with pytest.raises(NotImplementedError, match="single-state"):
-            _generate_nested_code(sdfg, state, nsdfg)
+        func_code, call_code = _generate_nested_code(sdfg, state, nsdfg)
+        ast.parse(func_code)
 
-    def test_multi_state_error_mentions_state_count(self):
-        """The error message should mention the number of states."""
+    def test_two_state_empty_first_has_return(self):
+        """Two-state SDFG with empty first state has return statement."""
         sdfg, state, nsdfg = _build_multi_state_nested_sdfg()
-        with pytest.raises(NotImplementedError, match="2 states"):
-            _generate_nested_code(sdfg, state, nsdfg)
+        func_code, _ = _generate_nested_code(sdfg, state, nsdfg)
+        assert "return out" in func_code
+
+    def test_two_state_empty_first_has_tasklet(self):
+        """Two-state SDFG with empty first state has the copy tasklet body."""
+        sdfg, state, nsdfg = _build_multi_state_nested_sdfg()
+        func_code, _ = _generate_nested_code(sdfg, state, nsdfg)
+        assert "y = x" in func_code
+
+    def test_two_state_compute_valid_python(self):
+        """Two states both with computation generates valid Python."""
+        sdfg, state, nsdfg = _build_two_state_compute_nested_sdfg()
+        func_code, call_code = _generate_nested_code(sdfg, state, nsdfg)
+        ast.parse(func_code)
+
+    def test_two_state_compute_has_both_tasklets(self):
+        """Both state computations appear in the generated code."""
+        sdfg, state, nsdfg = _build_two_state_compute_nested_sdfg()
+        func_code, _ = _generate_nested_code(sdfg, state, nsdfg)
+        # state1: tmp = inp * 2 (tasklet body + binding)
+        assert "* 2" in func_code
+        # state2: out = tmp + 1
+        assert "+ 1" in func_code
+
+    def test_two_state_compute_has_return(self):
+        """Two-state with both computing has return."""
+        sdfg, state, nsdfg = _build_two_state_compute_nested_sdfg()
+        func_code, _ = _generate_nested_code(sdfg, state, nsdfg)
+        assert "return out" in func_code
+
+    def test_interstate_assignment_valid_python(self):
+        """Interstate assignment generates valid Python."""
+        sdfg, state, nsdfg = _build_interstate_assignment_nsdfg()
+        func_code, call_code = _generate_nested_code(sdfg, state, nsdfg)
+        ast.parse(func_code)
+
+    def test_interstate_assignment_in_code(self):
+        """Interstate assignment k = 42 appears in generated code."""
+        sdfg, state, nsdfg = _build_interstate_assignment_nsdfg()
+        func_code, _ = _generate_nested_code(sdfg, state, nsdfg)
+        assert "k = 42" in func_code
+
+    def test_three_state_chain_valid_python(self):
+        """Three-state chain generates valid Python."""
+        sdfg, state, nsdfg = _build_three_state_chain_nsdfg()
+        func_code, call_code = _generate_nested_code(sdfg, state, nsdfg)
+        ast.parse(func_code)
+
+    def test_three_state_chain_has_all_operations(self):
+        """Three-state chain has all three operations."""
+        sdfg, state, nsdfg = _build_three_state_chain_nsdfg()
+        func_code, _ = _generate_nested_code(sdfg, state, nsdfg)
+        assert "+ 1" in func_code
+        assert "* 2" in func_code
+        assert "- 3" in func_code
+
+    def test_three_state_chain_has_return(self):
+        """Three-state chain has return."""
+        sdfg, state, nsdfg = _build_three_state_chain_nsdfg()
+        func_code, _ = _generate_nested_code(sdfg, state, nsdfg)
+        assert "return out" in func_code
+
+    def test_single_state_still_works(self):
+        """Single-state NestedSDFG still works via the unified path."""
+        sdfg, state, nsdfg = _build_simple_binop_nested_sdfg()
+        func_code, call_code = _generate_nested_code(sdfg, state, nsdfg)
+        assert "def __dace_nested_" in func_code
+        assert "return out" in func_code
+        ast.parse(func_code)
+
+    def test_conditional_generates_valid_python(self):
+        """Conditional branching NestedSDFG generates valid Python."""
+        sdfg, state, nsdfg = _build_conditional_nested_sdfg()
+        func_code, call_code = _generate_nested_code(sdfg, state, nsdfg)
+        ast.parse(func_code)
+
+    def test_conditional_has_if_construct(self):
+        """Conditional branching NestedSDFG emits an ``if`` construct."""
+        sdfg, state, nsdfg = _build_conditional_nested_sdfg()
+        func_code, _ = _generate_nested_code(sdfg, state, nsdfg)
+        assert "if " in func_code
+
+    def test_conditional_has_both_branches(self):
+        """Conditional branching NestedSDFG includes both branch computations."""
+        sdfg, state, nsdfg = _build_conditional_nested_sdfg()
+        func_code, _ = _generate_nested_code(sdfg, state, nsdfg)
+        # branch_a multiplies by 2, branch_b adds 1
+        assert "* 2" in func_code
+        assert "+ 1" in func_code
+
+    def test_conditional_has_return(self):
+        """Conditional branching NestedSDFG has return statement."""
+        sdfg, state, nsdfg = _build_conditional_nested_sdfg()
+        func_code, _ = _generate_nested_code(sdfg, state, nsdfg)
+        assert "return out" in func_code
+
+    def test_conditional_call_site_passes_symbol(self):
+        """Conditional NestedSDFG call site passes the symbol argument."""
+        sdfg, state, nsdfg = _build_conditional_nested_sdfg()
+        _, call_code = _generate_nested_code(sdfg, state, nsdfg)
+        assert "cond_val" in call_code
+
+
+# =============================================================================
+# Tests: Host dispatch
+# =============================================================================
+
+
+class TestNestedSDFGHostDispatch:
+    """Test that NestedSDFGs outside CuTile scopes are NOT claimed by cuTile."""
+
+    def test_predicate_false_for_sequential_map(self):
+        """NestedSDFG inside Sequential map is not in cuTile scope."""
+        from dace.codegen.py.cutile_target import _is_cutile_node
+        sdfg = SDFG("host_dispatch_seq")
+        sdfg.add_array("A", [16], dace.float64)
+        sdfg.add_array("B", [16], dace.float64)
+        state = sdfg.add_state("main")
+        me, mx = state.add_map("seq_map", {"i": "0:16"},
+                                schedule=ScheduleType.Sequential)
+        inner_sdfg = SDFG("inner")
+        inner_sdfg.add_array("inp", [1], dace.float64)
+        inner_sdfg.add_array("out", [1], dace.float64)
+        inner_state = inner_sdfg.add_state("s")
+        nsdfg = state.add_nested_sdfg(inner_sdfg, {"inp"}, {"out"})
+        a = state.add_read("A")
+        b = state.add_write("B")
+        state.add_memlet_path(a, me, nsdfg, memlet=Memlet("A[i]"),
+                              dst_conn="inp")
+        state.add_memlet_path(nsdfg, mx, b, memlet=Memlet("B[i]"),
+                              src_conn="out")
+        assert _is_cutile_node(state, nsdfg) is False
+
+    def test_predicate_false_for_top_level(self):
+        """NestedSDFG at top level (no map scope) is not in cuTile scope."""
+        from dace.codegen.py.cutile_target import _is_cutile_node
+        sdfg = SDFG("host_dispatch_top")
+        sdfg.add_array("A", [16], dace.float64)
+        sdfg.add_array("B", [16], dace.float64)
+        state = sdfg.add_state("main")
+        inner_sdfg = SDFG("inner")
+        inner_sdfg.add_array("inp", [16], dace.float64)
+        inner_sdfg.add_array("out", [16], dace.float64)
+        inner_state = inner_sdfg.add_state("s")
+        nsdfg = state.add_nested_sdfg(inner_sdfg, {"inp"}, {"out"})
+        a = state.add_read("A")
+        b = state.add_write("B")
+        state.add_edge(a, None, nsdfg, "inp", Memlet("A[0:16]"))
+        state.add_edge(nsdfg, "out", b, None, Memlet("B[0:16]"))
+        assert _is_cutile_node(state, nsdfg) is False
+
+    def test_predicate_true_for_cutile_scope(self):
+        """NestedSDFG inside CuTile map IS claimed by cuTile."""
+        from dace.codegen.py.cutile_target import _is_cutile_node
+        sdfg, state, nsdfg = _build_simple_binop_nested_sdfg()
+        assert _is_cutile_node(state, nsdfg) is True
 
 
 # =============================================================================

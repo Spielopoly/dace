@@ -13,6 +13,7 @@ import sympy as sp
 
 from dace import dtypes, registry, subsets
 import dace.codegen.dispatcher as dispatcher_mod
+from dace.codegen.py import control_flow as py_cflow
 from dace.codegen.py.framecode import codeblock_to_python
 from dace.codegen.py.prettycode import PythonCodeIOStream
 from dace.codegen.py.target import PythonTargetCodeGenerator
@@ -141,8 +142,9 @@ def _collect_free_symbols(entry: nodes.MapEntry, dfg_scope: object,
                           sdfg: "SDFG") -> List[str]:
     """Collect free symbols used in a map scope.
 
-    Returns symbols that appear in the map range or memlet subsets and
-    are declared in the SDFG's symbol table (but not constants).
+    Returns symbols that appear in the map range, memlet subsets, or
+    NestedSDFG symbol mappings and are declared in the SDFG's symbol
+    table (but not constants).
 
     :param entry: The map entry node.
     :param dfg_scope: The scope subgraph view.
@@ -155,6 +157,16 @@ def _collect_free_symbols(entry: nodes.MapEntry, dfg_scope: object,
         if memlet is None:
             continue
         syms |= {str(s) for s in memlet.free_symbols}
+    # Also collect symbols referenced by NestedSDFG symbol_mapping values,
+    # so that symbols like ``cond_val`` that are forwarded into a conditional
+    # NestedSDFG become kernel parameters.
+    for scope_node in dfg_scope.nodes():
+        if isinstance(scope_node, nodes.NestedSDFG):
+            for expr in scope_node.symbol_mapping.values():
+                if hasattr(expr, 'free_symbols'):
+                    syms |= {str(s) for s in expr.free_symbols}
+                else:
+                    syms.add(str(expr))
     syms = {s for s in syms if s in sdfg.symbols and s not in sdfg.constants}
     return sorted(syms)
 
@@ -1233,18 +1245,21 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
 
         # Build the function body in a temporary stream.
         body_stream = PythonCodeIOStream()
-        states = inner_sdfg.states()
-        if len(states) > 1:
-            raise NotImplementedError(
-                "CuTile NestedSDFG code generation only supports single-state "
-                f"inner SDFGs, but '{inner_sdfg.name}' has {len(states)} states. "
-                "Multi-state support requires control_flow_region_to_code integration."
-            )
-        for inner_state in states:
+
+        # Create a dispatch_state closure for control_flow_region_to_code.
+        # Each inner state is generated via _generate_nsdfg_state.
+        def dispatch_state(inner_state: "SDFGState") -> str:
+            tmp_stream = PythonCodeIOStream()
             self._generate_nsdfg_state(
                 inner_state, inner_sdfg, function_stream,
-                body_stream, state_id, cfg,
+                tmp_stream, state_id, cfg,
             )
+            return tmp_stream.getvalue()
+
+        py_cflow.control_flow_region_to_code(
+            inner_sdfg, dispatch_state, self._frame,
+            inner_sdfg.symbols, body_stream
+        )
 
         # Emit return statement.
         if output_conns:
