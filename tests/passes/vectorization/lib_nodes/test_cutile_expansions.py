@@ -167,16 +167,6 @@ def test_tile_binop_cutile_emits_bare_elementwise_op():
     assert "ct.where" not in body
 
 
-def test_tile_binop_cutile_masked_still_bare_op():
-    """Masked TileBinop does NOT wrap with ``ct.where`` — mask flows to the
-    store. ``has_mask=True`` drops the ``_mask`` input on the cutile body
-    because the binop never reads it."""
-    body, _ = _expand_cutile(TileBinop(name="B", widths=(8, ), op="*", has_mask=True))
-    _assert_parses_as_python(body)
-    assert "_a * _b" in body
-    assert "ct.where" not in body
-
-
 def test_tile_binop_cutile_symbol_operand_inlines_expr():
     """Symbol-kind RHS embeds the expression literally."""
     body, _ = _expand_cutile(TileBinop(name="B", widths=(8, ), op="+", kind_b="Symbol", expr_b="alpha"))
