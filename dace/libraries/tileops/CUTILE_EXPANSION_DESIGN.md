@@ -1,3 +1,5 @@
+# TODO: Document is outdated, needs to be updated
+
 # cuTile (`cuda.tile`) Expansion Design for Tile-Op Library Nodes
 
 Design for lowering the DaCe `tileops` library nodes to NVIDIA cuTile
