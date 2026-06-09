@@ -54,6 +54,58 @@ def _expand_cutile_tasklet(lib_node):
     return cls.expansion(lib_node, state, sdfg)
 
 
+def _expand_cutile_with_edges(lib_node, in_arrays=None, out_arrays=None):
+    """Return ``(body, language)`` wiring actual edges + arrays.
+
+    :param in_arrays: dict mapping input connector name to
+        ``(array_name, shape, dtype)``. An edge is created from an
+        :class:`AccessNode` of ``array_name`` to the lib node connector.
+    :param out_arrays: dict mapping output connector name to
+        ``(array_name, shape, dtype)``.
+    """
+    sdfg = dace.SDFG(f"cutile_smoke_{lib_node.label}")
+    state = sdfg.add_state("main")
+    state.add_node(lib_node)
+
+    for mapping, is_input in ((in_arrays or {}, True),
+                              (out_arrays or {}, False)):
+        for conn, (arr_name, shape, dtype) in mapping.items():
+            if arr_name not in sdfg.arrays:
+                sdfg.add_array(arr_name, shape, dtype)
+            acc = state.add_access(arr_name)
+            mem = dace.Memlet.from_array(arr_name, sdfg.arrays[arr_name])
+            if is_input:
+                state.add_edge(acc, None, lib_node, conn, mem)
+            else:
+                state.add_edge(lib_node, conn, acc, None, mem)
+
+    cls = lib_node.implementations["cutile"]
+    tasklet = cls.expansion(lib_node, state, sdfg)
+    return tasklet.code.as_string, tasklet.language
+
+
+def _expand_cutile_tasklet_with_edges(lib_node, in_arrays=None, out_arrays=None):
+    """Like :func:`_expand_cutile_with_edges` but returns the raw tasklet."""
+    sdfg = dace.SDFG(f"cutile_smoke_{lib_node.label}")
+    state = sdfg.add_state("main")
+    state.add_node(lib_node)
+
+    for mapping, is_input in ((in_arrays or {}, True),
+                              (out_arrays or {}, False)):
+        for conn, (arr_name, shape, dtype) in mapping.items():
+            if arr_name not in sdfg.arrays:
+                sdfg.add_array(arr_name, shape, dtype)
+            acc = state.add_access(arr_name)
+            mem = dace.Memlet.from_array(arr_name, sdfg.arrays[arr_name])
+            if is_input:
+                state.add_edge(acc, None, lib_node, conn, mem)
+            else:
+                state.add_edge(lib_node, conn, acc, None, mem)
+
+    cls = lib_node.implementations["cutile"]
+    return cls.expansion(lib_node, state, sdfg)
+
+
 def _expand_merge_cutile_with_dtype(lib_node, out_dtype):
     """Expand a :class:`TileMerge` ``cutile`` body with a wired ``_o`` output of
     ``out_dtype`` (the fallback path reads the output dtype off the edge)."""
@@ -84,7 +136,10 @@ def _assert_parses_as_python(body: str) -> None:
 
 def test_tile_load_cutile_emits_block_id_and_ct_load_with_padding():
     """K=1 TileLoad cutile body: ``__pid0 = ct.bid(0)`` + ``ct.load(...)``."""
-    body, lang = _expand_cutile(TileLoad(name="L", widths=(8, )))
+    body, lang = _expand_cutile_with_edges(
+        TileLoad(name="L", widths=(8, )),
+        in_arrays={"_src": ("src", (100,), dace.float32)},
+    )
     _assert_parses_as_python(body)
     assert "__pid0 = ct.bid(0)" in body
     assert "ct.load(_src, index=(__pid0,)" in body
@@ -95,7 +150,10 @@ def test_tile_load_cutile_emits_block_id_and_ct_load_with_padding():
 
 def test_tile_load_cutile_K2_emits_two_block_ids():
     """K=2 TileLoad cutile body has ``__pid0`` and ``__pid1``."""
-    body, _ = _expand_cutile(TileLoad(name="L", widths=(4, 8)))
+    body, _ = _expand_cutile_with_edges(
+        TileLoad(name="L", widths=(4, 8)),
+        in_arrays={"_src": ("src", (100, 200), dace.float32)},
+    )
     _assert_parses_as_python(body)
     assert "__pid0 = ct.bid(0)" in body
     assert "__pid1 = ct.bid(1)" in body
@@ -105,24 +163,28 @@ def test_tile_load_cutile_K2_emits_two_block_ids():
 
 def test_tile_load_cutile_pos_inf_pad_mode():
     """``pad_mode='POS_INF'`` selects ``ct.PaddingMode.POSITIVE_INFINITY``."""
-    body, _ = _expand_cutile(TileLoad(name="L", widths=(8, ), pad_mode="POS_INF"))
+    body, _ = _expand_cutile_with_edges(
+        TileLoad(name="L", widths=(8, ), pad_mode="POS_INF"),
+        in_arrays={"_src": ("src", (100,), dace.float32)},
+    )
     _assert_parses_as_python(body)
     assert "padding_mode=ct.PaddingMode.POSITIVE_INFINITY" in body
     assert "ct.PaddingMode.ZERO" not in body
 
 
-def test_tile_load_cutile_masked_does_not_reference_mask_in_body():
-    """``has_mask=True`` must NOT reference ``_mask`` in the body
-    (L-load-nomask: ``ct.load`` has no mask; gating is deferred to the store).
-    However, ``_mask`` IS declared as an input connector so that
-    ``ExpandTransformation.apply()`` can safely remap the mask edge from
-    the lib node to the expanded tasklet without leaving a dangling edge."""
-    tasklet = _expand_cutile_tasklet(TileLoad(name="L", widths=(8, ), has_mask=True))
+def test_tile_load_cutile_masked_uses_ct_where():
+    """``has_mask=True`` wraps the loaded tile with
+    ``ct.where(_mask, loaded, pad_value)`` to gate which lanes are valid.
+    ``_mask`` IS declared as an input connector."""
+    tasklet = _expand_cutile_tasklet_with_edges(
+        TileLoad(name="L", widths=(8, ), has_mask=True),
+        in_arrays={"_src": ("src", (100,), dace.float32)},
+    )
     body = tasklet.code.as_string
     _assert_parses_as_python(body)
-    assert "_mask" not in body
-    # _mask is in connectors (for edge-remapping safety) but unused in body
+    assert "ct.where(_mask" in body
     assert "_mask" in tasklet.in_connectors
+    assert "ct.load(_src" in body
     assert "padding_mode=ct.PaddingMode.ZERO" in body
 
 
