@@ -232,7 +232,6 @@ class ExpandTileBinopCutile(ExpandTransformation):
         lhs = _cutile_operand(node.kind_a, "_a", node.expr_a)
         rhs = _cutile_operand(node.kind_b, "_b", node.expr_b)
         rhs_expr = _CUTE_OP_EXPR[node.op].format(lhs=lhs, rhs=rhs)
-        body = f"_c = {rhs_expr}"
         inputs = set()
         if node.kind_a == _TILE:
             inputs.add("_a")
@@ -243,12 +242,9 @@ class ExpandTileBinopCutile(ExpandTransformation):
         elif node.kind_b == _SCALAR:
             inputs.add("_b")
         if node.has_mask:
-            # The cuTile binop does not use the mask (masking is applied at
-            # the store via ct.scatter), but when has_mask=True the lib node
-            # has a _mask connector with an incoming edge.
-            # ExpandTransformation.apply() remaps all edges to the new
-            # tasklet, so we must declare _mask to keep the SDFG valid.
             inputs.add("_mask")
+            rhs_expr = f"ct.where(_mask, {rhs_expr}, 0)"
+        body = f"_c = {rhs_expr}"
         return nodes.Tasklet(
             label=f"{node.label}_cutile",
             inputs={c: None
