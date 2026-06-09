@@ -56,32 +56,9 @@ def _combine_expr(op: str, acc: str, val: str) -> str:
     raise ValueError(f"unknown op {op!r}")
 
 
-_OP_CUTE = {"+": "ct.sum", "*": "ct.prod", "min": "ct.min", "max": "ct.max"}
 _VALID_OPS = ("+", "*", "min", "max")
 
-#: cuTile literal for each reduction op's identity, pre-selected into masked
-#: lanes before the (mask-less, L-reduce-nomask) reduction. ``min`` / ``max``
-#: need ``±inf`` which only ``ct.where`` can safely inject (the arithmetic
-#: blend hits the ``inf * 0 = NaN`` hazard — see the L-reduce-nomask note).
-_OP_IDENTITY_CUTE = {
-    "+": "0",
-    "*": "1",
-    "min": "float('inf')",
-    "max": "float('-inf')",
-}
 
-# Capability probe for ``ct.where`` (cuTile's select). The cuTile runtime is
-# never installed on CI, so this resolves to ``None`` there (meaning "assume
-# present" — emit the richest ``ct.where`` form as the documented default).
-# A unit test can override it to exercise the no-``where`` fallback / raise
-# paths. L-where-unconfirmed: no ``cuda.tile.where`` page exists in the
-# online cuTile-Python API docs (only a Tile-IR ``select(cond, x, y)`` op),
-# so its presence in the installed package stays unverified.
-try:  # pragma: no cover - cuTile is not installed on CI
-    import cuda.tile as ct  # type: ignore  # noqa: F401
-    _CT_HAS_WHERE = hasattr(ct, "where")
-except Exception:  # pragma: no cover - the CI path (no cuTile install)
-    _CT_HAS_WHERE = None
 
 
 @library.expansion
@@ -176,6 +153,75 @@ class ExpandTileReducePure(ExpandTransformation):
         )
 
 
+def _is_cutile_float_type(dtype: str) -> bool:
+    """Return True if ``dtype`` is a floating-point type."""
+    return "float" in dtype
+
+def _is_cutile_bool_type(dtype: str) -> bool:
+    """Return True if ``dtype`` is a boolean type."""
+    return "bool" in dtype
+
+def _is_cutile_unsigned_int_type(dtype: str) -> bool:
+    """Return True if ``dtype`` is an unsigned integer type."""
+    return "uint" in dtype
+
+def _is_cutile_signed_int_type(dtype: str) -> bool:
+    """Return True if ``dtype`` is a signed integer type."""
+    return "int" in dtype and not _is_cutile_unsigned_int_type(dtype)
+
+def _cutile_integer_bitwidth(dtype: str) -> int:
+    """Return the bitwidth of a cuTile integer type."""
+    def _get_number(s: str) -> int:
+        return int(''.join(filter(str.isdigit, s)))
+    
+    if _is_cutile_unsigned_int_type(dtype):
+        return _get_number(dtype)
+    if _is_cutile_signed_int_type(dtype):
+        return _get_number(dtype)
+    if _is_cutile_bool_type(dtype):
+        return 1
+    raise ValueError(f"not an integer type: {dtype!r}")
+
+
+def _identity_literal_cutile(op: str, dtype: str) -> str:
+    """Return a cuTile expression for the identity of ``op`` at type ``dtype``.
+
+    :param op: One of ``+``, ``*``, ``min``, ``max``.
+    :param dtype: cuTile scalar type name (e.g. ``float32``).
+    :returns: A cuTile expression suitable as the inactive-lane value.
+    """
+    if op == "+":
+        return f"ct.astype(0, dtype={dtype})"
+    elif op == "*":
+        return f"ct.astype(1, dtype={dtype})"
+    elif op == "min":
+        if _is_cutile_float_type(dtype):
+            return f"ct.astype(float('inf'), dtype={dtype})"
+        elif _is_cutile_bool_type(dtype):
+            return "True"
+        elif _is_cutile_unsigned_int_type(dtype):
+            bitwidth = _cutile_integer_bitwidth(dtype)
+            return f"ct.astype({2**bitwidth - 1}, dtype={dtype})"
+        elif _is_cutile_signed_int_type(dtype):
+            bitwidth = _cutile_integer_bitwidth(dtype)
+            return f"ct.astype({2**(bitwidth - 1) - 1}, dtype={dtype})"
+        else:
+            raise ValueError(f"unsupported type for min identity: {dtype!r}")
+    elif op == "max":
+        if _is_cutile_float_type(dtype):
+            return f"ct.astype(float('-inf'), dtype={dtype})"
+        elif _is_cutile_bool_type(dtype):
+            return "False"
+        elif _is_cutile_unsigned_int_type(dtype):
+            return f"ct.astype(0, dtype={dtype})"
+        elif _is_cutile_signed_int_type(dtype):
+            bitwidth = _cutile_integer_bitwidth(dtype)
+            return f"ct.astype({-2**(bitwidth - 1)}, dtype={dtype})"
+        else:
+            raise ValueError(f"unsupported type for max identity: {dtype!r}")
+    else:
+        raise NotImplementedError(f"unsupported op: {op!r}")
+
 @library.expansion
 class ExpandTileReduceCutile(ExpandTransformation):
     """``cuda.tile``-Python expansion of :class:`TileReduce`.
@@ -204,58 +250,31 @@ class ExpandTileReduceCutile(ExpandTransformation):
         :param parent_state: State that owns the lib node.
         :param parent_sdfg: SDFG that owns ``parent_state``.
         :returns: A Python-language tasklet.
-        :raises NotImplementedError: If ``has_mask`` and ``op in {min,
-            max}`` while ``ct.where`` is known absent — injecting ``±inf``
-            into masked lanes without a select hits the ``inf * 0 = NaN``
-            hazard (L-reduce-nomask).
         """
-        fn = _OP_CUTE[node.op]
-        axis_kw = "" if node.axis is None else f", axis={node.axis}"
+        
+        widths = tuple(node.widths)
+        op = node.op
 
-        if not node.has_mask:
-            body = f"_dst = {fn}(_src{axis_kw})"
-            inputs = {"_src"}
-            return nodes.Tasklet(
-                label=f"{node.label}_cutile",
-                inputs={c: None
-                        for c in inputs},
-                outputs={"_dst": None},
-                code=body,
-                language=dace.dtypes.Language.Python,
-            )
-
-        # has_mask=True: pre-select the op identity into masked lanes.
-        ident = _OP_IDENTITY_CUTE[node.op]
-        # _CT_HAS_WHERE is None on CI (no cuTile install) -> assume present and
-        # emit the documented ct.where default; only an explicit False forces
-        # the arithmetic fallback / raise.
-        if _CT_HAS_WHERE is not False:
-            lines = [
-                f"_masked_src = ct.where(_mask, _src, {ident})",
-                f"_dst = {fn}(_masked_src{axis_kw})",
-            ]
-        elif node.op == "+":
-            # 0 is the + identity, so zeroing inactive lanes is exact.
-            lines = [
-                "_m = _mask.astype(_src.dtype)",
-                f"_dst = ct.sum(_m * _src{axis_kw})",
-            ]
-        elif node.op == "*":
-            # 1 is the * identity: blend src in active lanes, 1 in inactive.
-            lines = [
-                "_m = _mask.astype(_src.dtype)",
-                f"_dst = ct.prod(_m * _src + (1.0 - _m){axis_kw})",
-            ]
+        if node.has_mask:
+            dtype = parent_sdfg.arrays[next(e for e in parent_state.in_edges(node) if e.dst_conn == "_src").data.data].dtype
+            identity = _identity_literal_cutile(op, dtype)
+            rhs = f"ct.where(_mask, _src, {identity})"
         else:
-            # L-reduce-nomask: masked min/max needs ct.where to inject ±inf;
-            # the arithmetic blend _src*_m + IDENT*(1-_m) yields NaN when a
-            # masked lane already holds inf (inf * 0). No safe lowering.
-            raise NotImplementedError(f"{node.label}: masked {node.op!r} tile reduction needs ct.where to inject "
-                                      f"±inf into masked lanes; cuTile reductions take no mask (L-reduce-nomask) "
-                                      f"and the arithmetic blend is unsafe for non-finite data. Verify ct.where in "
-                                      f"the installed cuda-tile package.")
-        body = "\n".join(lines)
-        inputs = {"_src", "_mask"}
+            rhs = "_src"
+        
+        if op == "+":
+            reduce_expr = f"ct.sum({rhs}, axis={node.axis})"
+        elif op == "*":
+            reduce_expr = f"ct.prod({rhs}, axis={node.axis})"
+        elif op == "min":   
+            reduce_expr = f"ct.min({rhs}, axis={node.axis})"
+        elif op == "max":
+            reduce_expr = f"ct.max({rhs}, axis={node.axis})"
+        else:
+            raise NotImplementedError(f"unsupported op: {op!r}")
+        
+        body = f"_dst = {reduce_expr}"
+        
         return nodes.Tasklet(
             label=f"{node.label}_cutile",
             inputs={c: None
