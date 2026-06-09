@@ -29,20 +29,6 @@ from .._pure_codegen import nested_loops, tile_offset
 from .. import _isa_codegen
 from ..environments import TileOpsScalar, TileOpsAVX512, TileOpsAVX2, TileOpsNeon, TileOpsSVE
 
-# Capability probe for ``ct.where`` (cuTile's select). The cuTile runtime is
-# never installed on CI, so this resolves to ``None`` there (meaning "assume
-# present" — emit the richest ``ct.where`` form as the documented default).
-# A unit test can override it to exercise the arithmetic-blend fallback / the
-# non-finite-float raise. L-where-unconfirmed: no ``cuda.tile.where`` page
-# exists in the online cuTile-Python API docs (only a Tile-IR ``select(cond,
-# x, y)`` op), so its presence in the installed package stays unverified.
-try:  # pragma: no cover - cuTile is not installed on CI
-    import cuda.tile as ct  # type: ignore  # noqa: F401
-    _CT_HAS_WHERE = hasattr(ct, "where")
-except Exception:  # pragma: no cover - the CI path (no cuTile install)
-    _CT_HAS_WHERE = None
-
-
 @library.expansion
 class ExpandTileMergePure(ExpandTransformation):
     """Correctness-only CPP tasklet lowering of ``TileMerge``."""
@@ -86,19 +72,10 @@ class ExpandTileMergePure(ExpandTransformation):
 class ExpandTileMergeCutile(ExpandTransformation):
     """``cuda.tile``-Python expansion of :class:`TileMerge`.
 
-    Primary (CI default): ``_o = ct.where(_cond, _t, _e)`` — the cuTile
+    ``_o = ct.where(_cond, _t, _e)`` — the cuTile
     select primitive. The surrounding iteration mask is applied at the
     downstream ``ct.scatter`` store, not at the select (matching the
     reference cuTile kernels).
-
-    Fallback (``ct.where`` known absent): an arithmetic blend
-    ``__m = _cond.astype(_t.dtype); _o = __m * _t + (1.0 - __m) * _e``.
-    This is exact for the ``0.0`` / ``1.0`` (or ``bool``) condition
-    encoding, but ``0.0 * inf = NaN`` would leak a non-finite *unselected*
-    lane into the result. So the fallback is emitted only for an
-    **integer** output dtype; a float output with possibly-non-finite
-    branches raises ``NotImplementedError`` because cuTile offers no other
-    confirmed safe select.
     """
 
     environments = []
@@ -118,31 +95,12 @@ class ExpandTileMergeCutile(ExpandTransformation):
             = NaN``); verify ``ct.where`` in the installed cuda-tile
             package.
         """
-        # _CT_HAS_WHERE is None on CI (no cuTile install) -> assume present and
-        # emit the documented ct.where default; only an explicit False forces
-        # the arithmetic fallback / raise.
-        if _CT_HAS_WHERE is not False:
-            body = "_o = ct.where(_cond, _t, _e)"
-        else:
-            out_edge = next(e for e in parent_state.out_edges(node) if e.src_conn == "_o")
-            out_dtype = parent_sdfg.arrays[out_edge.data.data].dtype
-            is_float = out_dtype.as_numpy_dtype().kind == "f"
-            if is_float:
-                # Blending a possibly-non-finite unselected branch with 0.0
-                # leaks NaN (0.0 * inf); no confirmed cuTile select otherwise.
-                raise NotImplementedError(f"{node.label}: cuTile select without ct.where cannot safely blend "
-                                          f"possibly-non-finite branches (0.0 * inf = NaN) for float output "
-                                          f"{out_dtype}; verify ct.where in the installed cuda-tile package.")
-            body = ("__m = _cond.astype(_t.dtype)\n"
-                    "_o = __m * _t + (1.0 - __m) * _e")
+        rhs = "ct.where(_cond, _t, _e)"
         inputs = {"_cond", "_t", "_e"}
-        # The cuTile select does not use the iteration mask (masking is
-        # applied at the store via ct.scatter), but when has_mask=True
-        # the lib node has a _mask connector with an incoming edge.
-        # ExpandTransformation.apply() remaps all edges to the new
-        # tasklet, so we must declare _mask to keep the SDFG valid.
         if node.has_mask:
             inputs.add("_mask")
+            rhs = f"ct.where(_mask, {rhs}, False)"
+        body = f"_o = {rhs}"
         return nodes.Tasklet(
             label=f"{node.label}_cutile",
             inputs={c: None

@@ -174,28 +174,27 @@ class ExpandTileBinopPure(ExpandTransformation):
 
 
 _CUTE_OP_EXPR = {
-    "+": "{lhs} + {rhs}",
-    "-": "{lhs} - {rhs}",
-    "*": "{lhs} * {rhs}",
+    "+": "({lhs} + {rhs})",
+    "-": "({lhs} - {rhs})",
+    "*": "({lhs} * {rhs})",
     # TODO: handle integer division and other differences between Python and C++ semantics (e.g. negative numbers)
-    "/": "{lhs} / {rhs}",
+    "/": "({lhs} / {rhs})",
     # TODO: address Python's different modulo semantics for negative numbers (math.fmod for floating point) (integers: r = a - (a / b) * b (with C++ division))
     # (maybe https://stackoverflow.com/questions/34291760/how-to-easily-implement-c-like-modulo-remainder-operation-in-python-2-7 but this is 2.7-specific) (https://en.wikipedia.org/wiki/Modulo#In_programming_languages) (https://www.youtube.com/watch?v=xVNYurap-lk)
-    "%": "{lhs} % {rhs}",
-    "<": "{lhs} < {rhs}",
-    "<=": "{lhs} <= {rhs}",
-    ">": "{lhs} > {rhs}",
-    ">=": "{lhs} >= {rhs}",
-    "==": "{lhs} == {rhs}",
-    "!=": "{lhs} != {rhs}",
-    "&&": "{lhs} and {rhs}",
-    "||": "{lhs} or {rhs}",
-    "&": "{lhs} & {rhs}",
-    "|": "{lhs} | {rhs}",
-    "^": "{lhs} ^ {rhs}",
+    "%": "({lhs} % {rhs})",
+    "<": "({lhs} < {rhs})",
+    "<=": "({lhs} <= {rhs})",
+    ">": "({lhs} > {rhs})",
+    ">=": "({lhs} >= {rhs})",
+    "==": "({lhs} == {rhs})",
+    "!=": "({lhs} != {rhs})",
+    "&&": "(ct.astype({lhs}, ct.bool_) & ct.astype({rhs}, ct.bool_))",
+    "||": "(ct.astype({lhs}, ct.bool_) | ct.astype({rhs}, ct.bool_))",
+    "&": "({lhs} & {rhs})",
+    "|": "({lhs} | {rhs})",
+    "^": "({lhs} ^ {rhs})",
     "min": "ct.minimum({lhs}, {rhs})",
     "max": "ct.maximum({lhs}, {rhs})",
-    # TODO: support all cutile ops, including math functions (e.g. sin/cos/exp/log)
 }
 
 
@@ -226,7 +225,8 @@ class ExpandTileBinopCutile(ExpandTransformation):
             """cuTile operand reference: inline expr for Symbol, the
             connector for Tile or Scalar (broadcasts NumPy-style)."""
             if kind == _SYMBOL:
-                return expr
+                from dace.symbolic import symstr
+                return symstr(expr)
             return conn
 
         lhs = _cutile_operand(node.kind_a, "_a", node.expr_a)
@@ -243,7 +243,7 @@ class ExpandTileBinopCutile(ExpandTransformation):
             inputs.add("_b")
         if node.has_mask:
             inputs.add("_mask")
-            rhs_expr = f"ct.where(_mask, {rhs_expr}, 0)"
+            rhs_expr = f"ct.where(_mask, {rhs_expr}, False)"
         body = f"_c = {rhs_expr}"
         return nodes.Tasklet(
             label=f"{node.label}_cutile",

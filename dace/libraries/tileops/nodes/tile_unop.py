@@ -47,8 +47,8 @@ _UNOP_CPP = {
 
 # op -> the cuTile-Python expression (operand placeholder ``{a}``).
 _CUTE_UNOP_EXPR = {
-    "neg": "-{a}",
-    "not": "~{a}",
+    "neg": "(-{a})",
+    "not": "(True ^ ct.astype({a}, ct.bool_))",
     "abs": "ct.abs({a})",
     "exp": "ct.exp({a})",
     "log": "ct.log({a})",
@@ -162,23 +162,26 @@ class ExpandTileUnopCutile(ExpandTransformation):
         :param parent_sdfg: SDFG that owns ``parent_state``.
         :returns: A Python-language tasklet with the element-wise body.
         """
-        if node.kind_a == _SYMBOL:
-            operand = node.expr_a
-        else:
-            operand = "_a"
-        body = f"_c = {_CUTE_UNOP_EXPR[node.op].format(a=operand)}"
+
+        def _cutile_operand(kind, conn, expr):
+            """cuTile operand reference: inline expr for Symbol, the
+            connector for Tile or Scalar (broadcasts NumPy-style)."""
+            if kind == _SYMBOL:
+                from dace.symbolic import symstr
+                return symstr(expr)
+            return conn
+
+        a = _cutile_operand(node.kind_a, "_a", node.expr_a)
+        rhs_expr = _CUTE_UNOP_EXPR[node.op].format(a=a)
         inputs = set()
         if node.kind_a == _TILE:
             inputs.add("_a")
         elif node.kind_a == _SCALAR:
             inputs.add("_a")
-        # The cuTile unop does not use the mask (masking is applied at
-        # the store via ct.scatter), but when has_mask=True the lib node
-        # has a _mask connector with an incoming edge.
-        # ExpandTransformation.apply() remaps all edges to the new
-        # tasklet, so we must declare _mask to keep the SDFG valid.
         if node.has_mask:
             inputs.add("_mask")
+            rhs_expr = f"ct.where(_mask, {rhs_expr}, False)"
+        body = f"_c = {rhs_expr}"
         return nodes.Tasklet(
             label=f"{node.label}_cutile",
             inputs={c: None

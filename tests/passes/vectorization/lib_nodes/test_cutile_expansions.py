@@ -320,23 +320,3 @@ def test_tile_merge_cutile_primary_emits_ct_where():
     _assert_parses_as_python(body)
     assert body == "_o = ct.where(_cond, _t, _e)"
     assert lang == dace.dtypes.Language.Python
-
-
-def test_tile_merge_cutile_fallback_arith_blend_for_int(monkeypatch):
-    """With ``ct.where`` absent and an integer output dtype, TileMerge emits
-    the arithmetic blend (no ``ct.where``)."""
-    monkeypatch.setattr(_tile_merge_mod, "_CT_HAS_WHERE", False)
-    body, _ = _expand_merge_cutile_with_dtype(TileMerge(name="M", widths=(8, )), dace.int32)
-    _assert_parses_as_python(body)
-    assert "ct.where" not in body
-    assert "_cond.astype(_t.dtype)" in body
-    assert "__m * _t" in body
-    assert "* _e" in body
-
-
-def test_tile_merge_cutile_fallback_float_raises(monkeypatch):
-    """With ``ct.where`` absent and a float output dtype, TileMerge raises
-    (``0.0 * inf = NaN`` would leak a non-finite unselected branch)."""
-    monkeypatch.setattr(_tile_merge_mod, "_CT_HAS_WHERE", False)
-    with pytest.raises(NotImplementedError):
-        _expand_merge_cutile_with_dtype(TileMerge(name="M", widths=(8, )), dace.float64)
