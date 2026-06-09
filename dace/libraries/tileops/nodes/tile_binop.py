@@ -177,7 +177,10 @@ _CUTE_OP_EXPR = {
     "+": "{lhs} + {rhs}",
     "-": "{lhs} - {rhs}",
     "*": "{lhs} * {rhs}",
+    # TODO: handle integer division and other differences between Python and C++ semantics (e.g. negative numbers)
     "/": "{lhs} / {rhs}",
+    # TODO: address Python's different modulo semantics for negative numbers (math.fmod for floating point) (integers: r = a - (a / b) * b (with C++ division))
+    # (maybe https://stackoverflow.com/questions/34291760/how-to-easily-implement-c-like-modulo-remainder-operation-in-python-2-7 but this is 2.7-specific) (https://en.wikipedia.org/wiki/Modulo#In_programming_languages) (https://www.youtube.com/watch?v=xVNYurap-lk)
     "%": "{lhs} % {rhs}",
     "<": "{lhs} < {rhs}",
     "<=": "{lhs} <= {rhs}",
@@ -192,6 +195,7 @@ _CUTE_OP_EXPR = {
     "^": "{lhs} ^ {rhs}",
     "min": "ct.minimum({lhs}, {rhs})",
     "max": "ct.maximum({lhs}, {rhs})",
+    # TODO: support all cutile ops, including math functions (e.g. sin/cos/exp/log)
 }
 
 
