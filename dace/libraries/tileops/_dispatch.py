@@ -82,9 +82,9 @@ def select_tile_implementation(node: nodes.LibraryNode, parent_state: dace.SDFGS
         :func:`detect_host_isa`), falling back to ``'pure'`` when that per-ISA
         expansion is not yet defined on the node.
     """
-    if len(node.widths) != 1:
-        return "pure"
     target_isa = getattr(node, "target_isa", "SCALAR")
+    if len(node.widths) != 1 and target_isa != "CUTILE":
+        return "pure"
     if target_isa == "AUTO":
         target_isa = detect_host_isa()
     impl = _ISA_TO_IMPL.get(target_isa, "pure")

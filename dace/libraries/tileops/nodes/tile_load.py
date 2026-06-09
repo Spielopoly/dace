@@ -22,12 +22,24 @@ from ..environments import TileOpsScalar, TileOpsAVX512, TileOpsAVX2, TileOpsNeo
 #: member (so ``max`` / ``prod`` partial-tile identities cannot be installed
 #: by load padding alone — they are routed to the reduction's pre-select;
 #: see the L-pad-identity note in ``CUTILE_EXPANSION_DESIGN.md``).
-_PAD_MODE_CUTE = {
+_PAD_MODE_CUTILE = {
     "ZERO": "ct.PaddingMode.ZERO",
     "NAN": "ct.PaddingMode.NAN",
     "POS_INF": "ct.PaddingMode.POSITIVE_INFINITY",
     "NEG_ZERO": "ct.PaddingMode.NEGATIVE_ZERO",
     "UNDETERMINED": "ct.PaddingMode.UNDETERMINED",
+}
+
+#: Scalar padding values for the ``ct.gather`` general-load path. ``ct.gather``
+#: has no padding-mode enum; it takes an arbitrary scalar ``padding_value``.
+#: Mirrors :data:`_PAD_MODE_CUTILE` (same keys) so a strided load installs the
+#: same OOB identity as the aligned ``ct.load`` path.
+_PAD_VALUE_CUTILE = {
+    "ZERO": "0",
+    "NAN": "float('nan')",
+    "POS_INF": "float('inf')",
+    "NEG_ZERO": "-0.0",
+    "UNDETERMINED": "0",
 }
 
 
@@ -132,35 +144,109 @@ class ExpandTileLoadCutile(ExpandTransformation):
         :param parent_sdfg: SDFG that owns ``parent_state``.
         :returns: A Python-language tasklet whose body calls
             ``ct.load`` with the :attr:`TileLoad.pad_mode` padding mode.
-        :raises ValueError: If :attr:`TileLoad.pad_mode` is not a
-            recognised cuTile padding-mode name.
         """
-        widths = list(node.widths)
+        from dace.symbolic import symstr
+        
+        widths = tuple(node.widths)
         K = len(widths)
-        if node.pad_mode not in _PAD_MODE_CUTE:
-            raise ValueError(f"{node.label}: unknown pad_mode {node.pad_mode!r}; "
-                             f"allowed: {sorted(_PAD_MODE_CUTE)}")
-        pad_mode = _PAD_MODE_CUTE[node.pad_mode]
-        shape_tuple = ", ".join(str(w) for w in widths)
-        index_tuple = ", ".join(f"__pid{k}" for k in range(K))
-        lines = [f"__pid{k} = ct.bid({k})" for k in range(K)]
-        lines.append(f"_dst = ct.load(_src, index=({index_tuple},), shape=({shape_tuple},),"
-                     f" padding_mode={pad_mode})")
-        # L-load-nomask: the cuTile load body never reads a per-lane
-        # mask (masking is applied downstream at the store/scatter).
-        # However, when has_mask=True the lib node has a _mask connector
-        # with an incoming edge; ExpandTransformation.apply() remaps all
-        # edges to the new tasklet, so we must declare _mask to keep the
-        # SDFG valid (it is simply unused in the load body).
-        inputs = {"_src"}
-        if node.has_mask:
-            inputs.add("_mask")
+        
+        if node.pad_mode not in _PAD_MODE_CUTILE:
+            raise ValueError(f"TileLoad cutile expansion: unrecognized pad_mode {node.pad_mode!r}; "
+                             f"must be one of {list(_PAD_MODE_CUTILE.keys())}")
+        pad_mode = _PAD_MODE_CUTILE[node.pad_mode]
+        
+        if node.src_kind == "Scalar":
+            # Broadcast a single value
+            # If the source comes from a global array, we need to load it first
+            src_edge = next(e for e in parent_state.in_edges(node) if e.dst_conn == "_src")
+            desc = parent_sdfg.arrays[src_edge.data.data]
+            is_len1_array = (isinstance(desc, dace.data.Array)
+                             and all(bool(dace.symbolic.simplify(s == 1)) for s in desc.shape))
+            if is_len1_array:
+                ref = f"ct.load(_src, index=({'0,' * len(desc.shape)}), shape=({'1,' * len(desc.shape)})).item()"
+            else:
+                ref = "_src.item()"
+            src_code = f"ct.broadcast_to({ref}, {widths})"
+        elif node.src_kind == "Symbol":
+            src_code = f"ct.broadcast_to(({symstr(node.src_expr, cpp_mode=False)}), {widths})"
+        elif node.src_kind == "Tile":
+            src_edge = next(e for e in parent_state.in_edges(node) if e.dst_conn == "_src")
+            src_arr = parent_sdfg.arrays[src_edge.data.data]
+            ndim = len(src_arr.strides)
+            used_dimensions = tuple(node.src_dims) if node.src_dims else tuple(range(ndim - K, ndim))
+            # cutile currently does not offer a way to reduce the number of indexing dimensions so we need to specify
+            # all dimensions
+            unused_dimensions = tuple(sorted(set(range(ndim)) - set(used_dimensions)))
+            all_dimensions = unused_dimensions + used_dimensions
+            all_widths = tuple(1 for _ in unused_dimensions) + tuple(widths)
+            if node.dim_strides:
+                coeffs = tuple(node.dim_strides)
+                if len(coeffs) != K:
+                    raise ValueError(f"TileLoad cutile expansion: dim_strides length {len(coeffs)} != widths length {K}")
+                is_default_coeffs = all(s == 1 for s in coeffs)
+            else:
+                coeffs = tuple(1 for _ in range(K))
+                is_default_coeffs = True
+            
+            if is_default_coeffs:
+                # Simple case: direct load with no striding
+                index_expr = "("
+                width_expr = "("
+                for d in range(ndim):
+                    if d in used_dimensions:
+                        dim_idx = used_dimensions.index(d)
+                        index_expr += f"__pid{dim_idx}, "
+                        width_expr += f"{widths[dim_idx]}, "
+                    else:
+                        index_expr += "0, " # TODO: Where should we get the index for the unused dimensions?
+                        width_expr += "1, "
+                index_expr += ")"
+                width_expr += ")"
+                src_code = f"ct.load(_src, index={index_expr}, shape={width_expr}, padding_mode={pad_mode})"
+            else:
+                # General case: a non-unit per-tile-dim coefficient ⇒ no aligned
+                # block tile, so build explicit per-source-dim index tiles and
+                # ct.gather. ct.gather wants `ndim` index entries (one per source
+                # dim) that broadcast to the output shape `widths`; its result IS
+                # the broadcasted shape, so the tile comes out already in
+                # tile-dim order (no ct.permute needed on this path).
+                pad_value = _PAD_VALUE_CUTILE[node.pad_mode]
+                idx_entries = []
+                for d in range(ndim):
+                    if d in used_dimensions:
+                        dim_idx = used_dimensions.index(d)
+                        # global element index along this axis:
+                        # (tile_start + lane) * coeff.
+                        base = (f"(ct.arange({widths[dim_idx]}, dtype=ct.int32) "
+                                f"+ __pid{dim_idx} * {widths[dim_idx]}) * {coeffs[dim_idx]}")
+                        # place the W arange on tile axis dim_idx (singleton elsewhere)
+                        slicer = ", ".join(":" if a == dim_idx else "None" for a in range(K))
+                        idx_entries.append(f"ct.broadcast_to(({base})[{slicer}], {widths})")
+                    else:
+                        idx_entries.append("0")  # fixed index 0 along unused source dims
+                idx_tuple = ", ".join(idx_entries)
+                src_code = f"ct.gather(_src, ({idx_tuple},), padding_value={pad_value})"
+            
+            if all_dimensions != tuple(sorted(all_dimensions)):
+                # We need to permute the loaded tile to match the expected layout
+                permute_order = tuple(all_dimensions.index(d) for d in range(ndim))
+                src_code = f"ct.permute({src_code}, axes={permute_order})"
+            
+            if node.has_mask:
+                src_code = f"ct.where(_mask, {src_code}, {_PAD_VALUE_CUTILE[node.pad_mode]})"
+                
+        else:
+            raise ValueError(f"TileLoad cutile expansion: unrecognized src_kind {node.src_kind!r}")
+        
+        code = ''.join(f"__pid{d} = ct.bid({d})\n" for d in range(K))
+        code += f"_dst = {src_code}"
+        inputs = (set() if node.src_kind == "Symbol" else {"_src"}) | ({"_mask"} if node.has_mask else set())
         return nodes.Tasklet(
             label=f"{node.label}_cutile",
             inputs={c: None
                     for c in inputs},
             outputs={"_dst": None},
-            code="\n".join(lines),
+            code=code,
             language=dace.dtypes.Language.Python,
         )
 

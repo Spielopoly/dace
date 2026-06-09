@@ -133,7 +133,7 @@ class VectorizeCPUMultiDim(ppl.Pipeline):
 
     def __init__(self,
                  widths: Tuple[int, ...],
-                 target_isa: Literal["AUTO", "AVX512", "AVX2", "ARM_SVE", "ARM_NEON", "SCALAR"] = "AUTO",
+                 target_isa: Literal["AUTO", "AVX512", "AVX2", "ARM_SVE", "ARM_NEON", "SCALAR", "CUTILE"] = "AUTO",
                  num_cores: int = 1,
                  remainder_strategy: Literal["full_mask", "masked_tail", "scalar_postamble"] = "full_mask",
                  branch_mode: Literal["merge", "fp_factor"] = "merge",
@@ -151,6 +151,8 @@ class VectorizeCPUMultiDim(ppl.Pipeline):
             (``dace.libraries.tileops._dispatch.detect_host_isa``);
             ``"AVX512"`` / ``"AVX2"`` / ``"ARM_SVE"`` / ``"ARM_NEON"`` pin one;
             ``"SCALAR"`` is the portable reference. K>=2 always uses ``pure``.
+            ``"CUTILE"`` is the cuTile backend, which is technically not a CPU
+            ISA but reuses the same Pipeline
         :param num_cores: Reserved for future per-core tiling; currently
             unused.
         :param remainder_strategy: Tile remainder handling (all implemented).
