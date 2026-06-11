@@ -79,42 +79,138 @@ class ExpandTileStorePure(ExpandTransformation):
 
 @library.expansion
 class ExpandTileStoreCutile(ExpandTransformation):
-    """``cuda.tile``-Python expansion of :class:`TileStore`.
-
-    Two emission shapes, matching the reference cuTile kernels:
-
-    * Unmasked: ``ct.store(_dst, index=(__pid0, ...), tile=_src)``
-      — contiguous block-tile store.
-    * Masked: ``ct.scatter(_dst, (idx_0, ...), _src, mask=_mask)``
-      with per-lane indices ``idx_k = ct.arange(W_k) + __pid_k * W_k``,
-      so OOB lanes at the tile tail are skipped per the iteration mask.
+    """TODO: docstring
     """
 
     environments = []
 
     @staticmethod
     def expansion(node: "TileStore", parent_state: dace.SDFGState, parent_sdfg: dace.SDFG) -> nodes.Tasklet:
-        """Return a Python tasklet emitting ``ct.store`` or ``ct.scatter``.
+        """Return a Python tasklet emitting ``ct.store`` / ``ct.scatter`` /
+        a broadcast fill assignment.
 
         :param node: The lib node being expanded.
         :param parent_state: State that owns the lib node.
         :param parent_sdfg: SDFG that owns ``parent_state``.
-        :returns: A Python-language tasklet whose body either calls
-            ``ct.store`` (unmasked) or ``ct.scatter`` (masked).
+        :returns: A Python-language tasklet replacing the lib node.
         """
-        widths = list(node.widths)
+        from dace.symbolic import symstr
+
+        widths = tuple(node.widths)
         K = len(widths)
-        lines = [f"__pid{k} = ct.bid({k})" for k in range(K)]
-        if node.has_mask:
-            for k, w in enumerate(widths):
-                lines.append(f"__idx{k} = ct.arange({w}, dtype=ct.int32) + __pid{k} * {w}")
-            idx_tuple = ", ".join(f"__idx{k}" for k in range(K))
-            lines.append(f"ct.scatter(_dst, ({idx_tuple},), _src, mask=_mask)")
+
+        dst_edge = next(e for e in parent_state.out_edges(node) if e.src_conn == "_dst")
+        dst_arr = parent_sdfg.arrays[dst_edge.data.data]
+
+        # Resolve the stored tile expression per src_kind (mirrors TileLoad).
+        if node.src_kind == "Scalar":
+            # Broadcast a single value. If the source comes from a global
+            # length-1 array, load it first; otherwise the connector already
+            # carries the scalar value.
+            src_edge = next(e for e in parent_state.in_edges(node) if e.dst_conn == "_src")
+            desc = parent_sdfg.arrays[src_edge.data.data]
+            is_len1_array = (isinstance(desc, dace.data.Array)
+                             and all(bool(dace.symbolic.simplify(s == 1)) for s in desc.shape))
+            if is_len1_array:
+                ref = f"ct.load(_src, index=({'0,' * len(desc.shape)}), shape=({'1,' * len(desc.shape)})).item()"
+            else:
+                ref = "_src.item()"
+            tile_expr = f"ct.broadcast_to({ref}, {widths})"
+        elif node.src_kind == "Symbol":
+            tile_expr = f"ct.broadcast_to(({symstr(node.src_expr, cpp_mode=False)}), {widths})"
+        elif node.src_kind == "Tile":
+            tile_expr = "_src"
         else:
-            index_tuple = ", ".join(f"__pid{k}" for k in range(K))
-            shape_tuple = ", ".join(str(w) for w in widths)
-            lines.append(f"ct.store(_dst, index=({index_tuple},), tile=_src)")
-        inputs = {"_src"} | ({"_mask"} if node.has_mask else set())
+            raise ValueError(f"TileStore cutile expansion: unrecognized src_kind {node.src_kind!r}")
+
+        inputs = (set() if node.src_kind == "Symbol" else {"_src"}) | ({"_mask"} if node.has_mask else set())
+
+        # A widths-shaped transient destination is a tile-register fill
+        # (e.g. the Symbol const-fill idiom), not a global-memory write:
+        # tiles are SSA values in cuTile, so the fill is a plain assignment.
+        is_tile_fill = bool(dst_arr.transient) and tuple(dst_arr.shape) == widths
+        if is_tile_fill:
+            if node.has_mask:
+                tile_expr = f"ct.where(_mask, {tile_expr}, 0)"
+            return nodes.Tasklet(
+                label=f"{node.label}_cutile",
+                inputs={c: None
+                        for c in inputs},
+                outputs={"_dst": None},
+                code=f"_dst = {tile_expr}",
+                language=dace.dtypes.Language.Python,
+            )
+
+        ndim = len(dst_arr.strides)
+        # Array dim each tile dim maps to (``dst_dims``); default to the
+        # last K dims in order (a plain row-major tile). cuTile indexing
+        # always spans all array dims, so unused dims are pinned to 0.
+        used_dimensions = tuple(node.dst_dims) if node.dst_dims else tuple(range(ndim - K, ndim))
+        unused_dimensions = tuple(sorted(set(range(ndim)) - set(used_dimensions)))
+        all_dimensions = unused_dimensions + used_dimensions
+        if node.dim_strides:
+            coeffs = tuple(node.dim_strides)
+            if len(coeffs) != K:
+                raise ValueError(f"TileStore cutile expansion: dim_strides length {len(coeffs)} != widths length {K}")
+            is_default_coeffs = all(s == 1 for s in coeffs)
+        else:
+            coeffs = tuple(1 for _ in range(K))
+            is_default_coeffs = True
+
+        lines = [f"__pid{k} = ct.bid({k})" for k in range(K)]
+
+        if is_default_coeffs and not node.has_mask:
+            # Aligned block store. The stored tile must be in array-dim
+            # order with singleton extents on unused dims: insert the
+            # singleton axes first (tile axes then follow ``all_dimensions``
+            # order), then permute into array order if needed.
+            if ndim > K:
+                expand_slicer = ", ".join(["None"] * len(unused_dimensions) + [":"] * K)
+                tile_expr = f"{tile_expr}[{expand_slicer}]"
+            if all_dimensions != tuple(sorted(all_dimensions)):
+                permute_order = tuple(all_dimensions.index(d) for d in range(ndim))
+                tile_expr = f"ct.permute({tile_expr}, axes={permute_order})"
+            index_entries = []
+            for d in range(ndim):
+                if d in used_dimensions:
+                    index_entries.append(f"__pid{used_dimensions.index(d)}")
+                else:
+                    index_entries.append("0")  # TODO: Where should we get the index for the unused dimensions?
+            if tile_expr != "_src":
+                lines.append(f"__tile = {tile_expr}")
+                tile_expr = "__tile"
+            lines.append(f"ct.store(_dst, index=({', '.join(index_entries)},), tile={tile_expr})")
+        else:
+            # General case: a lane mask and/or a non-unit per-tile-dim
+            # coefficient ⇒ no aligned block tile, so build explicit
+            # per-destination-dim index tiles and ct.scatter (the only
+            # lane-masked write cuTile offers — L-store-nomask). Index
+            # entries are built per tile axis, so the stored tile stays in
+            # tile-dim order (no ct.permute on this path; mirrors ct.gather).
+            idx_entries = []
+            for d in range(ndim):
+                if d in used_dimensions:
+                    k = used_dimensions.index(d)
+                    # global element index along this axis:
+                    # (tile_start + lane) * coeff.
+                    base = f"ct.arange({widths[k]}, dtype=ct.int32) + __pid{k} * {widths[k]}"
+                    if coeffs[k] != 1:
+                        base = f"({base}) * {coeffs[k]}"
+                    if K == 1:
+                        lines.append(f"__idx{k} = {base}")
+                    else:
+                        # place the W_k arange on tile axis k (singleton elsewhere)
+                        slicer = ", ".join(":" if a == k else "None" for a in range(K))
+                        lines.append(f"__idx{k} = ct.broadcast_to(({base})[{slicer}], {widths})")
+                    idx_entries.append(f"__idx{k}")
+                else:
+                    idx_entries.append("0")  # fixed index 0 along unused destination dims
+            if tile_expr != "_src":
+                lines.append(f"__tile = {tile_expr}")
+                tile_expr = "__tile"
+            mask_kw = ", mask=_mask" if node.has_mask else ""
+            lines.append(f"ct.scatter(_dst, ({', '.join(idx_entries)},), {tile_expr}{mask_kw})")
+
         return nodes.Tasklet(
             label=f"{node.label}_cutile",
             inputs={c: None

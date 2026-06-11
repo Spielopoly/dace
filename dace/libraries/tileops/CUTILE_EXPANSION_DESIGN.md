@@ -133,16 +133,33 @@ contiguous block load); the only required fixes are dropping the dead
 
 ---
 
-### 2. TileStore — `ExpandTileStoreCutile` EXISTS, CORRECT
+### 2. TileStore — `ExpandTileStoreCutile` EXISTS, GENERALIZED
 
-**Correctness today**: correct against the limitations.
+Mirrors the generality of `ExpandTileLoadCutile` (strided access,
+transposed / partial dim mappings, Scalar/Symbol broadcast sources,
+tile-transient fills). Emission shapes by case:
 
-- Unmasked → `ct.store` (no mask; respects **L-store-nomask**).
-- Masked → `ct.scatter` with per-lane `arange`-based indices and
-  `mask=__mask`. This is exactly the prescribed way to do a lane-masked
-  write (L-store-nomask + L-gs-mask).
+- **Tile-transient destination** (`_dst` is a `widths`-shaped transient —
+  the `src_kind='Symbol'` const-fill idiom): a plain broadcast
+  **assignment**, not a global write (tiles are SSA values in cuTile).
+  Masked fills blend inactive lanes to `0` via `ct.where`.
+- **Aligned unmasked global store** (unit `dim_strides`) → `ct.store`
+  (no mask; respects **L-store-nomask**). A destination with more dims
+  than the tile inserts singleton axes (`__src[None, :]`); an
+  out-of-order `dst_dims` mapping permutes the tile into array-dim order
+  via `ct.permute` first. Unused array dims index `0`.
+- **Masked and/or strided global store** → `ct.scatter` with per-lane
+  `arange`-based indices scaled by the per-tile-dim coefficient and
+  `mask=__mask` when masked. This is exactly the prescribed way to do a
+  lane-masked write (L-store-nomask + L-gs-mask). For K>=2 the index
+  tiles are broadcast to the full tile shape (cuTile scatter indices
+  must broadcast against the scattered tile — same index convention as
+  `ct.gather` on the load side).
+- **Scalar / Symbol sources** broadcast to the tile shape first
+  (`ct.broadcast_to`), exactly like `TileLoad`'s Scalar/Symbol paths;
+  `Symbol` declares no `__src` input.
 
-**Designed body** (unchanged from current):
+**Designed bodies**:
 
 K=1 unmasked:
 ```python
@@ -157,13 +174,33 @@ __idx0 = ct.arange(8, dtype=ct.int32) + __pid0 * 8
 ct.scatter(__output, (__idx0,), __src, mask=__mask)
 ```
 
-K=2 masked:
+K=1 strided (`dim_strides=(2,)`, unmasked — scatter, no mask kwarg):
+```python
+__pid0 = ct.bid(0)
+__idx0 = (ct.arange(8, dtype=ct.int32) + __pid0 * 8) * 2
+ct.scatter(__output, (__idx0,), __src)
+```
+
+K=2 masked (index tiles broadcast to the tile shape):
 ```python
 __pid0 = ct.bid(0)
 __pid1 = ct.bid(1)
-__idx0 = ct.arange(4, dtype=ct.int32) + __pid0 * 4
-__idx1 = ct.arange(8, dtype=ct.int32) + __pid1 * 8
+__idx0 = ct.broadcast_to((ct.arange(4, dtype=ct.int32) + __pid0 * 4)[:, None], (4, 8))
+__idx1 = ct.broadcast_to((ct.arange(8, dtype=ct.int32) + __pid1 * 8)[None, :], (4, 8))
 ct.scatter(__output, (__idx0, __idx1), __src, mask=__mask)
+```
+
+K=2 transposed (`dst_dims=(1, 0)`, unmasked):
+```python
+__pid0 = ct.bid(0)
+__pid1 = ct.bid(1)
+__tile = ct.permute(__src, axes=(1, 0))
+ct.store(__output, index=(__pid1, __pid0), tile=__tile)
+```
+
+Symbol fill of a tile transient (masked):
+```python
+__output = ct.where(__mask, ct.broadcast_to(3.14, (8,)), 0)
 ```
 
 **Mask handling**: at the store, via `ct.scatter(..., mask=__mask)`. This
@@ -173,6 +210,9 @@ this.
 
 **MUST VERIFY**: the `mask=` kwarg on `ct.scatter` (L-gs-mask is not 100%
 confirmed). Fallback if absent: see *Gather/Scatter mask fallback* below.
+Also verify that an **unmasked** strided `ct.scatter` bounds-checks OOB
+indices (the orchestrator masks imperfect boundaries, so the unmasked
+strided path only arises for perfectly divisible iteration spaces).
 
 ---
 
@@ -583,10 +623,20 @@ binop rhs paren-wrapped). The cuTile runtime is never executed.
 - `has_mask=True` → body has **no** `__mask` reference and the tasklet has
   no `__mask` input connector (assert `"__mask" not in tasklet.in_connectors`).
 
-**TileStore (unchanged, keep current 3 tests)**
+**TileStore (generalized — mirrors TileLoad)**
 - unmasked → `ct.store(...)`, no `ct.scatter`.
 - masked K=1 → `ct.scatter(__output, (__idx0,), __src, mask=__mask)`.
-- masked K=2 → two `arange` index tiles + 2-tuple scatter.
+- masked K=2 → two index tiles broadcast to the tile shape + 2-tuple scatter.
+- strided (`dim_strides` non-unit) → scatter with `* coeff` indices, even
+  unmasked; strided + masked combine in one scatter.
+- transposed `dst_dims` → `ct.permute` before the aligned store; index
+  tuple in array-dim order.
+- destination ndim > K → singleton-axis insertion (`__src[None, :]`) and
+  `0` index on unused dims.
+- Scalar source → `ct.broadcast_to(....item(), widths)`; Symbol source →
+  inline broadcast, no `__src` input.
+- `widths`-shaped transient destination → broadcast-fill assignment
+  (`ct.where`-blended when masked), no `ct.store`/`ct.scatter`.
 
 **TileBinop (unchanged, keep current 4 tests)**
 - bare op, no `ct.where`; masked still bare; symbol inlines; `min` →

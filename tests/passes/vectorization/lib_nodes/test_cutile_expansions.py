@@ -54,7 +54,7 @@ def _expand_cutile_tasklet(lib_node):
     return cls.expansion(lib_node, state, sdfg)
 
 
-def _expand_cutile_with_edges(lib_node, in_arrays=None, out_arrays=None):
+def _expand_cutile_with_edges(lib_node, in_arrays=None, out_arrays=None, transients=()):
     """Return ``(body, language)`` wiring actual edges + arrays.
 
     :param in_arrays: dict mapping input connector name to
@@ -62,29 +62,14 @@ def _expand_cutile_with_edges(lib_node, in_arrays=None, out_arrays=None):
         :class:`AccessNode` of ``array_name`` to the lib node connector.
     :param out_arrays: dict mapping output connector name to
         ``(array_name, shape, dtype)``.
+    :param transients: array names to declare as transients (e.g. a
+        ``widths``-shaped tile-fill destination).
     """
-    sdfg = dace.SDFG(f"cutile_smoke_{lib_node.label}")
-    state = sdfg.add_state("main")
-    state.add_node(lib_node)
-
-    for mapping, is_input in ((in_arrays or {}, True),
-                              (out_arrays or {}, False)):
-        for conn, (arr_name, shape, dtype) in mapping.items():
-            if arr_name not in sdfg.arrays:
-                sdfg.add_array(arr_name, shape, dtype)
-            acc = state.add_access(arr_name)
-            mem = dace.Memlet.from_array(arr_name, sdfg.arrays[arr_name])
-            if is_input:
-                state.add_edge(acc, None, lib_node, conn, mem)
-            else:
-                state.add_edge(lib_node, conn, acc, None, mem)
-
-    cls = lib_node.implementations["cutile"]
-    tasklet = cls.expansion(lib_node, state, sdfg)
+    tasklet = _expand_cutile_tasklet_with_edges(lib_node, in_arrays, out_arrays, transients)
     return tasklet.code.as_string, tasklet.language
 
 
-def _expand_cutile_tasklet_with_edges(lib_node, in_arrays=None, out_arrays=None):
+def _expand_cutile_tasklet_with_edges(lib_node, in_arrays=None, out_arrays=None, transients=()):
     """Like :func:`_expand_cutile_with_edges` but returns the raw tasklet."""
     sdfg = dace.SDFG(f"cutile_smoke_{lib_node.label}")
     state = sdfg.add_state("main")
@@ -94,7 +79,7 @@ def _expand_cutile_tasklet_with_edges(lib_node, in_arrays=None, out_arrays=None)
                               (out_arrays or {}, False)):
         for conn, (arr_name, shape, dtype) in mapping.items():
             if arr_name not in sdfg.arrays:
-                sdfg.add_array(arr_name, shape, dtype)
+                sdfg.add_array(arr_name, shape, dtype, transient=arr_name in transients)
             acc = state.add_access(arr_name)
             mem = dace.Memlet.from_array(arr_name, sdfg.arrays[arr_name])
             if is_input:
@@ -190,7 +175,11 @@ def test_tile_load_cutile_masked_uses_ct_where():
 
 def test_tile_store_cutile_unmasked_emits_ct_store():
     """Unmasked TileStore: ``ct.store(_dst, index=(__pid0,), tile=_src)``."""
-    body, _ = _expand_cutile(TileStore(name="S", widths=(8, )))
+    body, _ = _expand_cutile_with_edges(
+        TileStore(name="S", widths=(8, )),
+        in_arrays={"_src": ("src_tile", (8,), dace.float32)},
+        out_arrays={"_dst": ("dst", (100,), dace.float32)},
+    )
     _assert_parses_as_python(body)
     assert "__pid0 = ct.bid(0)" in body
     assert "ct.store(_dst, index=(__pid0,)" in body
@@ -201,7 +190,11 @@ def test_tile_store_cutile_unmasked_emits_ct_store():
 def test_tile_store_cutile_masked_emits_ct_scatter_with_arange_indices():
     """Masked TileStore: ``ct.scatter(_dst, (__idx0,), _src, mask=_mask)``
     with per-lane indices ``__idx_k = ct.arange(W_k) + __pid_k * W_k``."""
-    body, _ = _expand_cutile(TileStore(name="S", widths=(8, ), has_mask=True))
+    body, _ = _expand_cutile_with_edges(
+        TileStore(name="S", widths=(8, ), has_mask=True),
+        in_arrays={"_src": ("src_tile", (8,), dace.float32)},
+        out_arrays={"_dst": ("dst", (100,), dace.float32)},
+    )
     _assert_parses_as_python(body)
     assert "__pid0 = ct.bid(0)" in body
     assert "ct.arange(8, dtype=ct.int32)" in body
@@ -210,14 +203,142 @@ def test_tile_store_cutile_masked_emits_ct_scatter_with_arange_indices():
 
 
 def test_tile_store_cutile_K2_masked_scatter_has_two_idx_tiles():
-    """Masked K=2 store emits two per-lane index tiles + scatter."""
-    body, _ = _expand_cutile(TileStore(name="S", widths=(4, 8), has_mask=True))
+    """Masked K=2 store emits two per-lane index tiles + scatter. The
+    index tiles are broadcast to the full tile shape (cuTile scatter
+    indices must broadcast against the scattered tile, matching the
+    ``ct.gather`` index convention on the load side)."""
+    body, _ = _expand_cutile_with_edges(
+        TileStore(name="S", widths=(4, 8), has_mask=True),
+        in_arrays={"_src": ("src_tile", (4, 8), dace.float32)},
+        out_arrays={"_dst": ("dst", (100, 200), dace.float32)},
+    )
     _assert_parses_as_python(body)
     assert "ct.arange(4, dtype=ct.int32)" in body
     assert "ct.arange(8, dtype=ct.int32)" in body
     assert "__pid0 * 4" in body
     assert "__pid1 * 8" in body
+    assert "[:, None], (4, 8))" in body
+    assert "[None, :], (4, 8))" in body
     assert "ct.scatter(_dst, (__idx0, __idx1), _src, mask=_mask)" in body
+
+
+def test_tile_store_cutile_strided_emits_scatter_with_scaled_indices():
+    """Non-unit ``dim_strides`` ⇒ no aligned block tile: the store lowers
+    to ``ct.scatter`` with ``(ct.arange(W) + __pid0 * W) * coeff`` indices
+    (mirror of the load's strided ``ct.gather`` path), even unmasked."""
+    body, _ = _expand_cutile_with_edges(
+        TileStore(name="S", widths=(8, ), dim_strides=(2, )),
+        in_arrays={"_src": ("src_tile", (8,), dace.float32)},
+        out_arrays={"_dst": ("dst", (100,), dace.float32)},
+    )
+    _assert_parses_as_python(body)
+    assert "ct.store" not in body
+    assert "ct.arange(8, dtype=ct.int32)" in body
+    assert "* 2" in body
+    assert "ct.scatter(_dst, (__idx0,), _src)" in body
+    assert "mask=" not in body
+
+
+def test_tile_store_cutile_strided_masked_scatter_combines_mask_and_stride():
+    """Strided + masked store: one ``ct.scatter`` carries both the scaled
+    per-lane indices and ``mask=_mask``."""
+    body, _ = _expand_cutile_with_edges(
+        TileStore(name="S", widths=(8, ), dim_strides=(2, ), has_mask=True),
+        in_arrays={"_src": ("src_tile", (8,), dace.float32)},
+        out_arrays={"_dst": ("dst", (100,), dace.float32)},
+    )
+    _assert_parses_as_python(body)
+    assert "* 2" in body
+    assert "ct.scatter(_dst, (__idx0,), _src, mask=_mask)" in body
+
+
+def test_tile_store_cutile_transposed_dst_dims_permutes_tile():
+    """Out-of-order ``dst_dims`` (transposed store) permutes the tile into
+    array-dim order via ``ct.permute`` before the aligned ``ct.store``;
+    the index tuple follows array-dim order (``__pid1`` first)."""
+    body, _ = _expand_cutile_with_edges(
+        TileStore(name="S", widths=(4, 8), dst_dims=(1, 0)),
+        in_arrays={"_src": ("src_tile", (4, 8), dace.float32)},
+        out_arrays={"_dst": ("dst", (100, 200), dace.float32)},
+    )
+    _assert_parses_as_python(body)
+    assert "ct.permute(_src, axes=(1, 0))" in body
+    assert "ct.store(_dst, index=(__pid1, __pid0), tile=__tile)" in body
+
+
+def test_tile_store_cutile_unused_dst_dim_expands_rank_and_indexes_zero():
+    """A destination with more dims than the tile (K=1 tile into a 2-D
+    array, ``dst_dims=(1,)``) inserts a singleton axis (``_src[None, :]``)
+    and pins the unused array dim's index to 0."""
+    body, _ = _expand_cutile_with_edges(
+        TileStore(name="S", widths=(8, ), dst_dims=(1, )),
+        in_arrays={"_src": ("src_tile", (8,), dace.float32)},
+        out_arrays={"_dst": ("dst", (100, 200), dace.float32)},
+    )
+    _assert_parses_as_python(body)
+    assert "_src[None, :]" in body
+    assert "ct.store(_dst, index=(0, __pid0), tile=__tile)" in body
+
+
+def test_tile_store_cutile_scalar_src_broadcasts_item():
+    """``src_kind='Scalar'`` from a length-1 global array loads the value
+    and broadcasts it to the tile shape before the store (mirror of the
+    load's Scalar path)."""
+    body, _ = _expand_cutile_with_edges(
+        TileStore(name="S", widths=(8, ), src_kind="Scalar"),
+        in_arrays={"_src": ("sval", (1,), dace.float32)},
+        out_arrays={"_dst": ("dst", (100,), dace.float32)},
+    )
+    _assert_parses_as_python(body)
+    assert "ct.broadcast_to(ct.load(_src" in body
+    assert ".item()" in body
+    assert "tile=__tile" in body
+
+
+def test_tile_store_cutile_symbol_fill_to_tile_transient_is_assignment():
+    """``src_kind='Symbol'`` writing a ``widths``-shaped transient is the
+    const-fill idiom: a plain broadcast assignment (tiles are SSA values
+    in cuTile), NOT a ``ct.store``. No ``_src`` input is declared."""
+    tasklet = _expand_cutile_tasklet_with_edges(
+        TileStore(name="S", widths=(8, ), src_kind="Symbol", src_expr="alpha"),
+        out_arrays={"_dst": ("tile_c", (8,), dace.float32)},
+        transients=("tile_c", ),
+    )
+    body = tasklet.code.as_string
+    _assert_parses_as_python(body)
+    assert "_src" not in tasklet.in_connectors
+    assert "ct.store" not in body
+    assert "ct.scatter" not in body
+    assert "ct.broadcast_to(alpha, (8,))" in body
+    assert body.startswith("_dst = ")
+
+
+def test_tile_store_cutile_symbol_fill_masked_blends_with_where():
+    """A masked tile-transient fill blends inactive lanes to 0 via
+    ``ct.where(_mask, <broadcast>, 0)`` (mirror of the load's mask blend)."""
+    tasklet = _expand_cutile_tasklet_with_edges(
+        TileStore(name="S", widths=(8, ), src_kind="Symbol", src_expr="3.14", has_mask=True),
+        out_arrays={"_dst": ("tile_c", (8,), dace.float32)},
+        transients=("tile_c", ),
+    )
+    body = tasklet.code.as_string
+    _assert_parses_as_python(body)
+    assert "_mask" in tasklet.in_connectors
+    assert "ct.where(_mask, ct.broadcast_to(3.14, (8,)), 0)" in body
+
+
+def test_tile_store_cutile_symbol_to_global_broadcasts_then_stores():
+    """``src_kind='Symbol'`` writing a non-transient global array emits a
+    broadcast tile + aligned ``ct.store`` (no ``_src`` input)."""
+    tasklet = _expand_cutile_tasklet_with_edges(
+        TileStore(name="S", widths=(8, ), src_kind="Symbol", src_expr="alpha"),
+        out_arrays={"_dst": ("dst", (100,), dace.float32)},
+    )
+    body = tasklet.code.as_string
+    _assert_parses_as_python(body)
+    assert "_src" not in tasklet.in_connectors
+    assert "__tile = ct.broadcast_to(alpha, (8,))" in body
+    assert "ct.store(_dst, index=(__pid0,), tile=__tile)" in body
 
 
 def test_tile_binop_cutile_emits_bare_elementwise_op():
