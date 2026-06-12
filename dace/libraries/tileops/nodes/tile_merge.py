@@ -89,11 +89,6 @@ class ExpandTileMergeCutile(ExpandTransformation):
         :param parent_sdfg: SDFG that owns ``parent_state``.
         :returns: A Python-language tasklet with the ``ct.where`` (or
             arithmetic-blend) body.
-        :raises NotImplementedError: If ``ct.where`` is known absent and
-            the output dtype is floating point (the blend cannot safely
-            handle a possibly-non-finite unselected branch — ``0.0 * inf
-            = NaN``); verify ``ct.where`` in the installed cuda-tile
-            package.
         """
         rhs = "ct.where(_cond, _t, _e)"
         inputs = {"_cond", "_t", "_e"}
