@@ -11,6 +11,11 @@ sizes, multiple dtypes, interstate assignments, and recursive nesting.
 **Key naming convention:** inner SDFG array names match the outer tile
 transient names (e.g. ``_tile_a``, ``_tile_out``) so the AccessNode-centric
 codegen does not emit a spurious rebinding line after the NestedSDFG call.
+
+NOTE: the hand-stamping of ``ScheduleType.CuTile`` / ``StorageType.CuTile_Tile``
+/ ``GPU_Global`` in this file is DELIBERATE — these tests exercise cuTile
+codegen over hand-built NestedSDFG structures, not the ``VectorizeCuTile``
+pipeline, so a future "migrate to VectorizeCuTile" sweep must leave them as is.
 """
 import ast
 

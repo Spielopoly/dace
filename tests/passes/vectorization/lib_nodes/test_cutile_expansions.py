@@ -473,7 +473,7 @@ def test_tile_reduce_cutile_masked_sum_fallback_blend(monkeypatch):
     body, _ = _expand_cutile(TileReduce(name="R", widths=(8, ), op="+", has_mask=True))
     _assert_parses_as_python(body)
     assert "ct.where" not in body
-    assert "_mask.astype(_src.dtype)" in body
+    assert "ct.astype(_mask, _src.dtype)" in body
     # DaCe's Python tasklet pipeline re-parens binop rhs on unparse.
     assert "ct.sum((_m * _src))" in body
 

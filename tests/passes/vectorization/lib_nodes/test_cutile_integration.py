@@ -1,10 +1,12 @@
 # Copyright 2019-2026 ETH Zurich and the DaCe authors. All rights reserved.
 """End-to-end integration tests for the cuTile expansion + Python backend pipeline.
 
-Each test creates an SDFG (via API or @dace.program), applies VectorizeCPUMultiDim
-with target_isa="CUTILE", expands library nodes with cutile implementations,
-generates Python code via the Python backend, compiles, runs on GPU, and compares
-results against a NumPy reference.
+Each test creates an SDFG (via API or @dace.program), applies the
+``VectorizeCuTile`` orchestrator (vectorize with target_isa="CUTILE", lower
+schedules/storage/implementations, expand library nodes, select the Python
+backend), generates Python code, compiles, runs on GPU, and compares results
+against a NumPy reference. The structural tests double as regression tests of
+the cuTile lowering passes (``cutile_lowering.py``).
 """
 import ast
 
@@ -13,10 +15,8 @@ import pytest
 
 import dace
 from dace import dtypes
-from dace.sdfg import nodes
-from dace.transformation.passes.vectorization.vectorize_cpu_multi_dim import (
-    VectorizeCPUMultiDim,
-)
+from dace.sdfg import SDFG, nodes
+from dace.transformation.passes.vectorization.vectorize_cutile import VectorizeCuTile
 
 # All GPU execution tests require GPU
 pytestmark = pytest.mark.gpu
@@ -27,58 +27,13 @@ pytestmark = pytest.mark.gpu
 # ============================================================
 
 
-def _apply_cutile_pipeline(sdfg, widths=(8,)):
-    """Apply the full cuTile pipeline to an SDFG.
-
-    1. VectorizeCPUMultiDim with CUTILE target (includes expansion)
-    2. Set CuTile schedule on tiled maps (maps with step > 1)
-    3. Set GPU_Global storage on non-transient arrays
-    4. Set CuTile_Tile storage on tile transients inside CuTile scopes
-    5. Set Python backend
+def _apply_cutile_pipeline(sdfg: SDFG, widths=(8, )) -> None:
+    """Apply the full cuTile pipeline (the ``VectorizeCuTile`` orchestrator).
 
     :param sdfg: The SDFG to transform (modified in-place).
-    :param widths: Tile widths for vectorization.
+    :param widths: Tile widths for vectorization (must be powers of two).
     """
-    # Step 1: Vectorize and expand
-    VectorizeCPUMultiDim(
-        widths=widths, target_isa="CUTILE", expand_tile_nodes=True
-    ).apply_pass(sdfg, {})
-
-    # Step 2: Set CuTile schedule on tiled maps (step > 1)
-    for state in sdfg.states():
-        for node in state.nodes():
-            if isinstance(node, nodes.MapEntry):
-                for r in node.map.range:
-                    if str(r[2]) != "1":
-                        node.map.schedule = dtypes.ScheduleType.CuTile
-                        break
-
-    # Step 3: Set GPU_Global storage for non-transient arrays
-    for name, desc in sdfg.arrays.items():
-        if not desc.transient:
-            desc.storage = dtypes.StorageType.GPU_Global
-
-    # Step 4: Set CuTile_Tile storage for tile transients inside CuTile scopes
-    for state in sdfg.states():
-        scope_dict = state.scope_dict()
-        for node in state.nodes():
-            if isinstance(node, nodes.AccessNode):
-                desc = sdfg.arrays.get(node.data)
-                if (
-                    desc
-                    and desc.transient
-                    and desc.storage == dtypes.StorageType.Register
-                ):
-                    parent = scope_dict.get(node)
-                    if (
-                        parent is not None
-                        and isinstance(parent, nodes.MapEntry)
-                        and parent.map.schedule == dtypes.ScheduleType.CuTile
-                    ):
-                        desc.storage = dtypes.StorageType.CuTile_Tile
-
-    # Step 5: Python backend
-    sdfg.backend = dtypes.BackendLanguage.Python
+    VectorizeCuTile(widths=widths).apply_pass(sdfg, {})
 
 
 def _run_cutile(sdfg, **kwargs):

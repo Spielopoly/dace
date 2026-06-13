@@ -83,7 +83,7 @@ def select_tile_implementation(node: nodes.LibraryNode, parent_state: dace.SDFGS
         expansion is not yet defined on the node.
     """
     target_isa = getattr(node, "target_isa", "SCALAR")
-    if len(node.widths) != 1 and target_isa != "CUTILE":
+    if len(node.widths) != 1:
         return "pure"
     if target_isa == "AUTO":
         target_isa = detect_host_isa()

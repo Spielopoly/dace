@@ -45,8 +45,7 @@ from dace.dtypes import (
 )
 from dace.memlet import Memlet
 from dace.sdfg import SDFG, nodes
-from dace.transformation.passes.vectorization.vectorize_cpu_multi_dim import (
-    VectorizeCPUMultiDim, )
+from dace.transformation.passes.vectorization.vectorize_cutile import VectorizeCuTile
 
 _SDFG_COUNTER = itertools.count()
 
@@ -539,40 +538,14 @@ class TestPlainPythonContextManager:
 
 def _apply_cutile_pipeline(sdfg: SDFG, widths=(8, )) -> None:
     """Apply the canonicalize-free cuTile lowering used by the integration
-    tests: vectorize+expand with ``target_isa="CUTILE"``, set CuTile schedule on
-    tiled maps, GPU_Global storage on non-transients, CuTile_Tile storage on
-    register tile transients, and select the Python backend.
+    tests: the ``VectorizeCuTile`` orchestrator (vectorize with
+    ``target_isa="CUTILE"``, stamp CuTile schedules/storage/implementations,
+    expand library nodes, and select the Python backend).
 
     :param sdfg: SDFG to transform in place.
     :param widths: Per-dim tile widths (must be powers of two).
     """
-    VectorizeCPUMultiDim(widths=widths, target_isa="CUTILE",
-                         expand_tile_nodes=True).apply_pass(sdfg, {})
-
-    for state in sdfg.states():
-        for node in state.nodes():
-            if isinstance(node, nodes.MapEntry):
-                for r in node.map.range:
-                    if str(r[2]) != "1":
-                        node.map.schedule = ScheduleType.CuTile
-                        break
-
-    for _, desc in sdfg.arrays.items():
-        if not desc.transient:
-            desc.storage = StorageType.GPU_Global
-
-    for state in sdfg.states():
-        scope_dict = state.scope_dict()
-        for node in state.nodes():
-            if isinstance(node, nodes.AccessNode):
-                desc = sdfg.arrays.get(node.data)
-                if desc and desc.transient and desc.storage == StorageType.Register:
-                    parent = scope_dict.get(node)
-                    if (parent is not None and isinstance(parent, nodes.MapEntry)
-                            and parent.map.schedule == ScheduleType.CuTile):
-                        desc.storage = StorageType.CuTile_Tile
-
-    sdfg.backend = BackendLanguage.Python
+    VectorizeCuTile(widths=widths).apply_pass(sdfg, {})
 
 
 def _build_cutile_vadd_sdfg(name: str, dtype=dace.float64) -> SDFG:
