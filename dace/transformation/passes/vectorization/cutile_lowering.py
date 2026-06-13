@@ -177,7 +177,7 @@ class _CuTileLoweringPass(ppl.Pass):
         return ppl.Modifies.Everything
 
     def should_reapply(self, modified: ppl.Modifies) -> bool:
-        return False
+        return bool(modified & ppl.Modifies.Everything)
 
     def depends_on(self) -> Set[Type[ppl.Pass]]:
         return set()
