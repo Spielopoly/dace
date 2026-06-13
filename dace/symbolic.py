@@ -2282,7 +2282,13 @@ def _pystr_to_symbolic_uncached(expr, symbol_map=None, simplify=None) -> sympy.B
     return sympy_to_dace(result, symbol_map)
 
 
-@lru_cache(maxsize=2048)
+# ``typed=True`` is required: ``lru_cache`` keys entries by ``hash``/``==``, and
+# Python conflates booleans with integers (``hash(True) == hash(1)`` and
+# ``True == sympy.Integer(1)``). Without it, a cached ``simplify(True)`` would be
+# returned for a later ``simplify(sympy.Integer(1))`` (and vice versa), poisoning
+# the cache. ``typed=True`` keeps the ``bool`` and ``sympy.Integer`` entries
+# distinct. See ``tests/symbolic/test_simplify_cache_typed.py``.
+@lru_cache(maxsize=2048, typed=True)
 def simplify(expr: SymbolicType) -> SymbolicType:
     return sympy.simplify(expr)
 
