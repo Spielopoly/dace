@@ -33,7 +33,7 @@ def _apply_cutile_pipeline(sdfg: SDFG, widths=(8, )) -> None:
     :param sdfg: The SDFG to transform (modified in-place).
     :param widths: Tile widths for vectorization (must be powers of two).
     """
-    VectorizeCuTile(widths=widths).apply_pass(sdfg, {})
+    VectorizeCuTile(widths=widths, insert_data_copies=False).apply_pass(sdfg, {})
 
 
 def _run_cutile(sdfg, **kwargs):

@@ -2,7 +2,7 @@
 """cuTile lowering passes: tileops-anchored schedule, storage, and
 implementation stamping for the Python/cuTile backend.
 
-The five passes lower a tile-op SDFG — produced by
+The six passes lower a tile-op SDFG — produced by
 ``VectorizeCPUMultiDim(target_isa="CUTILE", expand_tile_nodes=False)`` —
 into the form the cuTile code generator (``dace/codegen/py/cutile_target.py``)
 consumes. All stamping is anchored on the emitted ``tileops`` library nodes,
@@ -15,6 +15,7 @@ Required order::
     CuTileSetSchedules         # outermost enclosing map -> CuTile, inner -> Sequential
     CuTileSetTileStorage       # Register tile transients -> CuTile_Tile
     CuTileSetGlobalStorage     # kernel-touched non-transients -> GPU_Global
+    CuTileInsertDataCopies     # (optional) clone GPU_Global non-transients, add copy states
     CuTileSetImplementations   # lib nodes -> target_isa="CUTILE", implementation="cutile"
 
 followed by ``sdfg.expand_library_nodes()`` and
@@ -40,8 +41,9 @@ instead of a silent ``'pure'`` fallback).
 import warnings
 from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, Type
 
-from dace import SDFG, data, dtypes, properties, transformation
+from dace import SDFG, data, dtypes, memlet as mmlt, properties, transformation
 from dace.sdfg import nodes
+from dace.sdfg.sdfg import InterstateEdge
 from dace.sdfg.state import SDFGState
 from dace.transformation import pass_pipeline as ppl
 
@@ -563,3 +565,144 @@ class CuTileSetImplementations(_CuTileLoweringPass):
             node.target_isa = "CUTILE"
             node.implementation = "cutile"
         return len(anchors)
+
+
+@properties.make_properties
+@transformation.explicit_cf_compatible
+class CuTileInsertDataCopies(_CuTileLoweringPass):
+    """Insert host-to-device and device-to-host copy states around cuTile
+    computation, so callers can pass NumPy (host) arrays instead of CuPy
+    (device) arrays.
+
+    The pass operates on the top-level SDFG only and targets non-transient
+    ``data.Array`` descriptors whose storage was stamped ``GPU_Global`` by
+    :class:`CuTileSetGlobalStorage`. For each such array the pass:
+
+    1. Creates a ``gpu_<name>`` transient clone with ``GPU_Global`` storage.
+    2. Reverts the original descriptor to ``CPU_Heap`` (host-accessible).
+    3. Replaces every in-graph reference (``AccessNode.data``, ``Memlet.data``,
+       interstate edge expressions) to use the clone.
+    4. Inserts a **copy-in state** before the current start block that copies
+       every candidate array from host to device (conservative — avoids
+       uninitialized device memory for partial writes).
+    5. Inserts a **copy-out state** after all sink nodes that copies written
+       candidates back from device to host.
+
+    The pass is idempotent: a second run finds no ``GPU_Global`` non-transients
+    (they were already cloned and reverted to ``CPU_Heap``) and returns
+    ``None``.
+
+    Must run after :class:`CuTileSetGlobalStorage` (the source of
+    ``GPU_Global`` stamps on non-transients). Has no effect on transients,
+    Scalars, or ``CuTile_Tile`` descriptors.
+    """
+
+    def apply_pass(self, sdfg: SDFG, pipeline_results: Dict[str, Any]) -> Optional[int]:
+        """Clone GPU_Global non-transients and insert copy-in / copy-out states.
+
+        :param sdfg: The top-level SDFG to transform in place.
+        :param pipeline_results: Unused pipeline results.
+        :returns: The number of arrays cloned (with copy states inserted), or
+            ``None`` if nothing was done (no candidates, or already applied).
+        :raises ValueError: When ``strict`` and no CuTile-scheduled map exists
+            (the pass is pointless without kernel computation).
+        """
+        # Precondition: at least one CuTile-scheduled map must exist.
+        if next(_iter_cutile_scopes(sdfg), None) is None:
+            _warn_or_raise(
+                "CuTileInsertDataCopies: no CuTile-scheduled map found; "
+                "run CuTileSetSchedules first", self.strict)
+            return None
+
+        # -- Step 1: Identify candidates ---------------------------------
+        # Non-transient Arrays with GPU_Global storage (stamped by
+        # CuTileSetGlobalStorage).  Scalars and CuTile_Tile are skipped.
+        candidates: Dict[str, data.Data] = {}
+        for name, desc in sdfg.arrays.items():
+            if (not desc.transient and isinstance(desc, data.Array)
+                    and desc.storage == dtypes.StorageType.GPU_Global):
+                candidates[name] = desc
+
+        if not candidates:
+            return None
+
+        # -- Step 2: Classify as input / output --------------------------
+        input_names: Set[str] = set()
+        output_names: Set[str] = set()
+        for state in sdfg.states():
+            for node in state.nodes():
+                if isinstance(node, nodes.AccessNode) and node.data in candidates:
+                    if state.out_degree(node) > 0:
+                        input_names.add(node.data)
+                    if state.in_degree(node) > 0:
+                        output_names.add(node.data)
+
+        # Conservative: include all candidates in copy-in to avoid
+        # uninitialized device memory for partial writes.
+        copyin_names = set(candidates.keys())
+        copyout_names = output_names
+
+        # -- Step 3: Clone arrays ----------------------------------------
+        cloned: Dict[str, str] = {}  # original name -> gpu clone name
+        for name, desc in candidates.items():
+            newdesc = desc.clone()
+            newdesc.storage = dtypes.StorageType.GPU_Global
+            newdesc.transient = True
+            gpu_name = sdfg.add_datadesc('gpu_' + name, newdesc,
+                                         find_new_name=True)
+            cloned[name] = gpu_name
+
+        # Revert originals to CPU_Heap.
+        for name in cloned:
+            sdfg.arrays[name].storage = dtypes.StorageType.CPU_Heap
+
+        # -- Step 4: Replace all internal references ---------------------
+        for state in sdfg.states():
+            for node in state.nodes():
+                if isinstance(node, nodes.AccessNode) and node.data in cloned:
+                    node.data = cloned[node.data]
+            for edge in state.edges():
+                if edge.data.data in cloned:
+                    edge.data.data = cloned[edge.data.data]
+
+        # Interstate edges (condition / assignment expressions).
+        for edge in sdfg.all_interstate_edges():
+            for orig, gpu in cloned.items():
+                edge.data.replace(orig, gpu)
+
+        # -- Step 5: Create copy-in state --------------------------------
+        start_block = sdfg.start_block
+        copyin_state = sdfg.add_state(sdfg.label + '_copyin')
+        # Wire copyin -> old start block.
+        sdfg.add_edge(copyin_state, start_block, InterstateEdge())
+        # Make copyin the new start.
+        sdfg.start_block = sdfg.node_id(copyin_state)
+        for name in sorted(copyin_names):
+            gpu_name = cloned[name]
+            src = nodes.AccessNode(name)
+            dst = nodes.AccessNode(gpu_name)
+            copyin_state.add_node(src)
+            copyin_state.add_node(dst)
+            copyin_state.add_nedge(
+                src, dst,
+                mmlt.Memlet.from_array(name, sdfg.arrays[name]))
+
+        # -- Step 6: Create copy-out state -------------------------------
+        if copyout_names:
+            copyout_state = sdfg.add_state(sdfg.label + '_copyout')
+            # Connect every sink to the copy-out state.
+            # Recompute sink nodes excluding the copyout state itself.
+            for sink in sdfg.sink_nodes():
+                if sink is not copyout_state:
+                    sdfg.add_edge(sink, copyout_state, InterstateEdge())
+            for name in sorted(copyout_names):
+                gpu_name = cloned[name]
+                src = nodes.AccessNode(gpu_name)
+                dst = nodes.AccessNode(name)
+                copyout_state.add_node(src)
+                copyout_state.add_node(dst)
+                copyout_state.add_nedge(
+                    src, dst,
+                    mmlt.Memlet.from_array(gpu_name, sdfg.arrays[gpu_name]))
+
+        return len(cloned)

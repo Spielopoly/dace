@@ -256,6 +256,15 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
             self._dispatcher.register_copy_dispatcher(
                 dtypes.StorageType.CuTile_Tile, dtypes.StorageType.CuTile_Tile,
                 sched, self)
+        # Register for cross-storage copies between CPU_Heap and GPU_Global.
+        # These arise from CuTileInsertDataCopies copy-in/copy-out states
+        # that transfer data between host and device outside any map scope.
+        self._dispatcher.register_copy_dispatcher(
+            dtypes.StorageType.CPU_Heap, dtypes.StorageType.GPU_Global,
+            None, self)
+        self._dispatcher.register_copy_dispatcher(
+            dtypes.StorageType.GPU_Global, dtypes.StorageType.CPU_Heap,
+            None, self)
         # Register array dispatcher for CuTile_Tile storage (allocation is a no-op).
         self._dispatcher.register_array_dispatcher(
             dtypes.StorageType.CuTile_Tile, self)
@@ -373,15 +382,21 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
                     dst_node: nodes.Node, edge: object,
                     function_stream: PythonCodeIOStream,
                     callsite_stream: PythonCodeIOStream) -> None:
-        """Handle copy operations between global arrays and tile arrays.
+        """Handle copy operations between arrays.
 
-        For CuTile_Tile arrays inside a scope, data flows through
-        MapEntry/MapExit boundaries and is handled by
-        :meth:`_generate_AccessNode`.  This method is a fallback for
-        any remaining direct AccessNode-to-AccessNode edges that the
-        dispatcher routes here.
+        Supports three categories of copies:
 
-        Uses numpy-compatible assignment (works with cupy arrays on GPU).
+        1. **Cross-storage CPU_Heap/Default <-> GPU_Global** (from
+           ``CuTileInsertDataCopies`` copy-in/copy-out states): emits
+           ``cupy.asarray`` (host-to-device) or ``cupy.asnumpy``
+           (device-to-host) transfers.  ``StorageType.Default`` is
+           treated as host-side since it resolves to ``CPU_Heap``.
+        2. **CuTile_Tile <-> other storage** inside a scope: data flows
+           through MapEntry/MapExit and is handled by
+           :meth:`_generate_AccessNode`; this path is a fallback for
+           direct AccessNode-to-AccessNode edges routed here.
+        3. **Same-storage copies**: emits plain numpy-compatible
+           assignment.
 
         :param sdfg: The SDFG.
         :param cfg: The control flow graph.
@@ -403,6 +418,26 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
                 f"copies, got {type(src_node).__name__} -> "
                 f"{type(dst_node).__name__}")
 
+        src_storage = sdfg.arrays[src_node.data].storage
+        dst_storage = sdfg.arrays[dst_node.data].storage
+
+        # --- Cross-storage CPU <-> GPU transfers ---
+        _HOST_STORAGES = (dtypes.StorageType.CPU_Heap,
+                          dtypes.StorageType.Default)
+        src_on_host = src_storage in _HOST_STORAGES
+        dst_on_host = dst_storage in _HOST_STORAGES
+        src_on_gpu = src_storage == dtypes.StorageType.GPU_Global
+        dst_on_gpu = dst_storage == dtypes.StorageType.GPU_Global
+        is_cpu_to_gpu = src_on_host and dst_on_gpu
+        is_gpu_to_cpu = src_on_gpu and dst_on_host
+
+        if is_cpu_to_gpu or is_gpu_to_cpu:
+            self._emit_cross_storage_copy(
+                sdfg, cfg, state_id, src_node, dst_node, memlet,
+                is_cpu_to_gpu, callsite_stream)
+            return
+
+        # --- Same-storage / CuTile_Tile fallback copies ---
         # Build source expression
         src_expr = src_node.data
         if memlet.src_subset is not None:
@@ -419,6 +454,66 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
 
         # Emit assignment (works for both numpy and cupy)
         callsite_stream.write(f"{dst_expr} = {src_expr}", cfg, state_id)
+
+    def _emit_cross_storage_copy(
+        self,
+        sdfg: "SDFG",
+        cfg: object,
+        state_id: int,
+        src_node: nodes.AccessNode,
+        dst_node: nodes.AccessNode,
+        memlet: object,
+        cpu_to_gpu: bool,
+        callsite_stream: PythonCodeIOStream,
+    ) -> None:
+        """Emit a cross-storage copy between CPU_Heap and GPU_Global arrays.
+
+        For CPU_Heap -> GPU_Global (copy-in), emits::
+
+            dst[:] = cupy.asarray(src)
+
+        For GPU_Global -> CPU_Heap (copy-out), emits::
+
+            dst[:] = cupy.asnumpy(src)
+
+        When the memlet carries subsets, the subset is applied to both
+        source and destination expressions.  For full-array copies
+        (typical of ``CuTileInsertDataCopies``), the ``[:]`` ensures
+        the data is copied into the pre-allocated array.
+
+        :param sdfg: The SDFG.
+        :param cfg: The control flow graph.
+        :param state_id: The state ID.
+        :param src_node: The source AccessNode.
+        :param dst_node: The destination AccessNode.
+        :param memlet: The memlet on the connecting edge.
+        :param cpu_to_gpu: ``True`` for CPU_Heap -> GPU_Global,
+            ``False`` for GPU_Global -> CPU_Heap.
+        :param callsite_stream: Stream for call-site code.
+        """
+        # Build source expression (with optional subset).
+        src_expr = src_node.data
+        if memlet.src_subset is not None:
+            src_subset_str = self._subset_to_python(memlet.src_subset)
+            if src_subset_str:
+                src_expr = f"{src_node.data}[{src_subset_str}]"
+
+        # Build destination LHS (with optional subset, or [:] for full copy).
+        if memlet.dst_subset is not None:
+            dst_subset_str = self._subset_to_python(memlet.dst_subset)
+            if dst_subset_str:
+                dst_lhs = f"{dst_node.data}[{dst_subset_str}]"
+            else:
+                dst_lhs = f"{dst_node.data}[:]"
+        else:
+            dst_lhs = f"{dst_node.data}[:]"
+
+        if cpu_to_gpu:
+            callsite_stream.write(
+                f"{dst_lhs} = cupy.asarray({src_expr})", cfg, state_id)
+        else:
+            callsite_stream.write(
+                f"{dst_lhs} = cupy.asnumpy({src_expr})", cfg, state_id)
 
     @staticmethod
     def _subset_to_python(subset: "subsets.Subset") -> str:

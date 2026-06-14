@@ -3,7 +3,7 @@
 
 Composes the K-dim tile-op vectorizer
 (:class:`~dace.transformation.passes.vectorization.vectorize_cpu_multi_dim.VectorizeCPUMultiDim`
-with ``target_isa="CUTILE"`` and ``expand_tile_nodes=False``) with the five
+with ``target_isa="CUTILE"`` and ``expand_tile_nodes=False``) with the six
 cuTile lowering passes from
 :mod:`~dace.transformation.passes.vectorization.cutile_lowering`, library-node
 expansion, and the Python backend stamp. The result is an SDFG the cuTile code
@@ -15,6 +15,7 @@ from typing import Any, Dict, Literal, Optional, Set, Tuple, Type
 from dace import SDFG, dtypes, properties, transformation
 from dace.transformation import pass_pipeline as ppl
 from dace.transformation.passes.vectorization.cutile_lowering import (
+    CuTileInsertDataCopies,
     CuTileSetGlobalStorage,
     CuTileSetImplementations,
     CuTileSetSchedules,
@@ -42,14 +43,17 @@ class VectorizeCuTile(ppl.Pass):
     4. :class:`CuTileSetTileStorage` — tile transients -> ``CuTile_Tile``.
     5. :class:`CuTileSetGlobalStorage` — kernel-touched non-transients ->
        ``GPU_Global``.
-    6. :class:`CuTileSetImplementations` — lib nodes -> ``target_isa="CUTILE"``,
+    6. :class:`CuTileInsertDataCopies` (optional, default on) — clone
+       ``GPU_Global`` non-transients to device transients and insert
+       copy-in/copy-out states so callers can pass NumPy host arrays.
+    7. :class:`CuTileSetImplementations` — lib nodes -> ``target_isa="CUTILE"``,
        ``implementation="cutile"``.
-    7. ``sdfg.expand_library_nodes()``
-    8. ``sdfg.backend = dtypes.BackendLanguage.Python``
+    8. ``sdfg.expand_library_nodes()``
+    9. ``sdfg.backend = dtypes.BackendLanguage.Python``
 
-    Steps 2–8 are exactly the manual escape-hatch recipe: run the five
+    Steps 2–9 are exactly the manual escape-hatch recipe: run the six
     lowering passes in that order with ``strict`` of your choice, then the two
-    explicit core-API calls of steps 7 and 8.
+    explicit core-API calls of steps 8 and 9.
 
     **Canonicalization is NOT run** (parity with ``VectorizeCPUMultiDim``):
     callers wanting the full front-door flow run
@@ -71,6 +75,13 @@ class VectorizeCuTile(ppl.Pass):
                                  desc="When True, lowering-pass precondition violations raise "
                                  "ValueError instead of emitting a UserWarning.")
 
+    insert_data_copies = properties.Property(
+        dtype=bool,
+        default=True,
+        desc="When True, insert copy-in/copy-out states so the SDFG "
+        "interface accepts numpy (host) arrays instead of requiring "
+        "cupy (device) arrays.")
+
     def __init__(self,
                  widths: Tuple[int, ...],
                  remainder_strategy: Literal["full_mask", "masked_tail", "scalar_postamble"] = "full_mask",
@@ -78,7 +89,8 @@ class VectorizeCuTile(ppl.Pass):
                  loop_to_map_permissive: bool = False,
                  nest_map_bodies: bool = False,
                  fuse_overlapping_loads: bool = False,
-                 strict: bool = False):
+                 strict: bool = False,
+                 insert_data_copies: bool = True):
         """Build the orchestrator (validates the configuration eagerly).
 
         :param widths: Per-dim tile widths, innermost-last (1..3 entries, all
@@ -96,12 +108,16 @@ class VectorizeCuTile(ppl.Pass):
         :param strict: When ``True``, lowering-pass precondition violations
             (e.g. a partially-vectorized SDFG) raise ``ValueError`` instead of
             emitting a ``UserWarning``.
+        :param insert_data_copies: When ``True`` (default), run
+            :class:`CuTileInsertDataCopies` to insert copy-in/copy-out states
+            so callers can pass NumPy host arrays instead of CuPy device arrays.
         :raises NotImplementedError: On any configuration
             :class:`VectorizeCPUMultiDim` rejects (raised here, at
             construction, not at ``apply_pass`` time).
         """
         super().__init__()
         self.strict = strict
+        self.insert_data_copies = insert_data_copies
         # Eager construction: VectorizeCPUMultiDim.__init__ validates the
         # whole knob row (widths count/powers of 2, remainder/branch combos),
         # so a bad config fails fast at orchestrator construction.
@@ -140,6 +156,8 @@ class VectorizeCuTile(ppl.Pass):
         num_kernels = CuTileSetSchedules(strict=self.strict).apply_pass(sdfg, {})
         CuTileSetTileStorage(strict=self.strict).apply_pass(sdfg, {})
         CuTileSetGlobalStorage(strict=self.strict).apply_pass(sdfg, {})
+        if self.insert_data_copies:
+            CuTileInsertDataCopies(strict=self.strict).apply_pass(sdfg, {})
         CuTileSetImplementations(strict=self.strict).apply_pass(sdfg, {})
         sdfg.expand_library_nodes()
         sdfg.backend = dtypes.BackendLanguage.Python

@@ -545,7 +545,7 @@ def _apply_cutile_pipeline(sdfg: SDFG, widths=(8, )) -> None:
     :param sdfg: SDFG to transform in place.
     :param widths: Per-dim tile widths (must be powers of two).
     """
-    VectorizeCuTile(widths=widths).apply_pass(sdfg, {})
+    VectorizeCuTile(widths=widths, insert_data_copies=False).apply_pass(sdfg, {})
 
 
 def _build_cutile_vadd_sdfg(name: str, dtype=dace.float64) -> SDFG:

@@ -1,5 +1,5 @@
 # Copyright 2019-2026 ETH Zurich and the DaCe authors. All rights reserved.
-"""Structure-only unit tests (no GPU) for the five cuTile lowering passes.
+"""Structure-only unit tests (no GPU) for the six cuTile lowering passes.
 
 Each pass in :mod:`dace.transformation.passes.vectorization.cutile_lowering`
 is tested in isolation on SDFGs produced by
@@ -20,6 +20,7 @@ from dace.libraries.tileops import TileBinop
 from dace.libraries.tileops.nodes import TileIota
 from dace.sdfg import SDFG, nodes
 from dace.transformation.passes.vectorization.cutile_lowering import (
+    CuTileInsertDataCopies,
     CuTileSetGlobalStorage,
     CuTileSetImplementations,
     CuTileSetSchedules,
@@ -637,18 +638,216 @@ class TestSetImplementations:
 
 
 # ============================================================
-# 6. Ordering / full pipeline
+# 6. CuTileInsertDataCopies
+# ============================================================
+
+
+def _apply_up_to_global_storage(sdfg: SDFG) -> None:
+    """Run passes up to and including CuTileSetGlobalStorage."""
+    CuTileValidateTiles().apply_pass(sdfg, {})
+    CuTileSetSchedules().apply_pass(sdfg, {})
+    CuTileSetTileStorage().apply_pass(sdfg, {})
+    CuTileSetGlobalStorage().apply_pass(sdfg, {})
+
+
+class TestInsertDataCopies:
+
+    def test_k1_vadd_clones_three_arrays(self):
+        """K=1 vadd: A, B, C are cloned and copy states are inserted."""
+        sdfg = _build_vadd_k1_sdfg()
+        _apply_up_to_global_storage(sdfg)
+        assert CuTileInsertDataCopies().apply_pass(sdfg, {}) == 3
+
+    def test_originals_reverted_to_cpu_heap(self):
+        """After the pass, the original A, B, C descriptors are CPU_Heap."""
+        sdfg = _build_vadd_k1_sdfg()
+        _apply_up_to_global_storage(sdfg)
+        CuTileInsertDataCopies().apply_pass(sdfg, {})
+        for name in ("A", "B", "C"):
+            assert sdfg.arrays[name].storage == dtypes.StorageType.CPU_Heap, \
+                f"{name} not CPU_Heap"
+
+    def test_gpu_clones_are_gpu_global_transients(self):
+        """gpu_* clones exist and are GPU_Global transients."""
+        sdfg = _build_vadd_k1_sdfg()
+        _apply_up_to_global_storage(sdfg)
+        CuTileInsertDataCopies().apply_pass(sdfg, {})
+        for orig_name in ("A", "B", "C"):
+            gpu_name = f"gpu_{orig_name}"
+            assert gpu_name in sdfg.arrays, f"{gpu_name} not found"
+            desc = sdfg.arrays[gpu_name]
+            assert desc.storage == dtypes.StorageType.GPU_Global, \
+                f"{gpu_name} storage is {desc.storage}"
+            assert desc.transient, f"{gpu_name} is not transient"
+
+    def test_copyin_state_exists(self):
+        """A copy-in state is inserted as the new start block."""
+        sdfg = _build_vadd_k1_sdfg()
+        _apply_up_to_global_storage(sdfg)
+        CuTileInsertDataCopies().apply_pass(sdfg, {})
+        copyin = sdfg.start_block
+        assert copyin.label.endswith("_copyin"), \
+            f"start block label is {copyin.label}, expected *_copyin"
+        # It should have AccessNodes for both original and GPU names.
+        access_names = {n.data for n in copyin.nodes()
+                        if isinstance(n, nodes.AccessNode)}
+        for orig in ("A", "B", "C"):
+            assert orig in access_names, f"{orig} not in copy-in state"
+            assert f"gpu_{orig}" in access_names, \
+                f"gpu_{orig} not in copy-in state"
+
+    def test_copyout_state_exists_with_written_arrays(self):
+        """A copy-out state is inserted after all sink nodes, containing
+        only written arrays (C for vadd)."""
+        sdfg = _build_vadd_k1_sdfg()
+        _apply_up_to_global_storage(sdfg)
+        CuTileInsertDataCopies().apply_pass(sdfg, {})
+        # The copy-out state is the sole sink of the SDFG.
+        sinks = sdfg.sink_nodes()
+        assert len(sinks) == 1
+        copyout = sinks[0]
+        assert copyout.label.endswith("_copyout"), \
+            f"sink label is {copyout.label}, expected *_copyout"
+        # Copy-out should contain the written arrays.  For vadd, C is written.
+        access_names = {n.data for n in copyout.nodes()
+                        if isinstance(n, nodes.AccessNode)}
+        assert "C" in access_names, "C (written) not in copy-out"
+        assert "gpu_C" in access_names, "gpu_C not in copy-out"
+
+    def test_internal_references_use_gpu_clones(self):
+        """All computation states reference gpu_* clones, not the originals."""
+        sdfg = _build_vadd_k1_sdfg()
+        _apply_up_to_global_storage(sdfg)
+        CuTileInsertDataCopies().apply_pass(sdfg, {})
+        copyin = sdfg.start_block
+        sinks = sdfg.sink_nodes()
+        for state in sdfg.states():
+            if state is copyin or state in sinks:
+                continue
+            for node in state.nodes():
+                if isinstance(node, nodes.AccessNode):
+                    assert node.data not in ("A", "B", "C"), \
+                        f"computation state still references original {node.data}"
+
+    def test_copyin_has_full_array_memlets(self):
+        """Copy-in edges use Memlet.from_array (full-array copies)."""
+        sdfg = _build_vadd_k1_sdfg()
+        _apply_up_to_global_storage(sdfg)
+        CuTileInsertDataCopies().apply_pass(sdfg, {})
+        copyin = sdfg.start_block
+        edges = list(copyin.edges())
+        assert len(edges) == 3, f"expected 3 copy-in edges, got {len(edges)}"
+        for edge in edges:
+            assert edge.data.data is not None
+            # Source should be the CPU original, dst should be GPU clone.
+            assert isinstance(edge.src, nodes.AccessNode)
+            assert isinstance(edge.dst, nodes.AccessNode)
+            assert edge.dst.data.startswith("gpu_"), \
+                f"copy-in dst {edge.dst.data} should start with gpu_"
+
+    def test_k2_vadd_clones_three_arrays(self):
+        """K=2 vadd: same three arrays are cloned."""
+        sdfg = _build_vadd_k2_sdfg()
+        _apply_up_to_global_storage(sdfg)
+        assert CuTileInsertDataCopies().apply_pass(sdfg, {}) == 3
+
+    def test_concrete_non_divisible_boundary(self):
+        """Concrete-size (100) with non-divisible tile boundary works."""
+        sdfg = _build_vadd_concrete_sdfg()
+        _apply_up_to_global_storage(sdfg)
+        assert CuTileInsertDataCopies().apply_pass(sdfg, {}) == 3
+        for orig in ("A", "B", "C"):
+            assert sdfg.arrays[orig].storage == dtypes.StorageType.CPU_Heap
+
+    def test_idempotent_second_run(self):
+        """A second run finds no GPU_Global non-transients and returns None."""
+        sdfg = _build_vadd_k1_sdfg()
+        _apply_up_to_global_storage(sdfg)
+        CuTileInsertDataCopies().apply_pass(sdfg, {})
+        snapshot = _storage_snapshot(sdfg)
+        num_states_before = len(list(sdfg.states()))
+        assert CuTileInsertDataCopies().apply_pass(sdfg, {}) is None
+        assert _storage_snapshot(sdfg) == snapshot
+        assert len(list(sdfg.states())) == num_states_before
+
+    def test_without_schedules_warns_and_returns_none(self):
+        """Precondition: no CuTile map -> warn + None."""
+        sdfg = _build_vadd_k1_sdfg()
+        with pytest.warns(UserWarning,
+                          match="CuTileInsertDataCopies: no CuTile-scheduled map found"):
+            assert CuTileInsertDataCopies().apply_pass(sdfg, {}) is None
+
+    def test_without_schedules_strict_raises(self):
+        """``strict=True`` turns the precondition warning into ValueError."""
+        sdfg = _build_vadd_k1_sdfg()
+        with pytest.raises(ValueError, match="run CuTileSetSchedules first"):
+            CuTileInsertDataCopies(strict=True).apply_pass(sdfg, {})
+
+    def test_non_kernel_array_not_cloned(self):
+        """A non-transient array D that is NOT GPU_Global is left untouched."""
+        sdfg, _ = _build_partially_vectorized_sdfg()
+        _apply_schedules_quietly(sdfg)
+        CuTileSetTileStorage().apply_pass(sdfg, {})
+        CuTileSetGlobalStorage().apply_pass(sdfg, {})
+        d_storage = sdfg.arrays["D"].storage
+        CuTileInsertDataCopies().apply_pass(sdfg, {})
+        # D was never GPU_Global, so it should not be cloned.
+        assert "gpu_D" not in sdfg.arrays
+        assert sdfg.arrays["D"].storage == d_storage
+
+    def test_scalars_not_cloned(self):
+        """Scalar descriptors are never cloned (even if somehow GPU_Global)."""
+        sdfg = _build_vadd_k1_sdfg()
+        _apply_up_to_global_storage(sdfg)
+        # Check no scalar is in the candidates (sanity).
+        for name, desc in sdfg.arrays.items():
+            if isinstance(desc, data.Scalar):
+                assert desc.storage != dtypes.StorageType.GPU_Global
+        CuTileInsertDataCopies().apply_pass(sdfg, {})
+        # After the pass, no gpu_ clone of a scalar should exist.
+        for name, desc in sdfg.arrays.items():
+            if name.startswith("gpu_"):
+                assert isinstance(desc, data.Array), \
+                    f"{name} is a cloned Scalar, but scalars should not be cloned"
+
+    def test_state_count_increases_by_two(self):
+        """Exactly two new states (copy-in, copy-out) are added."""
+        sdfg = _build_vadd_k1_sdfg()
+        _apply_up_to_global_storage(sdfg)
+        n_before = len(list(sdfg.states()))
+        CuTileInsertDataCopies().apply_pass(sdfg, {})
+        n_after = len(list(sdfg.states()))
+        assert n_after == n_before + 2
+
+    def test_nsdfg_inner_refs_unchanged(self):
+        """``nest_map_bodies=True``: inner NSDFG connector arrays keep their
+        names (they pick up the gpu_ data via outer memlets)."""
+        sdfg = _build_vadd_k1_sdfg(nest_map_bodies=True)
+        CuTileSetSchedules().apply_pass(sdfg, {})
+        CuTileSetTileStorage().apply_pass(sdfg, {})
+        CuTileSetGlobalStorage().apply_pass(sdfg, {})
+        inner = _single_nested_sdfg(sdfg)
+        inner_names_before = set(inner.arrays.keys())
+        CuTileInsertDataCopies().apply_pass(sdfg, {})
+        inner_names_after = set(inner.arrays.keys())
+        # The inner SDFG arrays should not change (no gpu_ names added inside).
+        assert inner_names_before == inner_names_after
+
+
+# ============================================================
+# 7. Ordering / full pipeline
 # ============================================================
 
 
 class TestPipelineOrdering:
 
     def _run_full_sequence(self, sdfg: SDFG) -> None:
-        """Apply the five passes in documented order, then expand + backend."""
+        """Apply the six passes in documented order, then expand + backend."""
         CuTileValidateTiles().apply_pass(sdfg, {})
         CuTileSetSchedules().apply_pass(sdfg, {})
         CuTileSetTileStorage().apply_pass(sdfg, {})
         CuTileSetGlobalStorage().apply_pass(sdfg, {})
+        CuTileInsertDataCopies().apply_pass(sdfg, {})
         CuTileSetImplementations().apply_pass(sdfg, {})
         sdfg.expand_library_nodes()
         sdfg.backend = dtypes.BackendLanguage.Python
