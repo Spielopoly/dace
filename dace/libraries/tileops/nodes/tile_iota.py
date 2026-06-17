@@ -83,6 +83,77 @@ class ExpandTileIotaPure(ExpandTransformation):
         )
 
 
+@library.expansion
+class ExpandTileIotaCutile(ExpandTransformation):
+    """``cuda.tile``-Python expansion of :class:`TileIota`.
+
+    Emits per-lane index arrays via ``ct.arange()`` for each dimension,
+    broadcast to the full tile shape for K>=2, then evaluates the
+    node's ``expr`` as a Python expression over those lane arrays.
+    Extra inputs (``_idx``, ``_src``, ...) are tile/array connectors that
+    broadcast element-wise in the cuTile expression.
+    """
+
+    environments = []
+
+    @staticmethod
+    def expansion(node: "TileIota", parent_state: dace.SDFGState, parent_sdfg: dace.SDFG) -> nodes.Tasklet:
+        """Return a Python tasklet that fills the tile via cuTile ops.
+
+        :param node: The ``TileIota`` lib node being expanded.
+        :param parent_state: State that owns the lib node.
+        :param parent_sdfg: SDFG that owns ``parent_state``.
+        :returns: A Python-language tasklet replacing the lib node.
+        """
+        widths = list(node.widths)
+        K = len(widths)
+        inputs = {c: None for c in node.extra_inputs}
+
+        # Degenerate single-lane case: all widths are 1.
+        if all(w == 1 for w in widths):
+            expr = node.expr
+            # Safe: K is capped at 3 in __init__, so __l{p} names never overlap.
+            for p in range(K):
+                expr = expr.replace(f"__l{p}", "0")
+            for conn in node.extra_inputs:
+                expr = expr.replace(f"{conn}[0]", conn)
+            body = f"_dst = {expr}"
+            return nodes.Tasklet(
+                label=f"{node.label}_cutile",
+                inputs=inputs,
+                outputs={"_dst": None},
+                code=body,
+                language=dace.dtypes.Language.Python,
+            )
+
+        shape_tuple = ", ".join(str(w) for w in widths)
+        lines = []
+
+        # Per-dim lane-index arrays, broadcast to full tile shape for K>=2.
+        if K == 1:
+            lines.append(f"__l0 = ct.arange({widths[0]}, dtype=ct.int32)")
+        else:
+            for k in range(K):
+                slc = ["None"] * K
+                slc[k] = ":"
+                slc_str = "[" + ", ".join(slc) + "]"
+                lines.append(
+                    f"__l{k} = ct.broadcast_to("
+                    f"ct.arange({widths[k]}, dtype=ct.int32){slc_str}, "
+                    f"({shape_tuple}))")
+
+        # The expression uses __l0..__l{K-1} which are now cuTile arrays.
+        lines.append(f"_dst = {node.expr}")
+
+        return nodes.Tasklet(
+            label=f"{node.label}_cutile",
+            inputs=inputs,
+            outputs={"_dst": None},
+            code="\n".join(lines),
+            language=dace.dtypes.Language.Python,
+        )
+
+
 @library.node
 class TileIota(nodes.LibraryNode):
     """Per-lane affine / indirect fill of an integer tile.
@@ -103,10 +174,25 @@ class TileIota(nodes.LibraryNode):
     The K-fold nested loop is CPP inside the pure expansion. The IR
     level above is a tile op — ``EmitTileOps`` / ``PromoteNSDFGBodyToTiles``
     never emit a raw CPP tasklet for these fills.
+
+    :cvar implementations: Per-target expansions; ``"pure"`` is the
+        CPP-loop correctness fallback. ``"cutile"`` emits the
+        :mod:`cuda.tile`-Python equivalent (opt-in; the cuTile pipeline
+        stamps it before expansion).
+    :cvar default_implementation: ``"pure"``.
     """
 
-    implementations = {"pure": ExpandTileIotaPure}
+    implementations = {"pure": ExpandTileIotaPure, "cutile": ExpandTileIotaCutile}
     default_implementation = "pure"
+
+    target_isa = properties.Property(
+        dtype=str,
+        allow_none=False,
+        default="SCALAR",
+        desc="CPU target ISA the Auto-dispatch lowers to for K==1 "
+        "(SCALAR | AVX512 | AVX2 | ARM_SVE | ARM_NEON | CUTILE); K>=2 is pure. "
+        "Stamped by the VectorizeCPUMultiDim orchestrator before expansion.",
+    )
 
     widths = properties.ListProperty(
         element_type=int,

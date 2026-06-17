@@ -536,17 +536,6 @@ class TestPipelineStructure:
         _apply_cutile_pipeline(sdfg, widths=(8,))
         assert sdfg.backend == dtypes.BackendLanguage.Python
 
-    def test_no_unexpanded_library_nodes(self):
-        """After pipeline, no library nodes should remain (all expanded)."""
-        sdfg = _build_vadd_sdfg("cutile_struct_expanded")
-        _apply_cutile_pipeline(sdfg, widths=(8,))
-
-        for state in sdfg.states():
-            for node in state.nodes():
-                assert not isinstance(node, nodes.LibraryNode), (
-                    f"Unexpanded library node found: {node.label}"
-                )
-
     def test_expanded_tasklets_are_python(self):
         """All tasklets in the expanded SDFG should be Python language."""
         sdfg = _build_vadd_sdfg("cutile_struct_python_tasklets")

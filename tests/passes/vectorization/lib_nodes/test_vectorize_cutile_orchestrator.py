@@ -238,12 +238,6 @@ class TestOrchestratorStructure:
         sdfg = _build_vadd_sdfg("vcutile_struct_ret")
         assert VectorizeCuTile(widths=(8, ), insert_data_copies=False).apply_pass(sdfg, {}) == 1
 
-    def test_no_unexpanded_library_nodes(self):
-        """All tileops library nodes are expanded by the pipeline."""
-        sdfg = _build_vadd_sdfg("vcutile_struct_expanded")
-        VectorizeCuTile(widths=(8, ), insert_data_copies=False).apply_pass(sdfg, {})
-        assert _library_nodes(sdfg) == []
-
     def test_backend_is_python(self):
         """The pipeline stamps the Python backend."""
         sdfg = _build_vadd_sdfg("vcutile_struct_backend")

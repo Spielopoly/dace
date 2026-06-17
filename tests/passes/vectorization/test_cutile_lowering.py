@@ -192,7 +192,7 @@ def _build_bare_tile_binop_sdfg(widths: Tuple[int, ...]) -> SDFG:
 
 
 def _build_tile_iota_sdfg() -> SDFG:
-    """Hand-built SDFG holding a ``TileIota`` (which has no 'cutile' impl)."""
+    """Hand-built SDFG holding a ``TileIota`` with a 'cutile' expansion."""
     sdfg = dace.SDFG("cutile_lowering_iota")
     sdfg.add_array("I", (8, ), dace.int64, transient=False)
     state = sdfg.add_state("main")
@@ -621,12 +621,37 @@ class TestSetImplementations:
         with pytest.raises(ValueError, match="already expanded"):
             CuTileSetImplementations(strict=True).apply_pass(sdfg, {})
 
-    def test_node_without_cutile_implementation_raises(self):
-        """``TileIota`` ships only 'pure': stamping must fail loudly, not
-        fall back silently."""
+    def test_tile_iota_stamped_cutile(self):
+        """``TileIota`` ships 'cutile': stamping succeeds."""
         sdfg = _build_tile_iota_sdfg()
-        with pytest.raises(ValueError, match="has no 'cutile' implementation"):
-            CuTileSetImplementations().apply_pass(sdfg, {})
+        assert CuTileSetImplementations().apply_pass(sdfg, {}) == 1
+        for node, _ in _tileops_nodes(sdfg):
+            assert node.target_isa == "CUTILE"
+            assert node.implementation == "cutile"
+
+    def test_tile_iota_expands_to_python_tasklet(self):
+        """``TileIota`` stamped 'cutile' expands to a Python tasklet."""
+        sdfg = _build_tile_iota_sdfg()
+        CuTileSetImplementations().apply_pass(sdfg, {})
+        sdfg.expand_library_nodes()
+        assert not any(isinstance(n, nodes.LibraryNode) for n, _ in sdfg.all_nodes_recursive())
+        tasklets = [n for n, _ in sdfg.all_nodes_recursive() if isinstance(n, nodes.Tasklet)]
+        assert len(tasklets) == 1
+        body = tasklets[0].code.as_string
+        assert "ct.arange" in body
+        assert "_dst" in body
+
+    def test_node_without_cutile_implementation_raises(self):
+        """A tileops node that lacks ``'cutile'`` in its implementations
+        dict must fail loudly, not fall back silently."""
+        from unittest.mock import patch
+        sdfg = _build_tile_iota_sdfg()
+        # Temporarily remove 'cutile' from TileIota.implementations so
+        # the error path triggers.  patch.dict restores the original on
+        # exit, so other tests are not affected.
+        with patch.dict(TileIota.implementations, {"pure": TileIota.implementations["pure"]}, clear=True):
+            with pytest.raises(ValueError, match="has no 'cutile' implementation"):
+                CuTileSetImplementations().apply_pass(sdfg, {})
 
     def test_idempotent_second_run(self):
         sdfg = _build_vadd_k1_sdfg()

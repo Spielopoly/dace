@@ -80,5 +80,139 @@ def test_tile_iota_pure_expansion_smoke():
     assert n_tasklets == 1
 
 
+def test_tile_iota_cutile_expansion_smoke():
+    """End-to-end: a ``TileIota`` wired into a K=1 inner map expands to a
+    Python tasklet emitting ``ct.arange`` when implementation is 'cutile'."""
+    from dace.libraries.tileops import TileIota
+    sdfg = dace.SDFG("iota_cutile_smoke")
+    sdfg.add_array("OUT", [8], dace.int64)
+    sdfg.add_array("_tile", [8], dace.int64, storage=dace.dtypes.StorageType.Register, transient=True)
+    state = sdfg.add_state()
+    me, mx = state.add_map("m", {"i": "0:1"})
+    iota = TileIota("iota_x", widths=(8,), expr="i + __l0")
+    iota.implementation = "cutile"
+    state.add_node(iota)
+    state.add_nedge(me, iota, dace.Memlet())
+    tile_acc = state.add_access("_tile")
+    state.add_edge(iota, "_dst", tile_acc, None, dace.Memlet("_tile[0:8]"))
+    state.add_nedge(tile_acc, mx, dace.Memlet())
+    out_acc = state.add_access("OUT")
+    state.add_nedge(mx, out_acc, dace.Memlet())
+    sdfg.validate()
+
+    sdfg.expand_library_nodes()
+    sdfg.validate()
+    # After expansion the lib node is gone; a Python tasklet replaces it.
+    n_lib_nodes = sum(1 for n, _ in sdfg.all_nodes_recursive() if isinstance(n, dace.nodes.LibraryNode))
+    n_tasklets = sum(1 for n, _ in sdfg.all_nodes_recursive() if isinstance(n, dace.nodes.Tasklet))
+    assert n_lib_nodes == 0
+    assert n_tasklets == 1
+    # Verify the tasklet is Python language and uses ct.arange.
+    for n, _ in sdfg.all_nodes_recursive():
+        if isinstance(n, dace.nodes.Tasklet):
+            assert n.language == dace.dtypes.Language.Python
+            assert "ct.arange" in n.code.as_string
+
+
+def test_tile_iota_cutile_expansion_k2_smoke():
+    """K=2 cuTile expansion broadcasts lane indices to full tile shape."""
+    from dace.libraries.tileops import TileIota
+    sdfg = dace.SDFG("iota_cutile_k2")
+    sdfg.add_array("OUT", [2, 4], dace.int64)
+    sdfg.add_array("_tile", [2, 4], dace.int64, storage=dace.dtypes.StorageType.Register, transient=True)
+    state = sdfg.add_state()
+    me, mx = state.add_map("m", {"i": "0:1"})
+    iota = TileIota("iota_x", widths=(2, 4), expr="__l0 * 4 + __l1")
+    iota.implementation = "cutile"
+    state.add_node(iota)
+    state.add_nedge(me, iota, dace.Memlet())
+    tile_acc = state.add_access("_tile")
+    state.add_edge(iota, "_dst", tile_acc, None, dace.Memlet("_tile[0:2, 0:4]"))
+    state.add_nedge(tile_acc, mx, dace.Memlet())
+    out_acc = state.add_access("OUT")
+    state.add_nedge(mx, out_acc, dace.Memlet())
+    sdfg.validate()
+
+    sdfg.expand_library_nodes()
+    sdfg.validate()
+    # After expansion the lib node is gone.
+    n_lib_nodes = sum(1 for n, _ in sdfg.all_nodes_recursive() if isinstance(n, dace.nodes.LibraryNode))
+    assert n_lib_nodes == 0
+    # Verify the tasklet uses Python language and ct.broadcast_to for K>=2.
+    for n, _ in sdfg.all_nodes_recursive():
+        if isinstance(n, dace.nodes.Tasklet):
+            assert n.language == dace.dtypes.Language.Python
+            assert "ct.broadcast_to" in n.code.as_string
+
+
+def test_tile_iota_cutile_expansion_single_lane():
+    """Single-lane (all widths = 1) cuTile expansion: no ct.arange,
+    lane vars substituted to 0."""
+    from dace.libraries.tileops import TileIota
+    sdfg = dace.SDFG("iota_cutile_w1")
+    sdfg.add_array("OUT", [1], dace.int64)
+    sdfg.add_array("_tile", [1], dace.int64, storage=dace.dtypes.StorageType.Register, transient=True)
+    state = sdfg.add_state()
+    me, mx = state.add_map("m", {"i": "0:1"})
+    iota = TileIota("iota_x", widths=(1,), expr="i + __l0")
+    iota.implementation = "cutile"
+    state.add_node(iota)
+    state.add_nedge(me, iota, dace.Memlet())
+    tile_acc = state.add_access("_tile")
+    state.add_edge(iota, "_dst", tile_acc, None, dace.Memlet("_tile[0:1]"))
+    state.add_nedge(tile_acc, mx, dace.Memlet())
+    out_acc = state.add_access("OUT")
+    state.add_nedge(mx, out_acc, dace.Memlet())
+    sdfg.validate()
+
+    sdfg.expand_library_nodes()
+    sdfg.validate()
+    n_lib_nodes = sum(1 for n, _ in sdfg.all_nodes_recursive() if isinstance(n, dace.nodes.LibraryNode))
+    assert n_lib_nodes == 0
+    for n, _ in sdfg.all_nodes_recursive():
+        if isinstance(n, dace.nodes.Tasklet):
+            assert n.language == dace.dtypes.Language.Python
+            # Lane var substituted to 0, no ct.arange in single-lane case.
+            code = n.code.as_string
+            assert "ct.arange" not in code
+            # The expression body may be parenthesised, e.g. ``(i + 0)``.
+            assert "_dst" in code and "i + 0" in code
+
+
+def test_tile_iota_cutile_expansion_with_extra_input():
+    """cuTile expansion with an ``extra_inputs`` connector (e.g. ``_idx``)
+    passes it through to the tasklet's input set."""
+    from dace.libraries.tileops import TileIota
+    sdfg = dace.SDFG("iota_cutile_idx")
+    sdfg.add_array("IDX", [8], dace.int64)
+    sdfg.add_array("OUT", [8], dace.int64)
+    sdfg.add_array("_tile", [8], dace.int64, storage=dace.dtypes.StorageType.Register, transient=True)
+    state = sdfg.add_state()
+    me, mx = state.add_map("m", {"i": "0:1"})
+    iota = TileIota("iota_idx", widths=(8,), expr="_idx[__l0]", extra_inputs=("_idx",))
+    iota.implementation = "cutile"
+    state.add_node(iota)
+    state.add_nedge(me, iota, dace.Memlet())
+    idx_acc = state.add_access("IDX")
+    state.add_edge(idx_acc, None, iota, "_idx", dace.Memlet("IDX[0:8]"))
+    tile_acc = state.add_access("_tile")
+    state.add_edge(iota, "_dst", tile_acc, None, dace.Memlet("_tile[0:8]"))
+    state.add_nedge(tile_acc, mx, dace.Memlet())
+    out_acc = state.add_access("OUT")
+    state.add_nedge(mx, out_acc, dace.Memlet())
+    sdfg.validate()
+
+    sdfg.expand_library_nodes()
+    sdfg.validate()
+    n_lib_nodes = sum(1 for n, _ in sdfg.all_nodes_recursive() if isinstance(n, dace.nodes.LibraryNode))
+    assert n_lib_nodes == 0
+    for n, _ in sdfg.all_nodes_recursive():
+        if isinstance(n, dace.nodes.Tasklet):
+            assert n.language == dace.dtypes.Language.Python
+            assert "_idx" in n.in_connectors
+            assert "ct.arange" in n.code.as_string
+            assert "_idx[__l0]" in n.code.as_string
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-q"])

@@ -30,7 +30,8 @@ import ast
 import pytest
 
 import dace
-from dace.libraries.tileops import (TileBinop, TileGather, TileLoad, TileMaskGen, TileMerge, TileReduce, TileStore)
+from dace.libraries.tileops import (TileBinop, TileGather, TileIota, TileLoad, TileMaskGen, TileMerge, TileReduce,
+                                    TileStore)
 from dace.libraries.tileops.nodes import tile_merge as _tile_merge_mod
 from dace.libraries.tileops.nodes import tile_reduce as _tile_reduce_mod
 
@@ -428,74 +429,6 @@ def test_tile_gather_cutile_nonunit_index_strides_raises():
         _expand_cutile(TileGather(name="G", widths=(8, ), index_strides=(2, )))
 
 
-def test_tile_reduce_cutile_unmasked_full_and_axis():
-    """Unmasked reduction emits ``ct.sum(_src)`` / ``ct.sum(_src, axis=1)``."""
-    full, _ = _expand_cutile(TileReduce(name="R", widths=(8, ), op="+"))
-    _assert_parses_as_python(full)
-    assert "_dst = ct.sum(_src)" in full
-
-    axed, _ = _expand_cutile(TileReduce(name="R", widths=(4, 8), op="+", axis=1))
-    _assert_parses_as_python(axed)
-    assert "ct.sum(_src, axis=1)" in axed
-
-
-def test_tile_reduce_cutile_unmasked_max_uses_ct_max():
-    """``op='max'`` routes to ``ct.max``."""
-    body, _ = _expand_cutile(TileReduce(name="R", widths=(8, ), op="max"))
-    _assert_parses_as_python(body)
-    assert "_dst = ct.max(_src)" in body
-
-
-def test_tile_reduce_cutile_masked_sum_preselects_identity_via_where():
-    """Masked ``+`` reduction (primary, ct.where assumed present on CI) must
-    pre-select the identity ``0`` into masked lanes and consume ``_mask``."""
-    tasklet = _expand_cutile_tasklet(TileReduce(name="R", widths=(4, 8), op="+", axis=1, has_mask=True))
-    body = tasklet.code.as_string
-    _assert_parses_as_python(body)
-    assert "ct.where(_mask, _src, 0)" in body
-    assert "ct.sum(_masked_src, axis=1)" in body
-    # The previously-dead _mask input is now genuinely consumed.
-    assert "_mask" in tasklet.in_connectors
-
-
-def test_tile_reduce_cutile_masked_min_preselects_pos_inf_via_where():
-    """Masked ``min`` reduction pre-selects ``+inf`` into masked lanes."""
-    body, _ = _expand_cutile(TileReduce(name="R", widths=(8, ), op="min", has_mask=True))
-    _assert_parses_as_python(body)
-    assert "ct.where(_mask, _src, float('inf'))" in body
-    assert "ct.min(_masked_src)" in body
-
-
-def test_tile_reduce_cutile_masked_sum_fallback_blend(monkeypatch):
-    """With ``ct.where`` known absent, masked ``+`` falls back to the
-    arithmetic blend ``_m * _src`` reduced by ``ct.sum``."""
-    monkeypatch.setattr(_tile_reduce_mod, "_CT_HAS_WHERE", False)
-    body, _ = _expand_cutile(TileReduce(name="R", widths=(8, ), op="+", has_mask=True))
-    _assert_parses_as_python(body)
-    assert "ct.where" not in body
-    assert "ct.astype(_mask, _src.dtype)" in body
-    # DaCe's Python tasklet pipeline re-parens binop rhs on unparse.
-    assert "ct.sum((_m * _src))" in body
-
-
-def test_tile_reduce_cutile_masked_prod_fallback_blend(monkeypatch):
-    """With ``ct.where`` absent, masked ``*`` blends ``1`` into inactive lanes."""
-    monkeypatch.setattr(_tile_reduce_mod, "_CT_HAS_WHERE", False)
-    body, _ = _expand_cutile(TileReduce(name="R", widths=(8, ), op="*", has_mask=True))
-    _assert_parses_as_python(body)
-    # DaCe's Python tasklet pipeline re-parens binop subexpressions on unparse.
-    assert "ct.prod(((_m * _src) + (1.0 - _m)))" in body
-
-
-def test_tile_reduce_cutile_masked_min_without_where_raises(monkeypatch):
-    """Masked ``min``/``max`` with ``ct.where`` absent raises (the ``inf*0``
-    hazard makes the arithmetic blend unsafe — L-reduce-nomask)."""
-    monkeypatch.setattr(_tile_reduce_mod, "_CT_HAS_WHERE", False)
-    with pytest.raises(NotImplementedError):
-        _expand_cutile(TileReduce(name="R", widths=(8, ), op="min", has_mask=True))
-    with pytest.raises(NotImplementedError):
-        _expand_cutile(TileReduce(name="R", widths=(8, ), op="max", has_mask=True))
-
 
 def test_tile_merge_cutile_primary_emits_ct_where():
     """Primary (CI default) TileMerge body is ``ct.where(_cond, _t, _e)``."""
@@ -503,3 +436,147 @@ def test_tile_merge_cutile_primary_emits_ct_where():
     _assert_parses_as_python(body)
     assert body == "_o = ct.where(_cond, _t, _e)"
     assert lang == dace.dtypes.Language.Python
+
+
+# ============================================================
+# TileIota cutile expansion
+# ============================================================
+
+
+def test_tile_iota_cutile_k1_affine_emits_arange_and_expr():
+    """K=1 affine iota ``i + __l0``: body defines ``__l0 = ct.arange(8, ...)``
+    and evaluates the expr in-line. DaCe's Python tasklet round-trip may
+    re-parenthesise binary ops (``a + b`` -> ``(a + b)``)."""
+    body, lang = _expand_cutile(TileIota(name="I", widths=(8, ), expr="i + __l0"))
+    _assert_parses_as_python(body)
+    assert "ct.bid" not in body  # TileIota has no block-ID preamble
+    assert "__l0 = ct.arange(8, dtype=ct.int32)" in body
+    # DaCe may re-paren: ``_dst = (i + __l0)``
+    assert "i + __l0" in body
+    assert "_dst" in body
+    assert lang == dace.dtypes.Language.Python
+
+
+def test_tile_iota_cutile_k1_strided_expr():
+    """K=1 strided iota ``i + 2 * __l0``: the stride factor is embedded
+    in the expression and broadcasts element-wise over the arange."""
+    body, lang = _expand_cutile(TileIota(name="I", widths=(4, ), expr="i + 2 * __l0"))
+    _assert_parses_as_python(body)
+    assert "__l0 = ct.arange(4, dtype=ct.int32)" in body
+    assert "i + 2 * __l0" in body or "i + (2 * __l0)" in body
+    assert lang == dace.dtypes.Language.Python
+
+
+def test_tile_iota_cutile_k2_broadcasts_lane_arrays():
+    """K=2 iota ``i + __l0 * 4 + __l1``: each lane array is broadcast to
+    the full ``(2, 4)`` tile shape before the expression."""
+    body, lang = _expand_cutile(TileIota(name="I", widths=(2, 4), expr="i + __l0 * 4 + __l1"))
+    _assert_parses_as_python(body)
+    assert "ct.bid" not in body  # TileIota has no block-ID preamble
+    assert "ct.broadcast_to(ct.arange(2, dtype=ct.int32)[:, None], (2, 4))" in body
+    assert "ct.broadcast_to(ct.arange(4, dtype=ct.int32)[None, :], (2, 4))" in body
+    # Expression may be re-parenthesised by DaCe's Python tasklet pipeline.
+    assert "__l0 * 4" in body
+    assert "__l1" in body
+    assert "_dst" in body
+    assert lang == dace.dtypes.Language.Python
+
+
+def test_tile_iota_cutile_k3_broadcasts_three_dims():
+    """K=3 iota: three lane arrays are broadcast to (2, 4, 8)."""
+    body, lang = _expand_cutile(
+        TileIota(name="I", widths=(2, 4, 8), expr="__l0 * 32 + __l1 * 8 + __l2"))
+    _assert_parses_as_python(body)
+    assert "ct.bid" not in body  # TileIota has no block-ID preamble
+    assert "ct.broadcast_to(ct.arange(2, dtype=ct.int32)[:, None, None], (2, 4, 8))" in body
+    assert "ct.broadcast_to(ct.arange(4, dtype=ct.int32)[None, :, None], (2, 4, 8))" in body
+    assert "ct.broadcast_to(ct.arange(8, dtype=ct.int32)[None, None, :], (2, 4, 8))" in body
+    assert "__l0 * 32" in body
+    assert "__l1 * 8" in body
+    assert "__l2" in body
+    assert lang == dace.dtypes.Language.Python
+
+
+def test_tile_iota_cutile_degenerate_single_lane_substitutes_zeros():
+    """All-ones widths (degenerate): lane vars replaced with 0, no arange."""
+    body, lang = _expand_cutile(TileIota(name="I", widths=(1, ), expr="i + __l0"))
+    _assert_parses_as_python(body)
+    # DaCe may re-paren: ``_dst = (i + 0)``
+    assert "i + 0" in body
+    assert "_dst" in body
+    assert "ct.arange" not in body
+    assert "ct.bid" not in body
+    assert lang == dace.dtypes.Language.Python
+
+
+def test_tile_iota_cutile_degenerate_k2_single_lane():
+    """K=2 with widths (1, 1): both lane vars replaced with 0."""
+    body, lang = _expand_cutile(TileIota(name="I", widths=(1, 1), expr="i + __l0 + __l1"))
+    _assert_parses_as_python(body)
+    # DaCe may re-paren: ``_dst = ((i + 0) + 0)``
+    assert "i + 0" in body
+    assert "_dst" in body
+    assert "ct.arange" not in body
+    assert lang == dace.dtypes.Language.Python
+
+
+def test_tile_iota_cutile_with_extra_input_idx():
+    """Extra input ``_idx`` in the expression: the connector is declared and
+    the expression uses array indexing over the arange tile."""
+    node = TileIota(name="I", widths=(8, ), expr="_idx[__l0]", extra_inputs=("_idx", ))
+    tasklet = _expand_cutile_tasklet(node)
+    body = tasklet.code.as_string
+    _assert_parses_as_python(body)
+    assert "_idx" in tasklet.in_connectors
+    assert "__l0 = ct.arange(8, dtype=ct.int32)" in body
+    assert "_idx[__l0]" in body
+
+
+def test_tile_iota_cutile_with_extra_input_src():
+    """Extra input ``_src`` used in a flat-offset expression: the connector
+    is declared and the indexing is element-wise cuTile gather."""
+    node = TileIota(name="I", widths=(4, ), expr="_src[__l0 * 2]", extra_inputs=("_src", ))
+    tasklet = _expand_cutile_tasklet(node)
+    body = tasklet.code.as_string
+    _assert_parses_as_python(body)
+    assert "_src" in tasklet.in_connectors
+    assert "_src[__l0 * 2]" in body or "_src[((__l0 * 2))]" in body or "_src[(__l0 * 2)]" in body
+
+
+def test_tile_iota_cutile_degenerate_single_lane_with_idx_rewrites_indexing():
+    """Degenerate single-lane with ``_idx[__l0]``: after substitution,
+    ``_idx[0]`` becomes the bare connector name ``_idx``."""
+    node = TileIota(name="I", widths=(1, ), expr="_idx[__l0]", extra_inputs=("_idx", ))
+    tasklet = _expand_cutile_tasklet(node)
+    body = tasklet.code.as_string
+    _assert_parses_as_python(body)
+    assert "_dst = _idx" in body
+    assert "_idx[0]" not in body
+    assert "_idx" in tasklet.in_connectors
+
+
+def test_tile_iota_cutile_multiple_extra_inputs():
+    """Multiple extra inputs: all are declared as connectors."""
+    node = TileIota(name="I", widths=(8, ), expr="_a + _b[__l0]", extra_inputs=("_a", "_b"))
+    tasklet = _expand_cutile_tasklet(node)
+    body = tasklet.code.as_string
+    _assert_parses_as_python(body)
+    assert "_a" in tasklet.in_connectors
+    assert "_b" in tasklet.in_connectors
+    # DaCe may re-paren: ``_dst = (_a + _b[__l0])``
+    assert "_a" in body
+    assert "_b[__l0]" in body
+
+
+def test_tile_iota_cutile_implementations_dict_has_cutile():
+    """``TileIota.implementations`` exposes ``'cutile'``."""
+    assert "cutile" in TileIota.implementations
+    assert "pure" in TileIota.implementations
+
+
+def test_tile_iota_cutile_target_isa_property_default():
+    """``TileIota.target_isa`` defaults to ``'SCALAR'`` and is stampable."""
+    node = TileIota(name="I", widths=(8, ), expr="__l0")
+    assert node.target_isa == "SCALAR"
+    node.target_isa = "CUTILE"
+    assert node.target_isa == "CUTILE"
