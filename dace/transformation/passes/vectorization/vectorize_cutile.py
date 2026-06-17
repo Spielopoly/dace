@@ -84,13 +84,15 @@ class VectorizeCuTile(ppl.Pass):
 
     def __init__(self,
                  widths: Tuple[int, ...],
+                 *,
                  remainder_strategy: Literal["full_mask", "masked_tail", "scalar_postamble"] = "full_mask",
                  branch_mode: Literal["merge", "fp_factor"] = "merge",
                  loop_to_map_permissive: bool = False,
                  nest_map_bodies: bool = False,
                  fuse_overlapping_loads: bool = False,
                  strict: bool = False,
-                 insert_data_copies: bool = True):
+                 insert_data_copies: bool = True,
+                 debug_save: bool = False):
         """Build the orchestrator (validates the configuration eagerly).
 
         :param widths: Per-dim tile widths, innermost-last (1..3 entries, all
@@ -118,6 +120,7 @@ class VectorizeCuTile(ppl.Pass):
         super().__init__()
         self.strict = strict
         self.insert_data_copies = insert_data_copies
+        self._debug_save = debug_save
         # Eager construction: VectorizeCPUMultiDim.__init__ validates the
         # whole knob row (widths count/powers of 2, remainder/branch combos),
         # so a bad config fails fast at orchestrator construction.
@@ -151,14 +154,30 @@ class VectorizeCuTile(ppl.Pass):
             or unconditionally on non-power-of-2 widths / a tile-op node type
             without a ``'cutile'`` implementation.
         """
+        
+        import time
+        DEBUG_SAVE_NAME = "/workspace/cutile_pipeline_debug/" + str(int(time.time())) + "/stage_{stage}.sdfg"
+        
+        stage = 0
+        
+        def debug_save_sdfg():
+            nonlocal stage
+            if self._debug_save:
+                sdfg.save(DEBUG_SAVE_NAME.format(stage=stage))
+                stage += 1
+
+        debug_save_sdfg()
         self._vectorizer.apply_pass(sdfg, {})
+        debug_save_sdfg()
         CuTileValidateTiles(strict=self.strict).apply_pass(sdfg, {})
+        debug_save_sdfg()
         num_kernels = CuTileSetSchedules(strict=self.strict).apply_pass(sdfg, {})
         CuTileSetTileStorage(strict=self.strict).apply_pass(sdfg, {})
         CuTileSetGlobalStorage(strict=self.strict).apply_pass(sdfg, {})
+        debug_save_sdfg()
         if self.insert_data_copies:
             CuTileInsertDataCopies(strict=self.strict).apply_pass(sdfg, {})
         CuTileSetImplementations(strict=self.strict).apply_pass(sdfg, {})
-        sdfg.expand_library_nodes()
         sdfg.backend = dtypes.BackendLanguage.Python
+        debug_save_sdfg()
         return num_kernels
