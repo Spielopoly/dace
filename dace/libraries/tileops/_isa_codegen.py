@@ -16,7 +16,66 @@ import dace
 from dace.sdfg import nodes
 from dace.symbolic import symstr
 
-from ._pure_codegen import nested_loops, tile_offset
+# ISA backends shared by every tile-op node: (implementation key, class-name
+# suffix, environment attribute on ``..environments``). Each backend exposes the
+# SAME ``dace::tileops::tile_<op>`` signature and differs ONLY in the header its
+# environment pulls in -- so a single factory builds all five expansion classes.
+_ISA_BACKENDS = (
+    ("scalar", "Scalar", "TileOpsScalar"),
+    ("avx512", "AVX512", "TileOpsAVX512"),
+    ("avx2", "AVX2", "TileOpsAVX2"),
+    ("neon", "Neon", "TileOpsNeon"),
+    ("sve", "SVE", "TileOpsSVE"),
+    ("cuda", "CUDA", "TileOpsCUDA"),
+)
+
+
+def make_isa_expansions(node_label: str, maker, module_globals: dict) -> dict:
+    """Build the five per-ISA ``ExpandTransformation`` classes for a tile-op node.
+
+    Every tile-op node (``TileBinop`` / ``TileUnop`` / ``TileITE`` / ``TileLoad``
+    / ``TileStore`` / ``TileMaskGen``) exposes the same five K=1 ISA backends,
+    each of which just calls the op's ``maker(node, state, sdfg, key)`` builder;
+    the only per-class difference is the environment (hence the backend header)
+    it declares. This factory replaces the five hand-written, near-identical
+    expansion classes per node (~30 classes across the package).
+
+    Each class is given the same ``__name__`` / ``__qualname__`` the hand-written
+    class had (``ExpandTile<node_label><Suffix>``) and is bound into
+    ``module_globals`` so any transformation lookup by qualified name still
+    resolves. The SDFG only ever serializes the implementation KEY (``"avx512"``)
+    and re-resolves the class from the node's in-code ``implementations`` map, so
+    the factory-built classes round-trip identically to the hand-written ones.
+
+    :param node_label: The node's CamelCase tag, e.g. ``"Binop"`` / ``"MaskGen"``.
+    :param maker: The op's tasklet builder ``(node, state, sdfg, key) -> Tasklet``.
+    :param module_globals: The defining module's ``globals()`` (for name binding).
+    :returns: ``{"scalar": cls, "avx512": cls, "avx2": cls, "neon": cls, "sve": cls}``
+        ready to splice into the node's ``implementations`` mapping.
+    """
+    from dace import library
+    from dace.transformation.transformation import ExpandTransformation
+    from . import environments as _env
+    out = {}
+    for key, suffix, env_name in _ISA_BACKENDS:
+        cls_name = f"ExpandTile{node_label}{suffix}"
+
+        def _expansion(node, parent_state, parent_sdfg, _maker=maker, _key=key):
+            return _maker(node, parent_state, parent_sdfg, _key)
+
+        cls = type(
+            cls_name, (ExpandTransformation, ), {
+                "environments": [getattr(_env, env_name)],
+                "expansion": staticmethod(_expansion),
+                "__doc__": f"{key} ISA lowering of Tile{node_label} (calls "
+                f"_isa_codegen.{maker.__name__}; the {env_name} environment pulls in the header).",
+                "__module__": module_globals.get("__name__", __name__),
+                "__qualname__": cls_name,
+            })
+        out[key] = library.expansion(cls)
+        module_globals[cls_name] = out[key]
+    return out
+
 
 # TileBinop.op -> the single-char op code the backend headers template on
 # (``dace::tileops::tile_binop<T, VLEN, Op, ...>``; legend in scalar.h).
@@ -84,6 +143,41 @@ def _in_ctype(node, parent_state, parent_sdfg, in_conn: str) -> str:
     return parent_sdfg.arrays[e.data.data].dtype.ctype
 
 
+def _resolve_operand_ctype(node, parent_state, parent_sdfg, conns, out_dtype: str) -> str:
+    """Resolve the C++ type the VALUE operands share (mirror of
+    ``ExpandTileBinopPure._operand_dtype``).
+
+    Prefer a data operand's (``_TILE`` / ``_SCALAR``) descriptor dtype; else a
+    symbol operand's declared type; else fall back to ``out_dtype``. Used to
+    decide whether the single-``T`` ISA runtime can carry this op (operands and
+    output share a type) or whether it must defer to the ``pure`` expansion
+    (operands and output differ -- a comparison's ``double`` operands vs ``bool``
+    output). The ISA runtime is type-strict (``out``, ``a``, ``b`` are all
+    ``T*``), so a mismatch would force a value-truncating ``(out_dtype)`` cast on
+    the operands; per user direction 2026-06-15 such a C-style cast is always
+    incorrect code, so we route to ``pure`` instead.
+    """
+    in_e = {e.dst_conn: e for e in parent_state.in_edges(node) if e.dst_conn is not None}
+    for kind, conn in conns:
+        if kind in (_TILE, _SCALAR) and conn in in_e:
+            return parent_sdfg.arrays[in_e[conn].data.data].dtype.ctype
+    for kind, conn, expr in [(k, c, e) for (k, c), e in zip(conns, _operand_exprs(node, conns))]:
+        if kind == _SYMBOL and expr:
+            try:
+                for s in dace.symbolic.symlist(dace.symbolic.pystr_to_symbolic(expr)):
+                    if str(s) in parent_sdfg.symbols:
+                        return parent_sdfg.symbols[str(s)].ctype
+            except Exception:  # noqa: BLE001
+                pass
+    return out_dtype
+
+
+def _operand_exprs(node, conns):
+    """Per-operand inline ``expr_*`` strings, aligned with ``conns`` order."""
+    mapping = {"_a": node.expr_a, "_b": getattr(node, "expr_b", None)}
+    return [mapping.get(conn) for _kind, conn in conns]
+
+
 def _scalar_ref(conn: str, desc, subset) -> str:
     """C++ reference for a Scalar/broadcast operand connector.
 
@@ -116,6 +210,18 @@ def make_binop_tasklet(node, parent_state, parent_sdfg, suffix: str) -> nodes.Ta
     vlen = _require_k1(node)
     in_e = {e.dst_conn: e for e in parent_state.in_edges(node) if e.dst_conn is not None}
     out_dtype = _out_ctype(node, parent_state, parent_sdfg, "_c")
+    # The single-``T`` ISA runtime cannot carry an op whose operands and output
+    # differ in type (a comparison: ``double`` operands, ``bool`` output). The
+    # old code forced ``T = out_dtype`` and cast each operand to it -- truncating
+    # ``(bool)1e-12 -> 1`` and corrupting the predicate. Defer to the ``pure``
+    # expansion (which keeps operands at their own dtype and stores the result
+    # with the natural implicit conversion) instead of emitting an incorrect
+    # C-style cast (user direction 2026-06-15).
+    operand_ctype = _resolve_operand_ctype(node, parent_state, parent_sdfg, [(node.kind_a, "_a"), (node.kind_b, "_b")],
+                                           out_dtype)
+    if operand_ctype != out_dtype:
+        from dace.libraries.tileops.nodes.tile_binop import ExpandTileBinopPure
+        return ExpandTileBinopPure.expansion(node, parent_state, parent_sdfg)
     pre = []
 
     def operand(kind, conn, expr):
@@ -176,6 +282,13 @@ def make_unop_tasklet(node, parent_state, parent_sdfg, suffix: str) -> nodes.Tas
     vlen = _require_k1(node)
     in_e = {e.dst_conn: e for e in parent_state.in_edges(node) if e.dst_conn is not None}
     out_dtype = _out_ctype(node, parent_state, parent_sdfg, "_c")
+    # Defer mixed operand/output-type unops (e.g. logical ``not`` of a numeric
+    # tile -> bool) to the ``pure`` expansion rather than casting the operand to
+    # the output type (user direction 2026-06-15: never emit a C-style cast).
+    operand_ctype = _resolve_operand_ctype(node, parent_state, parent_sdfg, [(node.kind_a, "_a")], out_dtype)
+    if operand_ctype != out_dtype:
+        from dace.libraries.tileops.nodes.tile_unop import ExpandTileUnopPure
+        return ExpandTileUnopPure.expansion(node, parent_state, parent_sdfg)
     pre = []
     if node.kind_a == _TILE:
         src = parent_sdfg.arrays[in_e["_a"].data.data].dtype.ctype
@@ -217,25 +330,23 @@ def make_unop_tasklet(node, parent_state, parent_sdfg, suffix: str) -> nodes.Tas
     )
 
 
-def make_merge_tasklet(node, parent_state, parent_sdfg, suffix: str) -> nodes.Tasklet:
-    """CPP tasklet calling ``dace::tileops::tile_merge`` (per-lane select).
+def make_ite_tasklet(node, parent_state, parent_sdfg, suffix: str) -> nodes.Tasklet:
+    """CPP tasklet calling ``dace::tileops::tile_ite`` (per-lane select).
 
-    ``_cond`` / ``_t`` / ``_e`` are all tile operands (Broadcast=false);
-    ``CondT`` is the condition tile's element type.
+    Unified-mask connector contract (user direction 2026-06-12): ``_mask``
+    is the select-arm predicate; downstream global TileStore handles
+    iter-mask gating. ``MaskT`` is the predicate tile's element type.
     """
     node.validate(parent_sdfg, parent_state)
     vlen = _require_k1(node)
     out_dtype = _out_ctype(node, parent_state, parent_sdfg, "_o")
-    cond_dtype = _in_ctype(node, parent_state, parent_sdfg, "_cond")
-    masked = "true" if node.has_mask else "false"
-    mask_arg = "_mask" if node.has_mask else "nullptr"
-    call = (f"dace::tileops::tile_merge<{out_dtype}, {cond_dtype}, {vlen}, false, false, {masked}>"
-            f"(_o, _cond, _t, _e, {mask_arg});")
-    inputs = {"_cond", "_t", "_e"} | ({"_mask"} if node.has_mask else set())
+    cond_dtype = _in_ctype(node, parent_state, parent_sdfg, "_mask")
+    call = (f"dace::tileops::tile_ite<{out_dtype}, {cond_dtype}, {vlen}, false, false, false>"
+            f"(_o, _mask, _t, _e, nullptr);")
     return nodes.Tasklet(
         label=f"{node.label}_{suffix}",
         inputs={c: None
-                for c in inputs},
+                for c in ("_mask", "_t", "_e")},
         outputs={"_o": None},
         code=call,
         language=dace.dtypes.Language.CPP,
@@ -254,14 +365,140 @@ def _k1_array_stride(node, parent_sdfg, edge, dims_prop) -> str:
     return f"({coeff}) * ({symstr(arr.strides[dims[0]])})"
 
 
+def make_mask_tasklet(node, parent_state, parent_sdfg, suffix: str) -> nodes.Tasklet:
+    """CPP tasklet calling ``dace::tileops::tile_mask_gen`` (K=1 iteration mask).
+
+    The K=1 mask is ``_o[l] = (iter_var + l) < global_ub``; ``iter_var`` and
+    ``global_ub`` are the surrounding-scope symbol expressions, rendered inline
+    exactly as :class:`ExpandTileMaskGenPure` does (e.g. ``i`` / ``kfdia``). An
+    ``int64`` index keeps array-sized bounds exact. K=1 only -- the selector
+    routes K>=2 (the per-dim AND conjunction) to ``pure``.
+    """
+    node.validate(parent_sdfg, parent_state)
+    vlen = _require_k1(node)
+    base = str(node.iter_vars[0])
+    ub = str(node.global_ubs[0])
+    call = f"dace::tileops::tile_mask_gen<int64_t, {vlen}>(_o, ({base}), ({ub}));"
+    return nodes.Tasklet(
+        label=f"{node.label}_{suffix}",
+        inputs={},
+        outputs={"_o": None},
+        code=call,
+        language=dace.dtypes.Language.CPP,
+    )
+
+
+def _has_replicate_gt1(node) -> bool:
+    """True if any per-dim replicate factor is (or may be) > 1.
+
+    A REPLICATE factor ``k > 1`` (e.g. ``c[i // 2]``) means lanes share a source
+    element, which the linear ``tile_load`` / ``tile_gather`` intrinsics (no
+    per-lane replicate divisor) cannot express -- the caller routes such a node
+    to the ``pure`` expansion. A symbolic factor is treated as ``>1`` (can't
+    prove it is 1 at compile time, so route safely).
+    """
+    for r in (node.replicate_factor_per_dim or []):
+        try:
+            if int(r) > 1:
+                return True
+        except (TypeError, ValueError):
+            return True
+    return False
+
+
+def _try_make_gather_tasklet(node, parent_state, parent_sdfg, suffix: str):
+    """Emit ``tile_gather`` for the clean 1D unit-stride gather (``a[idx[i]]``).
+
+    Only the canonical case lowers to the gather intrinsic: K=1, a single gather
+    dim on a 1-D source with unit stride, an index tile that depends on the one
+    tile lane (shape ``(W,)``), and no replicate. Then the per-lane source offset
+    is exactly ``_idx_<g>[l]`` and the runtime ``tile_gather`` (AVX-512
+    ``_mm512_i64gather_pd``; scalar reference on the other backends) applies
+    directly. Anything more complex -- a multi-dim source, a non-unit gather-dim
+    stride, a replicate factor, or a lane-independent index -- returns ``None``
+    so the caller keeps the per-lane ``pure`` expansion (the scalar fallback).
+    """
+    widths = list(node.widths)
+    if len(widths) != 1 or len(node.gather_dims) != 1 or _has_replicate_gt1(node):
+        return None
+    g = int(node.gather_dims[0])
+    if g != 0:
+        return None
+    src_edge = next(e for e in parent_state.in_edges(node) if e.dst_conn == "_src")
+    src_arr = parent_sdfg.arrays[src_edge.data.data]
+    if len(src_arr.shape) != 1:
+        return None
+    # Unit stride on the gather dim: ``_idx_0`` is then the direct element offset
+    # into ``_src`` (the intrinsic does ``src[idx[l]]`` with no stride multiply).
+    if not bool(dace.symbolic.simplify(src_arr.strides[0] == 1)):
+        return None
+    idx_conn = f"_idx_{g}"
+    idx_edge = next((e for e in parent_state.in_edges(node) if e.dst_conn == idx_conn), None)
+    if idx_edge is None:
+        return None
+    idx_arr = parent_sdfg.arrays[idx_edge.data.data]
+    # The index tile must depend on the single tile lane (shape ``(W,)``).
+    try:
+        idx_shape = tuple(int(s) for s in idx_arr.shape)
+    except (TypeError, ValueError):
+        return None
+    if idx_shape != (int(widths[0]), ):
+        return None
+    vlen = widths[0]
+    dst_dtype = _out_ctype(node, parent_state, parent_sdfg, "_dst")
+    idx_ctype = idx_arr.dtype.ctype
+    masked = "true" if node.has_mask else "false"
+    mask_arg = "_mask" if node.has_mask else "nullptr"
+    call = (f"dace::tileops::tile_gather<{dst_dtype}, {idx_ctype}, {vlen}, {masked}>"
+            f"(_dst, _src, {idx_conn}, {mask_arg});")
+    inputs = {"_src", idx_conn} | ({"_mask"} if node.has_mask else set())
+    return nodes.Tasklet(
+        label=f"{node.label}_{suffix}",
+        inputs={c: None
+                for c in inputs},
+        outputs={"_dst": None},
+        code=call,
+        language=dace.dtypes.Language.CPP,
+    )
+
+
 def make_load_tasklet(node, parent_state, parent_sdfg, suffix: str) -> nodes.Tasklet:
     """CPP tasklet calling ``dace::tileops::tile_load`` (contiguous / strided).
 
     The K=1 tile-dim linear stride into the source array is passed as the
-    ``stride`` argument; the header SIMD-loads when it is 1 and falls back to a
-    scalar gathered read otherwise.
+    ``stride`` argument; the header SIMD-loads when it is 1 (``_mm512_loadu_pd``)
+    and uses the gather intrinsic (``_mm512_i64gather_pd`` over a strided index
+    vector) otherwise.
 
+    ``src_kind != 'Tile'`` (a broadcast ``Symbol`` literal or a ``Scalar``
+    length-1 read) has no per-lane ``_src`` tile pointer, so the K=1 runtime
+    ``tile_load`` (which streams ``_src`` into ``_dst``) cannot express it; the
+    pure expansion broadcasts the literal / scalar to every lane instead.
+    Delegate to it -- symmetric to the ``src_kind != 'Tile'`` fallback in
+    :func:`make_store_tasklet`.
+
+    When ``gather_dims`` is set the clean 1D unit-stride case (``a[idx[i]]``)
+    lowers to the ``tile_gather`` intrinsic via :func:`_try_make_gather_tasklet`;
+    any richer gather (multi-dim source, non-unit stride, replicate) delegates to
+    :class:`ExpandTileLoadPure`, which emits the per-lane indirect read using the
+    ``_idx_<d>`` connectors (design section 9.3).
     """
+    if node.src_kind == "Tile" and node.gather_dims:
+        gather_tasklet = _try_make_gather_tasklet(node, parent_state, parent_sdfg, suffix)
+        if gather_tasklet is not None:
+            return gather_tasklet
+    if node.src_kind != "Tile" or node.gather_dims:
+        from dace.libraries.tileops.nodes.tile_load import ExpandTileLoadPure
+        return ExpandTileLoadPure.expansion(node, parent_state, parent_sdfg)
+    # REPLICATE codegen (user direction 2026-06-10): the K=1 intrinsic
+    # ``tile_load<T, VLEN, Masked>(_dst, _src, mask, stride)`` does
+    # ``dst[i] = src[i * stride]`` -- no per-lane replicate divisor. When a
+    # ``replicate_factor_per_dim[d] > 1`` (e.g. ``c[i // 2]`` -> factor 2 means
+    # lanes 0,1 share c[i//2], ...), the intrinsic produces wrong values. Fall
+    # back to the pure expansion (``src[(__l/replicate) * stride]`` per lane).
+    if _has_replicate_gt1(node):
+        from dace.libraries.tileops.nodes.tile_load import ExpandTileLoadPure
+        return ExpandTileLoadPure.expansion(node, parent_state, parent_sdfg)
     vlen = _require_k1(node)
     src_edge = next(e for e in parent_state.in_edges(node) if e.dst_conn == "_src")
     dst_dtype = _out_ctype(node, parent_state, parent_sdfg, "_dst")
@@ -288,8 +525,15 @@ def make_store_tasklet(node, parent_state, parent_sdfg, suffix: str) -> nodes.Ta
     Symbol literal or a Scalar length-1 read) has no per-lane source
     pointer, so the pure expansion's per-lane store is the right
     lowering for those shapes. Delegate to it instead.
+
+    When ``gather_dims`` is set the runtime ``tile_store`` does not apply
+    either -- it has no per-lane index input -- so the lowering delegates
+    to :class:`ExpandTileStorePure`, which emits the per-lane indirect
+    store using the ``_idx_<d>`` connectors (design section 9.3 scatter).
+    Symmetric to the ``make_load_tasklet`` gather fallback added in
+    commit 4ad424945.
     """
-    if node.src_kind != "Tile":
+    if node.src_kind != "Tile" or node.gather_dims:
         from dace.libraries.tileops.nodes.tile_store import ExpandTileStorePure
         return ExpandTileStorePure.expansion(node, parent_state, parent_sdfg)
     vlen = _require_k1(node)
@@ -306,140 +550,5 @@ def make_store_tasklet(node, parent_state, parent_sdfg, suffix: str) -> nodes.Ta
                 for c in inputs},
         outputs={"_dst": None},
         code=call,
-        language=dace.dtypes.Language.CPP,
-    )
-
-
-def _stride_is_one(stride_expr: str) -> bool:
-    """True iff the array stride C++ expression is statically the integer 1."""
-    return symstr(stride_expr).strip() == "1"
-
-
-def _num_idx_conns(node) -> int:
-    """Count the per-source-dim index connectors (``_idx_0`` ..)."""
-    return sum(1 for c in node.in_connectors if str(c).startswith("_idx_"))
-
-
-def _strided_lane(stride: int, off: str) -> str:
-    """Per-lane index into a (possibly ``c``-strided) index/value tile.
-
-    :param stride: The lane stride ``c`` into the tile.
-    :param off: The contiguous lane-offset expression (e.g. ``__l0``).
-    :returns: ``off`` for ``c == 1`` (contiguous), else ``(c) * (off)``.
-    """
-    return off if stride == 1 else f"({stride}) * ({off})"
-
-
-def make_gather_tasklet(node, parent_state, parent_sdfg, suffix: str) -> nodes.Tasklet:
-    """CPP tasklet for ``TileGather``.
-
-    The node carries one index tile per source dim, so the per-lane source
-    offset is ``sum_k _idx_<k>[lane] * src_strides[k]``. The header
-    ``dace::tileops::tile_gather`` models a single linear index (``src[idx[i]]``),
-    so it is used only for a 1D contiguous source (one index tile, unit stride) —
-    the common SpMV-style gather. Any multi-dim source or non-unit stride emits
-    the per-lane scalar read (same as ``pure``), which is still correct (and on a
-    non-contiguous source no ISA has a usable gather form anyway).
-    """
-    node.validate(parent_sdfg, parent_state)
-    vlen = _require_k1(node)
-    src_edge = next(e for e in parent_state.in_edges(node) if e.dst_conn == "_src")
-    src_arr = parent_sdfg.arrays[src_edge.data.data]
-    src_ndim = _num_idx_conns(node)
-    src_strides = [src_arr.strides[d] for d in range(len(src_arr.strides) - src_ndim, len(src_arr.strides))]
-    dst_dtype = _out_ctype(node, parent_state, parent_sdfg, "_dst")
-    masked = "true" if node.has_mask else "false"
-    idx_strides = node.index_strides or [1] * src_ndim
-    inputs = ({"_src"} | {f"_idx_{k}" for k in range(src_ndim)} | ({"_mask"} if node.has_mask else set()))
-    off = tile_offset([vlen])
-    # The ``tile_gather`` header reads ``_idx_0[lane]`` internally, so the
-    # contiguous-source fast path only applies to a unit-stride index tile;
-    # a ``c``-strided index window (``b[idx[c*i]]``) falls to the explicit
-    # per-lane form reading ``_idx_0[c*lane]``.
-    # Per-idx subscripting rule (mirror of ``tile_gather.ExpandTileGatherPure``
-    # ``_idx_subscript``): a Scalar source / single-element memlet lowers to a
-    # by-value scalar connector that CANNOT be subscripted (``int64_t _idx_0 =
-    # z1_lc[0];``); emit the bare name. Cloudsc snippet-one's
-    # ``zqx[z1, j+1, i+1]`` lands here (z1 is a loop-invariant scalar param).
-    def _idx_subscript(k: int) -> str:
-        ie = next(e for e in parent_state.in_edges(node) if e.dst_conn == f"_idx_{k}")
-        src_desc = parent_sdfg.arrays.get(ie.data.data) if ie.data is not None else None
-        if isinstance(src_desc, dace.data.Scalar):
-            return ""
-        try:
-            lane_count = ie.data.subset.num_elements_exact() if ie.data and ie.data.subset else None
-        except Exception:
-            lane_count = None
-        if lane_count == 1:
-            return ""
-        return f"[{_strided_lane(idx_strides[k], off)}]"
-
-    if src_ndim == 1 and _stride_is_one(src_strides[0]) and idx_strides[0] == 1:
-        idx_dtype = _in_ctype(node, parent_state, parent_sdfg, "_idx_0")
-        mask_arg = "_mask" if node.has_mask else "nullptr"
-        code = (f"dace::tileops::tile_gather<{dst_dtype}, {idx_dtype}, {vlen}, {masked}>"
-                f"(_dst, _src, _idx_0, {mask_arg});")
-    else:
-        soff = " + ".join(
-            f"((std::ptrdiff_t)_idx_{k}{_idx_subscript(k)} * ({symstr(src_strides[k])}))"
-            for k in range(src_ndim))
-        if node.has_mask:
-            code = nested_loops([vlen], f"_dst[{off}] = _mask[{off}] ? _src[{soff}] : {dst_dtype}(0);")
-        else:
-            code = nested_loops([vlen], f"_dst[{off}] = _src[{soff}];")
-    return nodes.Tasklet(
-        label=f"{node.label}_{suffix}",
-        inputs={c: None
-                for c in inputs},
-        outputs={"_dst": None},
-        code=code,
-        language=dace.dtypes.Language.CPP,
-    )
-
-
-def make_scatter_tasklet(node, parent_state, parent_sdfg, suffix: str) -> nodes.Tasklet:
-    """CPP tasklet for ``TileScatter`` (symmetric to :func:`make_gather_tasklet`)."""
-    node.validate(parent_sdfg, parent_state)
-    vlen = _require_k1(node)
-    dst_edge = next(e for e in parent_state.out_edges(node) if e.src_conn == "_dst")
-    dst_arr = parent_sdfg.arrays[dst_edge.data.data]
-    dst_ndim = _num_idx_conns(node)
-    dst_strides = [dst_arr.strides[d] for d in range(len(dst_arr.strides) - dst_ndim, len(dst_arr.strides))]
-    dst_dtype = dst_arr.dtype.ctype
-    masked = "true" if node.has_mask else "false"
-    inputs = ({"_src"} | {f"_idx_{k}" for k in range(dst_ndim)} | ({"_mask"} if node.has_mask else set()))
-    off = tile_offset([vlen])
-    # Same Scalar / single-element broadcast rule as the gather.
-    def _idx_subscript(k: int) -> str:
-        ie = next(e for e in parent_state.in_edges(node) if e.dst_conn == f"_idx_{k}")
-        src_desc = parent_sdfg.arrays.get(ie.data.data) if ie.data is not None else None
-        if isinstance(src_desc, dace.data.Scalar):
-            return ""
-        try:
-            lane_count = ie.data.subset.num_elements_exact() if ie.data and ie.data.subset else None
-        except Exception:
-            lane_count = None
-        if lane_count == 1:
-            return ""
-        return f"[{off}]"
-
-    if dst_ndim == 1 and _stride_is_one(dst_strides[0]):
-        idx_dtype = _in_ctype(node, parent_state, parent_sdfg, "_idx_0")
-        mask_arg = "_mask" if node.has_mask else "nullptr"
-        code = (f"dace::tileops::tile_scatter<{dst_dtype}, {idx_dtype}, {vlen}, {masked}>"
-                f"(_dst, _src, _idx_0, {mask_arg});")
-    else:
-        doff = " + ".join(f"((std::ptrdiff_t)_idx_{k}{_idx_subscript(k)} * ({symstr(dst_strides[k])}))"
-                          for k in range(dst_ndim))
-        if node.has_mask:
-            code = nested_loops([vlen], f"if (_mask[{off}]) _dst[{doff}] = _src[{off}];")
-        else:
-            code = nested_loops([vlen], f"_dst[{doff}] = _src[{off}];")
-    return nodes.Tasklet(
-        label=f"{node.label}_{suffix}",
-        inputs={c: None
-                for c in inputs},
-        outputs={"_dst": None},
-        code=code,
         language=dace.dtypes.Language.CPP,
     )

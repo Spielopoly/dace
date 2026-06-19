@@ -30,9 +30,7 @@ import ast
 import pytest
 
 import dace
-from dace.libraries.tileops import (TileBinop, TileGather, TileIota, TileLoad, TileMaskGen, TileMerge, TileReduce,
-                                    TileStore)
-from dace.libraries.tileops.nodes import tile_merge as _tile_merge_mod
+from dace.libraries.tileops import (TileBinop, TileIota, TileLoad, TileMaskGen, TileReduce, TileStore)
 from dace.libraries.tileops.nodes import tile_reduce as _tile_reduce_mod
 
 
@@ -90,29 +88,6 @@ def _expand_cutile_tasklet_with_edges(lib_node, in_arrays=None, out_arrays=None,
 
     cls = lib_node.implementations["cutile"]
     return cls.expansion(lib_node, state, sdfg)
-
-
-def _expand_merge_cutile_with_dtype(lib_node, out_dtype):
-    """Expand a :class:`TileMerge` ``cutile`` body with a wired ``_o`` output of
-    ``out_dtype`` (the fallback path reads the output dtype off the edge)."""
-    sdfg = dace.SDFG(f"cutile_merge_{lib_node.label}")
-    state = sdfg.add_state("main")
-    n = len(lib_node.widths)
-    shape = tuple(lib_node.widths) if n > 1 else (lib_node.widths[0], )
-    for name in ("cond", "then", "else", "out"):
-        sdfg.add_array(name, shape, out_dtype, transient=(name != "out"))
-    state.add_node(lib_node)
-    cond = state.add_access("cond")
-    then = state.add_access("then")
-    els = state.add_access("else")
-    out = state.add_access("out")
-    state.add_edge(cond, None, lib_node, "_cond", dace.Memlet.from_array("cond", sdfg.arrays["cond"]))
-    state.add_edge(then, None, lib_node, "_t", dace.Memlet.from_array("then", sdfg.arrays["then"]))
-    state.add_edge(els, None, lib_node, "_e", dace.Memlet.from_array("else", sdfg.arrays["else"]))
-    state.add_edge(lib_node, "_o", out, None, dace.Memlet.from_array("out", sdfg.arrays["out"]))
-    cls = lib_node.implementations["cutile"]
-    tasklet = cls.expansion(lib_node, state, sdfg)
-    return tasklet.code.as_string, tasklet.language
 
 
 def _assert_parses_as_python(body: str) -> None:
@@ -389,53 +364,6 @@ def test_tile_mask_gen_cutile_K2_combines_per_dim_via_broadcast_and_amp():
     assert "ct.broadcast_to(__mask0[:, None], (4, 8))" in body
     assert "ct.broadcast_to(__mask1[None, :], (4, 8))" in body
     assert " & " in body
-
-
-def test_tile_gather_cutile_1d_unmasked_emits_padding_value():
-    """1D unmasked gather: single index tile + ``padding_value=0`` (no mask)."""
-    body, lang = _expand_cutile(TileGather(name="G", widths=(8, )))
-    _assert_parses_as_python(body)
-    assert "ct.gather(_src, _idx_0, padding_value=0)" in body
-    assert "mask=" not in body
-    assert lang == dace.dtypes.Language.Python
-
-
-def test_tile_gather_cutile_1d_masked_emits_mask_and_padding_value():
-    """1D masked gather: ``mask=_mask, padding_value=0``."""
-    body, _ = _expand_cutile(TileGather(name="G", widths=(8, ), has_mask=True))
-    _assert_parses_as_python(body)
-    assert "ct.gather(_src, _idx_0, mask=_mask, padding_value=0)" in body
-
-
-def test_tile_gather_cutile_2d_masked_uses_index_tuple():
-    """2D-source masked gather uses the ``(_idx_0, _idx_1)`` tuple form."""
-    body, _ = _expand_cutile(TileGather(name="G", widths=(8, ), source_ndim=2, has_mask=True))
-    _assert_parses_as_python(body)
-    assert "ct.gather(_src, (_idx_0, _idx_1), mask=_mask, padding_value=0)" in body
-
-
-def test_tile_gather_cutile_pad_value_emitted():
-    """A non-zero ``pad_value`` is emitted as ``padding_value=<v>`` (cuTile
-    gather padding is an arbitrary scalar, so e.g. ``1`` for prod identity)."""
-    body, _ = _expand_cutile(TileGather(name="G", widths=(8, ), pad_value=1))
-    _assert_parses_as_python(body)
-    assert "padding_value=1" in body
-
-
-def test_tile_gather_cutile_nonunit_index_strides_raises():
-    """Non-unit ``index_strides`` cannot be expressed by ``ct.gather`` (no
-    per-lane stride) → ``NotImplementedError`` at expansion time."""
-    with pytest.raises(NotImplementedError):
-        _expand_cutile(TileGather(name="G", widths=(8, ), index_strides=(2, )))
-
-
-
-def test_tile_merge_cutile_primary_emits_ct_where():
-    """Primary (CI default) TileMerge body is ``ct.where(_cond, _t, _e)``."""
-    body, lang = _expand_cutile(TileMerge(name="M", widths=(8, )))
-    _assert_parses_as_python(body)
-    assert body == "_o = ct.where(_cond, _t, _e)"
-    assert lang == dace.dtypes.Language.Python
 
 
 # ============================================================

@@ -16,21 +16,21 @@ This test pins both modes on a 2-D axpy kernel:
 The kernel exercises a divisible 2-D map so the run finishes cleanly
 in both modes (no postamble interaction needed for this knob).
 """
+
+import pytest
+# [UNSKIPPED-FOR-ASSESSMENT 2026-06-14] pytestmark = pytest.mark.skip(reason="legacy K=1/K=2 descent path frozen during walker-primary migration -- this test goes through VectorizeCPUMultiDim or the harness; both depend on the legacy descent + emit infrastructure being removed. Will be revived (or replaced by walker-primary equivalents) after the new orchestrator pipeline lands end-to-end.")
 import dace
 import pytest
 
-from dace.libraries.tileops import (TileBinop, TileGather, TileLoad, TileMaskGen, TileReduce, TileScatter, TileStore,
-                                    TileUnop)
+from dace.libraries.tileops import TileBinop, TileLoad, TileMaskGen, TileReduce, TileStore, TileUnop
 from dace.transformation.passes.vectorization.vectorize_cpu_multi_dim import (
     VectorizeCPUMultiDim, )
 
 _TILE_LIB_NODE_TYPES = (
     TileBinop,
-    TileGather,
     TileLoad,
     TileMaskGen,
     TileReduce,
-    TileScatter,
     TileStore,
     TileUnop,
 )
@@ -58,7 +58,6 @@ def _vectorize(sdfg: dace.SDFG, *, expand_tile_nodes: bool) -> None:
         remainder_strategy="full_mask",
         branch_mode="merge",
         nest_map_bodies=True,
-        insert_copies=True,
         expand_tile_nodes=expand_tile_nodes,
     ).apply_pass(sdfg, {})
 

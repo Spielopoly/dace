@@ -6,24 +6,100 @@ Three rough sub-families:
 - Pattern replace (``repl_subset``, ``repl_subset_to_use_*_offset``):
   symbolic substitution on a single subset.
 - Memlet rewrite (``replace_memlet_expression``,
-  ``expand_memlet_expression``, ``offset_memlets``,
-  ``replace_all_access_subsets``): walk edges and replace the payload
-  in-place.
+  ``expand_memlet_expression``, ``replace_all_access_subsets``): walk edges
+  and replace the payload in-place.
 - Post-collapse (``squeeze_memlets_of_packed_arrays``,
   ``use_previous_subsets``, ``try_clean_other_subset_going_out_from_map_entry``):
   fix up memlets after upstream passes changed the descriptor shape or
   surrounding map.
 """
 import copy
-from typing import Dict, Iterable, List, Optional, Set, Union
+from typing import Dict, Iterable, Optional, Set, Union
 
 import dace
 from dace import SDFGState, typeclass
 from dace.memlet import Memlet
 from dace.sdfg.graph import Edge
+from dace.sdfg.nodes import AccessNode
+from dace.subsets import Range
 from dace.transformation.passes.vectorization.utils.lane_access import classify_lane_access
 from dace.transformation.passes.vectorization.utils.name_schemes import LaneIdScheme
 from dace.transformation.passes.vectorization.utils.symbolic_polymorphism import subs
+
+
+def infer_edge_endpoints(edge: Edge, sdfg: dace.SDFG):
+    """Return the (src_data_name, src_subset, dst_data_name, dst_subset) tuple
+    for a memlet edge with both endpoints inferred.
+
+    Per user direction 2026-06-10 (design 3.7 + 3.8.3): classifiers and
+    validators should ALWAYS know both real array names + subsets, not just the
+    one matching ``memlet.data``. This helper centralises the "which side is
+    which" reasoning so call sites don't reimplement the lookup.
+
+    Returns ``None`` for ``data_name`` when the corresponding endpoint is not
+    an :class:`AccessNode` (e.g. a lib node connector or a tasklet); in that
+    case the matching ``subset`` is also ``None`` (the connector descriptor
+    defines the shape on that side, not the memlet).
+
+    :param edge: A memlet-carrying edge.
+    :param sdfg: SDFG owning the endpoint descriptors.
+    :returns: ``(src_data_name, src_subset, dst_data_name, dst_subset)`` where
+        the ``subset`` fields are fresh :class:`Range` copies (safe to mutate)
+        or ``None`` for non-AN endpoints.
+    """
+    from dace.sdfg.nodes import AccessNode as _AccessNode
+    mem = edge.data
+    if mem is None:
+        raise ValueError(f"infer_edge_endpoints: edge {edge} has no memlet")
+    src_an = edge.src if isinstance(edge.src, _AccessNode) else None
+    dst_an = edge.dst if isinstance(edge.dst, _AccessNode) else None
+    src_data = src_an.data if src_an is not None else None
+    dst_data = dst_an.data if dst_an is not None else None
+    src_subset: Optional[Range] = None
+    dst_subset: Optional[Range] = None
+    if src_an is not None:
+        src_subset = an_side_subset(edge, src_an, sdfg)
+    if dst_an is not None:
+        dst_subset = an_side_subset(edge, dst_an, sdfg)
+    return src_data, src_subset, dst_data, dst_subset
+
+
+def an_side_subset(edge: Edge, an: AccessNode, sdfg: dace.SDFG) -> Range:
+    """Return the subset belonging to ``an`` on the AN-incident ``edge``.
+
+    Per TILIFICATION_TRANSFORMATION_DESIGN.md section 3.7, an
+    AN-incident edge carries the subset of one array as
+    ``edge.data.subset`` (the array named by ``edge.data.data``) and the
+    other side as ``edge.data.other_subset``. When ``other_subset`` is
+    absent the convention is an implicit full-shape copy, so the AN's
+    full descriptor range is the answer.
+
+    This three-way is the **only correct way** to read an AN's subset
+    from an AN-incident edge. Direct ``edge.data.subset`` reads silently
+    pick the wrong array when ``data`` points at the other endpoint.
+    Every consumer (classifier, staging pass, lib-node emitter) routes
+    through this helper.
+
+    :param edge: An edge with ``an`` as one of its endpoints.
+    :param an: The :class:`AccessNode` whose subset is wanted.
+    :param sdfg: The SDFG owning ``an`` (used to look up the descriptor
+        for the full-shape fallback).
+    :returns: A fresh :class:`Range` carrying ``an``'s subset on
+        ``edge``.
+    :raises ValueError: When ``edge`` has no memlet or its endpoints
+        don't include ``an``.
+    """
+    mem = edge.data
+    if mem is None:
+        raise ValueError(f"an_side_subset: edge {edge} has no memlet")
+    if edge.src is not an and edge.dst is not an:
+        raise ValueError(f"an_side_subset: AN {an.data!r} is not an endpoint of edge {edge}")
+    if mem.data == an.data and mem.subset is not None:
+        return copy.deepcopy(mem.subset)
+    if mem.other_subset is not None:
+        return copy.deepcopy(mem.other_subset)
+    desc = an.desc(sdfg)
+    return Range([(0, s - 1, 1) for s in desc.shape])
 
 
 def repl_subset(subset: dace.subsets.Range, repl_dict: Dict[str, str]) -> dace.subsets.Range:
@@ -238,8 +314,7 @@ def expand_memlet_expression(state: SDFGState,
             # (DIAGONAL) cases, which both take the legacy path.
             ld = None
             if param_sym is not None:
-                ld = classify_lane_access(subset, state.sdfg.arrays[edge.data.data].strides,
-                                          vector_map_param).lane_dim
+                ld = classify_lane_access(subset, state.sdfg.arrays[edge.data.data].strides, vector_map_param).lane_dim
             # When the lane param is absent from the inner subset (the NSDFG
             # connector consumed it into a length-1 view, e.g. ``bb[0, 0]``
             # for a ``bb[i, j]`` body access with ``i`` innermost), the lane
@@ -275,23 +350,6 @@ def expand_memlet_expression(state: SDFGState,
                 edge.data = dace.memlet.Memlet(data=edge.data.data, subset=copy.deepcopy(new_subset_expr))
                 modified_edges.add(edge)
     return modified_edges
-
-
-def offset_memlets(sdfg: dace.SDFG, dataname: str, offsets: List[dace.symbolic.SymExpr]):
-    """Subtract ``offsets`` from every memlet subset of ``dataname``.
-
-    Length-1 dimensions are collapsed out of the resulting subset.
-
-    :param sdfg: The SDFG to walk.
-    :param dataname: Data name whose memlets are offset.
-    :param offsets: Per-dimension offsets to subtract.
-    """
-    from dace.transformation.passes.vectorization.utils.iteration import walk_memlets_of
-    for _state, edge in walk_memlets_of(sdfg, dataname):
-        subset = edge.data.subset.offset_new(dace.subsets.Range(offsets), negative=True)
-        # If subset is not one dimensional we need to collapse 0 accesses
-        collapsed_subset_list = [(b, e, s) for (b, e, s) in subset if (e + 1 - b) // s != 1]
-        edge.data.subset = dace.subsets.Range(collapsed_subset_list)
 
 
 def replace_all_access_subsets(state: dace.SDFGState, name: str, new_subset_expr: str):

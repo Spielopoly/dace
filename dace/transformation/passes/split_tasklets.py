@@ -183,12 +183,45 @@ def to_ssa(code: str) -> List[str]:
     return ssa.stmts
 
 
+def _ast_function_names(rhs: str) -> Set[str]:
+    """AST-walk ``rhs`` and collect every identifier that appears at a ``Call.func``
+    position. This includes any function called regardless of whether it's a built-in
+    or a user-defined name (``sqrt``, ``mymath.func``, ``foo``...). Falls back to an
+    empty set if parsing fails (the caller adds the legacy allowlist on top).
+    """
+    try:
+        tree = ast.parse(rhs, mode="eval")
+    except (SyntaxError, ValueError):
+        return set()
+    names: Set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            f = node.func
+            if isinstance(f, ast.Name):
+                names.add(f.id)
+            elif isinstance(f, ast.Attribute):
+                # Walk down to the leaf (rightmost) attribute name. Also drop the
+                # base-name (the module / class on the LHS) -- ``math.sqrt`` becomes
+                # ``math`` and ``sqrt`` both excluded as function-path identifiers.
+                inner = f
+                while isinstance(inner, ast.Attribute):
+                    names.add(inner.attr)
+                    inner = inner.value
+                if isinstance(inner, ast.Name):
+                    names.add(inner.id)
+    return names
+
+
 def _get_vars(ssa_line: str) -> Tuple[List[str], List[str]]:
     """
     Extract the left-hand-side and right-hand-side variable names of an SSA line.
 
-    Function names (built-in user functions, ``log``/``exp`` and boolean keywords) are
-    ignored so they are not mistaken for per-lane input connectors.
+    Function names (anything appearing at a ``Call.func`` AST position) are ignored so
+    they are not mistaken for per-lane input connectors. Per user direction 2026-06-09:
+    "Ensure that we split all function expressions like this regardless of what function
+    it was". Previous versions used a hard-coded allowlist (``log`` / ``exp`` / etc.)
+    which made ``sqrt``, ``tanh``, user-defined functions, and any other call show up as
+    a stale input connector.
 
     :param ssa_line: A single ``lhs = rhs`` SSA statement.
     :returns: A tuple ``(lhs_vars, rhs_vars)`` of the assigned name and the read names.
@@ -196,7 +229,11 @@ def _get_vars(ssa_line: str) -> Tuple[List[str], List[str]]:
     lhs, rhs = ssa_line.split(" = ")
     lhs = lhs.strip()
     rhs = rhs.strip()
-    function_names = dace.symbolic.builtin_userfunctions().union({
+    # AST-detected function-position names (works for ANY function call) +
+    # the legacy allowlist (covers ``or`` / ``and`` boolean keywords + ``True`` /
+    # ``False`` literals + builtin user functions that might be referenced
+    # bare without a Call wrapper).
+    function_names = (_ast_function_names(rhs).union(dace.symbolic.builtin_userfunctions()).union({
         "log",
         "Log",
         "ln",
@@ -211,9 +248,30 @@ def _get_vars(ssa_line: str) -> Tuple[List[str], List[str]]:
         "math",
         "Math",
         "MATH",
-    }).union({"True", "False"})
+    }).union({"True", "False"}))
 
     return [lhs], list(dace.symbolic.symbols_in_code(rhs, symbols_to_ignore=function_names))
+
+
+def _ssa_lhs_is_bool(ssa_line: str) -> bool:
+    """True iff the SSA statement's RHS is a comparison / boolean expression, so its
+    assigned variable holds a ``bool`` rather than the numeric ``input_type``.
+
+    A split-out condition such as ``__t0 = (_a > 0.0)`` (or ``__t1 = a and b``,
+    ``__t2 = not c``) must be typed ``bool``: downstream it feeds a ``TileITE`` /
+    mask ``_mask`` connector whose operand contract requires a bool array. Typing
+    such an intermediate numerically (the default ``input_type``) trips the
+    ``mask_connectors_are_bool`` invariant in ConvertTaskletsToTileOps.
+    """
+    try:
+        rhs = ast.parse(ssa_line.split(" = ", 1)[1].strip(), mode="eval").body
+    except (SyntaxError, IndexError):
+        return False
+    if isinstance(rhs, (ast.Compare, ast.BoolOp)):
+        return True
+    if isinstance(rhs, ast.UnaryOp) and isinstance(rhs.op, ast.Not):
+        return True
+    return False
 
 
 @transformation.explicit_cf_compatible
@@ -447,6 +505,10 @@ class SplitTasklets(ppl.Pass):
                                  }.union({str(s)
                                           for s in sdfg.symbols.keys()}).union(tasklet.free_symbols)
             state.remove_node(tasklet)
+            # Variables assigned by a comparison / boolean SSA statement hold a bool;
+            # their split transient must be typed bool (mask / ITE-cond contract), not
+            # the numeric ``input_type``.
+            bool_vars = {lhs for stmt in ssa_statements if _ssa_lhs_is_bool(stmt) for lhs in _get_vars(stmt)[0]}
             added_tasklets = list()
             for i, ssa_statement in enumerate(ssa_statements):  # Since SSA we are going to add in a line
                 lhs_vars, rhs_vars = _get_vars(ssa_statement)
@@ -510,7 +572,7 @@ class SplitTasklets(ppl.Pass):
                             if array_name not in state.sdfg.arrays:
                                 state.sdfg.add_scalar(
                                     name=array_name,
-                                    dtype=input_type,
+                                    dtype=dace.bool_ if in_conn in bool_vars else input_type,
                                     storage=dace.dtypes.StorageType.Register,
                                     transient=True,
                                 )
@@ -543,7 +605,7 @@ class SplitTasklets(ppl.Pass):
                     if array_name not in state.sdfg.arrays:
                         state.sdfg.add_scalar(
                             name=array_name,
-                            dtype=input_type,
+                            dtype=dace.bool_ if out_conn in bool_vars else input_type,
                             storage=dace.dtypes.StorageType.Register,
                             transient=True,
                         )

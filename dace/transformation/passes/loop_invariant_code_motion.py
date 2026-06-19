@@ -23,7 +23,7 @@ import copy
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from dace import SDFG, SDFGState, properties, symbolic
-from dace.sdfg import nodes
+from dace.sdfg import nodes, InterstateEdge
 from dace.sdfg.state import ControlFlowRegion, LoopRegion
 from dace.transformation import pass_pipeline as ppl
 from dace.transformation import transformation as xf
@@ -113,10 +113,11 @@ def _hoist_loop_region(loop: LoopRegion) -> int:
     # deeper-nested states are skipped (unconditional-execution gate).
     variant_syms = _variant_symbols_of_loop(loop)
     variant_data = _written_data_in_region(loop)
+    region_writers = _region_writer_counts(loop)
     start = loop.start_block
     if isinstance(start, SDFGState):
         while True:
-            tasklet = _find_one_invariant_tasklet(start, variant_syms, variant_data)
+            tasklet = _find_one_invariant_tasklet(start, variant_syms, variant_data, region_writers)
             if tasklet is None:
                 break
             preheader = _get_or_create_preheader(loop)
@@ -218,7 +219,6 @@ def _move_region_before(parent: ControlFlowRegion, loop: Any, child: Any) -> Non
     before ``loop``. Incoming edges to ``loop`` now go to ``child`` first,
     and a new unconditional edge ``child -> loop`` is added.
     """
-    import dace.sdfg as _sd
     # Detach internal edges touching child inside loop.
     for e in list(loop.in_edges(child)) + list(loop.out_edges(child)):
         loop.remove_edge(e)
@@ -234,7 +234,7 @@ def _move_region_before(parent: ControlFlowRegion, loop: Any, child: Any) -> Non
     for e in list(parent.in_edges(loop)):
         parent.remove_edge(e)
         parent.add_edge(e.src, child, e.data)
-    parent.add_edge(child, loop, _sd.InterstateEdge())
+    parent.add_edge(child, loop, InterstateEdge())
 
 
 def _region_free_symbols(region: Any) -> Set[str]:
@@ -317,6 +317,23 @@ def _written_data_in_region(region: ControlFlowRegion) -> Set[str]:
     return written
 
 
+def _region_writer_counts(region: ControlFlowRegion) -> Dict[str, int]:
+    """Per-data count of writer AccessNodes across every state of ``region``.
+
+    Used to reject hoisting an invariant assignment (e.g. ``s = 0.0``) whose
+    target is *also* written elsewhere in the loop (e.g. an inner-loop
+    accumulation ``s = s + a[i, j]``): moving the init to the preheader would
+    stop it re-running per iteration, so later iterations would see the carried
+    value instead of the constant.
+    """
+    counts: Dict[str, int] = {}
+    for state in region.all_states():
+        for n in state.data_nodes():
+            if state.in_degree(n) > 0:
+                counts[n.data] = counts.get(n.data, 0) + 1
+    return counts
+
+
 def _get_or_create_preheader(loop: LoopRegion) -> SDFGState:
     parent = loop.parent_graph
     if parent is None:
@@ -332,11 +349,12 @@ def _find_one_invariant_tasklet(
     state: SDFGState,
     variant_syms: Set[str],
     variant_data: Set[str],
+    region_writers: Dict[str, int],
 ) -> Optional[nodes.Tasklet]:
     for n in state.nodes():
         if not isinstance(n, nodes.Tasklet):
             continue
-        if _is_tasklet_invariant(state, n, variant_syms, variant_data):
+        if _is_tasklet_invariant(state, n, variant_syms, variant_data, region_writers):
             return n
     return None
 
@@ -346,6 +364,7 @@ def _is_tasklet_invariant(
     tasklet: nodes.Tasklet,
     variant_syms: Set[str],
     variant_data: Set[str],
+    region_writers: Dict[str, int],
 ) -> bool:
     # Side effects / WCR
     try:
@@ -402,6 +421,13 @@ def _is_tasklet_invariant(
         if n.data == out_data and state.in_degree(n) > 0:
             writers += 1
     if writers != 1:
+        return False
+    # ...and across the whole loop region: if ``out_data`` is written anywhere
+    # else in the loop (e.g. an inner-loop accumulation into the same scalar),
+    # hoisting this assignment to the preheader would stop it re-running each
+    # iteration -- later iterations would observe the carried value, not the
+    # constant. Only this tasklet's single write may exist region-wide.
+    if region_writers.get(out_data, 0) != 1:
         return False
 
     # Integer div / mod by a possibly-zero invariant divisor.

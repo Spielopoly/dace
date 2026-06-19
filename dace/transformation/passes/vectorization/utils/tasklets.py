@@ -6,7 +6,6 @@ code from the ``TaskletType`` classification in ``dace.sdfg.tasklet_utils``,
 falling back to a scalar lane loop when no template applies.
 """
 import copy
-import re
 from dataclasses import dataclass
 from typing import Dict, Optional, Set, Tuple, Union
 
@@ -22,20 +21,6 @@ from dace.transformation.passes.vectorization.utils.code_rewrite import (
     use_laneid_symbol_in_expression,
 )
 from dace.transformation.passes.vectorization.utils.name_schemes import (LaneIdScheme, PackedNameScheme, VecNameScheme)
-
-
-def match_connector_to_data(state: dace.SDFGState, tasklet: dace.nodes.Tasklet) -> dict:
-    """Map a tasklet's input connectors to their array descriptors.
-
-    :param state: The state containing the tasklet.
-    :param tasklet: The tasklet whose connectors are inspected.
-    :returns: Mapping from input connector name to the array descriptor.
-    """
-    tdict = dict()
-    for ie in state.in_edges(tasklet):
-        if ie.data is not None:
-            tdict[ie.dst_conn] = state.sdfg.arrays[ie.data.data]
-    return tdict
 
 
 def is_assignment_tasklet(node: dace.nodes.Tasklet) -> bool:
@@ -54,19 +39,77 @@ def is_assignment_tasklet(node: dace.nodes.Tasklet) -> bool:
     return False
 
 
-_VECTOR_COPY_CALL_RE = re.compile(r"\bvector_copy\s*\(")
+def descriptor_is_tile_or_broadcast(desc, widths: Tuple[int, ...]) -> bool:
+    """ONE-aware classification: ``desc`` is a tile (full ``widths``) or a
+    broadcast-tile (each dim is the tile width ``w_d`` or a broadcast marker --
+    the ``dace.symbolic.ONE`` symbol / a literal ``1``), with at least one real
+    (non-broadcast) width dim.
 
+    CLASSIFICATION ONLY -- this never reshapes a memlet. ``(W, ONE)`` / ``(ONE,
+    W)`` broadcast shapes live solely on ``TileLoad`` / ``TileStore`` index
+    connectors, which know how to handle them internally; collapsing such a
+    shape to ``(W,)`` in a memlet trips DaCe's subset-dimensionality validator
+    (user direction 2026-06-15: ``(W, ONE) and similar shapes should be only
+    passed to the tile load or tile store``). This predicate lets callers (e.g.
+    the K-dim tile-only test contract) recognise that a value is tile-shaped
+    -- treating the ``ONE`` marker as the integer ``1`` it stands for -- without
+    ever touching the memlet.
 
-def is_vector_assign_tasklet(t: dace.nodes.Tasklet) -> bool:
-    """Check whether a tasklet performs a ``vector_copy`` call.
+    Note the rank gate: a scalar ``(1,)`` bridge in a K=1 ``__tile_k1_tail``
+    body has rank 1, so against a rank-2 ``widths`` it is correctly NOT a tile
+    (scalar-load -> scalar chains stay python scalar tasklets, user direction
+    2026-06-15). The strict-output sibling is ``tile_binop._is_tile_shape``.
 
-    The match is word-boundary anchored so ``my_vector_copy(`` does not
-    falsely match; comments / string literals are not stripped.
-
-    :param t: The tasklet to check.
-    :returns: True iff the tasklet's code contains a ``vector_copy(`` call.
+    :param desc: A data descriptor (``dace.data.Array`` / ``Scalar`` / ...).
+    :param widths: Per-tile-dim widths, innermost-last.
+    :returns: True iff ``desc`` is a tile or a broadcast-tile of rank
+        ``len(widths)``.
     """
-    return _VECTOR_COPY_CALL_RE.search(t.code.as_string) is not None
+    import sympy
+    from dace.symbolic import ONE
+    if not isinstance(desc, dace.data.Array):
+        return False
+    shape = tuple(desc.shape)
+    if len(shape) != len(widths):
+        return False
+    n_real = 0
+    for s, w in zip(shape, widths):
+        try:
+            is_w = bool(dace.symbolic.simplify(s - w) == 0)
+        except Exception:  # noqa: BLE001 -- symbolic simplification may refuse
+            is_w = (s == w)
+        is_one_marker = isinstance(s, sympy.Basic) and ONE in s.free_symbols
+        try:
+            is_lit_one = bool(dace.symbolic.simplify(s - 1) == 0)
+        except Exception:  # noqa: BLE001
+            is_lit_one = (s == 1)
+        if is_w:
+            n_real += 1
+        elif is_one_marker or is_lit_one:
+            continue  # broadcast dim -- the ``ONE`` marker, i.e. width 1
+        else:
+            return False
+    return n_real >= 1
+
+
+def tasklet_reads_or_writes_tile(state: dace.SDFGState, tasklet: dace.nodes.Tasklet, widths: Tuple[int, ...]) -> bool:
+    """True iff any in/out edge of ``tasklet`` carries data whose descriptor is a
+    tile or broadcast-tile (see :func:`descriptor_is_tile_or_broadcast`).
+
+    Encodes the K-dim tile-only invariant: tile-shaped values flow ONLY through
+    tile lib nodes, never through raw tasklets. A raw tasklet that touches a
+    tile is unlowered residue (a real failure); a tasklet operating purely on
+    scalars (e.g. the scalar ``__tile_k1_tail`` remainder) is legitimate and is
+    NOT counted.
+    """
+    sdfg = state.sdfg
+    for edge in list(state.in_edges(tasklet)) + list(state.out_edges(tasklet)):
+        if edge.data is None or edge.data.data is None:
+            continue
+        desc = sdfg.arrays.get(edge.data.data)
+        if desc is not None and descriptor_is_tile_or_broadcast(desc, widths):
+            return True
+    return False
 
 
 # Operator tables consumed by ``instantiate_tasklet_from_info``. Kept at
@@ -162,13 +205,12 @@ def _emit_ite_with_symbol_arms(ctx: EmitCtx) -> str:
         tree = ast.parse(rhs, mode="eval").body
     except SyntaxError as ex:
         raise NotImplementedError(f"_emit_ite_with_symbol_arms: parse failed on {rhs!r}: {ex}")
-    if not (isinstance(tree, ast.Call) and isinstance(tree.func, ast.Name)
-            and tree.func.id in ('ITE', 'merge') and len(tree.args) == 3):
+    if not (isinstance(tree, ast.Call) and isinstance(tree.func, ast.Name) and tree.func.id in ('ITE', 'merge')
+            and len(tree.args) == 3):
         raise NotImplementedError(f"_emit_ite_with_symbol_arms: expected ``ITE(c, t, e)``, got {rhs!r}")
     out_conns = list(ctx.node.out_connectors.keys())
     if len(out_conns) != 1:
-        raise NotImplementedError(
-            f"_emit_ite_with_symbol_arms: expected 1 output connector, got {out_conns}")
+        raise NotImplementedError(f"_emit_ite_with_symbol_arms: expected 1 output connector, got {out_conns}")
     out_conn = out_conns[0]
     in_conns = list(ctx.node.in_connectors.keys())
 
@@ -178,8 +220,7 @@ def _emit_ite_with_symbol_arms(ctx: EmitCtx) -> str:
         for c in in_conns:
             expr = re.sub(rf"\b{re.escape(c)}\b", f"{c}[_vi]", expr)
         if ctx.vector_map_param and re.search(rf"\b{re.escape(ctx.vector_map_param)}\b", expr):
-            expr = re.sub(rf"\b{re.escape(ctx.vector_map_param)}\b",
-                          f"({ctx.vector_map_param} + _vi)", expr)
+            expr = re.sub(rf"\b{re.escape(ctx.vector_map_param)}\b", f"({ctx.vector_map_param} + _vi)", expr)
         return expr
 
     cond = _shift(ast.unparse(tree.args[0]))
@@ -308,10 +349,9 @@ def _generate_code(ctx: EmitCtx, rhs1_, rhs2_, const1_, const2_, lhs_, op_) -> s
     # arms and miscompile, so refuse loudly.
     code_str = (ctx.node.code.as_string or "").strip()
     if " if " in code_str and " else " in code_str:
-        raise NotImplementedError(
-            f"vectorization: tasklet {ctx.node.label!r} carries a Python ternary "
-            f"({code_str!r}); producers must emit ``ITE(c, t, e)`` instead so the "
-            f"vectorizer can lower it as a ``TERNARY_ARRAY``.")
+        raise NotImplementedError(f"vectorization: tasklet {ctx.node.label!r} carries a Python ternary "
+                                  f"({code_str!r}); producers must emit ``ITE(c, t, e)`` instead so the "
+                                  f"vectorizer can lower it as a ``TERNARY_ARRAY``.")
 
     # Fallback: unsupported operator (or op with no ``_masked`` template).
     # When ``ctx.mask_connector`` is set the per-lane write MUST be gated
@@ -402,7 +442,7 @@ def _binary_expr(l_op: str, op: str, r_op: str) -> str:
 
 
 def _connector_reads_invariant_scalar(state: dace.SDFGState, node: dace.nodes.Tasklet, conn: str,
-                                       vector_map_param: str) -> bool:
+                                      vector_map_param: str) -> bool:
     """Whether input connector ``conn`` reads a lane-invariant value.
 
     A subset that does NOT mention the vectorized map parameter is by
@@ -428,6 +468,21 @@ def _connector_reads_invariant_scalar(state: dace.SDFGState, node: dace.nodes.Ta
     :param vector_map_param: The vectorized map parameter.
     :return: ``True`` when the connector reads a lane-invariant value.
     """
+    # Authoritative per-lane signal: when the INNER access subset itself still
+    # mentions the vectorized map parameter, every lane reads a DIFFERENT
+    # element -- it is per-lane data, never a broadcast. The legacy widening
+    # rewrites many inner views to ``[0:W]`` (dropping the param), so a subset
+    # that STILL carries it is unambiguous and must short-circuit the
+    # outer-begin heuristic below. This is the gather-sibling case: a contiguous
+    # operand ``c[i:i+W]`` riding alongside a packed gather, whose OUTER NSDFG
+    # boundary memlet is the whole array ``c[0:N]`` (begin 0) -- the outer-begin
+    # rule would otherwise mis-read it as a broadcast and collapse W lanes to
+    # ``c[0]`` (TSVC s4113 ``a[ip[i]] = b[ip[i]] + c[i]``).
+    for ie in state.in_edges(node):
+        if ie.dst_conn == conn and ie.data is not None and ie.data.subset is not None:
+            if vector_map_param in {str(s) for s in ie.data.subset.free_symbols}:
+                return False
+            break
     # The inner subset alone is not enough: the legacy widening rewrites
     # the inner view's index to ``[0:W]`` for every connector, so neither
     # ``a[0]`` (intended broadcast) nor ``b[i]`` (intended sliding window)
@@ -648,9 +703,9 @@ def instantiate_tasklet_from_info(state: dace.SDFGState,
             # and codegen references an undeclared symbol. CPP lowering is reserved for
             # the intrinsic ops; the matching ``SCALAR_SYMBOL`` / ``SYMBOL_SYMBOL`` /
             # ``SCALAR_SCALAR`` per-lane assignments stay Python for the same reason.
-            node.code = dace.properties.CodeBlock(code="\n".join(
-                [f"{lhs}[{i}] = {LaneIdScheme.make_dim(c1, 0, i)}" for i in range(vw)]) + "\n",
-                                                  language=dace.Language.Python)
+            node.code = dace.properties.CodeBlock(
+                code="\n".join([f"{lhs}[{i}] = {LaneIdScheme.make_dim(c1, 0, i)}" for i in range(vw)]) + "\n",
+                language=dace.Language.Python)
     elif ttype in {tutil.TaskletType.ARRAY_SYMBOL, tutil.TaskletType.ARRAY_ARRAY}:
         # A binop operand whose connector reads a single (non-vectorized)
         # element is a scalar value at the C level, not a vector pointer.
@@ -705,8 +760,7 @@ def instantiate_tasklet_from_info(state: dace.SDFGState,
         # the vectorized map param shifted to ``(<param> + _vi)`` so a lane
         # index symbol like ``_loop_it_0`` walks the W consecutive lane values.
         if op in ('ITE', 'merge'):
-            node.code = dace.properties.CodeBlock(code=_emit_ite_with_symbol_arms(ctx),
-                                                  language=dace.Language.CPP)
+            node.code = dace.properties.CodeBlock(code=_emit_ite_with_symbol_arms(ctx), language=dace.Language.CPP)
             return
         arr_name = rhs1 if rhs1 is not None else rhs2
         occurrences = tutil.count_name_occurrences(node.code.as_string.split(" = ")[1].strip(), arr_name)
@@ -943,31 +997,3 @@ def _insert_vector_copy_around_edge(state: dace.SDFGState, edge: Edge[Memlet],
         e3 = state.add_edge(t, "_out", dst, dst_conn, copy.deepcopy(edge.data))
     state.remove_edge(edge)
     return (e1, e2, e3)
-
-
-def insert_assignment_tasklet_from_src(state: dace.SDFGState, edge: Edge[Memlet],
-                                       vector_storage_type: dace.dtypes.StorageType,
-                                       vector_width: int) -> Tuple[Edge[Memlet], Edge[Memlet], Edge[Memlet]]:
-    """Splice ``vector_copy`` after the source: ``src -> tasklet -> vec -> dst``.
-
-    :param state: The SDFG state containing the edge.
-    :param edge: The edge to splice around.
-    :param vector_storage_type: Storage type for the vector transient.
-    :param vector_width: Lane count.
-    :returns: The three new edges in source-to-destination order.
-    """
-    return _insert_vector_copy_around_edge(state, edge, vector_storage_type, vector_width, direction="from_src")
-
-
-def insert_assignment_tasklet_to_dst(state: dace.SDFGState, edge: Edge[Memlet],
-                                     vector_storage_type: dace.dtypes.StorageType,
-                                     vector_width: int) -> Tuple[Edge[Memlet], Edge[Memlet], Edge[Memlet]]:
-    """Splice ``vector_copy`` before the destination: ``src -> vec -> tasklet -> dst``.
-
-    :param state: The SDFG state containing the edge.
-    :param edge: The edge to splice around.
-    :param vector_storage_type: Storage type for the vector transient.
-    :param vector_width: Lane count.
-    :returns: The three new edges in source-to-destination order.
-    """
-    return _insert_vector_copy_around_edge(state, edge, vector_storage_type, vector_width, direction="to_dst")

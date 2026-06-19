@@ -267,12 +267,12 @@ inline void tile_binop(T* __restrict__ out, const T* __restrict__ a, const T* __
 }
 
 // ===================================================================
-// tile_merge : out[i] = cond[i] ? t : e ; ZERO-FILL inactive.
+// tile_ite : out[i] = cond[i] ? t : e ; ZERO-FILL inactive.
 // The select is via blendv (per-lane high-bit), with cond built as an
 // all-ones/zero vector mask from the cond tile.
 // ===================================================================
 template <typename T, typename CondT, bool BroadcastThen, bool BroadcastElse, bool Masked>
-inline void tile_merge(T* __restrict__ out, const CondT* __restrict__ cond, const T* __restrict__ t,
+inline void tile_ite(T* __restrict__ out, const CondT* __restrict__ cond, const T* __restrict__ t,
                        const T* __restrict__ e, const bool* __restrict__ mask, int vlen) {
   auto scalar_tail = [&](int i) {
     const T tv = (!BroadcastThen) ? t[i] : t[0];
@@ -389,9 +389,9 @@ inline void tile_unop(T* __restrict__ out, const T* __restrict__ a, const bool* 
 }
 
 template <typename T, typename CondT, int VLEN, bool BroadcastThen, bool BroadcastElse, bool Masked>
-inline void tile_merge(T* __restrict__ out, const CondT* __restrict__ cond, const T* __restrict__ t,
+inline void tile_ite(T* __restrict__ out, const CondT* __restrict__ cond, const T* __restrict__ t,
                        const T* __restrict__ e, const bool* __restrict__ mask) {
-  tile_merge<T, CondT, BroadcastThen, BroadcastElse, Masked>(out, cond, t, e, mask, VLEN);
+  tile_ite<T, CondT, BroadcastThen, BroadcastElse, Masked>(out, cond, t, e, mask, VLEN);
 }
 
 // ===================================================================
@@ -676,6 +676,25 @@ template <typename T, typename IdxT, int VLEN, bool Masked>
 inline void tile_scatter(T* __restrict__ dst, const T* __restrict__ src, const IdxT* __restrict__ idx,
                          const bool* __restrict__ mask) {
   tile_scatter<T, IdxT, Masked>(dst, src, idx, mask, VLEN);
+}
+
+// ---------------------------- tile_mask_gen ----------------------------
+// out[l] = (base + l) < ub. AVX2: 64-bit-lane compare (``_mm256_cmpgt_epi64``,
+// W=4; ``ub > base+l`` => active) extracted to bool bytes; scalar tail.
+template <typename IdxT, int VLEN>
+inline void tile_mask_gen(bool* __restrict__ out, IdxT base, IdxT ub) {
+  constexpr int W = 4;
+  const __m256i iota = _mm256_set_epi64x(3, 2, 1, 0);
+  const __m256i ubv = _mm256_set1_epi64x((long long)ub);
+  int i = 0;
+  for (; i + W <= VLEN; i += W) {
+    __m256i lanes = _mm256_add_epi64(_mm256_set1_epi64x((long long)base + i), iota);
+    __m256i cmp = _mm256_cmpgt_epi64(ubv, lanes);  // ub > base+l => active
+    alignas(32) std::int64_t tmp[W];
+    _mm256_storeu_si256((__m256i*)tmp, cmp);
+    for (int j = 0; j < W; ++j) out[i + j] = tmp[j] != 0;
+  }
+  for (; i < VLEN; ++i) out[i] = (base + IdxT(i)) < ub;
 }
 
 }  // namespace tileops

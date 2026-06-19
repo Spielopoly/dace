@@ -2,7 +2,7 @@
 //
 // ARM SVE backend of the K=1 tile-op intrinsics. A sibling of
 // ``dace/tile_ops/scalar.h`` exposing the SAME ``dace::tileops`` signatures
-// (``tile_binop`` / ``tile_merge`` / ``tile_load`` / ``tile_store`` /
+// (``tile_binop`` / ``tile_ite`` / ``tile_load`` / ``tile_store`` /
 // ``tile_gather`` / ``tile_scatter``, each with a constexpr-VLEN and a
 // runtime-VLEN form), lowered to ARM Scalable Vector Extension intrinsics.
 // Element types: ``float`` (f32), ``double`` (f64), ``int32_t`` (s32),
@@ -151,7 +151,7 @@ inline svbool_t sve_cmpne(svbool_t pg, svint32_t a, svint32_t b) { return svcmpn
 inline svbool_t sve_cmpne(svbool_t pg, svfloat64_t a, svfloat64_t b) { return svcmpne_f64(pg, a, b); }
 inline svbool_t sve_cmpne(svbool_t pg, svint64_t a, svint64_t b) { return svcmpne_s64(pg, a, b); }
 
-// ---- ``v != 0`` predicate (for And / Or logical truthiness + tile_merge cond) ----
+// ---- ``v != 0`` predicate (for And / Or logical truthiness + tile_ite cond) ----
 inline svbool_t sve_cmpne0(svbool_t pg, svfloat32_t v) { return svcmpne_n_f32(pg, v, 0.0f); }
 inline svbool_t sve_cmpne0(svbool_t pg, svint32_t v) { return svcmpne_n_s32(pg, v, 0); }
 inline svbool_t sve_cmpne0(svbool_t pg, svfloat64_t v) { return svcmpne_n_f64(pg, v, 0.0); }
@@ -262,12 +262,12 @@ inline void tile_binop(T* __restrict__ out, const T* __restrict__ a, const T* __
 }
 
 // ===========================================================================
-// tile_merge : out[i] = cond[i] ? t : e
+// tile_ite : out[i] = cond[i] ? t : e
 // PRODUCER -> ZERO-FILL inactive. ``cond`` is a ``CondT`` truthiness array
 // (stored 1/0); the select predicate is ``cond != 0``.
 // ===========================================================================
 template <typename T, typename CondT, bool BroadcastThen, bool BroadcastElse, bool Masked>
-inline void tile_merge(T* __restrict__ out, const CondT* __restrict__ cond, const T* __restrict__ t,
+inline void tile_ite(T* __restrict__ out, const CondT* __restrict__ cond, const T* __restrict__ t,
                        const T* __restrict__ e, const bool* __restrict__ mask, int vlen) {
   using VecT = decltype(sve_dup(T(0)));  // vec type for T, from the sve_dup overload set
   const VecT zero = sve_dup(T(0));
@@ -315,7 +315,7 @@ inline void tile_unop(T* __restrict__ out, const T* __restrict__ a, const bool* 
 }
 
 template <typename T, typename CondT, int VLEN, bool BroadcastThen, bool BroadcastElse, bool Masked>
-inline void tile_merge(T* __restrict__ out, const CondT* __restrict__ cond, const T* __restrict__ t,
+inline void tile_ite(T* __restrict__ out, const CondT* __restrict__ cond, const T* __restrict__ t,
                        const T* __restrict__ e, const bool* __restrict__ mask) {
   using VecT = decltype(sve_dup(T(0)));  // vec type for T, from the sve_dup overload set
   const VecT zero = sve_dup(T(0));
@@ -571,6 +571,23 @@ inline void tile_scatter(T* __restrict__ dst, const T* __restrict__ src, const I
       if constexpr (std::is_same<T, double>::value) svst1_scatter_s64index_f64(wp, dst, vidx, v);
       else svst1_scatter_s64index_s64(wp, dst, vidx, v);
     }
+  }
+}
+
+// ---------------------------- tile_mask_gen ----------------------------
+// out[l] = (base + l) < ub. SVE: per 64-bit-lane chunk, svindex + svcmplt give
+// the active predicate; narrowing svst1b writes 1/0 bytes. (Written on an x86
+// dev box -- SVE path not hardware-exercised; semantics mirror scalar.h.)
+template <typename IdxT, int VLEN>
+inline void tile_mask_gen(bool* __restrict__ out, IdxT base, IdxT ub) {
+  const std::int64_t n = (std::int64_t)ub;
+  const std::int64_t cnt = svcntd();
+  for (std::int64_t i = 0; i < VLEN; i += cnt) {
+    svbool_t wp = svwhilelt_b64((uint64_t)i, (uint64_t)VLEN);  // valid out lanes
+    svint64_t lanes = svindex_s64((std::int64_t)base + i, 1);  // base+i + {0,1,...}
+    svbool_t active = svcmplt(wp, lanes, n);                   // (base+i+l) < ub
+    svint64_t ones = svdup_n_s64_z(active, 1);                 // 1 active / 0 else
+    svst1b_s64(wp, reinterpret_cast<signed char*>(out) + i, ones);
   }
 }
 

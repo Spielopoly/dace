@@ -743,7 +743,9 @@ def test_cloudsc_for_1133_shape_nested_inner_loopregion():
     """
     import numpy as np
     sdfg = _pfsqrf_2d_nested.to_sdfg(simplify=True)
-    res = LoopToScan().apply_pass(sdfg, {})
+    # Nested (vector) scan lift is opt-in (the default keeps the inner map -- see
+    # the ``lift_nested_scan`` Property); this test exercises the lift path.
+    res = LoopToScan(lift_nested_scan=True).apply_pass(sdfg, {})
     sdfg.validate()
     assert res is not None and res >= 1, (f'LoopToScan should lift the for_1133 prefix-sum shape; got '
                                           f'res={res}, scan libnodes={_num_scan_nodes(sdfg)}.')
@@ -911,7 +913,7 @@ def test_outer_body_with_extra_content_state_alongside_inner_loop():
                 arr[jk, jl] = arr[jk - 1, jl] + tmp[jl]
 
     sdfg = with_slice_state.to_sdfg(simplify=True)
-    res = LoopToScan().apply_pass(sdfg, {})
+    res = LoopToScan(lift_nested_scan=True).apply_pass(sdfg, {})
     sdfg.validate()
     assert res is not None and res >= 1, (f'LoopToScan should lift the for_1133 shape even with extra body states; got '
                                           f'res={res}, scan libnodes={_num_scan_nodes(sdfg)}.')
@@ -934,7 +936,7 @@ def test_inner_loop_with_multi_state_body():
                 arr[jk, jl] = tmp_val
 
     sdfg = multi_inner.to_sdfg(simplify=True)
-    res = LoopToScan().apply_pass(sdfg, {})
+    res = LoopToScan(lift_nested_scan=True).apply_pass(sdfg, {})
     sdfg.validate()
     assert res is not None and res >= 1, (f'LoopToScan should lift the shape even when the inner body is multi-state; '
                                           f'got res={res}, scan libnodes={_num_scan_nodes(sdfg)}.')
@@ -956,7 +958,7 @@ def test_carrier_with_extra_constant_axis_besides_inner_var():
                 arr[1, jk, jl] = arr[1, jk - 1, jl] + delta[1, jk, jl]
 
     sdfg = per_species.to_sdfg(simplify=True)
-    res = LoopToScan().apply_pass(sdfg, {})
+    res = LoopToScan(lift_nested_scan=True).apply_pass(sdfg, {})
     sdfg.validate()
     assert res is not None and res >= 1, (f'LoopToScan should lift a 3-D carrier with one constant non-scan axis; got '
                                           f'res={res}, scan libnodes={_num_scan_nodes(sdfg)}.')
@@ -978,7 +980,7 @@ def test_carrier_read_through_two_hop_transient_chain():
                 arr[jk, jl] = row[jl] + delta[jk, jl]
 
     sdfg = two_hop.to_sdfg(simplify=True)
-    res = LoopToScan().apply_pass(sdfg, {})
+    res = LoopToScan(lift_nested_scan=True).apply_pass(sdfg, {})
     sdfg.validate()
     assert res is not None and res >= 1, (f'LoopToScan should walk through a 2-hop transient slice chain; got '
                                           f'res={res}, scan libnodes={_num_scan_nodes(sdfg)}.')
@@ -1078,10 +1080,18 @@ def test_backward_stride_minus_one_prefix_sum():
                                         f'max diff = {np.abs(acc - expected).max()}')
 
 
-def test_level_indexed_write_with_multiple_constant_slots():
-    """The cloudsc ``for_430`` shape: multiple constant-index slots on the
-    same carrier in a level loop. Each slot's update is independent and
-    forms its own prefix recurrence along the level axis."""
+def test_multi_slot_carrier_is_refused_not_miscompiled():
+    """The cloudsc ``for_430`` shape: multiple constant-index slots on the SAME
+    carrier in a level loop (``zvqx[0/1/2, jk, jl]``). Each slot is an independent
+    prefix recurrence along the level axis, but the multi-slot rewrite chains a
+    per-slot ``_rewrite`` over the shared loop and fails to capture each slot's
+    external seed (``zvqx[r, 0, jl]``), reading an uninitialised buffer -- so the
+    lift is numerically WRONG (maxdiff ~0.85 vs the sequential oracle).
+
+    LoopToScan must therefore REFUSE the multi-slot shape (leave it sequential)
+    rather than lift it, even with ``lift_nested_scan=True``. This guards against
+    the silent miscompile: with the old code the kernel lifted (3 Scan libnodes)
+    and diverged; correct behaviour is no lift + values equal to the oracle."""
     KLEV, KLON = (dace.symbol(s) for s in ['KLEV', 'KLON'])
 
     @dace.program
@@ -1093,11 +1103,26 @@ def test_level_indexed_write_with_multiple_constant_slots():
                 zvqx[2, jk, jl] = zvqx[2, jk - 1, jl] + delta[jk, jl] * 0.3
 
     sdfg = multi_slot.to_sdfg(simplify=True)
-    res = LoopToScan().apply_pass(sdfg, {})
+    # Even with nested-scan lifting enabled, the multi-slot carrier is refused.
+    res = LoopToScan(lift_nested_scan=True).apply_pass(sdfg, {})
     sdfg.validate()
-    assert res is not None and res >= 1, (f'LoopToScan should lift multi-slot level-indexed prefix sums; got '
-                                          f'res={res}, scan libnodes={_num_scan_nodes(sdfg)}.')
-    assert _num_scan_nodes(sdfg) >= 1
+    assert not res, f'multi-slot carrier must be refused (unsound rewrite), got res={res}'
+    assert _num_scan_nodes(sdfg) == 0
+
+    # Numerical correctness: the un-lifted (sequential) SDFG matches the oracle.
+    klev, klon = 6, 4
+    rng = np.random.default_rng(430)
+    zvqx = rng.random((5, klev, klon))
+    delta = rng.random((klev, klon))
+    ref = zvqx.copy()
+    for jk in range(1, klev):
+        for jl in range(klon):
+            ref[0, jk, jl] = ref[0, jk - 1, jl] + delta[jk, jl] * 0.1
+            ref[1, jk, jl] = ref[1, jk - 1, jl] + delta[jk, jl] * 0.2
+            ref[2, jk, jl] = ref[2, jk - 1, jl] + delta[jk, jl] * 0.3
+    got = zvqx.copy()
+    sdfg(zvqx=got, delta=delta, KLEV=klev, KLON=klon)
+    assert np.allclose(got[:3], ref[:3]), f'max-diff {np.abs(got[:3] - ref[:3]).max()}'
 
 
 def test_scan_with_conditional_body_descends_into_if():
@@ -1552,6 +1577,43 @@ def test_fuse_body_states_refuses_carry_through_state_boundary():
     assert np.allclose(sa, a_exp), ('s252 carry broke after canonicalize: ``_fuse_body_states`` must '
                                     'refuse the body merge when the inter-state edge orders a carrier '
                                     'read before its write')
+
+
+@dace.program
+def nested_scan_parallel_inner(aa: dace.float64[N, N], bb: dace.float64[N, N]):
+    # j carries the recurrence (outer), i is the data-parallel inner axis -- the
+    # shape LoopStridePermutation produces by moving the unit-stride axis inner.
+    for j in range(1, N):
+        for i in range(N):
+            aa[j, i] = aa[j - 1, i] + bb[j, i]
+
+
+def test_nested_scan_keeps_map_inside_by_default():
+    """Default (``lift_nested_scan=False``): a carry loop wrapping a DOALL inner
+    loop is NOT lifted -- it stays a sequential loop + (later) parallel map, so
+    no ``Scan`` libnode is emitted. Running the un-lifted SDFG still matches."""
+    sdfg = nested_scan_parallel_inner.to_sdfg(simplify=True)
+    rng = np.random.default_rng(1)
+    aa0 = rng.standard_normal((16, 16))
+    bb = rng.standard_normal((16, 16))
+    ref = aa0.copy()
+    sdfg(aa=ref, bb=bb.copy(), N=16)
+
+    LoopToScan().apply_pass(sdfg, {})
+    assert _num_scan_nodes(sdfg) == 0, ('the carry loop wrapping a parallelizable inner loop must NOT '
+                                        'be lifted by default (keep the map inside)')
+    got = aa0.copy()
+    sdfg(aa=got, bb=bb.copy(), N=16)
+    assert np.allclose(got, ref)
+
+
+def test_nested_scan_lifts_with_knob():
+    """``lift_nested_scan=True``: the vector scan is still lifted (a ``Scan``
+    libnode with a Map over the inner axis)."""
+    sdfg = nested_scan_parallel_inner.to_sdfg(simplify=True)
+    res = LoopToScan(lift_nested_scan=True).apply_pass(sdfg, {})
+    assert res, "lift_nested_scan=True should lift the vector scan"
+    assert _num_scan_nodes(sdfg) >= 1, "a Scan libnode is emitted when the knob opts in"
 
 
 if __name__ == '__main__':

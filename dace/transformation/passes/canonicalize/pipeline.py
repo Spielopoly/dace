@@ -12,6 +12,7 @@ from dace.transformation import transformation
 from dace.transformation import pass_pipeline as ppl
 
 from dace.transformation.passes.simplify import SimplifyPass
+from dace.transformation.passes.simplification.continue_to_condition import ContinueToCondition
 from dace.transformation.passes.split_tasklets import SplitTasklets
 from dace.transformation.passes.vectorization.lower_ite_to_fp_factor import LowerITEToFpFactor
 from dace.transformation.passes.canonicalize.cascade_iedge_assignments_up import CascadeInterstateEdgeAssignmentsUp
@@ -48,6 +49,7 @@ from dace.transformation.passes.break_anti_dependence import BreakAntiDependence
 from dace.transformation.passes.canonicalize.empty_state_elimination import EmptyStateElimination
 from dace.transformation.passes.canonicalize.hoist_iv_updates import HoistInductionVariableUpdates
 from dace.transformation.passes.canonicalize.induction_variable_substitution import InductionVariableSubstitution
+from dace.transformation.passes.scalar_to_symbol import ScalarToSymbolPromotion
 from dace.transformation.passes.canonicalize.materialize_loop_exit_symbols import MaterializeLoopExitSymbols
 from dace.transformation.passes.canonicalize.normalize_negative_stride import NormalizeNegativeStride
 from dace.transformation.passes.canonicalize.reroll_unrolled_loops import RerollUnrolledLoops
@@ -287,8 +289,13 @@ def _build_stages(unroll_limit: int = DEFAULT_UNROLL_LIMIT,
     # NormalizeNegativeStride runs first so every downstream matcher
     # (LoopToMap's affine subset classifier, LoopToScan's ``stride != 1``
     # refusal, RerollUnrolledLoops) only ever sees positive-stride loops.
+    # ContinueToCondition runs explicitly after the initial cleanup passes (it is
+    # also inside SimplifyPass, but running it here lifts ``continue`` -> guarding
+    # condition before the structural transforms, the same way the break lift is
+    # applied early). A no-op on kernels without a ``continue`` (e.g. the current
+    # TSVC corpus emits none); it hardens the pipeline for kernels that do.
     s += [('clean', NormalizeNegativeStride()), ('clean', _uniq), ('clean', SplitTasklets()),
-          ('clean', LowerITEToFpFactor()), ('clean', SimplifyPass())]
+          ('clean', LowerITEToFpFactor()), ('clean', ContinueToCondition()), ('clean', SimplifyPass())]
 
     # prep (still maps): push guarding conditionals into maps, then replicate
     # a conditional per independent output so it can fission later.
@@ -379,10 +386,22 @@ def _build_stages(unroll_limit: int = DEFAULT_UNROLL_LIMIT,
     # whose final value is read after the loop: it materialises the closed-form exit
     # under a fresh ``_loop_exit_<sym>_<N>`` symbol and rewrites every downstream
     # reader so the "loop-defined symbol used after the loop" refusal disappears.
-    s += [('reduce', HoistInductionVariableUpdates()), ('reduce', InductionVariableSubstitution()),
-          ('reduce', MaterializeLoopExitSymbols()), ('reduce', LoopInvariantCodeMotion()), ('reduce', SimplifyPass()),
-          ('reduce', LoopToReduce()), ('reduce', LoopToScan(interchange_carry_with_map=interchange_carry_with_map)),
-          ('reduce', ArgMaxLift()), ('reduce', EarlyExitToFindIndex()), ('reduce', LoopToConditionalReduce())]
+    # Reduce PREP only (the loop-lifting LoopTo* passes moved AFTER fission +
+    # LoopStridePermutation -- see 'loop_to_x' below -- so the pipeline shape is
+    # LoopFission -> LoopStridePermutation -> LoopToX -> LoopToMap).
+    # PromoteConstInputs runs FIRST: a read-only integer scalar argument used
+    # purely for indexing (e.g. a loop-stride ``inc``) is a non-transient scalar
+    # the default promotion skips. Promoting it to a symbol -- and unwrapping the
+    # frontend's defensive ``k + dace.int64(inc)`` cast -- lets the following
+    # SimplifyPass collapse the secondary-IV update into a clean symbolic
+    # ``k := k + inc`` iedge, which InductionVariableSubstitution then closes to
+    # ``a[k + (i-1)*inc]`` so the strided argmax (TSVC s318) becomes liftable.
+    _promote_const_inputs = ScalarToSymbolPromotion()
+    _promote_const_inputs.readonly_inputs = True
+    _promote_const_inputs.unwrap_integer_casts = True
+    s += [('reduce', _promote_const_inputs), ('reduce', SimplifyPass()), ('reduce', HoistInductionVariableUpdates()),
+          ('reduce', InductionVariableSubstitution()), ('reduce', MaterializeLoopExitSymbols()),
+          ('reduce', LoopInvariantCodeMotion()), ('reduce', SimplifyPass())]
 
     # cascade_iedges_up (post-reduce): lift invariant interstate-edge assignments
     # (e.g. ``kfdia_plus_1 = kfdia + 1``) past every enclosing loop (all-or-nothing
@@ -440,13 +459,25 @@ def _build_stages(unroll_limit: int = DEFAULT_UNROLL_LIMIT,
     # standalone ``NormalizeLoopsAndMaps`` for callers that want it; just not
     # wired into the canonicalize pipeline.
 
-    # loop_stride_permutation (before LoopToMap): no-op stub. A loop-level
-    # interchange would need a loop-interchange primitive (none exists) and
-    # loop-carried-dependence analysis; instead the loops that *can* become
-    # maps are permuted as maps right after LoopToMap (see 'reorder' below),
-    # which is dependence-free by the Map contract and reuses the proven,
-    # symbolic-safe MinimizeStridePermutation.
+    # loop_stride_permutation (after LoopFission, before every LoopTo* lift):
+    # interchange a perfect loop nest so a unit-stride DOALL loop is innermost.
+    # For a recurrence kernel (``aa[j,i] = aa[j-1,i] + ...`` with ``i`` the
+    # unit-stride parallel axis) this turns ``for i: for j:`` into ``for j(seq):
+    # for i(parallel):`` -- the inner ``i`` becomes a contiguous map and ``j``
+    # stays a plain sequential loop, so NO ``Scan`` libnode (over a strided
+    # apply) is needed. Soundness rests on moving only DOALL loops (a parallel
+    # loop is freely interchangeable); see the pass docstring.
     s += [('loop_stride_permutation', LoopStridePermutation())]
+
+    # loop_to_x (moved here from the 'reduce' stage so the order is
+    # LoopFission -> LoopStridePermutation -> LoopToX -> LoopToMap): lift the
+    # accumulator / scan / argmax / find-index / conditional-reduce shapes that
+    # LoopStridePermutation did NOT turn into a sequential-loop + parallel-map.
+    # The reduce PREP (LICM / SimplifyPass / IV substitution / ...) already ran
+    # above; these are the lifting passes only.
+    s += [('loop_to_x', LoopToReduce()),
+          ('loop_to_x', LoopToScan(interchange_carry_with_map=interchange_carry_with_map)), ('loop_to_x', ArgMaxLift()),
+          ('loop_to_x', EarlyExitToFindIndex()), ('loop_to_x', LoopToConditionalReduce())]
 
     # untrivialize: splice out the single-iteration trivial-loop scaffold (the
     # wrappers MoveIfIntoLoop put around bare siblings) *while still a LoopRegion*,

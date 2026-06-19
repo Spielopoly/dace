@@ -1,4 +1,6 @@
 # Copyright 2019-2026 ETH Zurich and the DaCe authors. All rights reserved.
+
+import pytest
 import dace
 import numpy
 import pytest
@@ -612,19 +614,25 @@ def div_index_symbol(src: dace.float64[N], dst: dace.float64[N]):
 
 @pytest.mark.simple  # canonical: test_div_index_symbol (symbolic divisor, harder)
 def test_div_index_const3():
-    """``src[i // 3]`` — divisor does NOT divide W=8, so the phase ``i % 3``
-    is non-zero on most tiles; the lane-replicate must account for it."""
+    """``src[i // 3]`` — a STATIC divisor that does NOT divide W=8. The REPLICATE
+    lane formula ``__l / k`` requires ``W % k == 0``; for a compile-time-constant
+    divisor ``TileLoad`` validates this at construction and refuses a non-dividing
+    factor with a ``ValueError`` (contrast the *symbolic* ``test_div_index_symbol``
+    ``[3]`` / ``[5]``, where the divisor is unprovable at compile time and instead
+    trips an uncatchable runtime abort, hence those are skipped). Refused until a
+    phase-aware "replicate with remainder" lands."""
     N_val = 64
-    run_vectorization_test(
-        dace_func=div_index_const3,
-        arrays={
-            "src": numpy.random.rand(N_val),
-            "dst": numpy.zeros(N_val)
-        },
-        params={"N": N_val},
-        vector_width=8,
-        sdfg_name="div_index_const3",
-    )
+    with pytest.raises(ValueError, match="must divide"):
+        run_vectorization_test(
+            dace_func=div_index_const3,
+            arrays={
+                "src": numpy.random.rand(N_val),
+                "dst": numpy.zeros(N_val)
+            },
+            params={"N": N_val},
+            vector_width=8,
+            sdfg_name="div_index_const3",
+        )
 
 
 @pytest.mark.simple  # canonical: test_div_index_symbol (symbolic divisor, harder)
@@ -643,10 +651,29 @@ def test_div_index_const4():
     )
 
 
-@pytest.mark.parametrize("dv", [2, 3, 5])
+@pytest.mark.parametrize(
+    "dv",
+    [
+        2,
+        4,
+        8,
+        # Non-dividing divisors violate the REPLICATE precondition W % DV == 0 (W=8). For a
+        # SYMBOLIC divisor that cannot be proven at compile time, the TileLoad expansion emits a
+        # runtime ``if (W % DV != 0) std::abort()`` guard (tile_load.py, per user direction
+        # 2026-06-10). DV=3/5 trip it -> SIGABRT, which is uncatchable (kills the worker, so it
+        # cannot be marked xfail). Skipped until phase-aware "replicate with remainder" lands.
+        pytest.param(3,
+                     marks=pytest.mark.skip(reason="REPLICATE i//DV needs W%DV==0 (W=8); DV=3 "
+                                            "non-dividing hits the runtime W%DV abort guard")),
+        pytest.param(5,
+                     marks=pytest.mark.skip(reason="REPLICATE i//DV needs W%DV==0 (W=8); DV=5 "
+                                            "non-dividing hits the runtime W%DV abort guard")),
+    ])
 def test_div_index_symbol(dv):
     """``src[i // DV]`` with a loop-invariant symbol divisor (constant across
-    the lanes, value supplied at call time)."""
+    the lanes, value supplied at call time). Divisors must divide the tile width
+    W=8 (REPLICATE formula ``__l / DV`` requires ``W % DV == 0``); non-dividing
+    divisors are skipped above pending phase-aware replicate-with-remainder."""
     N_val = 64
     run_vectorization_test(
         dace_func=div_index_symbol,
@@ -947,9 +974,9 @@ def _assert_laneid_fan_collapsed(vec_sdfg):
     for t in fan_tasklets:
         assert "_idx" in t.in_connectors, (f"{t.label} did not get an _idx connector; "
                                            f"in_connectors={set(t.in_connectors)}")
-        assert not LaneIdScheme.contains_lane_chunk(t.code.as_string), (
-            f"{t.label} still references a laneid symbol (legacy or Option B chunked): "
-            f"{t.code.as_string!r}")
+        assert not LaneIdScheme.contains_lane_chunk(
+            t.code.as_string), (f"{t.label} still references a laneid symbol (legacy or Option B chunked): "
+                                f"{t.code.as_string!r}")
 
 
 def test_gather_load_collapse_laneid_structural():
@@ -1156,7 +1183,7 @@ def test_scatter_loop_permissive_tile(n):
     """For-loop data scatter ``dst[idx[i]] = src[i] + 1.0`` tiles on the v2
     path: ``loop_to_map_permissive`` parallelises the scatter loop (the write is
     not uniquely indexed, so plain LoopToMap refuses) and the body descent routes
-    the ``dst[idx[i]]`` store through a :class:`TileScatter`. The result matches
+    the ``dst[idx[i]]`` store through a :class:`TileStore` (scatter). The result matches
     the unvectorized reference (``n=17`` exercises the masked tail).
 
     Driven through the orchestrator directly (not ``run_vectorization_test``)

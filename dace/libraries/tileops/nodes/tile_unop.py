@@ -23,7 +23,6 @@ from dace.transformation.transformation import ExpandTransformation
 
 from .._pure_codegen import nested_loops, tile_offset
 from .. import _isa_codegen
-from ..environments import TileOpsScalar, TileOpsAVX512, TileOpsAVX2, TileOpsNeon, TileOpsSVE
 
 _TILE = "Tile"
 _SYMBOL = "Symbol"
@@ -31,6 +30,13 @@ _SCALAR = "Scalar"
 _VALID_KINDS = (_TILE, _SYMBOL, _SCALAR)
 
 # op -> (prefix, suffix) for the pure (K>=2) inline C++ form ``<pre>operand<suf>``.
+#: Op -> (prefix, suffix) for the pure inline C++ form ``<pre>operand<suf>``.
+#:
+#: Uses ``std::`` for elemental functions to match the K=1 ISA backend's tile_unop_apply
+#: (which calls ``std::abs`` / ``std::exp`` / etc.). An earlier attempt to use the
+#: ``dace::math::`` namespace failed because ``dace::math::abs`` only has overloads for
+#: ``typeless_nan`` and ``unsigned integer`` -- a ``double`` argument trips the wrong
+#: overload at compile time.
 _UNOP_CPP = {
     "neg": ("(-", ")"),
     "not": ("(!", ")"),
@@ -114,24 +120,50 @@ class ExpandTileUnopPure(ExpandTransformation):
 
         out_dtype = parent_sdfg.arrays[next(e for e in parent_state.out_edges(node)
                                             if e.src_conn == "_c").data.data].dtype.ctype
+        # Never emit a ``(bool)X`` cast (``not`` has a bool output + bool
+        # operand; casting a value to bool truncates it). Unary ops preserve
+        # the operand dtype, so the cast only matters for int-literal -> typed
+        # resolution, never bool. Suppress it when the dtype is bool.
+        _cast = "" if out_dtype == "bool" else f"({out_dtype})"
         if node.kind_a == _SYMBOL:
             # Cast to out_dtype so a literal / symbolic int operand resolves
             # cleanly against a typed unop call (mirrors the binop fix).
-            operand = f"({out_dtype})({node.expr_a})"
+            operand = f"{_cast}({node.expr_a})"
         elif node.kind_a == _TILE:
             operand = f"_a[{off}]"
-        else:  # Scalar: length-1 Array reads ``_a[0]``, a dace.data.Scalar is ``_a``.
+        else:  # Scalar: descriptor-aware reference.
+            # A tile-shape Array widened upstream is read per lane ``_a[off]``
+            # like a Tile (never ``(T)_a`` -- a pointer cast); any volume-1
+            # source (Scalar / length-1 Array) is passed by value and read as
+            # the bare ``_a``. A per-lane tile read keeps the tile dtype uncast;
+            # a broadcast is cast.
+            from .tile_binop import scalar_operand_ref
             desc = parent_sdfg.arrays[in_e["_a"].data.data]
-            ref = "_a" if isinstance(desc, dace.data.Scalar) else "_a[0]"
-            operand = f"({out_dtype})({ref})"
+            ref, broadcast = scalar_operand_ref(desc, "_a", widths, off)
+            operand = f"{_cast}({ref})" if broadcast else ref
 
         pre, post = _UNOP_CPP[node.op]
         rhs_expr = f"{pre}{operand}{post}"
-        if node.has_mask:
-            body = f"_c[{off}] = _mask[{off}] ? ({rhs_expr}) : {out_dtype}(0);"
+        # Output kind dispatch (design 6.2): non-Tile input + Scalar / length-1 output -> single
+        # assignment (no lane loop). Otherwise the K-fold tile loop.
+        from .tile_binop import _is_scalar_shape
+        out_desc = parent_sdfg.arrays[next(e for e in parent_state.out_edges(node) if e.src_conn == "_c").data.data]
+        out_is_scalar = (node.kind_a != _TILE and _is_scalar_shape(out_desc))
+        if out_is_scalar:
+            # A volume-1 output (Scalar / length-1 Array) is a by-value local
+            # (``T _c;``), so it -- and the volume-1 ``_mask`` -- are referenced
+            # bare. ``[0]`` is a memlet concern, never a tasklet-body one.
+            if node.has_mask:
+                body = f"_c = _mask ? ({rhs_expr}) : {out_dtype}(0);"
+            else:
+                body = f"_c = {rhs_expr};"
+            code = body
         else:
-            body = f"_c[{off}] = {rhs_expr};"
-        code = nested_loops(widths, body)
+            if node.has_mask:
+                body = f"_c[{off}] = _mask[{off}] ? ({rhs_expr}) : {out_dtype}(0);"
+            else:
+                body = f"_c[{off}] = {rhs_expr};"
+            code = nested_loops(widths, body)
         inputs = set()
         if node.kind_a in (_TILE, _SCALAR):
             inputs.add("_a")
@@ -192,61 +224,6 @@ class ExpandTileUnopCutile(ExpandTransformation):
         )
 
 
-@library.expansion
-class ExpandTileUnopScalar(ExpandTransformation):
-    """K=1 scalar backend lowering (``dace/tile_ops/scalar.h``)."""
-
-    environments = [TileOpsScalar]
-
-    @staticmethod
-    def expansion(node, parent_state, parent_sdfg):
-        return _isa_codegen.make_unop_tasklet(node, parent_state, parent_sdfg, "scalar")
-
-
-@library.expansion
-class ExpandTileUnopAVX512(ExpandTransformation):
-    """K=1 avx512 backend lowering (``dace/tile_ops/avx512.h``)."""
-
-    environments = [TileOpsAVX512]
-
-    @staticmethod
-    def expansion(node, parent_state, parent_sdfg):
-        return _isa_codegen.make_unop_tasklet(node, parent_state, parent_sdfg, "avx512")
-
-
-@library.expansion
-class ExpandTileUnopAVX2(ExpandTransformation):
-    """K=1 avx2 backend lowering (``dace/tile_ops/avx2.h``)."""
-
-    environments = [TileOpsAVX2]
-
-    @staticmethod
-    def expansion(node, parent_state, parent_sdfg):
-        return _isa_codegen.make_unop_tasklet(node, parent_state, parent_sdfg, "avx2")
-
-
-@library.expansion
-class ExpandTileUnopNeon(ExpandTransformation):
-    """K=1 neon backend lowering (``dace/tile_ops/arm_neon.h``)."""
-
-    environments = [TileOpsNeon]
-
-    @staticmethod
-    def expansion(node, parent_state, parent_sdfg):
-        return _isa_codegen.make_unop_tasklet(node, parent_state, parent_sdfg, "neon")
-
-
-@library.expansion
-class ExpandTileUnopSVE(ExpandTransformation):
-    """K=1 sve backend lowering (``dace/tile_ops/arm_sve.h``)."""
-
-    environments = [TileOpsSVE]
-
-    @staticmethod
-    def expansion(node, parent_state, parent_sdfg):
-        return _isa_codegen.make_unop_tasklet(node, parent_state, parent_sdfg, "sve")
-
-
 @library.node
 class TileUnop(nodes.LibraryNode):
     """Element-wise unary op on a K-dim register tile.
@@ -262,11 +239,11 @@ class TileUnop(nodes.LibraryNode):
     implementations = {
         "pure": ExpandTileUnopPure,
         "cutile": ExpandTileUnopCutile,
-        "scalar": ExpandTileUnopScalar,
-        "avx512": ExpandTileUnopAVX512,
-        "avx2": ExpandTileUnopAVX2,
-        "neon": ExpandTileUnopNeon,
-        "sve": ExpandTileUnopSVE,
+        # K=1 ISA backends (scalar / avx512 / avx2 / neon / sve): a call into
+        # dace/tile_ops/<backend>.h -- same call, the backend's env pulls in the
+        # matching header. Built by the shared factory (selector routes K>=2 to
+        # ``pure``).
+        **_isa_codegen.make_isa_expansions("Unop", _isa_codegen.make_unop_tasklet, globals()),
     }
     default_implementation = "pure"
 
@@ -366,10 +343,16 @@ class TileUnop(nodes.LibraryNode):
             raise ValueError(f"{self.label}: has_mask=True but '_mask' not connected")
         if self.kind_a in (_TILE, _SCALAR) and "_a" not in in_e:
             raise ValueError(f"{self.label}: kind_a={self.kind_a!r} but '_a' not connected")
+        c_arr = sdfg.arrays[out_e["_c"].data.data]
         if self.kind_a == _TILE:
-            c_arr = sdfg.arrays[out_e["_c"].data.data]
             src = sdfg.arrays[in_e["_a"].data.data].dtype
             if not _promotion_ok(src, c_arr.dtype):
                 raise NotImplementedError(
                     f"{self.label}: Tile operand '_a' dtype {src} cannot be promoted to output dtype "
                     f"{c_arr.dtype} (narrowing conversion); cast explicitly via a separate tasklet.")
+        # Output-kind rule (design 6.2): when input is Tile, the output must be tile-shape.
+        from .tile_binop import _is_tile_shape
+        if self.kind_a == _TILE and not _is_tile_shape(c_arr, tuple(self.widths)):
+            raise NotImplementedError(
+                f"{self.label}: output-kind rule violated -- kind_a=Tile but '_c' descriptor is not "
+                f"tile-shape {tuple(self.widths)!r}. Per design section 6.2: Tile input -> Tile output.")

@@ -1,6 +1,11 @@
 # Copyright 2019-2026 ETH Zurich and the DaCe authors. All rights reserved.
-import dace
+
 import pytest
+# Unblocked 2026-06-12 per user direction (``enabling cloudsc tests and
+# gradually enabling more tests``). The walker-primary pipeline lands the
+# K-dim path e2e (gather + scatter passing); some legacy ``branch_mode`` /
+# ``emission_style`` parametrisations may still need triage.
+import dace
 import numpy
 from tests.passes.vectorization.helpers.harness import (
     run_vectorization_test,
@@ -241,7 +246,7 @@ def test_snippet_from_cloudsc_four(tile_emit_mode, remainder_strategy, emission_
 
 
 @pytest.mark.parametrize("opt_parameters", _OPT_PARAMS)
-def test_snippet_from_cloudsc_three(opt_parameters, branch_mode, remainder_strategy):
+def test_snippet_from_cloudsc_three(opt_parameters, branch_mode, remainder_strategy, vectorize_config):
     fuse_overlapping_loads, insert_copies = opt_parameters
 
     sdfg = _get_cloudsc_snippet_three(add_scalar=False)
@@ -291,11 +296,13 @@ def test_snippet_from_cloudsc_three(opt_parameters, branch_mode, remainder_strat
                            insert_copies=insert_copies,
                            branch_mode=branch_mode,
                            remainder_strategy=remainder_strategy,
+                           vectorize_config=vectorize_config,
                            param_tag=f"param{_OPT_PARAMS.index(opt_parameters)}")
 
 
 @pytest.mark.parametrize("opt_parameters", _OPT_PARAMS)
-def test_snippet_from_cloudsc_three_with_partial_subset(opt_parameters, branch_mode, remainder_strategy):
+def test_snippet_from_cloudsc_three_with_partial_subset(opt_parameters, branch_mode, remainder_strategy,
+                                                        vectorize_config):
     fuse_overlapping_loads, insert_copies = opt_parameters
 
     sdfg = _get_cloudsc_snippet_three(add_scalar=False, map_range_dependent_subset=True)
@@ -346,11 +353,13 @@ def test_snippet_from_cloudsc_three_with_partial_subset(opt_parameters, branch_m
                            no_inline=True,
                            branch_mode=branch_mode,
                            remainder_strategy=remainder_strategy,
+                           vectorize_config=vectorize_config,
                            param_tag=f"param{_OPT_PARAMS.index(opt_parameters)}")
 
 
 @pytest.mark.parametrize("opt_parameters", _OPT_PARAMS)
-def test_snippet_from_cloudsc_three_with_partial_subset_without_inline(opt_parameters, branch_mode, remainder_strategy):
+def test_snippet_from_cloudsc_three_with_partial_subset_without_inline(opt_parameters, branch_mode, remainder_strategy,
+                                                                       vectorize_config):
     fuse_overlapping_loads, insert_copies = opt_parameters
 
     sdfg = _get_cloudsc_snippet_three(add_scalar=False, map_range_dependent_subset=True)
@@ -401,11 +410,13 @@ def test_snippet_from_cloudsc_three_with_partial_subset_without_inline(opt_param
                            no_inline=True,
                            branch_mode=branch_mode,
                            remainder_strategy=remainder_strategy,
+                           vectorize_config=vectorize_config,
                            param_tag=f"param{_OPT_PARAMS.index(opt_parameters)}")
 
 
 @pytest.mark.parametrize("opt_parameters", _OPT_PARAMS)
-def test_snippet_from_cloudsc_three_without_inline_sdfgs(opt_parameters, branch_mode, remainder_strategy):
+def test_snippet_from_cloudsc_three_without_inline_sdfgs(opt_parameters, branch_mode, remainder_strategy,
+                                                         vectorize_config):
     fuse_overlapping_loads, insert_copies = opt_parameters
 
     sdfg = _get_cloudsc_snippet_three(add_scalar=False)
@@ -456,11 +467,12 @@ def test_snippet_from_cloudsc_three_without_inline_sdfgs(opt_parameters, branch_
                            no_inline=True,
                            branch_mode=branch_mode,
                            remainder_strategy=remainder_strategy,
+                           vectorize_config=vectorize_config,
                            param_tag=f"param{_OPT_PARAMS.index(opt_parameters)}")
 
 
 @pytest.mark.parametrize("opt_parameters", _OPT_PARAMS)
-def test_snippet_from_cloudsc_three_with_scalar_use(opt_parameters, branch_mode, remainder_strategy):
+def test_snippet_from_cloudsc_three_with_scalar_use(opt_parameters, branch_mode, remainder_strategy, vectorize_config):
     fuse_overlapping_loads, insert_copies = opt_parameters
 
     sdfg = _get_cloudsc_snippet_three(add_scalar=True)
@@ -511,4 +523,5 @@ def test_snippet_from_cloudsc_three_with_scalar_use(opt_parameters, branch_mode,
                            insert_copies=insert_copies,
                            branch_mode=branch_mode,
                            remainder_strategy=remainder_strategy,
+                           vectorize_config=vectorize_config,
                            param_tag=f"param{_OPT_PARAMS.index(opt_parameters)}")

@@ -4,6 +4,7 @@ import ctypes
 import json
 import inspect
 import numpy
+import ml_dtypes
 import re
 from sympy import Float, Integer
 from collections import OrderedDict
@@ -15,6 +16,7 @@ from dace.config import Config
 from enum import auto, Enum
 from dace.attr_enum import ExtensibleAttributeEnum
 from dace.registry import undefined_safe_enum
+from dace.version import __version__
 
 if TYPE_CHECKING:
     from dace.codegen.py.prettycode import PythonCodeIOStream
@@ -239,27 +241,56 @@ STORAGEDEFAULT_SCHEDULE = {
 
 # Translation of types to C types
 _CTYPES = {
-    None: "void",
-    int: "int",
-    float: "float",
-    complex: "dace::complex64",
-    bool: "bool",
-    numpy.bool_: "bool",
-    numpy.int8: "int8_t",
-    numpy.int16: "int16_t",
-    numpy.int32: "int32_t",
-    numpy.intc: "int",
-    numpy.int64: "int64_t",
-    numpy.uint8: "uint8_t",
-    numpy.uint16: "uint16_t",
-    numpy.uint32: "uint32_t",
-    numpy.uintc: "dace::uint",
-    numpy.uint64: "uint64_t",
-    numpy.float16: "dace::float16",
-    numpy.float32: "float",
-    numpy.float64: "double",
-    numpy.complex64: "dace::complex64",
-    numpy.complex128: "dace::complex128",
+    None:
+    "void",
+    int:
+    "int",
+    float:
+    "float",
+    complex:
+    "dace::complex64",
+    bool:
+    "bool",
+    numpy.bool_:
+    "bool",
+    numpy.int8:
+    "int8_t",
+    numpy.int16:
+    "int16_t",
+    numpy.int32:
+    "int32_t",
+    numpy.intc:
+    "int",
+    numpy.int64:
+    "int64_t",
+    numpy.uint8:
+    "uint8_t",
+    numpy.uint16:
+    "uint16_t",
+    numpy.uint32:
+    "uint32_t",
+    numpy.uintc:
+    "dace::uint",
+    numpy.uint64:
+    "uint64_t",
+    numpy.float16:
+    "dace::float16",
+    numpy.float32:
+    "float",
+    numpy.float64:
+    "double",
+    numpy.complex64:
+    "dace::complex64",
+    numpy.complex128:
+    "dace::complex128",
+    # Low-precision types (runtime C++ headers not yet implemented -- see
+    # ``dace::bfloat16`` / ``dace::float8_e4m3`` / ``dace::float8_e5m2``).
+    ml_dtypes.bfloat16:
+    "dace::bfloat16",
+    ml_dtypes.float8_e4m3fn:
+    "dace::float8_e4m3fn",
+    ml_dtypes.float8_e5m2:
+    "dace::float8_e5m2",
 }
 
 # Translation of types to python or numpy types
@@ -334,6 +365,10 @@ _FFI_CTYPES = {
     numpy.float64: ctypes.c_double,
     numpy.complex64: ctypes.c_uint64,
     numpy.complex128: ctypes.c_longdouble,
+    # Low-precision types: marshalled as their raw integer storage.
+    ml_dtypes.bfloat16: ctypes.c_uint16,
+    ml_dtypes.float8_e4m3fn: ctypes.c_uint8,
+    ml_dtypes.float8_e5m2: ctypes.c_uint8,
 }
 
 # Number of bytes per data type
@@ -359,6 +394,9 @@ _BYTES = {
     numpy.float64: 8,
     numpy.complex64: 8,
     numpy.complex128: 16,
+    ml_dtypes.bfloat16: 2,
+    ml_dtypes.float8_e4m3fn: 1,
+    ml_dtypes.float8_e5m2: 1,
 }
 
 
@@ -957,7 +995,7 @@ class callback(typeclass):
             elif isinstance(arg, data.Data):
                 pass
             elif isinstance(arg, str):
-                arg = json_to_typeclass(arg)
+                arg = json_to_typeclass(arg, {'version': __version__})
             else:
                 raise TypeError("Cannot resolve type from: {}".format(arg))
             self.input_types.append(arg)
@@ -1188,7 +1226,7 @@ class callback(typeclass):
 
         import dace.serialize  # Avoid import loop
 
-        return callback([json_to_typeclass(rettype) if rettype else None for rettype in rettypes],
+        return callback([json_to_typeclass(rettype, context) if rettype else None for rettype in rettypes],
                         *(dace.serialize.from_json(arg, context) for arg in json_obj['arguments']))
 
     def __str__(self):
@@ -1264,6 +1302,9 @@ if TYPE_CHECKING:
     class uint32(_DaCeArray, npt.NDArray[numpy.uint32]): ...
     class uint64(_DaCeArray, npt.NDArray[numpy.uint64]): ...
     class float16(_DaCeArray, npt.NDArray[numpy.float16]): ...
+    class bfloat16(_DaCeArray, npt.NDArray): ...
+    class float8_e4m3fn(_DaCeArray, npt.NDArray): ...
+    class float8_e5m2(_DaCeArray, npt.NDArray): ...
     class float32(_DaCeArray, npt.NDArray[numpy.float32]): ...
     class float64(_DaCeArray, npt.NDArray[numpy.float64]): ...
     class complex64(_DaCeArray, npt.NDArray[numpy.complex64]): ...
@@ -1285,6 +1326,15 @@ else:
     uint32 = typeclass(numpy.uint32)
     uint64 = typeclass(numpy.uint64)
     float16 = typeclass(numpy.float16)
+    # Low-precision types backed by ml_dtypes scalars (numpy-registered), named
+    # verbatim as ml_dtypes names them. E4M3 is the finite ``fn`` variant
+    # (max +-448, no inf) -- the hardware E4M3 of NVIDIA __nv_fp8_e4m3 / AMD /
+    # OCP training. The C++ runtime headers (dace::bfloat16 / dace::float8_e4m3fn
+    # / dace::float8_e5m2) are not implemented yet -- this registers the
+    # Python-side dtypes only.
+    bfloat16 = typeclass(ml_dtypes.bfloat16)
+    float8_e4m3fn = typeclass(ml_dtypes.float8_e4m3fn)
+    float8_e5m2 = typeclass(ml_dtypes.float8_e5m2)
     float32 = typeclass(numpy.float32)
     float64 = typeclass(numpy.float64)
     complex64 = typeclass(numpy.complex64)
@@ -1313,6 +1363,9 @@ def dtype_to_typeclass(dtype=None):
         numpy.uint64: uint64,
         numpy.uintc: uint32,
         numpy.float16: float16,
+        ml_dtypes.bfloat16: bfloat16,
+        ml_dtypes.float8_e4m3fn: float8_e4m3fn,
+        ml_dtypes.float8_e5m2: float8_e5m2,
         numpy.float32: float32,
         numpy.float64: float64,
         numpy.complex64: complex64,
@@ -1326,7 +1379,7 @@ def dtype_to_typeclass(dtype=None):
     return DTYPE_TO_TYPECLASS[dtype]
 
 
-FLOAT_TYPES = {float64, float32, float16}
+FLOAT_TYPES = {float64, float32, float16, bfloat16, float8_e4m3fn, float8_e5m2}
 
 INT_TYPES = {int8, int16, int32, int64, uintp, uint8, uint16, uint32, uint64}
 
@@ -1346,6 +1399,9 @@ TYPECLASS_TO_STRING = {
     int32: "dace::int32",
     int64: "dace::int64",
     float16: "dace::float16",
+    bfloat16: "dace::bfloat16",
+    float8_e4m3fn: "dace::float8_e4m3fn",
+    float8_e5m2: "dace::float8_e5m2",
     float32: "dace::float32",
     float64: "dace::float64",
     complex64: "dace::complex64",
@@ -1362,6 +1418,9 @@ TYPECLASS_TO_LITERAL_SUFFIX = {
     uint32: 'u32',
     uint64: 'u64',
     float16: 'f16',
+    bfloat16: 'bf16',
+    float8_e4m3fn: 'e4m3fn',
+    float8_e5m2: 'e5m2',
     float32: 'f32',
     float64: 'f64',
 }
@@ -1384,7 +1443,7 @@ TYPECLASS_TO_CPP_LITERAL_SUFFIX = {
 
 TYPECLASS_STRINGS = [
     "int", "float", "complex", "bool", "bool_", "int8", "int16", "int32", "int64", "uint8", "uint16", "uint32",
-    "uint64", "float16", "float32", "float64", "complex64", "complex128"
+    "uint64", "float16", "bfloat16", "float8_e4m3fn", "float8_e5m2", "float32", "float64", "complex64", "complex128"
 ]
 
 INTEGER_TYPES = [bool, bool_, int8, int16, int32, int64, uint8, uint16, uint32, uint64]

@@ -6,11 +6,13 @@ opt-in fixtures defined in ``tests/passes/vectorization/conftest.py``
 (``tile_emit_mode``, ``branch_mode``, ``remainder_strategy``,
 ``emission_style``, ``vectorize_config``) are visible to the test.
 """
+
+import pytest
+# [UNSKIPPED-FOR-ASSESSMENT 2026-06-14] pytestmark = pytest.mark.skip(reason="legacy K=1/K=2 descent path frozen during walker-primary migration -- this test goes through VectorizeCPUMultiDim or the harness; both depend on the legacy descent + emit infrastructure being removed. Will be revived (or replaced by walker-primary equivalents) after the new orchestrator pipeline lands end-to-end.")
 import pytest
 import numpy as np
 
 from tests.corpus import tsvc
-from tests.passes.vectorization.helpers.harness import run_vectorization_test
 
 _G1D = tsvc.collect(regime="1d")
 _G2D = tsvc.collect(regime="2d")
@@ -74,12 +76,10 @@ def test_tsvc_hardening_canonicals(kernel_name, tile_emit_mode, branch_mode, rem
     # already exercised in ``test_tsvc_vectorization``; here we focus on
     # the knob cross, not the remainder shape, which the
     # ``remainder_strategy`` fixture handles independently).
-    if kernel.regime == "1d":
-        l1, l2 = 64, tsvc.LEN_2D_FIXED
-    else:
-        l1, l2 = tsvc.LEN_2D_FIXED, 16
+    # regime_sizes keeps LEN_1D >= LEN_2D + margin so a[inc+i] stays in bounds.
+    l1, l2 = tsvc.regime_sizes(kernel.regime, 64 if kernel.regime == "1d" else 16)
 
-    rng = np.random.default_rng(seed=hash(kernel_name) & 0xFFFF)
+    rng = np.random.default_rng(seed=tsvc.stable_seed(kernel_name))
     arrays = tsvc.allocate(kernel, l1, l2, rng)
     sym = tsvc.symbols(kernel, l1, l2)
     sparams = tsvc.scalar_params(kernel, l1)
@@ -99,5 +99,3 @@ def test_tsvc_hardening_canonicals(kernel_name, tile_emit_mode, branch_mode, rem
         insert_copies=insert_copies,
         vectorize_config=vectorize_config,
     )
-
-

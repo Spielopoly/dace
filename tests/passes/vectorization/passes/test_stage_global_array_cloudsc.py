@@ -19,6 +19,9 @@ e2e-numerical convention.
 The pass module does not exist yet — the implementation agent creates it. Until
 then this file raises an ``ImportError`` for the pass *only*.
 """
+
+import pytest
+# [UNSKIPPED-FOR-ASSESSMENT 2026-06-14] pytestmark = pytest.mark.skip(reason="legacy K=1/K=2 descent path frozen during walker-primary migration -- this test goes through VectorizeCPUMultiDim or the harness; both depend on the legacy descent + emit infrastructure being removed. Will be revived (or replaced by walker-primary equivalents) after the new orchestrator pipeline lands end-to-end.")
 import copy
 
 import numpy
@@ -141,7 +144,10 @@ def test_cloudsc_four_zqlhs_chain_numerics(klon: int):
     ref.compile()(**ref_arrays, **params)
     vec.compile()(**vec_arrays, **params)
     for key in arrays:
-        numpy.testing.assert_allclose(vec_arrays[key], ref_arrays[key], rtol=RTOL, atol=ATOL,
+        numpy.testing.assert_allclose(vec_arrays[key],
+                                      ref_arrays[key],
+                                      rtol=RTOL,
+                                      atol=ATOL,
                                       err_msg=f"cloudsc_four[klon={klon}]: array {key!r} diverged after staging")
 
 

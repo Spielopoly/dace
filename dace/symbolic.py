@@ -212,6 +212,57 @@ class symbol(sympy.Symbol):
         # yapf: enable
 
 
+#: Sentinel symbol for tile-shape broadcast dimensions in the K-dim
+#: vectorisation track (design section 3.8.1).
+#:
+#: A descriptor with shape ``(W_0, ONE, W_2)`` declares that dim 1 is a
+#: broadcast (size-1) dimension that downstream codegen must address as
+#: replicated -- not collapse-and-fold-out. Transformations that special-case
+#: literal-1 dims (length-1-array-to-scalar conversion, soft-squeeze in cpp
+#: codegen, ``to_unsqueeze`` in schedule trees) skip dims marked ``ONE`` via
+#: a sympy free-symbol identity check (``ONE in shape.free_symbols``).
+#:
+#: Final lowering substitutes ``ONE -> 1`` at the bottom of the per-arch
+#: codegen pipeline, so the C++ literal is unchanged for actual indexing.
+#: User direction 2026-06-10: name is literally ``"ONE"``; full-tile idx
+#: arrays always carry ``ONE`` for non-dependent dims so the gather lib
+#: nodes' broadcast lowering is uniform across CPU and GPU expansions.
+ONE = symbol('ONE', dtype=dtypes.int32, integer=True, positive=True)
+
+
+def collapse_one_dims(shape, treat_one_symbol_as_one: bool = False):
+    """Drop literal-1 dims (and optionally :data:`ONE`-marked dims) from a shape.
+
+    Two modes per user direction 2026-06-10:
+
+    * **Default** (``treat_one_symbol_as_one=False``): drops literal Python
+      ``1`` entries only. The sympy :data:`ONE` sentinel survives so
+      transformations that special-case its identity (per design 3.8.2 the
+      ``ONE``-marker firewall in :class:`ConvertLengthOneArraysToScalars`)
+      keep working. ``(8, 1)`` -> ``(8,)``; ``(8, ONE)`` -> ``(8, ONE)``.
+
+    * **Opt-in** (``treat_one_symbol_as_one=True``): also drops dims whose
+      ``free_symbols`` contains :data:`ONE`. Used by sites that need the
+      "structural-equivalent" view (e.g. ``resolve_gather_deps`` in
+      :mod:`dace.libraries.tileops._pure_codegen`, the GatherLift tile-shape
+      lookup, and test assertions). ``(8, ONE)`` -> ``(8,)`` here.
+
+    :param shape: A shape tuple / list / sequence; entries may be Python
+        ints, sympy ``Basic`` instances, or :class:`SymExpr`.
+    :param treat_one_symbol_as_one: Whether to also drop ``ONE``-symbol dims.
+    :returns: A new tuple with the requested entries removed in source order.
+    """
+
+    def _is_dropped(s):
+        if s == 1:
+            return True
+        if treat_one_symbol_as_one and isinstance(s, sympy.Basic) and ONE in s.free_symbols:
+            return True
+        return False
+
+    return tuple(s for s in shape if not _is_dropped(s))
+
+
 class UndefinedSymbol(symbol):
     """ Defines an undefined symbolic expression whose value is deferred to runtime.
 
@@ -1231,6 +1282,39 @@ class right_shift(sympy.Function):
         # Keep symbolic shifts unevaluated so they round-trip to ``x >> y`` rather
         # than collapsing to ``int_floor(x, 2**y)``.
         if x.is_Number and y.is_Number:
+            return x >> y
+
+
+class logical_left_shift(sympy.Function):
+    """Logical (zero-fill) left shift -- the Fortran ``ISHFT`` lowering.
+
+    Distinct from :class:`left_shift`: it shifts the unsigned bit pattern (no
+    sign extension), lowering to the ``dace::logical_left_shift`` runtime
+    helper.  Symbolic operands stay unevaluated so they round-trip to the
+    helper rather than collapsing to ``x * 2**y``.
+    """
+
+    @classmethod
+    def eval(cls, x, y):
+        if x.is_Number and y.is_Number and x.is_nonnegative:
+            # For a non-negative value the zero-fill and arithmetic results
+            # agree; leave the sign-dependent case to the runtime helper.
+            return x << y
+
+
+class logical_right_shift(sympy.Function):
+    """Logical (zero-fill) right shift -- the Fortran ``ISHFT`` (negative count)
+    lowering.
+
+    Distinct from :class:`right_shift`: it shifts the unsigned bit pattern (no
+    sign extension), lowering to the ``dace::logical_right_shift`` runtime
+    helper.  Only folds for a concrete non-negative value (where zero-fill and
+    arithmetic agree); otherwise stays unevaluated.
+    """
+
+    @classmethod
+    def eval(cls, x, y):
+        if x.is_Number and y.is_Number and x.is_nonnegative:
             return x >> y
 
 

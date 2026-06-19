@@ -24,6 +24,9 @@ adjustment to keep the ``T[1]`` array shape. Kernels that already
 synthesize an explicit ``T*`` boundary upstream are not affected and
 land cleanly through the K=0 path.
 """
+
+import pytest
+# [UNSKIPPED-FOR-ASSESSMENT 2026-06-14] pytestmark = pytest.mark.skip(reason="legacy K=1/K=2 descent path frozen during walker-primary migration -- this test goes through VectorizeCPUMultiDim or the harness; both depend on the legacy descent + emit infrastructure being removed. Will be revived (or replaced by walker-primary equivalents) after the new orchestrator pipeline lands end-to-end.")
 import numpy as np
 import pytest
 
@@ -73,13 +76,11 @@ def test_k0_remainder_tsvc(kernel_name: str):
     un-transformed scalar reference at a non-divisible LEN.
     """
     kernel = _resolve_canonical(kernel_name)
-    # Non-divisible LEN so the postamble actually fires (LEN % 8 != 0).
-    if kernel.regime == "1d":
-        l1, l2 = 65, tsvc.LEN_2D_FIXED
-    else:
-        l1, l2 = tsvc.LEN_2D_FIXED, 17
+    # Non-divisible swept LEN so the postamble actually fires (swept % 8 != 0).
+    # regime_sizes keeps LEN_1D >= LEN_2D + margin so a[inc+i] stays in bounds.
+    l1, l2 = tsvc.regime_sizes(kernel.regime, 65 if kernel.regime == "1d" else 17)
 
-    rng = np.random.default_rng(seed=hash(kernel_name) & 0xFFFF)
+    rng = np.random.default_rng(seed=tsvc.stable_seed(kernel_name))
     arrays = tsvc.allocate(kernel, l1, l2, rng)
     sym = tsvc.symbols(kernel, l1, l2)
     sparams = tsvc.scalar_params(kernel, l1)

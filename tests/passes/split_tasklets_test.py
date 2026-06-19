@@ -488,6 +488,32 @@ def test_split_does_not_treat_ite_as_variable(body: str, inputs: set):
     assert saw_ite_call, "the ITE(...) call did not survive splitting"
 
 
+def test_split_comparison_intermediate_is_bool():
+    """A split-out comparison / boolean sub-expression must be typed ``bool``, not the
+    numeric ``input_type``. Regression: SplitTasklets typed every intermediate with the
+    inputs' dtype, so ``__t0 = (_a > 0.0)`` became ``double`` and, fed to a ``TileITE``
+    ``_mask`` connector downstream, tripped ConvertTaskletsToTileOps'
+    ``mask_connectors_are_bool`` invariant (the K=2 cond-mask tests)."""
+    sdfg = dace.SDFG("split_cmp_bool")
+    for arr in ("_a", "_c", "_b"):
+        sdfg.add_array(arr + "_ARR", shape=(1, ), dtype=dace.float64, transient=False)
+    state = sdfg.add_state("main")
+    t = state.add_tasklet("t", {"_a", "_c"}, {"_b"}, "_b = _c if (_a > 0.0) else 0.0")
+    state.add_edge(state.add_access("_a_ARR"), None, t, "_a", dace.Memlet("_a_ARR[0]"))
+    state.add_edge(state.add_access("_c_ARR"), None, t, "_c", dace.Memlet("_c_ARR[0]"))
+    state.add_edge(t, "_b", state.add_access("_b_ARR"), None, dace.Memlet("_b_ARR[0]"))
+    sdfg.validate()
+    SplitTasklets().apply_pass(sdfg=sdfg, pipeline_results={})
+    sdfg.validate()
+    # The intermediate produced by the comparison ``_a > 0.0`` must be a bool scalar
+    # (without the fix every split transient was the numeric ``input_type``).
+    bool_transients = [name for name, desc in sdfg.arrays.items() if desc.transient and desc.dtype == dace.bool_]
+    assert bool_transients, ("the split comparison intermediate was not typed bool; transient dtypes: " + str({
+        n: d.dtype
+        for n, d in sdfg.arrays.items() if d.transient
+    }))
+
+
 def test_to_ssa_preserves_int_floor_call():
     """A two-arg ``int_floor(a, b)`` must be split as a function call, not
     mangled into an infix ``a int_floor b`` or have its divisor dropped.
@@ -519,19 +545,21 @@ def test_to_ssa_temp_names_do_not_collide_with_input():
     assert any("int_floor(LEN_1D, 2)" in ln for ln in lines), joined
 
 
-@pytest.mark.parametrize("code,n_lines", [
-    # A function call with trivial (name/constant) args is NOT split: a
-    # multi-input function ``foo(a, b, c, d)`` stays a single statement.
-    ("out = foo(a, b, c, d)", 1),
-    # Each non-trivial arg is lifted into its own tasklet *before* the call,
-    # so ``foo(a+1, b+1, c+1, d+1)`` needs 4 arg tasklets + the call = 5.
-    ("out = foo(a + 1, b + 1, c + 1, d + 1)", 5),
-    # Only the non-trivial arg is lifted.
-    ("out = foo(a, b + 1, c, d)", 2),
-    # Two-arg builtin function: ``int_floor(a + 1, 2)`` lifts the ``a + 1``.
-    ("out = int_floor(a + 1, 2)", 2),
-    ("out = int_floor(a, b)", 1),
-])
+@pytest.mark.parametrize(
+    "code,n_lines",
+    [
+        # A function call with trivial (name/constant) args is NOT split: a
+        # multi-input function ``foo(a, b, c, d)`` stays a single statement.
+        ("out = foo(a, b, c, d)", 1),
+        # Each non-trivial arg is lifted into its own tasklet *before* the call,
+        # so ``foo(a+1, b+1, c+1, d+1)`` needs 4 arg tasklets + the call = 5.
+        ("out = foo(a + 1, b + 1, c + 1, d + 1)", 5),
+        # Only the non-trivial arg is lifted.
+        ("out = foo(a, b + 1, c, d)", 2),
+        # Two-arg builtin function: ``int_floor(a + 1, 2)`` lifts the ``a + 1``.
+        ("out = int_floor(a + 1, 2)", 2),
+        ("out = int_floor(a, b)", 1),
+    ])
 def test_to_ssa_multi_input_function_split(code: str, n_lines: int):
     """A function with multiple inputs is split only where its arguments are
     non-trivial: trivial args (names/constants) keep the call as one
@@ -958,3 +986,59 @@ if __name__ == "__main__":
         test_single_tasklet_symbol_only_split(expression_str, expected_num_statements)
     test_complex_expression()
     test_complex_expression_with_scalars()
+
+# Per user direction 2026-06-09: ensure SplitTasklets handles ANY function call by lifting
+# arguments to SSA. The legacy allowlist (``log`` / ``exp`` / ...) made unfamiliar function
+# names (``sqrt``, ``tanh``, user-defined) leak as stale input connectors -- now fixed via
+# AST-detection of function-position names in ``_get_vars``.
+
+
+@pytest.mark.parametrize(
+    "body_expr",
+    [
+        "_c = sqrt(_a + _b)",  # function over binop
+        "_c = sqrt(_a * _a + _b * _b)",  # function over nested expr (the user's exact example)
+        "_c = tanh(_a) * _b",  # function output feeds another binop
+        "_c = my_custom_func(_a, _b)",  # arbitrary user function name
+        "_c = sin(cos(_a + _b))",  # nested function calls
+    ],
+)
+def test_split_handles_arbitrary_function_calls(body_expr):
+    """SplitTasklets handles ANY function call by lifting each argument sub-expression to
+    its own intermediate transient. The function name is detected via AST (no allowlist
+    required).
+
+    For ``_c = sqrt(_a * _a + _b * _b)`` the expected split is:
+       __t0 = _a * _a
+       __t1 = _b * _b
+       __t2 = __t0 + __t1
+       _c = sqrt(__t2)
+
+    Per user direction 2026-06-09: "Ensure that we split all function expressions like
+    this regardless of what function it was".
+    """
+    import dace as _d
+    from dace.transformation.passes.split_tasklets import SplitTasklets
+    sdfg = _d.SDFG("split_func_fixture")
+    sdfg.add_array("A", (4, ), _d.float64, transient=False)
+    sdfg.add_array("B", (4, ), _d.float64, transient=False)
+    sdfg.add_array("C", (4, ), _d.float64, transient=False)
+    state = sdfg.add_state("s")
+    me, mx = state.add_map("k", {"ii": "0:4"})
+    a = state.add_access("A")
+    b = state.add_access("B")
+    c = state.add_access("C")
+    t = state.add_tasklet("body", {"_a", "_b"}, {"_c"}, body_expr)
+    state.add_memlet_path(a, me, t, dst_conn="_a", memlet=_d.Memlet("A[ii]"))
+    state.add_memlet_path(b, me, t, dst_conn="_b", memlet=_d.Memlet("B[ii]"))
+    state.add_memlet_path(t, mx, c, src_conn="_c", memlet=_d.Memlet("C[ii]"))
+    # Pass should run without raising. validate() at the tail of apply_pass is the gate.
+    SplitTasklets().apply_pass(sdfg, {})
+    # No tasklet should have an "_<func>" or function-name in-connector.
+    for n in state.nodes():
+        if isinstance(n, _d.nodes.Tasklet):
+            for in_conn in n.in_connectors.keys():
+                # Connector names that match a known function name suggest the function
+                # leaked through as a variable.
+                assert in_conn not in {"sqrt", "tanh", "sin", "cos", "my_custom_func"}, \
+                    f"function name {in_conn!r} leaked as an in-connector on {n.label!r}"

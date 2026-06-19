@@ -17,20 +17,24 @@ path handles this directly (a contiguous, non-last-dim vectorization),
 validated here against the unvectorized reference across the
 branch/remainder/emission matrix.
 
-The K-dim tile-op path (``vectorize_config="tile_nodes"``) is NOT
-exercised here yet: its ``pure`` expansion lays the register tile out
-C-row-major and maps tile dims to map params positionally, so a
-Fortran-strided array is read at the wrong offsets. Carrying per-dim
-strides into the tile load/store expansion is a tracked follow-up; this
-test is its future regression target.
+The K-dim tile-op path (``vectorize_config="tile_nodes"``) IS exercised
+here. Its tile load/store expansion strides each tile dim along the
+ARRAY dim that dim's iter-var indexes (``src_dims`` / ``dst_dims``), not
+positionally, so a Fortran-strided array is read at unit stride on its
+leftmost (innermost-map) subscript -- both the main loop and the masked
+remainder. (Earlier the read/store sides defaulted to the last K dims,
+striding the ``i``-tile by ``M`` and reading a row instead of the
+unit-stride column; fixed by threading the per-dim mapping through
+``InsertTileLoadStore``.)
 
 TODO: add a Fortran-packed indirection (gather/scatter) test built on the
 indirect-access subgraph pattern in ``indirect/test_strided_gather_scatter``
 (a bare ``Memlet("B[idx[i], j]")`` string is not valid — the gather index
 must flow through its own connector / dynamic subset).
 """
-import numpy as np
+
 import pytest
+import numpy as np
 
 import dace
 
@@ -55,8 +59,14 @@ def _build_fortran_2d_axpy() -> dace.SDFG:
     state = sdfg.add_state("main")
     state.add_mapped_tasklet(
         "axpy",
-        {"j": "0:N", "i": "0:M"},
-        {"_a": dace.Memlet("A[i, j]"), "_b": dace.Memlet("B[i, j]")},
+        {
+            "j": "0:N",
+            "i": "0:M"
+        },
+        {
+            "_a": dace.Memlet("A[i, j]"),
+            "_b": dace.Memlet("B[i, j]")
+        },
         "_c = _a + _b",
         {"_c": dace.Memlet("C[i, j]")},
         external_edges=True,
@@ -75,8 +85,15 @@ def test_fortran_2d_axpy(branch_mode, remainder_strategy, emission_style):
     C = np.zeros((M_val, N_val), order="F")
     run_vectorization_test(
         dace_func=_build_fortran_2d_axpy(),
-        arrays={"A": A, "B": B, "C": C},
-        params={"M": M_val, "N": N_val},
+        arrays={
+            "A": A,
+            "B": B,
+            "C": C
+        },
+        params={
+            "M": M_val,
+            "N": N_val
+        },
         sdfg_name="fortran_2d_axpy",
         from_sdfg=True,
         branch_mode=branch_mode,

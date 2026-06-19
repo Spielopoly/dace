@@ -17,6 +17,8 @@ from dace import properties
 from dace.data import add_mask
 from dace.transformation import pass_pipeline as ppl
 from dace.transformation.passes.vectorization.utils.lane_access import classify_lane_access
+from dace.transformation.passes.vectorization.utils.mask_scaffold import (prepend_dominating_init_state,
+                                                                          thread_symbols_into_nsdfg)
 from dace.transformation.passes.vectorization.utils.map_predicates import (
     get_single_nsdfg_inside_map,
     is_innermost_map,
@@ -37,22 +39,8 @@ class GenerateIterationMask(ppl.Pass):
                                desc="``step_w_only`` masks only maps with step==vector_width "
                                "(legacy step-W detection); ``all_innermost`` masks every innermost "
                                "map (used by full_loop_mask strategy); ``masked`` masks maps tagged "
-                               "``__masked_rem`` by SplitMapForVectorRemainder(mode='masked'); "
-                               "``global`` (SVE-style) masks every innermost map with the fill keyed "
-                               "to the *running loop variable* against the *global* trip "
-                               "(``mask[l] = (iter_var + l < global_ub)``) rather than the map's own "
-                               "static ``lb``/``ub`` — required when the per-core block spans multiple "
-                               "W-tiles so the cutoff differs per tile. The first three mode names "
-                               "match the ``VectorizeCPU.remainder_strategy`` knob.")
-    global_ub = properties.Property(dtype=str,
-                                    default=None,
-                                    allow_none=True,
-                                    desc="``mode='global'`` only: the original (pre-tile) *exclusive* "
-                                    "upper bound of the innermost trip (e.g. ``\"N\"``). The mask fill "
-                                    "is ``iter_var + l < global_ub``. Optional: when ``None`` it is "
-                                    "auto-derived from the enclosing ``core`` map's range "
-                                    "(symbolic-safe); a ``ValueError`` is raised only if neither is "
-                                    "available.")
+                               "``__masked_rem`` by SplitMapForVectorRemainder(mode='masked'). The "
+                               "mode names match the ``VectorizeCPU.remainder_strategy`` knob.")
 
     lower_to_intrinsics = properties.Property(dtype=bool,
                                               default=False,
@@ -63,16 +51,11 @@ class GenerateIterationMask(ppl.Pass):
                                               "fault on inactive tail lanes. Such a map is auto-degraded to a "
                                               "scalar (Sequential, step-1) remainder instead of being masked.")
 
-    def __init__(self,
-                 vector_width: int = 8,
-                 mode: str = "step_w_only",
-                 lower_to_intrinsics: bool = False,
-                 global_ub: Optional[str] = None):
+    def __init__(self, vector_width: int = 8, mode: str = "step_w_only", lower_to_intrinsics: bool = False):
         super().__init__()
         self.vector_width = vector_width
         self.mode = mode
         self.lower_to_intrinsics = lower_to_intrinsics
-        self.global_ub = global_ub
 
     def modifies(self) -> ppl.Modifies:
         return ppl.Modifies.Descriptors | ppl.Modifies.States | ppl.Modifies.AccessNodes
@@ -89,9 +72,9 @@ class GenerateIterationMask(ppl.Pass):
         :raises ValueError: If ``mode`` is not a recognised mode.
         :raises NotImplementedError: If a targeted map body is not a single NestedSDFG.
         """
-        if self.mode not in ("step_w_only", "all_innermost", "masked", "global"):
+        if self.mode not in ("step_w_only", "all_innermost", "masked"):
             raise ValueError(f"GenerateIterationMask.mode must be 'step_w_only', 'all_innermost', "
-                             f"'masked', or 'global', got {self.mode!r}")
+                             f"or 'masked', got {self.mode!r}")
         W = self.vector_width
         applied = 0
         for n, g in [(n, g) for n, g in sdfg.all_nodes_recursive()
@@ -105,9 +88,7 @@ class GenerateIterationMask(ppl.Pass):
                 continue
             if self.mode == "masked" and not n.map.label.endswith("__masked_rem"):
                 continue
-            # 'global' (SVE-style) and 'all_innermost' target every
-            # innermost map; 'global' additionally keys the fill to the
-            # running loop variable against the global trip.
+            # 'all_innermost' targets every innermost map.
             nsdfg_node = get_single_nsdfg_inside_map(g, n)
             if nsdfg_node is None:
                 raise NotImplementedError(f"GenerateIterationMask requires every innermost map's body to be a single "
@@ -133,44 +114,9 @@ class GenerateIterationMask(ppl.Pass):
                     n.map.label = n.map.label[:-len("__masked_rem")]
                 n.map.schedule = dace.dtypes.ScheduleType.Sequential
                 continue
-            global_ub = None
-            if self.mode == "global":
-                if self.global_ub is not None:
-                    global_ub = str(self.global_ub)
-                else:
-                    core = self._enclosing_core_map(g, n)
-                    if core is None:
-                        raise ValueError("GenerateIterationMask.mode='global' needs global_ub, or an "
-                                         "enclosing 'core'-prefixed map to auto-derive it from (run the "
-                                         f"SVE tiling first); map {n.label!r} has neither")
-                    # The original pre-tile exclusive trip bound: the core
-                    # map keeps the original inclusive end, so end + 1 is the
-                    # global bound (symbolic-safe — sympy folds (N-1)+1 -> N).
-                    global_ub = str(core.map.range[-1][1] + 1)
-            if self._attach_mask(nsdfg_node, n.map.params[-1], lb, ub, W, global_ub):
+            if self._attach_mask(nsdfg_node, n.map.params[-1], lb, ub, W):
                 applied += 1
         return applied or None
-
-    @staticmethod
-    def _enclosing_core_map(state: dace.SDFGState, map_entry: dace.nodes.MapEntry) -> Optional[dace.nodes.MapEntry]:
-        """The ``core``-prefixed map enclosing ``map_entry``, or ``None``.
-
-        The SVE tiling wraps the innermost map in a ``core``-prefixed
-        block-distribution map; that map keeps the *original* inclusive
-        trip end, so its ``range[-1][1] + 1`` is the global exclusive
-        bound the ``mode='global'`` fill needs.
-
-        :param state: The state containing ``map_entry``.
-        :param map_entry: The innermost map entry.
-        :returns: The enclosing ``core`` :class:`MapEntry`, or ``None``.
-        """
-        scope = state.scope_dict()
-        node = scope.get(map_entry)
-        while node is not None:
-            if (isinstance(node, dace.nodes.MapEntry) and any(p.startswith("core") for p in node.map.params)):
-                return node
-            node = scope.get(node)
-        return None
 
     @staticmethod
     def _subset_fans_out(sub, strides, iter_var: str) -> bool:
@@ -303,13 +249,7 @@ class GenerateIterationMask(ppl.Pass):
                     return True
         return False
 
-    def _attach_mask(self,
-                     nsdfg_node: dace.nodes.NestedSDFG,
-                     iter_var: str,
-                     lb,
-                     ub,
-                     W: int,
-                     global_ub: Optional[str] = None) -> bool:
+    def _attach_mask(self, nsdfg_node: dace.nodes.NestedSDFG, iter_var: str, lb, ub, W: int) -> bool:
         """Add and fill the ``_iter_mask`` transient inside one body NestedSDFG.
 
         :param nsdfg_node: The NestedSDFG node whose inner SDFG receives the mask.
@@ -317,17 +257,6 @@ class GenerateIterationMask(ppl.Pass):
         :param lb: Symbolic lower bound of the innermost range.
         :param ub: Symbolic upper bound of the innermost range.
         :param W: Number of lanes in the mask.
-        :param global_ub: ``mode='global'`` (SVE-style) only. When given,
-            the fill is keyed to the *running loop variable* against the
-            *global* exclusive bound — ``mask[l] = (iter_var + l < global_ub)``
-            — rather than the map's static ``lb``/``ub``. The per-core
-            block spans multiple W-tiles, so after the vectorizer tiles
-            the map (W-step outer + length-W inner) the body NSDFG runs
-            once per W-tile and ``iter_var`` (the W-step outer param) is
-            in scope: the mask correctly re-evaluates per tile so the
-            ragged last-block cutoff is honoured. (The static-``lb``
-            form below is for the single-trailing-block masked
-            remainder, where a per-tile refill would be wrong.)
         :returns: ``True`` if a mask was added, ``False`` if one already existed.
         """
         inner: dace.SDFG = nsdfg_node.sdfg
@@ -347,60 +276,40 @@ class GenerateIterationMask(ppl.Pass):
         # on every inner iteration. For step-W trip-1 maps (the legacy
         # ``step_w_only`` path), ``lb == iter_var`` at runtime so this is
         # backward compatible.
-        if global_ub is not None:
-            # SVE-style: per-tile cutoff against the global trip, keyed to
-            # the running loop variable (see the global_ub docstring).
-            key_str = str(iter_var)
-            bound_str = str(global_ub)
-            cmp = "<"
-            bound_syms = [str(s) for s in dace.symbolic.symlist(dace.symbolic.pystr_to_symbolic(bound_str)).values()]
-        else:
-            # Map's STATIC start value (``lb``) rather than the dynamic
-            # ``iter_var``. Reason: after Vectorize tiles the map (W-step
-            # outer + step-1 length-W inner), the body NSDFG runs
-            # per-inner-iteration; referencing the loop param would re-fill
-            # the mask 8x with shifting values. ``lb`` (e.g. ``8*floor(N/8)``
-            # for the masked remainder) is invariant across inner
-            # iterations. For step-W trip-1 maps (legacy ``step_w_only``),
-            # ``lb == iter_var`` at runtime so this is backward compatible.
-            key_str = str(lb)
-            bound_str = str(ub)
-            cmp = "<="
-            bound_syms = [str(s) for s in dace.symbolic.symlist(ub).values()]
+        # Map's STATIC start value (``lb``) rather than the dynamic
+        # ``iter_var``. Reason: after Vectorize tiles the map (W-step
+        # outer + step-1 length-W inner), the body NSDFG runs
+        # per-inner-iteration; referencing the loop param would re-fill
+        # the mask 8x with shifting values. ``lb`` (e.g. ``8*floor(N/8)``
+        # for the masked remainder) is invariant across inner
+        # iterations. For step-W trip-1 maps (legacy ``step_w_only``),
+        # ``lb == iter_var`` at runtime so this is backward compatible.
+        key_str = str(lb)
+        bound_str = str(ub)
+        cmp = "<="
+        bound_syms = [str(s) for s in dace.symbolic.symlist(ub).values()]
 
         # Ensure every free symbol in the key/bound is visible inside the
         # inner NSDFG. The map's own ``iter_var`` is also kept in the symbol
         # set for backward compatibility with callers that might rely on it.
         symbols_to_ensure = ([iter_var] + bound_syms + [str(s) for s in dace.symbolic.symlist(lb).values()])
-        for sname in symbols_to_ensure:
-            if sname not in inner.symbols and sname in nsdfg_node.sdfg.parent_sdfg.symbols:
-                inner.add_symbol(sname, nsdfg_node.sdfg.parent_sdfg.symbols[sname])
-            elif sname not in inner.symbols:
-                # iter_var is typically not in parent_sdfg.symbols (it's a map
-                # parameter, scoped to the map entry). Default to int64.
-                inner.add_symbol(sname, dace.int64)
-            if sname not in nsdfg_node.symbol_mapping:
-                nsdfg_node.symbol_mapping[sname] = sname
+        thread_symbols_into_nsdfg(inner, nsdfg_node, symbols_to_ensure, nsdfg_node.sdfg.parent_sdfg)
 
-        # Capture the current start block BEFORE prepending the new prep
-        # state, otherwise ``inner.start_block`` becomes ambiguous between
-        # the existing start and the new node.
-        old_start = inner.start_block
-
-        # Each lane ``l`` sets ``mask[l] = (key + l <cmp> bound)``: the
-        # default form is ``(lb + l <= ub)``; the SVE-style global form is
-        # ``(iter_var + l < global_ub)``.
+        # Each lane ``l`` sets ``mask[l] = (lb + l <= ub)``. Emit the fill in a
+        # dedicated start state so it dominates the whole body (shared scaffolding
+        # with GenerateTileIterationMask's ``_tile_mask_init``).
         body = "\n".join([f"_o[{l}] = (({key_str}) + {l} {cmp} ({bound_str}));" for l in range(W)])
-        prep = inner.add_state("_iter_mask_init", is_start_block=True)
-        an = prep.add_access(mask_name)
-        t = prep.add_tasklet(
-            name="_iter_mask_fill",
-            inputs=set(),
-            outputs={"_o"},
-            code=body,
-            language=dace.dtypes.Language.CPP,
-        )
-        prep.add_edge(t, "_o", an, None, dace.Memlet(f"{mask_name}[0:{W}]"))
-        if old_start is not None and old_start is not prep:
-            inner.add_edge(prep, old_start, dace.InterstateEdge())
+
+        def _build_mask(prep: dace.SDFGState) -> None:
+            an = prep.add_access(mask_name)
+            t = prep.add_tasklet(
+                name="_iter_mask_fill",
+                inputs=set(),
+                outputs={"_o"},
+                code=body,
+                language=dace.dtypes.Language.CPP,
+            )
+            prep.add_edge(t, "_o", an, None, dace.Memlet(f"{mask_name}[0:{W}]"))
+
+        prepend_dominating_init_state(inner, "_iter_mask_init", _build_mask)
         return True

@@ -9,11 +9,14 @@ memlet writes M elements with ``N != M``, no single
 the vectorization with ``NotImplementedError`` rather than silently
 emitting a wrong copy.
 """
+
+import pytest
+# [UNSKIPPED-FOR-ASSESSMENT 2026-06-14] pytestmark = pytest.mark.skip(reason="legacy K=1/K=2 descent path frozen during walker-primary migration -- this test goes through VectorizeCPUMultiDim or the harness; both depend on the legacy descent + emit infrastructure being removed. Will be revived (or replaced by walker-primary equivalents) after the new orchestrator pipeline lands end-to-end.")
 import dace
 import pytest
 
 from dace import subsets
-from dace.transformation.passes.vectorization.utils.post_descent_invariants import cleanup_an_to_an_edges
+from dace.transformation.passes.vectorization.vectorize import cleanup_an_to_an_edges
 from dace.transformation.passes.vectorization.vectorize_cpu_multi_dim import VectorizeCPUMultiDim
 
 N = dace.symbol("N")
@@ -88,8 +91,6 @@ def _vectorize(sdfg: dace.SDFG) -> None:
         branch_mode="merge",
         loop_to_map_permissive=True,
         nest_map_bodies=True,
-        insert_copies=True,
-        fuse_overlapping_loads=False,
         scalar_remainder_emit="tile_k1",
         expand_tile_nodes=False,
     ).apply_pass(sdfg, {})
@@ -129,9 +130,7 @@ def test_mismatched_an_to_an_refuses_vectorization():
     # Skip ``sdfg.validate()`` here -- DaCe rejects this pattern at AN -> AN
     # rank check before our descent could see it. We invoke the descent's
     # helper directly on the body NSDFG to exercise its own refusal logic.
-    nested = next(
-        n for n, _ in sdfg.all_nodes_recursive()
-        if isinstance(n, dace.nodes.NestedSDFG))
+    nested = next(n for n, _ in sdfg.all_nodes_recursive() if isinstance(n, dace.nodes.NestedSDFG))
     with pytest.raises(NotImplementedError, match=r"AccessNode.*->.*AccessNode.*mismatched"):
         cleanup_an_to_an_edges(nested.sdfg)
 

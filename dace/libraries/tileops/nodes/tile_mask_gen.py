@@ -14,6 +14,7 @@ from dace import library, properties
 from dace.sdfg import nodes
 from dace.transformation.transformation import ExpandTransformation
 
+from .. import _isa_codegen
 from .._pure_codegen import nested_loops, tile_offset
 
 
@@ -109,7 +110,15 @@ class TileMaskGen(nodes.LibraryNode):
     ``iter_var_k + l_k < global_ub_k`` holds.
     """
 
-    implementations = {"pure": ExpandTileMaskGenPure, "cutile": ExpandTileMaskGenCutile}
+    implementations = {
+        "pure": ExpandTileMaskGenPure,
+        "cutile": ExpandTileMaskGenCutile,
+        # K=1 ISA backends (scalar / avx512 / avx2 / neon / sve): a call into
+        # dace/tile_ops/<backend>.h -- same call, the backend's env pulls in the
+        # matching header. Built by the shared factory (selector routes K>=2 to
+        # ``pure``).
+        **_isa_codegen.make_isa_expansions("MaskGen", _isa_codegen.make_mask_tasklet, globals()),
+    }
     default_implementation = "pure"
 
     target_isa = properties.Property(
@@ -163,16 +172,17 @@ class TileMaskGen(nodes.LibraryNode):
         self.global_ubs = list(global_ubs)
 
     def validate(self, sdfg: dace.SDFG, state: dace.SDFGState) -> None:
-        """Confirm ``_o`` is connected and the descriptor has ``bool``.
+        """Confirm ``_o`` is connected and its descriptor satisfies the design
+        section 10.2 mask descriptor lock (``Array(shape=widths, dtype=bool_,
+        storage=Register, transient=True)``).
 
         :param sdfg: SDFG that owns ``state``.
         :param state: State that owns ``self``.
-        :raises ValueError: If ``_o`` is not connected or has the
-            wrong dtype.
+        :raises ValueError: If ``_o`` is not connected or fails the lock.
         """
+        from .._pure_codegen import validate_mask_descriptor_lock
         out_e = {e.src_conn: e for e in state.out_edges(self) if e.src_conn is not None}
         if "_o" not in out_e:
             raise ValueError(f"{self.label}: required output '_o' not connected")
         mask_arr = sdfg.arrays[out_e["_o"].data.data]
-        if mask_arr.dtype != dace.bool_:
-            raise ValueError(f"{self.label}: _o must have dtype bool_, got {mask_arr.dtype}")
+        validate_mask_descriptor_lock(self.label, "_o", mask_arr, tuple(self.widths))

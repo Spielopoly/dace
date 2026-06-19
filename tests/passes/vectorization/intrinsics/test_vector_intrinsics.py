@@ -1,4 +1,7 @@
 # Copyright 2019-2025 ETH Zurich and the DaCe authors. All rights reserved.
+
+import pytest
+# [UNSKIPPED-FOR-ASSESSMENT 2026-06-14] pytestmark = pytest.mark.skip(reason="legacy K=1/K=2 descent path frozen during walker-primary migration -- this test goes through VectorizeCPUMultiDim or the harness; both depend on the legacy descent + emit infrastructure being removed. Will be revived (or replaced by walker-primary equivalents) after the new orchestrator pipeline lands end-to-end.")
 import os
 from typing import Dict, List
 import dace
@@ -167,7 +170,6 @@ def select_env_flags():
     """
 
     feats = detect_cpu_vector_features()
-    print("Detected SIMD:", feats)
 
     configs = []
 
@@ -209,10 +211,6 @@ def select_env_flags():
     # ------------------------
     elif feats.get("neon", False):
         configs.append({"__DACE_USE_INTRINSICS": "1", "__DACE_USE_SVE": "0"})
-
-    print("Generated test configurations:")
-    for cfg in configs:
-        print("  ", cfg)
 
     return configs
 

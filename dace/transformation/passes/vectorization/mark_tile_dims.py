@@ -12,12 +12,13 @@ masked-tail emission failing in a confusing way.
 from typing import Dict, Optional, Tuple
 
 import dace
-from dace import properties, symbolic
+from dace import properties
 from dace.sdfg.nodes import MapEntry
 from dace.transformation import pass_pipeline as ppl
 from dace.transformation.passes.vectorization.split_map_for_tile_remainder import (SCALAR_TAIL_MARKER,
                                                                                    TILE_K1_TAIL_MARKER)
 from dace.transformation.passes.vectorization.utils.map_predicates import is_innermost_map
+from dace.transformation.passes.vectorization.utils.pass_invariants import (assert_invariant, no_memlet_dim_mismatch)
 from dace.transformation.passes.vectorization.utils.tile_dims import TileDimSpec
 
 
@@ -84,7 +85,7 @@ class MarkTileDims(ppl.Pass):
 
         :param map_entry: The candidate inner map entry.
         :returns: The spec when the K innermost params each have
-            step == 1 and a non-degenerate trip; ``None`` otherwise.
+            step == 1; ``None`` otherwise.
         :raises NotImplementedError: When ``skip_ineligible`` is
             ``False`` and the map is ineligible.
         """
@@ -101,28 +102,21 @@ class MarkTileDims(ppl.Pass):
         iter_vars = tuple(params[-K:])
         slice_ranges = ranges[-K:]
         global_ubs = []
+        # Unified "no-mask interior + w-mask remainder" model: every tiled dim
+        # gets a spec regardless of trip, and the trip is NOT required to be
+        # >= W. A ``trip < W`` dim lowers to a single w-mask remainder tile
+        # (mask ``l < trip``); ``trip == 0`` is a correct all-false-mask no-op.
+        # SplitMapForTileRemainder peels each non-divisible dim into a (possibly
+        # empty) ``__tile_main`` interior (mask-free) + a masked remainder, and
+        # GenerateTileIterationMask masks every non-interior region -- so a
+        # short, symbolic, or per-iteration-varying (e.g. wavefront) trip is
+        # handled by masking, or under ``scalar_postamble`` by the scalar
+        # remainder loop. There is no ``trip >= W`` precondition and no runtime
+        # trap: a too-small trip just executes fewer active lanes.
         for (lb, ub, step), iv in zip(slice_ranges, iter_vars):
             if step != 1 and str(step) != "1":
                 return self._fail_or_skip(
                     f"map {map_entry.label!r} dim {iv!r} has step {step!r}; v2 requires step == 1")
-            trip_expr = symbolic.simplify(ub - lb + 1)
-            # Map iter-var ``iv`` is the ``-K + idx``-th param; pair it with
-            # ``widths[idx]`` (innermost-last alignment) so a too-small
-            # trip is checked against the right width.
-            dim_idx = iter_vars.index(iv)
-            tile_w = int(widths[dim_idx])
-            try:
-                trip_int = int(trip_expr)
-                if trip_int <= 1:
-                    return self._fail_or_skip(f"map {map_entry.label!r} dim {iv!r} has degenerate trip {trip_int} "
-                                              f"(must be > 1); flatten the map first")
-                if trip_int < tile_w:
-                    return self._fail_or_skip(
-                        f"map {map_entry.label!r} dim {iv!r} trip {trip_int} < tile width {tile_w}; "
-                        f"smaller-than-W outer dims are not supported in this slice (collapse the dim "
-                        f"or pick smaller widths)")
-            except (TypeError, ValueError):
-                pass
             global_ubs.append(str(ub + 1))
         return TileDimSpec(
             iter_vars=iter_vars,
@@ -164,4 +158,6 @@ class MarkTileDims(ppl.Pass):
             spec = self._classify_one(n)
             if spec is not None:
                 specs[n] = spec
+        assert_invariant(no_memlet_dim_mismatch(sdfg), "MarkTileDims",
+                         "memlet subset and other_subset have matching dimensionality")
         return specs or None

@@ -18,8 +18,26 @@ Both modes must produce numerically identical results against the
 unvectorized scalar reference, otherwise the two lowerings have drifted.
 """
 import os
+import zlib
 
+import numpy as np
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def _deterministic_global_numpy_seed(request):
+    """Seed NumPy's GLOBAL RNG per test, deterministically from the test node id,
+    so any unseeded ``np.random.*`` call is reproducible across processes. A fresh
+    global RNG (or a ``hash()``-derived seed) otherwise varies per run -> flaky,
+    and a lucky draw can mask a real OOB (as it long did for s4116). Tests that
+    build their own ``np.random.default_rng(seed=...)`` are unaffected (separate
+    stream); the per-node-id seed also keeps distinct tests from sharing data.
+
+    (Audit note: this crc32 matches ``tsvc.stable_seed``; reuse that single source
+    once verified -- left inline here to avoid importing tsvc into conftest, which
+    loads at collection and has whole-suite blast radius, without a test run.)"""
+    np.random.seed(zlib.crc32(request.node.nodeid.encode()) & 0xFFFFFFFF)
+
 
 # Note: tests that pass legacy knobs (``lower_to_intrinsics=True``,
 # ``collapse_laneid_index_loads=True``, ``filter_map=``) are NOT deselected
@@ -34,7 +52,7 @@ import pytest
 def branch_mode(request) -> str:
     """Branch lowering variant the K=1 tile path must support:
 
-    - ``"merge"`` — same-write-set if/else -> per-lane ``TileMerge`` select.
+    - ``"merge"`` — same-write-set if/else -> per-lane ``TileITE`` select.
     - ``"fp_factor"`` — ``c*x + (1-c)*y`` arithmetic (the legacy
       ``EliminateBranches`` form), lowered on the tile path via tile binops.
 
@@ -78,16 +96,13 @@ def tile_emit_mode(request):
     }[request.param]
 
 
-@pytest.fixture(params=["default", "sve_style"])
+@pytest.fixture(params=["default"])
 def emission_style(request) -> str:
     """Emission model the K=1 tile path must support:
 
     - ``"default"`` — fixed-width tile maps + remainder per ``remainder_strategy``.
-    - ``"sve_style"`` — SVE-style always-mask emission: the per-core block runs
-      as a masked while-loop, the tail handled by the iteration mask (no
-      remainder split).
 
-    Both must produce numerically identical results against the unvectorized
+    Must produce numerically identical results against the unvectorized
     scalar reference."""
     return request.param
 
@@ -181,7 +196,7 @@ def pytest_generate_tests(metafunc):
     knob_params = {
         "branch_mode": ["fp_factor", "merge"],
         "tile_emit_mode": ["flat", "nested", "nested_copies"],
-        "emission_style": ["default", "sve_style"],
+        "emission_style": ["default"],
         "remainder_strategy": ["scalar", "masked"],
     }
     for knob, vals in knob_params.items():
@@ -195,25 +210,14 @@ def pytest_generate_tests(metafunc):
         metafunc.parametrize(knob, vals, indirect=True)
 
 
-#: Test files that exercise ONLY the legacy 1D ``VectorizeCPU`` / ``VectorizeSVE``
-#: / ``VectorizeBreak`` path (they directly instantiate those orchestrators and
-#: never route through the tile harness ``run_vectorization_test`` /
-#: ``VectorizeCPUMultiDim``). The branch is migrating to the K-dim tile-op path,
-#: so these are disabled for now (user directive). Re-enable by removing an entry
-#: as its kernels gain tile-path coverage. Paths are relative to this directory.
-_LEGACY_ONLY_FILES = frozenset({
-    "kernels/test_disjoint_chain.py",
-    "kernels/test_gather_scatter_knob.py",
-    "kernels/test_int_floor.py",
-    "kernels/test_inter_lane_stride.py",
-    "kernels/test_multi_element_strided.py",
-    "kernels/test_remainder_required.py",
-    "passes/test_detect_multi_dim_strided.py",
-    "passes/test_force_op_variant.py",
-    "sve/test_sve_style.py",
-    "sve/test_sve_style_parity.py",
-    "sve/test_sve_variable_probe.py",
-})
+#: Test files that exercise ONLY the legacy 1D ``VectorizeCPU`` path (they
+#: directly instantiate that orchestrator and never route through the tile
+#: harness ``run_vectorization_test`` / ``VectorizeCPUMultiDim``). The legacy
+#: 1-D path is a permanent first-class knob (the SpMV row-reduction lift lives
+#: here), so these files are collected and gated end-to-end alongside the tile
+#: path. Add an entry here only to *temporarily* freeze a file during a
+#: migration. Paths are relative to this directory.
+_LEGACY_ONLY_FILES = frozenset()
 
 
 def _is_legacy_only(item) -> bool:
@@ -237,18 +241,11 @@ def _is_legacy_only(item) -> bool:
 
 
 def _knob_combo_supported(params: dict) -> bool:
-    """Whether a (branch_mode, remainder_strategy, emission_style) combo is a
-    valid tile-pipeline configuration — independent of the kernel.
+    """Whether a (branch_mode, remainder_strategy) combo is a valid
+    tile-pipeline configuration — independent of the kernel.
 
     Only the knobs present in ``params`` constrain the result (a test that
     declares just ``remainder_strategy`` is never deselected on the others).
-    The remaining rule:
-
-    - ``emission_style='sve_style'`` (always-masked, no remainder split) forces
-      ``branch_mode='merge'`` — ``fp_factor``'s ``c*x + (1-c)*y`` arithmetic
-      cannot share the ``_iter_mask`` predicate the SVE chain emits everywhere.
-      The remainder knob is now free (``remainder='masked'`` simply re-uses
-      ``full_mask`` since the SVE chain is itself always-masked).
 
     ``fp_factor`` + ``remainder='masked'`` is allowed on the tile path: the
     orchestrator combines the per-lane bool mask with the float arithmetic by
@@ -260,10 +257,7 @@ def _knob_combo_supported(params: dict) -> bool:
         so it is never reported as a skip), ``True`` otherwise.
     """
     branch = params.get("branch_mode")
-    emission = params.get("emission_style")
     remainder = params.get("remainder_strategy")
-    if emission == "sve_style" and branch not in (None, "merge"):
-        return False
     # ``vectorize_config=legacy_cpu`` ignores ``tile_emit_mode`` (it has no
     # ``nest_map_bodies`` concept — legacy keeps bodies flat). The combo
     # would run with the tile_emit_mode value simply being ignored, but
@@ -274,13 +268,10 @@ def _knob_combo_supported(params: dict) -> bool:
     if vec_config == "legacy_cpu" and tile_emit is not None and tile_emit != "flat":
         return False
     # ``legacy_cpu`` cannot do ``use_fp_factor=True + masked_remainder`` (its
-    # ``VectorizeCPU`` constructor raises ValueError) and ``sve_style`` has
-    # no remainder loop (the global ``_iter_mask`` covers the tail).
-    # Deselect at collection so these don't surface as runtime skips.
+    # ``VectorizeCPU`` constructor raises ValueError). Deselect at collection
+    # so it doesn't surface as a runtime skip.
     if vec_config == "legacy_cpu":
         if branch == "fp_factor" and remainder == "masked":
-            return False
-        if emission == "sve_style" and remainder is not None and remainder != "scalar":
             return False
     return True
 
@@ -323,8 +314,8 @@ def vectorize_config(request) -> str:
 
     - ``"tile_nodes"`` — the K-dim tile-op routing through
       ``VectorizeCPUMultiDim``: K=1 and K>=2 both emit the tile lib nodes
-      (TileBinop / TileLoad / TileStore / TileMerge / TileGather /
-      TileScatter), expanded to the per-ISA backend (scalar reference in
+      (TileBinop / TileLoad / TileStore / TileITE / TileLoad (gather) /
+      TileStore (scatter)), expanded to the per-ISA backend (scalar reference in
       the harness). Body-nesting is controlled per-test via the
       ``tile_emit_mode`` fixture (or an explicit ``nest_map_bodies``
       kwarg to :func:`run_vectorization_test`).

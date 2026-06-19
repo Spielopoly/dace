@@ -15,9 +15,6 @@ mismatch where one site composes a name and another parses it differently:
 - ``PackedNameScheme`` — scatter / gather buffers ``<base>_packed``.
 - ``TileNameScheme`` — v2 tile-transient names (``<base>_tile``,
   ``<base>_tile_idx``, ``_tile_iter_mask``, ``<base>_tile_cond_mask``).
-- ``CORE_MAP_PARAM_PREFIX`` — prefix marking outer map parameters minted
-  by the SVE tile-by-cores step (so the loop-conversion pass can find
-  the right outer scope later).
 
 ``_packed`` is reserved for scatter/gather; ``_vec`` is used for everything
 else in the 1D path; ``_tile`` is reserved for the v2 multi-dim path so
@@ -30,8 +27,6 @@ from typing import Iterable, Iterator, List, Optional, Tuple
 
 import dace
 from dace.sdfg import SDFG
-
-CORE_MAP_PARAM_PREFIX = "core"
 
 
 class LaneIdScheme:
@@ -409,59 +404,6 @@ class TileNameScheme:
             if name.endswith(suffix):
                 return True
         return False
-
-
-class TileConnectors:
-    """Canonical connector (port) names for the tile-op library nodes.
-
-    Exposed globally so the emitter (``EmitTileOps`` /
-    ``PromoteNSDFGBodyToTiles``) and every lib node agree on one set of
-    port names rather than scattering string literals. These are the
-    lib-node connectors (the ``pure`` / ``cutile`` expansions use their own
-    internal tasklet variable names, e.g. ``__src``, which are not
-    connectors).
-
-    :cvar SRC: Source-array input of ``TileLoad`` / ``TileGather`` /
-        ``TileScatter`` / ``TileReduce`` (and the tile input of
-        ``TileStore``).
-    :cvar DST: Tile output of ``TileLoad`` / ``TileGather`` /
-        ``TileReduce`` (and the array output of ``TileStore`` /
-        ``TileScatter``).
-    :cvar MASK: Optional iteration / condition mask input.
-    :cvar A: ``TileBinop`` left operand.
-    :cvar B: ``TileBinop`` right operand.
-    :cvar C: ``TileBinop`` output.
-    :cvar O: ``TileMaskGen`` mask output.
-    :cvar IDX_PREFIX: Prefix of a gather / scatter per-source-dim index
-        connector ``_idx_<k>`` (``k`` is the source-array dim index).
-    """
-
-    SRC = "_src"
-    DST = "_dst"
-    MASK = "_mask"
-    A = "_a"
-    B = "_b"
-    C = "_c"
-    O = "_o"
-    IDX_PREFIX = "_idx_"
-
-    @staticmethod
-    def idx(k: int) -> str:
-        """Build the per-source-dim gather/scatter index connector name.
-
-        :param k: Source-array dimension index.
-        :returns: ``_idx_<k>``.
-        """
-        return f"{TileConnectors.IDX_PREFIX}{k}"
-
-    @staticmethod
-    def is_idx(name: str) -> bool:
-        """Whether ``name`` is a gather/scatter index connector ``_idx_<k>``.
-
-        :param name: Connector name.
-        :returns: True iff it matches the ``_idx_<k>`` shape.
-        """
-        return name.startswith(TileConnectors.IDX_PREFIX) and name[len(TileConnectors.IDX_PREFIX):].isdigit()
 
 
 def _walk_sdfgs(sdfg: SDFG) -> Iterator[SDFG]:

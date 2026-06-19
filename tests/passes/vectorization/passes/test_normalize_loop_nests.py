@@ -10,6 +10,9 @@ or multi-state leaf body (the cloudsc ``zqlhs`` RMW chain) intact for the tile
 descent. These tests pin both behaviours, including value preservation on the
 cloudsc inout pattern.
 """
+
+import pytest
+# [UNSKIPPED-FOR-ASSESSMENT 2026-06-14] pytestmark = pytest.mark.skip(reason="legacy K=1/K=2 descent path frozen during walker-primary migration -- this test goes through VectorizeCPUMultiDim or the harness; both depend on the legacy descent + emit infrastructure being removed. Will be revived (or replaced by walker-primary equivalents) after the new orchestrator pipeline lands end-to-end.")
 import numpy
 import pytest
 
@@ -106,7 +109,10 @@ def test_cloudsc_inout_normalization_is_value_preserving():
     va = {k: v.copy() for k, v in arrays.items()}
     vec.compile()(**va, **params)
     for k in arrays:
-        numpy.testing.assert_allclose(va[k], ra[k], rtol=1e-12, atol=1e-12,
+        numpy.testing.assert_allclose(va[k],
+                                      ra[k],
+                                      rtol=1e-12,
+                                      atol=1e-12,
                                       err_msg=f"normalize changed cloudsc array {k!r}")
 
 

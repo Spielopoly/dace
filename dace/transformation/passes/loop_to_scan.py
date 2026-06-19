@@ -38,7 +38,8 @@ captured by the Scan libnode -- but the matcher checks the body explicitly and r
 on any other carried writes to non-transient arrays.
 """
 import ast
-from typing import Any, List, NamedTuple, Optional
+import copy
+from typing import Any, Dict, List, NamedTuple, Optional
 
 from dace import SDFG, data, dtypes, properties, subsets, symbolic
 from dace import memlet as mm
@@ -50,8 +51,8 @@ from dace.transformation.passes.analysis import loop_analysis
 
 # Re-export the supported associative ops via :class:`ScanOp`; the matcher recognises
 # the same four ops the libnode expansions cover.
-from dace.libraries.standard.nodes.scan import (Scan, ScanOp, INPUT_CONNECTOR_NAME as _SCAN_IN, OUTPUT_CONNECTOR_NAME as
-                                                _SCAN_OUT, INIT_CONNECTOR_NAME as _SCAN_INIT)
+from dace.libraries.standard.nodes.scan import (Scan, ScanOp, INPUT_CONNECTOR_NAME, OUTPUT_CONNECTOR_NAME,
+                                                INIT_CONNECTOR_NAME)
 
 #: Map AST BinOp class -> ScanOp.
 _BINOP_TO_SCAN_OP = {
@@ -282,9 +283,25 @@ class LoopToScan(ppl.Pass):
               "parallel Map)."),
     )
 
-    def __init__(self, interchange_carry_with_map: bool = False):
+    lift_nested_scan = properties.Property(
+        dtype=bool,
+        default=False,
+        desc=("Controls the NESTED (vector) scan shape ``for j: for i: a[j,i] = "
+              "a[j-1,i] OP b[j,i]`` -- a carry loop ``j`` wrapping a data-parallel "
+              "inner loop ``i``. With the default ``False`` the lift is REFUSED when "
+              "the inner loop is parallelizable: the carry loop is left as a plain "
+              "sequential ``LoopRegion`` and the inner loop is mapped by ``LoopToMap`` "
+              "(``for j(seq): map[i]``) -- a contiguous unit-stride map with no ``Scan`` "
+              "libnode, the preferred shape after ``LoopStridePermutation`` interchanges "
+              "the unit-stride axis innermost. Set ``True`` to still lift the vector "
+              "scan (a ``Scan`` with a Map over the inner axis). Non-parallelizable "
+              "inner loops are lifted regardless (there is no map to keep)."),
+    )
+
+    def __init__(self, interchange_carry_with_map: bool = False, lift_nested_scan: bool = False):
         super().__init__()
         self.interchange_carry_with_map = interchange_carry_with_map
+        self.lift_nested_scan = lift_nested_scan
 
     def modifies(self) -> ppl.Modifies:
         return ppl.Modifies.CFG | ppl.Modifies.Descriptors | ppl.Modifies.Nodes | ppl.Modifies.Memlets
@@ -294,6 +311,16 @@ class LoopToScan(ppl.Pass):
 
     def depends_on(self):
         return set()
+
+    @staticmethod
+    def _inner_loop_parallelizable(inner_loop: LoopRegion, sdfg: SDFG) -> bool:
+        """``True`` iff the nested scan's inner loop is a DOALL loop ``LoopToMap``
+        would parallelize -- i.e. there is a map to keep instead of lifting."""
+        from dace.transformation.interstate.loop_to_map import LoopToMap
+        try:
+            return LoopToMap.can_be_applied_to(sdfg, loop=inner_loop)
+        except Exception:  # noqa: BLE001 -- oracle refuses exotic shapes -> not a keepable map
+            return False
 
     def apply_pass(self, sdfg: SDFG, _pipeline_results) -> Optional[int]:
         # Whole-SDFG preprocess: strip frontend ``__out = __inp`` copy tasklets so the
@@ -364,6 +391,19 @@ class LoopToScan(ppl.Pass):
             if id(loop) in interchanged_loop_ids:
                 continue
             infos = _match_all(loop, sdfg)
+            # NESTED (vector) scan default: when the matched scan wraps a
+            # data-parallel inner loop, prefer to KEEP THE MAP INSIDE -- leave
+            # this carry loop sequential and let ``LoopToMap`` map the inner
+            # loop (``for j(seq): map[i]``). That avoids a ``Scan`` over a
+            # strided apply and is the shape ``LoopStridePermutation`` sets up
+            # by moving the unit-stride parallel axis innermost. Lifting the
+            # vector scan is opt-in via ``lift_nested_scan``. A non-parallel
+            # inner loop has no map to keep, so it is lifted regardless.
+            if infos and not self.lift_nested_scan:
+                infos = [
+                    info for info in infos
+                    if not (info.inner_loop is not None and self._inner_loop_parallelizable(info.inner_loop, sdfg))
+                ]
             if infos:
                 for info in infos:
                     _rewrite(parent, loop, info, sdfg)
@@ -720,6 +760,26 @@ def _match_all(loop: LoopRegion, sdfg: SDFG) -> List[_Scan]:
                 read_subsets.add(str(e.data.subset))
             if len(read_subsets) > 1:
                 return []
+
+    # Refuse the multi-slot shape: several matched scan recurrences on the SAME
+    # carrier array at distinct constant slots (e.g. ``acc[0, i]``, ``acc[1, i]``,
+    # ... in one body -- both the flat shape and the nested ``zvqx[r, jk, jl]``
+    # cloudsc for_430 shape). The multi-slot rewrite chains a per-slot ``_rewrite``
+    # over the shared loop and mis-captures each slot's external seed
+    # (``acc[r, start]``), reading an uninitialised buffer -> numerically wrong
+    # (verified maxdiff ~0.85 vs the sequential oracle for the nested case). Leave
+    # the loop sequential -- for the flat shape ``LoopFission`` then splits the
+    # slots into independent single-slot loops, each lifted correctly by the
+    # single-carrier path. Keyed on the count of matched infos per array (not raw
+    # write subsets) so a single scan with an extra side-effect write to the
+    # carrier (the v5 fused-body shape -- one matched info) is NOT refused. The
+    # multi-*array* case (one info per distinct array, e.g. cloudsc pfsqrf's five
+    # different carriers) is likewise untouched.
+    infos_per_array: Dict[str, int] = {}
+    for s in matched:
+        infos_per_array[s.out_name] = infos_per_array.get(s.out_name, 0) + 1
+    if any(c > 1 for c in infos_per_array.values()):
+        return []
     return matched
 
 
@@ -1090,12 +1150,11 @@ def _rewrite_interchange_carry_with_map(shape: _CarryMapShape, sdfg: SDFG) -> Op
     carry_var = loop.loop_variable
     # Materialise the loop's init / cond / update statements so they don't
     # share Python objects with the soon-removed outer ``LoopRegion``.
-    import copy as _copy
     new_inner_loop = LoopRegion(label=f'{carry_var}_inner_carry',
-                                condition_expr=_copy.deepcopy(loop.loop_condition),
+                                condition_expr=copy.deepcopy(loop.loop_condition),
                                 loop_var=carry_var,
-                                initialize_expr=_copy.deepcopy(loop.init_statement),
-                                update_expr=_copy.deepcopy(loop.update_statement),
+                                initialize_expr=copy.deepcopy(loop.init_statement),
+                                update_expr=copy.deepcopy(loop.update_statement),
                                 inverted=loop.inverted)
     # Move ``inner_state`` (and any other blocks the inner SDFG had) into
     # the new ``LoopRegion``. The inner SDFG already had ``inner_state`` as
@@ -1609,7 +1668,6 @@ def _composite_redirect_carrier_to_delta_buf(state: SDFGState, info: _CompositeB
     outer_idx = symbolic.simplify(symbolic.pystr_to_symbolic(outer_var) - info.iter_start)
     inner_idx = symbolic.simplify(symbolic.pystr_to_symbolic(inner_var) - inner_start)
     new_subset = subsets.Range([(outer_idx, outer_idx, 1), (inner_idx, inner_idx, 1)])
-    import copy as _copy
     carrier_ans = [n for n in list(state.nodes()) if isinstance(n, nodes.AccessNode) and n.data == info.out_name]
     for an in carrier_ans:
         # Create the fresh delta_buf AN to replace this carrier endpoint.
@@ -1618,12 +1676,12 @@ def _composite_redirect_carrier_to_delta_buf(state: SDFGState, info: _CompositeB
         for e in list(state.in_edges(an)):
             state.remove_edge(e)
             state.add_edge(e.src, e.src_conn, new_an, None, mm.Memlet(data=delta_buf,
-                                                                      subset=_copy.deepcopy(new_subset)))
+                                                                      subset=copy.deepcopy(new_subset)))
         # Move every out-edge from the new AN with a re-subset memlet.
         for e in list(state.out_edges(an)):
             state.remove_edge(e)
             state.add_edge(new_an, None, e.dst, e.dst_conn, mm.Memlet(data=delta_buf,
-                                                                      subset=_copy.deepcopy(new_subset)))
+                                                                      subset=copy.deepcopy(new_subset)))
         state.remove_node(an)
 
 
@@ -2761,9 +2819,9 @@ def _emit_scan_nested(state: SDFGState, sdfg: SDFG, info: _Scan, delta_buf: str,
     node = Scan(name=f'{state.label}_op', op=info.op, exclusive=False)
     node.stride = symbolic.simplify(info.scan_stride * inner_size)
     state.add_node(node)
-    state.add_edge(delta_read, None, node, _SCAN_IN,
+    state.add_edge(delta_read, None, node, INPUT_CONNECTOR_NAME,
                    mm.Memlet(data=delta_buf, subset=subsets.Range([(0, trip - 1, 1), (0, inner_size - 1, 1)])))
-    state.add_edge(node, _SCAN_OUT, scan_write, None,
+    state.add_edge(node, OUTPUT_CONNECTOR_NAME, scan_write, None,
                    mm.Memlet(data=scan_buf, subset=subsets.Range([(0, trip - 1, 1), (0, inner_size - 1, 1)])))
 
 
@@ -2886,7 +2944,7 @@ def _emit_scan_with_init_direct(state: SDFGState, sdfg: SDFG, info: _Scan, delta
     delta_read = state.add_read(delta_buf)
     out_write = state.add_write(info.out_name)
     node = Scan(name=f'{state.label}_op', op=info.op, exclusive=False)
-    node.add_in_connector(_SCAN_INIT)
+    node.add_in_connector(INIT_CONNECTOR_NAME)
     state.add_node(node)
 
     state.add_edge(
@@ -2894,10 +2952,10 @@ def _emit_scan_with_init_direct(state: SDFGState, sdfg: SDFG, info: _Scan, delta
         mm.Memlet(data=info.out_name,
                   subset=subsets.Range([(seed_axis_expr, seed_axis_expr, 1)]),
                   other_subset=subsets.Range([(0, 0, 1)])))
-    state.add_edge(seed_an, None, node, _SCAN_INIT, mm.Memlet(data=seed_name, subset=subsets.Range([(0, 0, 1)])))
-    state.add_edge(delta_read, None, node, _SCAN_IN, mm.Memlet(data=delta_buf,
+    state.add_edge(seed_an, None, node, INIT_CONNECTOR_NAME, mm.Memlet(data=seed_name, subset=subsets.Range([(0, 0, 1)])))
+    state.add_edge(delta_read, None, node, INPUT_CONNECTOR_NAME, mm.Memlet(data=delta_buf,
                                                                subset=subsets.Range([(0, trip - 1, 1)])))
-    state.add_edge(node, _SCAN_OUT, out_write, None,
+    state.add_edge(node, OUTPUT_CONNECTOR_NAME, out_write, None,
                    mm.Memlet(data=info.out_name, subset=subsets.Range([(write_start, write_end, 1)])))
 
 
@@ -3035,8 +3093,8 @@ def _emit_scan(state: SDFGState, sdfg: SDFG, info: _Scan, delta_buf: str, scan_b
     node = Scan(name=f'{state.label}_op', op=info.op, exclusive=False)
     node.stride = info.scan_stride
     state.add_node(node)
-    state.add_edge(r, None, node, _SCAN_IN, mm.Memlet(data=delta_buf, subset=subsets.Range([(0, trip - 1, 1)])))
-    state.add_edge(node, _SCAN_OUT, w, None, mm.Memlet(data=scan_buf, subset=subsets.Range([(0, trip - 1, 1)])))
+    state.add_edge(r, None, node, INPUT_CONNECTOR_NAME, mm.Memlet(data=delta_buf, subset=subsets.Range([(0, trip - 1, 1)])))
+    state.add_edge(node, OUTPUT_CONNECTOR_NAME, w, None, mm.Memlet(data=scan_buf, subset=subsets.Range([(0, trip - 1, 1)])))
 
 
 def _emit_seed_add(state: SDFGState, sdfg: SDFG, info: _Scan, scan_buf: str, trip: Any):
@@ -3221,16 +3279,16 @@ def _emit_scalar_carry_scan(state: SDFGState, sdfg: SDFG, info: _ScalarCarryScan
     scan_write = state.add_write(scan_buf)
 
     node = Scan(name=f'{state.label}_op', op=info.op, exclusive=False)
-    node.add_in_connector(_SCAN_INIT)
+    node.add_in_connector(INIT_CONNECTOR_NAME)
     state.add_node(node)
 
     state.add_edge(
         acc_read, None, seed_an, None,
         mm.Memlet(data=info.acc_name, subset=subsets.Range([(0, 0, 1)]), other_subset=subsets.Range([(0, 0, 1)])))
-    state.add_edge(seed_an, None, node, _SCAN_INIT, mm.Memlet(data=seed_name, subset=subsets.Range([(0, 0, 1)])))
-    state.add_edge(delta_read, None, node, _SCAN_IN, mm.Memlet(data=delta_buf,
+    state.add_edge(seed_an, None, node, INIT_CONNECTOR_NAME, mm.Memlet(data=seed_name, subset=subsets.Range([(0, 0, 1)])))
+    state.add_edge(delta_read, None, node, INPUT_CONNECTOR_NAME, mm.Memlet(data=delta_buf,
                                                                subset=subsets.Range([(0, trip - 1, 1)])))
-    state.add_edge(node, _SCAN_OUT, scan_write, None, mm.Memlet(data=scan_buf,
+    state.add_edge(node, OUTPUT_CONNECTOR_NAME, scan_write, None, mm.Memlet(data=scan_buf,
                                                                 subset=subsets.Range([(0, trip - 1, 1)])))
 
 

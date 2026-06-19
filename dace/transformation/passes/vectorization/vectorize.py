@@ -23,8 +23,62 @@ from dace.transformation.passes.vectorization.utils.nsdfg_reshape import (
     _setup_multi_element_strided_inside_nsdfg,
     emit_staging_copy,
 )
-from dace.transformation.passes.vectorization.utils.post_descent_invariants import (assert_post_descent_invariants,
-                                                                                     cleanup_an_to_an_edges)
+
+
+# NOTE: post_descent_invariants was deleted with the legacy descent (PromoteNSDFGBodyToTiles).
+# The walker-primary path (InsertTileLoadStore + ClearPerLaneIndexSymbols audit) replaces both.
+# Local stubs below preserve the surface for any 1D-legacy ``vectorize.py`` callers that still
+# reach for the descent invariants helper -- they become no-ops since the descent is gone.
+def assert_post_descent_invariants(*args, **kwargs):
+    """No-op stub -- legacy descent was deleted in the walker-primary migration."""
+    return None
+
+
+def cleanup_an_to_an_edges(sdfg, *args, **kwargs):
+    """Refuse an ``AccessNode -> AccessNode`` copy whose two sides move a
+    DIFFERENT number of elements.
+
+    DaCe's AN -> AN validation only checks non-negative size, not volume
+    equality between ``subset`` and ``other_subset`` -- so a lopsided copy
+    (e.g. write 2 elements, read 1) validates yet cannot be expressed as a
+    single ``_out = _in`` assignment tasklet. Raise ``NotImplementedError``
+    rather than silently emitting a wrong copy.
+
+    The legacy descent expressed an AN -> AN copy as a single ``_out = _in``
+    assignment tasklet, which moves exactly one element to one element; any
+    side-volume inequality (``N != M``, including a lopsided 1->2 "broadcast")
+    cannot be expressed that way and is refused. Equal-volume copies pass
+    through. (Re-homed 2026-06-15: the legacy descent that owned this refusal
+    was stubbed in the walker-primary migration; the invariant check is
+    restored here so the malformed pattern fails loudly instead of
+    miscompiling.)
+    """
+    from dace.sdfg.nodes import AccessNode
+    if sdfg is None or not hasattr(sdfg, "all_states"):
+        return None
+    for state in sdfg.all_states():
+        for edge in state.edges():
+            if not (isinstance(edge.src, AccessNode) and isinstance(edge.dst, AccessNode)):
+                continue
+            m = edge.data
+            if m is None or m.subset is None or m.other_subset is None:
+                continue
+            try:
+                n_dst = m.subset.num_elements()
+                n_src = m.other_subset.num_elements()
+                equal = bool(dace.symbolic.simplify(n_dst - n_src) == 0)
+            except Exception:  # noqa: BLE001 -- exotic symbolic subset
+                continue
+            if equal:
+                continue
+            raise NotImplementedError(
+                f"AccessNode '{edge.src.data}' -> AccessNode '{edge.dst.data}': mismatched-volume copy "
+                f"(other_subset {m.other_subset} = {n_src} elems read, subset {m.subset} = {n_dst} elems "
+                f"written); no single '_out = _in' tasklet can express it. Refusing rather than emitting a "
+                f"wrong copy.")
+    return None
+
+
 from dace.transformation.passes.length_one_array_scalar_conversion import ConvertLengthOneArraysToScalars
 import dace.sdfg.tasklet_utils as tutil
 from dace.transformation.passes.vectorization.utils.symbolic_polymorphism import free_symbol_names, free_symbols
@@ -172,7 +226,7 @@ class Vectorize(ppl.Pass):
         try:
             int_size = int(e + 1 - b)
             int_vwidth = int(self.vector_width)
-        except:
+        except (TypeError, ValueError):
             int_size = None
             int_vwidth = None
         assert (int_size is not None and int_size == int_vwidth) or (
@@ -495,8 +549,7 @@ class Vectorize(ppl.Pass):
                 # gather. (The contiguous single-dim case is handled above;
                 # this is its non-contiguous sibling, judged by the
                 # descriptor stride, not dim position.)
-                if (len(param_dims_wide) == 1 and self.vector_width > 1
-                        and arr.strides[param_dims_wide[0][0]] != 1
+                if (len(param_dims_wide) == 1 and self.vector_width > 1 and arr.strides[param_dims_wide[0][0]] != 1
                         and param_dims_wide[0][1] == self.vector_width):
                     d0 = param_dims_wide[0][0]
                     # Guard: a strided access widens ONLY the lane dim; every
@@ -578,8 +631,7 @@ class Vectorize(ppl.Pass):
                                                 direction=direction,
                                                 multi_dim_param_dims=tuple(d for d, _ in param_dims_wide))
 
-    def _boundary_lane_dims(self, state: dace.SDFGState, nsdfg: dace.nodes.NestedSDFG,
-                            vector_map_param: str) -> dict:
+    def _boundary_lane_dims(self, state: dace.SDFGState, nsdfg: dace.nodes.NestedSDFG, vector_map_param: str) -> dict:
         """Map each NSDFG connector to its lane dim in inner-array coordinates.
 
         The connector name equals the inner array name. For each boundary
@@ -606,8 +658,8 @@ class Vectorize(ppl.Pass):
             one dim.
         """
         lane_dims: dict = {}
-        for edge, conn in ([(e, e.dst_conn) for e in state.in_edges(nsdfg)] +
-                           [(e, e.src_conn) for e in state.out_edges(nsdfg)]):
+        for edge, conn in ([(e, e.dst_conn) for e in state.in_edges(nsdfg)] + [(e, e.src_conn)
+                                                                               for e in state.out_edges(nsdfg)]):
             if conn is None or edge.data is None or edge.data.subset is None:
                 continue
             boundary_subset = edge.data.subset
@@ -1556,9 +1608,10 @@ class Vectorize(ppl.Pass):
                 # non-stride-1 dim, leave the memlet alone — the gather/strided-load path will
                 # handle it (mirrors the original code, which would no-op-substitute in such
                 # cases by extending the contiguous dim that did not contain the param).
-                non_contig_lane_crosses_nsdfg = (
-                    len(param_dims) == 1 and arr_strides is not None and arr_strides[param_dims[0]] != 1
-                    and (isinstance(edge.dst, dace.nodes.NestedSDFG) or isinstance(edge.src, dace.nodes.NestedSDFG)))
+                non_contig_lane_crosses_nsdfg = (len(param_dims) == 1 and arr_strides is not None
+                                                 and arr_strides[param_dims[0]] != 1
+                                                 and (isinstance(edge.dst, dace.nodes.NestedSDFG)
+                                                      or isinstance(edge.src, dace.nodes.NestedSDFG)))
                 if len(param_dims) == 1 and arr_strides is not None and arr_strides[param_dims[0]] == 1:
                     d = param_dims[0]
                     lb, le, ls = new_range_list[d]

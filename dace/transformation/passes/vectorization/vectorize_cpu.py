@@ -24,9 +24,54 @@ from dace.transformation.passes.vectorization.detect_multi_dim_strided_load impo
 from dace.transformation.passes.vectorization.detect_multi_dim_strided_store import DetectMultiDimStridedStore
 from dace.transformation.passes.insert_assign_tasklets_at_map_boundary import InsertAssignTaskletsAtMapBoundary
 from dace.transformation.passes.vectorization.nest_innermost_map_body import NestInnermostMapBodyIntoNSDFG
+from dace.transformation.passes.vectorization.lift_map_reduction import LiftMapReductionToReduce
 from dace.transformation.passes.vectorization.split_map_for_vector_remainder import SplitMapForVectorRemainder
 from dace.transformation.passes.vectorization.generate_iteration_mask import GenerateIterationMask
 from dace.transformation.passes.vectorization.utils.iteration import assert_no_lane_memlet_reads
+
+
+class _EarlyPureWCRReductionLift(LiftMapReductionToReduce):
+    """Distinct pipeline type for the early ``pure_wcr_only`` reduction lift.
+
+    ``VectorizeCPU`` is a :class:`~dace.transformation.pass_pipeline.Pipeline`,
+    which forbids two passes of the *same type*. This subclass lets the early
+    pure-WCR lift (before ``_WCRToAugAssignPass`` strips the WCR) coexist with
+    the full RMW-shape :class:`LiftMapReductionToReduce` that runs later, after
+    ``InlineSDFGs`` has put the opaque body in its final shape.
+    """
+
+    def __init__(self):
+        super().__init__(pure_wcr_only=True)
+
+
+class _WCRToAugAssignPass(ppl.Pass):
+    """Thin Pass wrapper running :class:`WCRToAugAssign` to a fixed point.
+
+    Strips every write-conflict resolution that survived into the body (an
+    in-place ``a[i] = a[i] + b[i]`` is canonicalised / ``LoopToMap``-lowered to an
+    ``... -(+=)-> a`` WCR, including the AN->AN copy shape). The vectorizer assumes
+    NO inner WCR -- a stray one is silently mis-vectorised (the reduction is
+    dropped, computing ``a = b``). Runs after ``LoopToMap`` so any WCR the
+    parallelisation minted is also converted to an explicit RMW tasklet before the
+    vectorize prep. Mirrors the multi-dim path's ``_RunWCRToAugAssign``.
+    """
+
+    def modifies(self) -> ppl.Modifies:
+        return ppl.Modifies.Nodes | ppl.Modifies.Edges | ppl.Modifies.Memlets
+
+    def should_reapply(self, modified) -> bool:
+        return False
+
+    def apply_pass(self, sdfg, _pipeline_results):
+        from dace.transformation.dataflow import WCRToAugAssign
+        from dace.transformation.passes.vectorization.utils.pass_invariants import (assert_invariant,
+                                                                                    no_wcr_in_map_body)
+        applied = sdfg.apply_transformations_repeated(WCRToAugAssign, permissive=False, validate=False)
+        # Post-condition / legacy vectorize pre-condition: no WCR survives inside any
+        # map body (the in-place vectorizer does not resolve loop-carried reductions;
+        # the reduction-out boundary edge MapExit -> AN lives outside the body).
+        assert_invariant(no_wcr_in_map_body(sdfg), "VectorizeCPU", "no WCR inside the map body before vectorizing")
+        return applied
 
 
 class _LoopToMapPass(ppl.Pass):
@@ -53,6 +98,35 @@ class _LoopToMapPass(ppl.Pass):
     def apply_pass(self, sdfg, _pipeline_results):
         from dace.transformation.interstate import LoopToMap
         return sdfg.apply_transformations_repeated(LoopToMap, permissive=self._permissive)
+
+
+class _AssertNoBodyWCRPass(ppl.Pass):
+    """Vectorizer-entry precondition: NO loose WCR survives in the region about to
+    be vectorized. Asserts BOTH checkers after the body has been nested --
+    ``no_wcr_in_map_body`` (a loose WCR in the map body) AND
+    ``no_wcr_inside_nested_sdfgs`` (a self-contained WCR hiding inside the body
+    NSDFG, which the map-body checker alone cannot see). The only WCR allowed
+    past this point is a genuine reduction in lifted form (a ``Reduce`` libnode
+    produced by ``LiftMapReductionToReduce`` / the boundary ``MapExit -> AN``
+    edge), neither of which is a loose inner edge-WCR. Every self-contained /
+    in-place RMW must already be an explicit aug-assign (``WCRToAugAssign``).
+    Read-only.
+    """
+
+    def modifies(self) -> ppl.Modifies:
+        return ppl.Modifies.Nothing
+
+    def should_reapply(self, modified) -> bool:
+        return False
+
+    def apply_pass(self, sdfg, _pipeline_results):
+        from dace.transformation.passes.vectorization.utils.pass_invariants import (assert_invariant,
+                                                                                    no_wcr_in_map_body,
+                                                                                    no_wcr_inside_nested_sdfgs)
+        assert_invariant(no_wcr_in_map_body(sdfg), "VectorizeCPU", "no loose WCR in the map body before vectorizing")
+        assert_invariant(no_wcr_inside_nested_sdfgs(sdfg), "VectorizeCPU",
+                         "no loose WCR inside the body NSDFG before vectorizing")
+        return None
 
 
 class _AssertNoLaneMemletReadsPass(ppl.Pass):
@@ -102,9 +176,7 @@ class VectorizeCPU(ppl.Pipeline):
                  loop_to_map_permissive: bool = False,
                  force_autovec_ops: Optional[Set[str]] = None,
                  force_pscalar_ops: Optional[Set[str]] = None,
-                 remainder_strategy: str = "scalar",
-                 num_cores: int = 1,
-                 sve_style: Optional[str] = None):
+                 remainder_strategy: str = "scalar"):
         """Build the pipeline.
 
         :param vector_width: SIMD lane count.
@@ -151,131 +223,9 @@ class VectorizeCPU(ppl.Pipeline):
         :param force_pscalar_ops: ops to emit as ``vector_<op>_pscalar`` (no autovec hint).
         :param remainder_strategy: ``"scalar"`` (scalar postamble), ``"masked"`` (iter-mask
             remainder) or ``"full_loop_mask"`` (R3, not yet wired).
-        :param num_cores: number of contiguous core blocks the innermost
-            data-parallel map is tiled into. Only meaningful with
-            ``sve_style`` set (the SVE-style model tiles the map across
-            ``num_cores`` cores, then turns each per-core chunk into a
-            masked while-loop). ``<= 1`` is the inert default; ``sve_style``
-            requires ``> 1``.
-        :param sve_style: select the **SVE-style always-mask emission
-            model** (``None`` = off, today's pipeline). Every operation is
-            emitted with an ``_iter_mask`` so the trailing partial block
-            needs no remainder loop — the mask gates the inactive lanes.
-            Two lengths:
-
-            - ``"fixed"`` — compile-time ``vector_width`` lanes. Runs on
-              AVX-512 / portable x86: the architecture's mask register IS
-              the iteration mask. This is *SVE-style on a fixed-width ISA*,
-              not the ARM SVE backend.
-            - ``"variable"`` — ARM SVE runtime vector length
-              (``svcntd()`` / ``svwhilelt_b64``); the D2 Map→SVE-while
-              lowering. Queued as the final SVE task — raises
-              ``NotImplementedError`` for now.
-
-            **Knob interaction under ``sve_style`` (the always-mask model
-            makes several tuning knobs forced, irrelevant, or
-            conflicting):**
-
-            - *Forced on* (set internally; their default is fine, you do
-              not pass them): branch lowering forced to the ITE path
-              (``use_fp_factor`` is ignored — the always-mask model
-              requires SIMD blends, so ``branch_normalization`` is on),
-              ``lower_to_intrinsics=True`` (locked Option B — masked
-              indirection safety).
-            - *Rejected if non-default* (raise ``ValueError``):
-              ``only_apply_vectorization_pass=True`` (the SVE-style prep
-              chain is mandatory), ``remainder_strategy`` other than the
-              default (SVE-style has no remainder loop — the mask covers
-              the tail), ``gather_intrinsic=False`` / ``scatter_intrinsic
-              =False`` (a per-lane scalar fan faults on inactive lanes),
-              non-empty ``force_autovec_ops`` / ``force_pscalar_ops``
-              (they only affect the non-masked default path, which
-              SVE-style never takes — they would silently no-op).
-            - *Required*: ``num_cores > 1``.
-            - *Orthogonal — silently allowed, no SVE-specific meaning*:
-              ``fuse_overlapping_loads``, ``collapse_laneid_index_loads``,
-              ``apply_on_maps``, ``insert_copies``, ``no_inline``,
-              ``fail_on_unvectorizable``, ``eliminate_trivial_vector_map``,
-              ``user_skip_nsdfg_arrays``, ``loop_to_map_permissive``,
-              ``try_to_demote_symbols_in_nsdfgs``.
-
         :raises ValueError: on a rejected knob combination (see body).
-        :raises NotImplementedError: for ``remainder_strategy="full_loop_mask"``,
-            for ``sve_style="variable"`` (queued), and for ``sve_style``
-            set at all until the S-SVE5b pipeline assembly lands (the
-            knob contract / validation / documentation are in place now;
-            ``ForLoopToMaskedWhile`` lands in S-SVE5a first).
+        :raises NotImplementedError: for ``remainder_strategy="full_loop_mask"`` (R3, queued).
         """
-        # SVE-style always-mask emission is validated FIRST so an sve_style
-        # caller gets SVE-specific messages, not a downstream legacy mutex
-        # (e.g. the use_fp_factor/remainder check — use_fp_factor defaults
-        # True and is *ignored* under sve_style, so that check must not
-        # fire here). Policy: orthogonal-harmless knobs are silently
-        # allowed; relevant-but-conflicting or no-effect-under-SVE knobs
-        # set to a non-default value raise. Full taxonomy: the
-        # ``sve_style`` docstring entry.
-        _VALID_SVE_STYLE = {None, "fixed", "variable"}
-        if sve_style not in _VALID_SVE_STYLE:
-            raise ValueError(f"VectorizeCPU: sve_style must be one of "
-                             f"{sorted(s for s in _VALID_SVE_STYLE if s is not None)} or None, "
-                             f"got {sve_style!r}")
-        sve_fixed = False
-        if sve_style is not None:
-            if sve_style == "variable":
-                # Per design pivot 2026-05-20: variable-VL emission
-                # (one opaque CPP tasklet per map with a svwhilelt-
-                # driven while-loop body) is deferred. For SVE hardware
-                # use ``sve_style="fixed"`` with ``vector_width`` matched
-                # to the target SVE register width (W=8 for SVE-512, W=4
-                # for SVE-256, etc.) — the existing fixed chain already
-                # emits svwhilelt + svcntd internally per W-chunk via
-                # cpu_vectorizable_math_arm_sve.h. The exploratory
-                # ``SveStyleVariableFinalize`` class is retained in
-                # vectorize_sve.py as a prototype of the future
-                # "whole map as CPP tasklet" approach (SpMV + axpy +
-                # triad recognisers implemented), but not user-reachable
-                # via this knob.
-                raise NotImplementedError("VectorizeCPU: sve_style='variable' is deferred (open task). For SVE "
-                                          "hardware use sve_style='fixed' with vector_width matched to the target "
-                                          "SVE register width (W=8 for SVE-512, W=4 for SVE-256, etc.); the SVE "
-                                          "arch header (cpu_vectorizable_math_arm_sve.h) already uses svwhilelt + "
-                                          "svcntd per W-chunk internally. The variable-VL whole-map-to-CPP-tasklet "
-                                          "approach is parked in SveStyleVariableFinalize as a prototype.")
-            # Branch lowering is forced to the ITE path: ``use_fp_factor``
-            # defaults True (legacy), so rejecting it would force every
-            # sve_style caller to also pass use_fp_factor=False. The
-            # always-mask model requires ITE blends, so use_fp_factor is
-            # ignored and branch_normalization is forced on (documented;
-            # the forced assignment lands with the S-SVE5b pipeline).
-            if only_apply_vectorization_pass:
-                raise ValueError("VectorizeCPU: sve_style needs the full tile->mask->for->while "
-                                 "prep chain; only_apply_vectorization_pass must be False")
-            if remainder_strategy != "scalar":
-                raise ValueError("VectorizeCPU: sve_style has no remainder loop (the iteration "
-                                 "mask covers the trailing partial block); remainder_strategy is "
-                                 "N/A under sve_style — leave it at the default")
-            if not gather_intrinsic or not scatter_intrinsic:
-                raise ValueError("VectorizeCPU: sve_style forces gather/scatter intrinsics "
-                                 "(a per-lane scalar fan faults on inactive lanes); "
-                                 "gather_intrinsic and scatter_intrinsic must stay True")
-            if force_autovec_ops or force_pscalar_ops:
-                raise ValueError("VectorizeCPU: sve_style emits the masked intrinsic path only; "
-                                 "force_autovec_ops / force_pscalar_ops affect the non-masked "
-                                 "default path and would silently no-op under sve_style")
-            if num_cores <= 1:
-                raise ValueError("VectorizeCPU: sve_style tiles the innermost map across "
-                                 "num_cores contiguous core blocks; pass num_cores > 1")
-            # sve_style='fixed' forces the ITE branch front and the
-            # masked intrinsic path. ``use_fp_factor`` defaults True
-            # (legacy) — override silently to the ITE front as
-            # documented; force lower_to_intrinsics so masked gather/
-            # scatter is safe (a per-lane scalar fan faults on inactive
-            # lanes). The chain itself is the SveStyleFinalize
-            # orchestrator appended after the shared front below.
-            sve_fixed = (sve_style == "fixed")
-            use_fp_factor = False
-            branch_normalization = True
-            lower_to_intrinsics = True
         if use_fp_factor and branch_normalization:
             raise ValueError("VectorizeCPU: use_fp_factor and branch_normalization are mutually exclusive; "
                              "choose one branch-lowering strategy")
@@ -295,8 +245,7 @@ class VectorizeCPU(ppl.Pipeline):
         #                       body with a P3 ``_iter_mask`` so the trailing
         #                       OOB lanes are gated.
         #   "full_loop_mask"  - R3 (TODO): no remainder split; one step-W map
-        #                       with ``_iter_mask`` wired everywhere
-        #                       (SVE-style).
+        #                       with ``_iter_mask`` wired everywhere.
         _VALID_REMAINDER = {"scalar", "masked", "full_loop_mask"}
         if remainder_strategy not in _VALID_REMAINDER:
             raise ValueError(f"VectorizeCPU: remainder_strategy must be one of "
@@ -471,6 +420,19 @@ class VectorizeCPU(ppl.Pipeline):
                 # vectorizer can stride. Runs before the Vectorize / prep
                 # passes. No-op for ``dace.map`` kernels.
                 _LoopToMapPass(permissive=loop_to_map_permissive),
+                # Genuine scalar reductions (``dot += a[i]*b[i]``, ``acc = sum(A)``)
+                # survive canonicalisation as a scalar ``CR:+`` / ``CR:*`` MapExit
+                # edge that ``WCRToAugAssign`` cannot strip (the fold is not a
+                # sequential in-place RMW). Lift those to a product buffer +
+                # ``Reduce`` libnode HERE -- before ``_WCRToAugAssignPass`` asserts
+                # no map-body WCR -- mirroring the multi-dim path's early lift. The
+                # RMW-shape reductions are still lifted by the full pass after
+                # ``InlineSDFGs`` (their opaque body must be in final shape first).
+                _EarlyPureWCRReductionLift(),
+                # Strip any inner WCR (from a canonicalised in-place RMW or minted
+                # by LoopToMap) into an explicit augmented-assign tasklet -- the
+                # vectorizer assumes no inner WCR. Runs right after LoopToMap.
+                _WCRToAugAssignPass(),
                 RemoveFPTypeCasts(),
                 RemoveIntTypeCasts(),
                 PowerOperatorExpansion(),
@@ -484,23 +446,19 @@ class VectorizeCPU(ppl.Pipeline):
             ]
             if not no_inline:
                 passes.append(InlineSDFGs())
-            if sve_fixed:
-                # SVE-style 'fixed': the whole tile -> mask -> vectorize ->
-                # detect -> MapToForLoop -> ForLoopToMaskedWhile chain is a
-                # single coordinating pass that captures the global trip
-                # bound at tile time (the M3.2 pattern). It owns the
-                # vectorizer + detect + RemoveVectorMaps internally, so the
-                # normal prep / post-vectorizer blocks are bypassed.
-                from dace.transformation.passes.vectorization.vectorize_sve import SveStyleFinalize
-                passes.append(
-                    SveStyleFinalize(vectorizer,
-                                     vector_width=vector_width,
-                                     num_cores=num_cores,
-                                     lower_to_intrinsics=lower_to_intrinsics,
-                                     eliminate_trivial_vector_map=eliminate_trivial_vector_map))
-                self._applied_before = False
-                super().__init__(passes)
-                return
+            # Reduction lift: an innermost map that carries a scalar
+            # read-modify-write reduction across its iterations (the spmv row
+            # reduction ``acc = acc + data[idx]*x[indices[idx]]``) is
+            # mis-vectorized by the 1-D ``Vectorize`` pass once the reduced
+            # trip exceeds ``vector_width`` (the per-chunk partials are never
+            # folded). Rewrite it to the canonical product-map + ``Reduce``
+            # libnode shape the vectorizer lowers correctly: the product map
+            # vectorizes as a plain gather + product (scalar remainder keeps
+            # the gather tail in range) and the ``Reduce`` carries its own
+            # vectorized horizontal fold. No-op on kernels without a
+            # map-carried reduction. Runs after ``InlineSDFGs`` so the body
+            # (an un-inlinable indirect-access NSDFG) is in its final shape.
+            passes.append(LiftMapReductionToReduce())
             # P1 (NestInnermostMapBodyIntoNSDFG) + P2
             # (SplitMapForVectorRemainder) ALWAYS run.  P2 does the symbolic
             # divisibility analysis: when ``simplify(ub-lb+1) % W == 0`` is
@@ -540,6 +498,13 @@ class VectorizeCPU(ppl.Pipeline):
                                           mode="masked",
                                           lower_to_intrinsics=lower_to_intrinsics),
                 ])
+            # Vectorizer-entry precondition: the nested body must carry no loose WCR.
+            # Self-contained / in-place RMW is already an explicit aug-assign; genuine
+            # reductions are now ``Reduce`` libnodes (LiftMapReductionToReduce) or boundary
+            # MapExit -> AN edges -- none of which is a loose inner edge-WCR. Asserts BOTH
+            # checkers so a self-contained WCR hiding inside a body NSDFG (invisible to the
+            # map-body checker) is caught loudly instead of mis-vectorized.
+            passes.append(_AssertNoBodyWCRPass())
             passes.append(vectorizer)
         else:
             passes = [RemoveMathCall(), vectorizer]

@@ -15,13 +15,14 @@ are intentional — loud failures are preferred over silent shape
 corruption at the NSDFG boundary.
 """
 import copy
-from typing import Dict, Optional, Set
+from typing import Optional, Set
 
 import dace
 from dace import SDFGState
 
 from dace.transformation.passes.vectorization.utils.code_rewrite import drop_dims
 from dace.transformation.passes.vectorization.utils.name_schemes import PackedNameScheme, VecNameScheme
+from dace.transformation.passes.vectorization.utils.strided_codegen import render_strided_call
 from dace.transformation.passes.vectorization.utils.symbolic_polymorphism import free_symbols
 
 _ITER_MASK_PREFIX = "_iter_mask"
@@ -52,8 +53,8 @@ _STRIDED_LOAD_PREP_PREFIX = "_strided_load_prep_"
 _STRIDED_STORE_FINISH_PREFIX = "_strided_store_finish_"
 _MULTI_ELEM_LOAD_PREP_PREFIX = "_multi_elem_load_prep_"
 _MULTI_ELEM_STORE_FINISH_PREFIX = "_multi_elem_store_finish_"
-_STRIDED_AUX_STATE_PREFIXES = (_STRIDED_LOAD_PREP_PREFIX, _STRIDED_STORE_FINISH_PREFIX,
-                               _MULTI_ELEM_LOAD_PREP_PREFIX, _MULTI_ELEM_STORE_FINISH_PREFIX)
+_STRIDED_AUX_STATE_PREFIXES = (_STRIDED_LOAD_PREP_PREFIX, _STRIDED_STORE_FINISH_PREFIX, _MULTI_ELEM_LOAD_PREP_PREFIX,
+                               _MULTI_ELEM_STORE_FINISH_PREFIX)
 
 
 def _is_strided_aux_state(state: SDFGState) -> bool:
@@ -274,38 +275,6 @@ def emit_staging_copy(state: SDFGState,
         t.add_in_connector("_mask", dtype=dace.dtypes.pointer(dace.bool_), force=True)
         mask_an = state.add_access(mask_name)
         state.add_edge(mask_an, None, t, "_mask", dace.memlet.Memlet(f"{mask_name}[0:{W}]"))
-
-
-def get_vector_max_access_ranges(state: SDFGState, node: dace.nodes.NestedSDFG) -> Dict[str, str]:
-    """Map each vector-map param to the end bound of the outer data-parallel map.
-
-    Walks ``nsdfg -> vector_map -> data_map`` and matches each vector-map
-    ``begin`` (canonicalised via ``dace.symbolic.simplify``) to a data-map
-    ``begin``, returning that data-map's end bound. For
-    ``map i=0:N -> map i_v=i:i+4:4 -> NestedSDFG`` the result is
-    ``{'i_v': 'N - 1'}``.
-
-    :param state: The SDFG state containing the nested SDFG node.
-    :param node: The nested SDFG node whose vector access ranges to determine.
-    :returns: Dictionary mapping vector-map param names to the outer data-map's
-        end bound (string repr). This is the upper iteration bound, not the
-        per-memlet access range.
-    """
-    scope_dict = state.scope_dict()
-    vector_map = scope_dict[node]
-    data_map = scope_dict[vector_map]
-
-    # Simplify-keyed mapping: data-map ``begin`` -> data-map ``end``.
-    d_simplified_begin_to_end = {dace.symbolic.simplify(begin): end for begin, end, _ in data_map.map.range}
-
-    param_max_ranges = {}
-    for v_param, (v_begin, _, _) in zip(vector_map.map.params, vector_map.map.range):
-        canonical_begin = dace.symbolic.simplify(v_begin)
-        # Bare lookup: matches when the vector-map ``begin`` simplifies
-        # to the same sympy expression as one of the data-map begins.
-        param_max_ranges[v_param] = str(d_simplified_begin_to_end[canonical_begin])
-
-    return param_max_ranges
 
 
 def find_state_containing_node(root_sdfg: dace.SDFG, node: dace.nodes.Node) -> dace.SDFGState:
@@ -811,8 +780,8 @@ def prepare_vectorized_array(state: dace.SDFGState,
 
         # Offset the surviving dim by the outer subset's start on that dim,
         # so an inner access like ``arr[start]`` becomes the first vector
-        # lane ``arr[0]``. Don't route through ``offset_memlets`` here: it
-        # post-collapses length-1 dims which would silently turn the
+        # lane ``arr[0]``. Offset the memlets directly here rather than via a
+        # collapse-all-length-1-dims helper, which would silently turn the
         # vector-lane memlet into a 0-D ``arr[]`` access.
         if not (reuse_name_if_existing and use_name is not None):
             from dace.transformation.passes.vectorization.utils.iteration import walk_memlets_of
@@ -974,10 +943,7 @@ def _setup_strided_inside_nsdfg(state: dace.SDFGState,
         prep = inner_sdfg.add_state(_STRIDED_LOAD_PREP_PREFIX + inner_conn, is_start_block=(mask_name is None))
         bbox_an = prep.add_access(inner_conn)
         vec_an = prep.add_access(vec_name)
-        if mask_name is not None:
-            code = f"strided_load_masked<{dtype_ctype}>(_in, _out, {vector_width}, {stride}, _mask);"
-        else:
-            code = f"strided_load<{dtype_ctype}>(_in, _out, {vector_width}, {stride});"
+        code = render_strided_call("strided_load", dtype_ctype, vector_width, stride, masked=mask_name is not None)
         tasklet = prep.add_tasklet(
             name=f"_strided_load_{inner_conn}",
             inputs={"_in"},
@@ -1032,10 +998,7 @@ def _setup_strided_inside_nsdfg(state: dace.SDFGState,
         vec_an = finish.add_access(vec_name)
         bbox_an = finish.add_access(inner_conn)
         mask_name = _iter_mask_name(inner_sdfg)
-        if mask_name is not None:
-            code = f"strided_store_masked<{dtype_ctype}>(_in, _out, {vector_width}, {stride}, _mask);"
-        else:
-            code = f"strided_store<{dtype_ctype}>(_in, _out, {vector_width}, {stride});"
+        code = render_strided_call("strided_store", dtype_ctype, vector_width, stride, masked=mask_name is not None)
         tasklet = finish.add_tasklet(
             name=f"_strided_store_{inner_conn}",
             inputs={"_in"},
@@ -1178,10 +1141,12 @@ def _setup_multi_element_strided_inside_nsdfg(state: dace.SDFGState, nsdfg_node:
         bbox_an = prep.add_access(inner_conn)
         for p in range(K):
             vec_an = prep.add_access(phase_names[p])
-            if mask_name is not None:
-                code = f"strided_load_masked<{dtype_ctype}>(_in + {p}, _out, {W}, {S}, _mask);"
-            else:
-                code = f"strided_load<{dtype_ctype}>(_in + {p}, _out, {W}, {S});"
+            code = render_strided_call("strided_load",
+                                       dtype_ctype,
+                                       W,
+                                       S,
+                                       masked=mask_name is not None,
+                                       in_expr=f"_in + {p}")
             tasklet = prep.add_tasklet(
                 name=f"_multi_elem_load_{inner_conn}_p{p}",
                 inputs={"_in"},
@@ -1216,10 +1181,12 @@ def _setup_multi_element_strided_inside_nsdfg(state: dace.SDFGState, nsdfg_node:
         mask_name = _iter_mask_name(inner_sdfg)
         for p in range(K):
             vec_an = finish.add_access(phase_names[p])
-            if mask_name is not None:
-                code = f"strided_store_masked<{dtype_ctype}>(_in, _out + {p}, {W}, {S}, _mask);"
-            else:
-                code = f"strided_store<{dtype_ctype}>(_in, _out + {p}, {W}, {S});"
+            code = render_strided_call("strided_store",
+                                       dtype_ctype,
+                                       W,
+                                       S,
+                                       masked=mask_name is not None,
+                                       out_expr=f"_out + {p}")
             tasklet = finish.add_tasklet(
                 name=f"_multi_elem_store_{inner_conn}_p{p}",
                 inputs={"_in"},
