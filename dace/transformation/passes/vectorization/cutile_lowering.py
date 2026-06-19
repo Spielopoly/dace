@@ -60,10 +60,9 @@ def _tile_node_types() -> Tuple[Type[nodes.LibraryNode], ...]:
     :returns: All tile-op ``LibraryNode`` classes exported by
         :mod:`dace.libraries.tileops.nodes` (including :class:`TileIota`).
     """
-    from dace.libraries.tileops.nodes import (TileBinop, TileGather, TileIota, TileLoad, TileMaskGen, TileMerge,
-                                              TileReduce, TileScatter, TileStore, TileUnop)
-    return (TileBinop, TileGather, TileIota, TileLoad, TileMaskGen, TileMerge, TileReduce, TileScatter, TileStore,
-            TileUnop)
+    from dace.libraries.tileops.nodes import (TileBinop, TileIota, TileLoad, TileMaskGen, TileReduce, TileStore,
+                                              TileUnop)
+    return (TileBinop, TileIota, TileLoad, TileMaskGen, TileReduce, TileStore, TileUnop)
 
 
 def _collect_tile_nodes(sdfg: SDFG) -> List[Tuple[nodes.LibraryNode, SDFGState]]:

@@ -89,7 +89,6 @@ class VectorizeCuTile(ppl.Pass):
                  branch_mode: Literal["merge", "fp_factor"] = "merge",
                  loop_to_map_permissive: bool = False,
                  nest_map_bodies: bool = False,
-                 fuse_overlapping_loads: bool = False,
                  strict: bool = False,
                  insert_data_copies: bool = True,
                  debug_save: bool = False):
@@ -105,8 +104,6 @@ class VectorizeCuTile(ppl.Pass):
             parallelise scatter-style loops.
         :param nest_map_bodies: Forwarded; ``True`` routes every innermost map
             body through the NestedSDFG tile descent.
-        :param fuse_overlapping_loads: Forwarded; harness-parity knob
-            (currently a no-op on the tile path).
         :param strict: When ``True``, lowering-pass precondition violations
             (e.g. a partially-vectorized SDFG) raise ``ValueError`` instead of
             emitting a ``UserWarning``.
@@ -130,7 +127,6 @@ class VectorizeCuTile(ppl.Pass):
                                                 branch_mode=branch_mode,
                                                 loop_to_map_permissive=loop_to_map_permissive,
                                                 nest_map_bodies=nest_map_bodies,
-                                                fuse_overlapping_loads=fuse_overlapping_loads,
                                                 expand_tile_nodes=False)
 
     def modifies(self) -> ppl.Modifies:
