@@ -274,7 +274,7 @@ def validate_mask_descriptor_lock(node_label, conn_name, desc, widths):
     if desc.dtype != dace.bool_:
         raise ValueError(f"{node_label}: {conn_name!r} mask dtype {desc.dtype} must be bool_ "
                          f"(section 10.2)")
-    if desc.storage != dace.dtypes.StorageType.Register:
+    if desc.storage != dace.dtypes.StorageType.Register and desc.storage != dace.dtypes.StorageType.CuTile_Tile:
         raise ValueError(f"{node_label}: {conn_name!r} mask storage {desc.storage} must be "
                          f"Register (section 10.2)")
     if not desc.transient:
