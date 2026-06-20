@@ -493,6 +493,138 @@ class ExpandGemmPBLAS(ExpandTransformation):
         return _gemm_pblas.to_sdfg()
 
 
+@dace.library.expansion
+class ExpandGemmCuPy(ExpandTransformation):
+    """CuPy-based GPU GEMM: C = alpha * op(A) @ op(B) + beta * C.
+
+    Produces a nested SDFG with a Python-language tasklet calling
+    ``cupy.matmul``. Handles alpha/beta scaling and transposition.
+
+    .. note::
+        ``node.algorithm``, ``node.compute_type``, and
+        ``node.accumulator_type`` are cuBLAS-specific and are ignored
+        by this expansion.
+    """
+
+    environments = []
+
+    @staticmethod
+    def expansion(node: 'Gemm', state: SDFGState,
+                  sdfg: SDFG) -> SDFG:
+        node.validate(sdfg, state)
+
+        # Get operands using the existing helper.
+        ((edge_a, outer_array_a, shape_a, strides_a, _, _),
+         (edge_b, outer_array_b, shape_b, strides_b, _, _),
+         cdata) = _get_matmul_operands(node, state, sdfg)
+
+        dtype_a = outer_array_a.dtype.type
+        dtype_b = outer_array_b.dtype.type
+        dtype_c = dace.dtype_to_typeclass(
+            np.result_type(dtype_a, dtype_b).type)
+
+        # Compute shapes after transposition.
+        if node.transA:
+            trans_shape_a = list(reversed(shape_a))
+        else:
+            trans_shape_a = shape_a
+        if node.transB:
+            trans_shape_b = list(reversed(shape_b))
+        else:
+            trans_shape_b = shape_b
+
+        M, K, N = trans_shape_a[0], trans_shape_a[1], trans_shape_b[1]
+        shape_c = (M, N)
+
+        # Create the nested SDFG.
+        nsdfg = dace.SDFG(node.label + '_cupy')
+        nstate = nsdfg.add_state()
+
+        nsdfg.add_array('_a', shape_a, dtype_a, strides=strides_a,
+                        storage=outer_array_a.storage)
+        nsdfg.add_array('_b', shape_b, dtype_b, strides=strides_b,
+                        storage=outer_array_b.storage)
+        nsdfg.add_array('_c', shape_c, dtype_c, strides=cdata[-3],
+                        storage=cdata[1].storage)
+
+        # Build tasklet code.
+        code_lines = ['import cupy']
+
+        if node.transA:
+            code_lines.append('__a_t = cupy.asarray(__a).T')
+        else:
+            code_lines.append('__a_t = cupy.asarray(__a)')
+        if node.transB:
+            code_lines.append('__b_t = cupy.asarray(__b).T')
+        else:
+            code_lines.append('__b_t = cupy.asarray(__b)')
+
+        alpha = node.alpha
+        if equal_valued(0, alpha):
+            code_lines.append(
+                f'__result = cupy.zeros(({M}, {N}), '
+                f'dtype=cupy.result_type(__a_t.dtype, __b_t.dtype))')
+        elif equal_valued(1, alpha):
+            code_lines.append('__result = cupy.matmul(__a_t, __b_t)')
+        else:
+            alpha_str = symstr(alpha)
+            code_lines.append(
+                f'__result = {alpha_str} * cupy.matmul(__a_t, __b_t)')
+
+        beta = node.beta
+        # If cin is False, there is no C input to apply beta to -- beta is ignored.
+        has_cin = not equal_valued(0, beta) and node.cin
+
+        if has_cin:
+            if equal_valued(1, beta):
+                code_lines.append(
+                    '__result = __result + cupy.asarray(__cin)')
+            else:
+                beta_str = symstr(beta)
+                code_lines.append(
+                    f'__result = __result + {beta_str}'
+                    f' * cupy.asarray(__cin)')
+
+        code_lines.append('__c_out = cupy.asnumpy(__result)')
+
+        code = '\n'.join(code_lines)
+
+        # Connector setup.
+        in_connectors = {'__a': None, '__b': None}
+        out_connectors = {'__c_out': None}
+        if has_cin:
+            in_connectors['__cin'] = None
+
+        tasklet = dace.sdfg.nodes.Tasklet(
+            node.label + '_cupy_tasklet',
+            in_connectors,
+            out_connectors,
+            code,
+            language=dace.dtypes.Language.Python,
+        )
+        nstate.add_node(tasklet)
+
+        # Wire input/output edges.
+        a_read = nstate.add_read('_a')
+        b_read = nstate.add_read('_b')
+        c_write = nstate.add_write('_c')
+
+        nstate.add_edge(a_read, None, tasklet, '__a',
+                        dace.Memlet.from_array('_a', nsdfg.arrays['_a']))
+        nstate.add_edge(b_read, None, tasklet, '__b',
+                        dace.Memlet.from_array('_b', nsdfg.arrays['_b']))
+        nstate.add_edge(tasklet, '__c_out', c_write, None,
+                        dace.Memlet.from_array('_c', nsdfg.arrays['_c']))
+
+        if has_cin:
+            c_read = nstate.add_read('_c')
+            nstate.add_edge(
+                c_read, None, tasklet, '__cin',
+                dace.Memlet.from_array('_c', nsdfg.arrays['_c']))
+
+        return nsdfg
+
+
 @dace.library.node
 class Gemm(dace.sdfg.nodes.LibraryNode):
     """Executes alpha * (A @ B) + beta * C. C should be unidirectionally
@@ -507,6 +639,7 @@ class Gemm(dace.sdfg.nodes.LibraryNode):
         "cuBLAS": ExpandGemmCuBLAS,
         "rocBLAS": ExpandGemmRocBLAS,
         "PBLAS": ExpandGemmPBLAS,
+        "CuPy": ExpandGemmCuPy,
     }
     default_implementation = None
 

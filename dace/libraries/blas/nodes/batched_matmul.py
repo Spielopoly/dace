@@ -1,7 +1,7 @@
 # Copyright 2019-2025 ETH Zurich and the DaCe authors. All rights reserved.
 from copy import deepcopy as dc
 from dace import dtypes, memlet as mm, properties, data as dt
-from dace.symbolic import symstr, equal
+from dace.symbolic import symstr, equal, equal_valued
 import dace.library
 from dace.frontend.common import op_repository as oprepo
 import dace.sdfg.nodes
@@ -418,6 +418,109 @@ class ExpandBatchedMatMulCuBLAS(ExpandTransformation):
         return tasklet
 
 
+@dace.library.expansion
+class ExpandBatchedMatMulCuPy(ExpandTransformation):
+    """CuPy-based GPU batched matrix multiplication.
+
+    Uses ``cupy.matmul`` which natively handles batched and broadcasted
+    matrix multiplications for N-dimensional inputs.
+    """
+
+    environments = []
+
+    @staticmethod
+    def expansion(node: 'BatchedMatMul', state: dace.SDFGState,
+                  sdfg: dace.SDFG) -> dace.SDFG:
+        node.validate(sdfg, state)
+
+        # Gather input/output descriptors from the graph edges.
+        adesc, bdesc, cdesc = None, None, None
+        for e in state.in_edges(node):
+            if e.dst_conn == '_a':
+                adesc = sdfg.arrays[e.data.data]
+            elif e.dst_conn == '_b':
+                bdesc = sdfg.arrays[e.data.data]
+        for e in state.out_edges(node):
+            if e.src_conn == '_c':
+                cdesc = sdfg.arrays[e.data.data]
+        if adesc is None or bdesc is None or cdesc is None:
+            raise ValueError(
+                'Expected connectors _a, _b (inputs) and _c (output)')
+
+        dtype_a = adesc.dtype
+        dtype_b = bdesc.dtype
+        dtype_c = cdesc.dtype
+
+        shape_a = adesc.shape
+        shape_b = bdesc.shape
+        shape_c = cdesc.shape
+
+        # Create the nested SDFG.
+        nsdfg = dace.SDFG(node.label + '_cupy')
+        nstate = nsdfg.add_state()
+
+        nsdfg.add_array('_a', shape_a, dtype_a,
+                        strides=adesc.strides, storage=adesc.storage)
+        nsdfg.add_array('_b', shape_b, dtype_b,
+                        strides=bdesc.strides, storage=bdesc.storage)
+        nsdfg.add_array('_c', shape_c, dtype_c,
+                        strides=cdesc.strides, storage=cdesc.storage)
+
+        # Build tasklet code.
+        code_lines = ['import cupy']
+
+        # Transpose handling — only last two dims for batched matmul.
+        if node.transA:
+            code_lines.append(
+                '__a_t = cupy.swapaxes(cupy.asarray(__a), -1, -2)')
+        else:
+            code_lines.append('__a_t = cupy.asarray(__a)')
+        if node.transB:
+            code_lines.append(
+                '__b_t = cupy.swapaxes(cupy.asarray(__b), -1, -2)')
+        else:
+            code_lines.append('__b_t = cupy.asarray(__b)')
+
+        # Alpha scaling.
+        alpha = node.alpha
+        if equal_valued(1, alpha):
+            code_lines.append('__result = cupy.matmul(__a_t, __b_t)')
+        elif equal_valued(0, alpha):
+            code_lines.append(
+                '__result = cupy.zeros_like(cupy.asarray(__c))')
+        else:
+            alpha_str = symstr(alpha)
+            code_lines.append(
+                f'__result = {alpha_str} * cupy.matmul(__a_t, __b_t)')
+
+        code_lines.append('__c_out = cupy.asnumpy(__result)')
+
+        code = '\n'.join(code_lines)
+
+        tasklet = dace.sdfg.nodes.Tasklet(
+            node.label + '_cupy_tasklet',
+            {'__a': None, '__b': None},
+            {'__c_out': None},
+            code,
+            language=dace.dtypes.Language.Python,
+        )
+        nstate.add_node(tasklet)
+
+        # Wire input/output edges.
+        a_read = nstate.add_read('_a')
+        b_read = nstate.add_read('_b')
+        c_write = nstate.add_write('_c')
+
+        nstate.add_edge(a_read, None, tasklet, '__a',
+                        dace.Memlet.from_array('_a', nsdfg.arrays['_a']))
+        nstate.add_edge(b_read, None, tasklet, '__b',
+                        dace.Memlet.from_array('_b', nsdfg.arrays['_b']))
+        nstate.add_edge(tasklet, '__c_out', c_write, None,
+                        dace.Memlet.from_array('_c', nsdfg.arrays['_c']))
+
+        return nsdfg
+
+
 @dace.library.node
 class BatchedMatMul(dace.sdfg.nodes.LibraryNode):
 
@@ -426,7 +529,8 @@ class BatchedMatMul(dace.sdfg.nodes.LibraryNode):
         "pure": ExpandBatchedMatMulPure,
         "MKL": ExpandBatchedMatMulMKL,
         "OpenBLAS": ExpandBatchedMatMulOpenBLAS,
-        "cuBLAS": ExpandBatchedMatMulCuBLAS
+        "cuBLAS": ExpandBatchedMatMulCuBLAS,
+        "CuPy": ExpandBatchedMatMulCuPy,
     }
     transA = properties.Property(dtype=bool, desc="Whether to transpose A before multiplying")
     transB = properties.Property(dtype=bool, desc="Whether to transpose B before multiplying")

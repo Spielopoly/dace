@@ -1336,6 +1336,127 @@ class ExpandReduceGPUAuto(pm.ExpandTransformation):
         return nsdfg
 
 
+# Mapping from ReductionType to CuPy function call templates.
+# NOTE: CuPy does not support ``ufunc.reduce()`` for bitwise operations
+# (bitwise_and, bitwise_or, bitwise_xor) -- those fall back to ExpandReducePure.
+_REDUCTION_TYPE_TO_CUPY = {
+    dtypes.ReductionType.Sum: 'cupy.sum({inp}, axis={axes})',
+    dtypes.ReductionType.Product: 'cupy.prod({inp}, axis={axes})',
+    dtypes.ReductionType.Min: 'cupy.min({inp}, axis={axes})',
+    dtypes.ReductionType.Max: 'cupy.max({inp}, axis={axes})',
+    dtypes.ReductionType.Logical_And: 'cupy.all({inp}, axis={axes})',
+    dtypes.ReductionType.Logical_Or: 'cupy.any({inp}, axis={axes})',
+}
+
+
+@dace.library.expansion
+class ExpandReduceCuPy(pm.ExpandTransformation):
+    """
+        CuPy expansion of the Reduce node.  Emits a nested SDFG containing a
+        Python-language tasklet that delegates to the corresponding CuPy
+        reduction function (``cupy.sum``, ``cupy.max``, etc.).
+
+        Supported reduction types are listed in ``_REDUCTION_TYPE_TO_CUPY``.
+        For unsupported types (Custom, Exchange, Sub, Div, Min_Location,
+        Max_Location, Logical_Xor) the expansion falls back to
+        ``ExpandReducePure``.
+    """
+    environments = []
+
+    @staticmethod
+    def expansion(node: 'Reduce', state: SDFGState, sdfg: SDFG):
+        node.validate(sdfg, state)
+        inedge: graph.MultiConnectorEdge = state.in_edges(node)[0]
+        outedge: graph.MultiConnectorEdge = state.out_edges(node)[0]
+        insubset = dcpy(inedge.data.subset)
+        isqdim = insubset.squeeze()
+        outsubset = dcpy(outedge.data.subset)
+        osqdim = outsubset.squeeze()
+        input_data = sdfg.arrays[inedge.data.data]
+        output_data = sdfg.arrays[outedge.data.data]
+
+        if len(osqdim) == 0:  # Fix for scalars
+            osqdim = [0]
+
+        # Standardize and squeeze axes
+        axes = node.axes if node.axes is not None else list(range(len(inedge.data.subset)))
+        axes = [axis for axis in axes if axis in isqdim]
+
+        # Degenerate reduction — fall back BEFORE connector renaming
+        if len(axes) == 0:
+            return ExpandReducePure.expansion(node, state, sdfg)
+
+        # Detect reduction type
+        redtype = detect_reduction_type(node.wcr)
+        if redtype not in _REDUCTION_TYPE_TO_CUPY:
+            warnings.warn(f'ExpandReduceCuPy: unsupported reduction type '
+                          f'{redtype}, falling back to ExpandReducePure')
+            return ExpandReducePure.expansion(node, state, sdfg)
+
+        # --- Rename outer connectors (required by expansion framework) ---
+        inedge._dst_conn = '_in'
+        outedge._src_conn = '_out'
+        node.add_in_connector('_in')
+        node.add_out_connector('_out')
+
+        # --- Create nested SDFG ---
+        nsdfg = SDFG('reduce_cupy')
+
+        nsdfg.add_array('_in',
+                        insubset.size(),
+                        input_data.dtype,
+                        strides=[s for i, s in enumerate(input_data.strides) if i in isqdim],
+                        storage=input_data.storage)
+
+        nsdfg.add_array('_out',
+                        outsubset.size(),
+                        output_data.dtype,
+                        strides=[s for i, s in enumerate(output_data.strides) if i in osqdim],
+                        storage=output_data.storage)
+
+        nstate = nsdfg.add_state()
+
+        # --- Compute CuPy axes argument ---
+        # Map axes from original to squeezed positions
+        squeezed_axes = [isqdim.index(a) for a in axes]
+
+        if len(squeezed_axes) == len(insubset.size()):
+            # All dimensions reduced
+            axes_str = 'None'
+        elif len(squeezed_axes) == 1:
+            axes_str = str(squeezed_axes[0])
+        else:
+            axes_str = repr(tuple(squeezed_axes))
+
+        # --- Build tasklet code ---
+        cupy_template = _REDUCTION_TYPE_TO_CUPY[redtype]
+        cupy_call = cupy_template.format(inp='__inp_cp', axes=axes_str)
+
+        # The Python backend maps connector names to local variables:
+        #   input  connectors are read from the incoming memlet,
+        #   output connectors are written to the outgoing memlet AFTER the
+        #   tasklet body.  We therefore assign the CuPy result (converted
+        #   back to NumPy) directly to the output connector variable so
+        #   the backend can copy it into the output array.
+        tasklet_code = ('import cupy\n'
+                        '__inp_cp = cupy.asarray(__in)\n'
+                        f'__out = cupy.asnumpy({cupy_call})')
+
+        tasklet = nstate.add_tasklet('cupy_reduce', {'__in'}, {'__out'},
+                                     tasklet_code,
+                                     language=dace.Language.Python)
+
+        # Wire edges
+        r = nstate.add_read('_in')
+        w = nstate.add_write('_out')
+        nstate.add_edge(r, None, tasklet, '__in',
+                        dace.Memlet.from_array('_in', nsdfg.arrays['_in']))
+        nstate.add_edge(tasklet, '__out', w, None,
+                        dace.Memlet.from_array('_out', nsdfg.arrays['_out']))
+
+        return nsdfg
+
+
 @dace.library.node
 class Reduce(dace.sdfg.nodes.LibraryNode):
     """ An SDFG node that reduces an N-dimensional array to an
@@ -1350,7 +1471,8 @@ class Reduce(dace.sdfg.nodes.LibraryNode):
         'CUDA (device)': ExpandReduceCUDADevice,
         'CUDA (block)': ExpandReduceCUDABlock,
         'CUDA (block allreduce)': ExpandReduceCUDABlockAll,
-        'GPUAuto': ExpandReduceGPUAuto
+        'GPUAuto': ExpandReduceGPUAuto,
+        'CuPy': ExpandReduceCuPy,
         # 'CUDA (warp)': ExpandReduceCUDAWarp,
         # 'CUDA (warp allreduce)': ExpandReduceCUDAWarpAll
     }
