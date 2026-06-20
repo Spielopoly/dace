@@ -236,7 +236,7 @@ def test_structure_transient_allocation_uses_python_constructor():
     generated = allocation_stream.getvalue()
     assert 'Pair(' in generated
     assert 'value=0' in generated
-    assert 'buffer=numpy.zeros' in generated
+    assert 'buffer=numpy.empty' in generated
 
 
 def test_advanced_indexing_helper_emits_python_index_expression():

@@ -252,7 +252,7 @@ class PythonCodeGen(PythonTargetCodeGenerator):
             if isinstance(field_desc, data.Structure):
                 value = self._structure_default_expression(field_desc)
             elif isinstance(field_desc, data.Array):
-                value = self._zeros_expr(field_desc)
+                value = self._alloc_expr(field_desc)
             elif isinstance(field_desc, data.Scalar):
                 value = self._scalar_default(field_desc)
             else:
@@ -262,19 +262,26 @@ class PythonCodeGen(PythonTargetCodeGenerator):
             members.append(f'{field_name}={value}')
         return f'{_structure_type_name(desc)}({", ".join(members)})'
     
-    def _default_expression(self, desc: data.Data, *, on_gpu: bool = False) -> str:
-        """Returns an expression that evaluates to a default-initialized value of the given descriptor's type."""
+    def _default_expression(self, desc: data.Data, *, on_gpu: bool = False, setzero: bool = False) -> str:
+        """Returns an expression that evaluates to a default-initialized value of the given descriptor's type.
+
+        :param desc: The data descriptor to generate an expression for.
+        :param on_gpu: Whether to use cupy (GPU) instead of numpy (CPU).
+        :param setzero: Whether to zero-initialize the allocation (``zeros``) or leave it
+            uninitialized (``empty``).  Mirrors ``AccessNode.setzero``.
+        """
         if isinstance(desc, data.Structure):
             return self._structure_default_expression(desc)
         if isinstance(desc, data.Array):
-            return self._zeros_expr(desc, on_gpu=on_gpu)
+            return self._alloc_expr(desc, on_gpu=on_gpu, setzero=setzero)
         if isinstance(desc, data.Scalar):
             return self._scalar_default(desc)
         raise NotImplementedError(f'Unsupported descriptor in Python backend: {type(desc).__name__}')
 
-    def _zeros_expr(self, desc: data.Array, *, on_gpu: bool = False) -> str:
+    def _alloc_expr(self, desc: data.Array, *, on_gpu: bool = False, setzero: bool = False) -> str:
         module = 'cupy' if on_gpu else 'numpy'
-        return f'{module}.zeros({self._shape_expression(desc.shape)}, dtype={_numpy_dtype(desc.dtype)})'
+        func = 'zeros' if setzero else 'empty'
+        return f'{module}.{func}({self._shape_expression(desc.shape)}, dtype={_numpy_dtype(desc.dtype)})'
 
     def _persistent_key(self, sdfg: SDFG, name: str) -> str:
         return f'{sdfg.cfg_id}:{name}'
@@ -523,7 +530,7 @@ class PythonCodeGen(PythonTargetCodeGenerator):
         on_gpu = (isinstance(desc, data.Array)
                   and desc.storage != dtypes.StorageType.Register
                   and _sdfg_uses_cutile(sdfg))
-        init_expr = self._default_expression(desc, on_gpu=on_gpu)
+        init_expr = self._default_expression(desc, on_gpu=on_gpu, setzero=node.setzero)
 
         if is_global:
             allocation_stream.write(f'global {name}', cfg, state_id)

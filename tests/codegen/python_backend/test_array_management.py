@@ -52,7 +52,7 @@ class TestAllocateArray:
         assert 'tmp = 0' in code
 
     def test_allocate_array_transient_1d(self):
-        """1D float64 transient -> numpy.zeros with correct shape."""
+        """1D float64 transient -> numpy.empty (setzero=False by default)."""
         sdfg = _make_python_sdfg('test_alloc_1d')
         sdfg.add_transient('tmp', [10], dace.float64)
         sdfg.add_array('A', [10], dace.float64)
@@ -64,11 +64,11 @@ class TestAllocateArray:
         state.add_edge(a, None, tmp, None, Memlet(data='A', subset='0:10', other_subset='0:10'))
         state.add_edge(tmp, None, b, None, Memlet(data='tmp', subset='0:10', other_subset='0:10'))
         code = sdfg.generate_code()[0].code
-        assert 'numpy.zeros' in code
+        assert 'numpy.empty' in code
         assert 'float64' in code
 
     def test_allocate_array_transient_2d(self):
-        """2D transient -> correct shape in numpy.zeros."""
+        """2D transient -> correct shape in numpy.empty (setzero=False by default)."""
         sdfg = _make_python_sdfg('test_alloc_2d')
         sdfg.add_transient('tmp', [3, 5], dace.float64)
         sdfg.add_array('A', [3, 5], dace.float64)
@@ -80,7 +80,7 @@ class TestAllocateArray:
         state.add_edge(a, None, tmp, None, Memlet(data='A', subset='0:3, 0:5', other_subset='0:3, 0:5'))
         state.add_edge(tmp, None, b, None, Memlet(data='tmp', subset='0:3, 0:5', other_subset='0:3, 0:5'))
         code = sdfg.generate_code()[0].code
-        assert 'numpy.zeros' in code
+        assert 'numpy.empty' in code
         assert '3' in code and '5' in code
 
     def test_allocate_array_transient_int32(self):
@@ -99,7 +99,7 @@ class TestAllocateArray:
         assert 'int32' in code
 
     def test_allocate_non_transient(self):
-        """Non-transient arrays are not allocated -- no numpy.zeros for them."""
+        """Non-transient arrays are not allocated -- no numpy.empty/zeros for them."""
         sdfg = _make_python_sdfg('test_alloc_non_trans')
         sdfg.add_array('A', [10], dace.float64)
         sdfg.add_array('B', [10], dace.float64)
@@ -108,8 +108,37 @@ class TestAllocateArray:
         b = state.add_write('B')
         state.add_edge(a, None, b, None, Memlet(data='A', subset='0:10', other_subset='0:10'))
         code = sdfg.generate_code()[0].code
+        assert 'A = numpy.empty' not in code
+        assert 'B = numpy.empty' not in code
         assert 'A = numpy.zeros' not in code
         assert 'B = numpy.zeros' not in code
+
+    def test_allocate_array_transient_setzero(self):
+        """setzero=True -> numpy.zeros; setzero=False -> numpy.empty."""
+        sdfg = _make_python_sdfg('test_alloc_setzero')
+        sdfg.add_transient('zeroed', [10], dace.float64)
+        sdfg.add_transient('unzeroed', [10], dace.float64)
+        sdfg.add_array('A', [10], dace.float64)
+        sdfg.add_array('B', [10], dace.float64)
+        sdfg.add_array('C', [10], dace.float64)
+        state = sdfg.add_state('s')
+
+        a = state.add_read('A')
+        zeroed_node = state.add_access('zeroed')
+        zeroed_node.setzero = True
+        unzeroed_node = state.add_access('unzeroed')
+        unzeroed_node.setzero = False
+        b = state.add_write('B')
+        c = state.add_write('C')
+
+        state.add_edge(a, None, zeroed_node, None, Memlet(data='A', subset='0:10', other_subset='0:10'))
+        state.add_edge(zeroed_node, None, b, None, Memlet(data='zeroed', subset='0:10', other_subset='0:10'))
+        state.add_edge(a, None, unzeroed_node, None, Memlet(data='A', subset='0:10', other_subset='0:10'))
+        state.add_edge(unzeroed_node, None, c, None, Memlet(data='unzeroed', subset='0:10', other_subset='0:10'))
+
+        code = sdfg.generate_code()[0].code
+        assert 'zeroed = numpy.zeros' in code
+        assert 'unzeroed = numpy.empty' in code
 
     def test_allocate_unsupported_type(self):
         """Unsupported data type (Stream) raises NotImplementedError."""
@@ -436,3 +465,20 @@ class TestArrayManagementCorrectness:
         y = np.array([0.0], dtype=np.float64)
         csdfg(x=x, y=y)
         assert y[0] == 99.0
+
+    def test_setzero_transient_correctness(self):
+        """setzero=True -> transient is zero-initialized; read it back to verify."""
+        N = 8
+        sdfg = _make_python_sdfg('test_setzero_corr')
+        sdfg.add_transient('tmp', [N], dace.float64)
+        sdfg.add_array('B', [N], dace.float64)
+        state = sdfg.add_state('s')
+        # tmp is a zero-initialized transient, copy straight to output
+        tmp = state.add_access('tmp')
+        tmp.setzero = True
+        b = state.add_write('B')
+        state.add_edge(tmp, None, b, None, Memlet(data='tmp', subset='0:8', other_subset='0:8'))
+        csdfg = sdfg.compile()
+        B = np.ones(N, dtype=np.float64)
+        csdfg(B=B)
+        np.testing.assert_array_equal(B, np.zeros(N, dtype=np.float64))
