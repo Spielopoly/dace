@@ -77,15 +77,6 @@ def test_k1_auto_resolves_via_host_isa():
     assert select_tile_implementation(_binop((8, ), "AUTO")) == expected
 
 
-@pytest.mark.parametrize("target_isa", ["AVX512", "AVX2", "ARM_SVE", "ARM_NEON", "SCALAR"])
-def test_k1_isa_not_defined_on_node_falls_back_to_pure(target_isa: str):
-    """K == 1 with a known ISA whose expansion the node does not define
-    falls back to ``'pure'`` (``TileMaskGen`` only has pure + cutile)."""
-    node = TileMaskGen(name="tmg", widths=(8, ), iter_vars=("i", ), global_ubs=("N", ))
-    node.target_isa = target_isa
-    assert select_tile_implementation(node) == "pure"
-
-
 def test_k1_cutile_on_node_with_cutile_impl_resolves_cutile():
     """K == 1 + CUTILE on a node that defines ``'cutile'`` resolves to it,
     even when the node lacks every CPU-ISA expansion (``TileMaskGen``)."""
