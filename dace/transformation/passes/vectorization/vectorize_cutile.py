@@ -151,8 +151,10 @@ class VectorizeCuTile(ppl.Pass):
             without a ``'cutile'`` implementation.
         """
         
+        import os
         import time
-        DEBUG_SAVE_NAME = "/workspace/cutile_pipeline_debug/" + str(int(time.time())) + "/stage_{stage}.sdfg"
+        debug_dir = os.environ.get("DACE_CUTILE_DEBUG_DIR", ".cutile_pipeline_debug")
+        DEBUG_SAVE_NAME = os.path.join(debug_dir, str(int(time.time())), "stage_{stage}.sdfg")
         
         stage = 0
         
