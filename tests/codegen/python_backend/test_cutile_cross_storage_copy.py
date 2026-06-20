@@ -3,8 +3,8 @@
 
 Verifies that CuTilePythonCodeGen correctly:
 1. Registers copy dispatchers for CPU_Heap <-> GPU_Global copies.
-2. Emits ``cupy.asarray`` for CPU_Heap -> GPU_Global transfers.
-3. Emits ``cupy.asnumpy`` for GPU_Global -> CPU_Heap transfers.
+2. Emits ``.set()`` for CPU_Heap -> GPU_Global transfers.
+3. Emits ``.get(out=...)`` for GPU_Global -> CPU_Heap transfers.
 4. Handles memlet subsets in cross-storage copies.
 5. Falls through to plain assignment for same-storage copies.
 """
@@ -136,7 +136,7 @@ class TestCopyMemoryCPUToGPU:
     """Test copy_memory for CPU_Heap -> GPU_Global transfers."""
 
     def test_full_array_copy_cpu_to_gpu(self):
-        """Full-array CPU_Heap -> GPU_Global emits cupy.asarray."""
+        """Full-array CPU_Heap -> GPU_Global emits .set()."""
         (sdfg, codegen, state, src, dst, edge,
          fn_stream, cs_stream) = _build_copy_sdfg_and_edge(
             "test_cpu_to_gpu_full",
@@ -148,7 +148,7 @@ class TestCopyMemoryCPUToGPU:
         codegen.copy_memory(sdfg, sdfg, state, 0, src, dst, edge,
                             fn_stream, cs_stream)
         code = cs_stream.getvalue()
-        assert "cupy.asarray" in code
+        assert ".set(" in code
         assert "A_gpu[" in code  # dst has indexing
         assert "A_cpu" in code
 
@@ -167,7 +167,8 @@ class TestCopyMemoryCPUToGPU:
         code = cs_stream.getvalue()
         # Memlet(data="X") auto-infers src_subset from array shape,
         # so the source expression will include the subset.
-        assert "cupy.asarray(X" in code
+        assert ".set(" in code
+        assert "X" in code
         assert "X_dev[" in code
 
     def test_subset_copy_cpu_to_gpu(self):
@@ -185,7 +186,7 @@ class TestCopyMemoryCPUToGPU:
         codegen.copy_memory(sdfg, sdfg, state, 0, src, dst, edge,
                             fn_stream, cs_stream)
         code = cs_stream.getvalue()
-        assert "cupy.asarray" in code
+        assert ".set(" in code
         assert "B_cpu[" in code
         assert "B_gpu[" in code
 
@@ -202,7 +203,8 @@ class TestCopyMemoryCPUToGPU:
         codegen.copy_memory(sdfg, sdfg, state, 0, src, dst, edge,
                             fn_stream, cs_stream)
         code = cs_stream.getvalue()
-        assert "cupy.asarray(M_host" in code
+        assert ".set(" in code
+        assert "M_host" in code
         assert "M_dev[" in code
 
 
@@ -210,7 +212,7 @@ class TestCopyMemoryGPUToCPU:
     """Test copy_memory for GPU_Global -> CPU_Heap transfers."""
 
     def test_full_array_copy_gpu_to_cpu(self):
-        """Full-array GPU_Global -> CPU_Heap emits cupy.asnumpy."""
+        """Full-array GPU_Global -> CPU_Heap emits .get(out=...)."""
         (sdfg, codegen, state, src, dst, edge,
          fn_stream, cs_stream) = _build_copy_sdfg_and_edge(
             "test_gpu_to_cpu_full",
@@ -222,7 +224,7 @@ class TestCopyMemoryGPUToCPU:
         codegen.copy_memory(sdfg, sdfg, state, 0, src, dst, edge,
                             fn_stream, cs_stream)
         code = cs_stream.getvalue()
-        assert "cupy.asnumpy" in code
+        assert ".get(out=" in code
         assert "C_cpu[" in code
         assert "C_gpu" in code
 
@@ -240,7 +242,8 @@ class TestCopyMemoryGPUToCPU:
                             fn_stream, cs_stream)
         code = cs_stream.getvalue()
         # Memlet auto-infers src_subset from array shape.
-        assert "cupy.asnumpy(Y_dev" in code
+        assert "Y_dev" in code
+        assert ".get(out=" in code
         assert "Y[" in code
 
     def test_subset_copy_gpu_to_cpu(self):
@@ -258,7 +261,7 @@ class TestCopyMemoryGPUToCPU:
         codegen.copy_memory(sdfg, sdfg, state, 0, src, dst, edge,
                             fn_stream, cs_stream)
         code = cs_stream.getvalue()
-        assert "cupy.asnumpy" in code
+        assert ".get(out=" in code
         assert "D_gpu[" in code
         assert "D_cpu[" in code
 
@@ -275,7 +278,8 @@ class TestCopyMemoryGPUToCPU:
         codegen.copy_memory(sdfg, sdfg, state, 0, src, dst, edge,
                             fn_stream, cs_stream)
         code = cs_stream.getvalue()
-        assert "cupy.asnumpy(N_dev" in code
+        assert "N_dev" in code
+        assert ".get(out=" in code
         assert "N_host[" in code
 
 
@@ -302,6 +306,8 @@ class TestCopyMemorySameStorage:
         code = cs_stream.getvalue()
         assert "cupy.asarray" not in code
         assert "cupy.asnumpy" not in code
+        assert ".set(" not in code
+        assert ".get(out=" not in code
         # Should have a plain assignment
         assert "P_gpu" in code
         assert "Q_gpu" in code
@@ -321,6 +327,8 @@ class TestCopyMemorySameStorage:
         code = cs_stream.getvalue()
         assert "cupy.asarray" not in code
         assert "cupy.asnumpy" not in code
+        assert ".set(" not in code
+        assert ".get(out=" not in code
         assert "R_cpu" in code
         assert "S_cpu" in code
 
@@ -382,7 +390,8 @@ class TestCopyMemoryDtypes:
         codegen.copy_memory(sdfg, sdfg, state, 0, src, dst, edge,
                             fn_stream, cs_stream)
         code = cs_stream.getvalue()
-        assert "cupy.asarray(arr_cpu" in code
+        assert ".set(" in code
+        assert "arr_cpu" in code
 
     @pytest.mark.parametrize("dtype", [
         dace.float32,
@@ -404,7 +413,8 @@ class TestCopyMemoryDtypes:
         codegen.copy_memory(sdfg, sdfg, state, 0, src, dst, edge,
                             fn_stream, cs_stream)
         code = cs_stream.getvalue()
-        assert "cupy.asnumpy(arr_gpu" in code
+        assert "arr_gpu" in code
+        assert ".get(out=" in code
 
 
 # =============================================================================
@@ -416,7 +426,7 @@ class TestEmitCrossStorageCopy:
     """Direct tests of _emit_cross_storage_copy."""
 
     def test_cpu_to_gpu_direct_no_subset(self):
-        """Direct call with no-subset memlet emits cupy.asarray with [:] dst."""
+        """Direct call with no-subset memlet emits .set() with [:] dst."""
         sdfg = _make_cutile_python_sdfg("test_direct_cpu_gpu_no_sub")
         sdfg.add_array("src", [10], dace.float64,
                        storage=dtypes.StorageType.CPU_Heap)
@@ -435,11 +445,12 @@ class TestEmitCrossStorageCopy:
             sdfg, sdfg, 0, src_node, dst_node, memlet,
             cpu_to_gpu=True, callsite_stream=cs_stream)
         code = cs_stream.getvalue()
-        assert "cupy.asarray(src" in code
+        assert ".set(" in code
+        assert "src" in code
         assert "dst[" in code
 
     def test_gpu_to_cpu_direct_no_subset(self):
-        """Direct call with no-subset memlet emits cupy.asnumpy with [:] dst."""
+        """Direct call with no-subset memlet emits .get(out=...) with [:] dst."""
         sdfg = _make_cutile_python_sdfg("test_direct_gpu_cpu_no_sub")
         sdfg.add_array("src", [10], dace.float64,
                        storage=dtypes.StorageType.GPU_Global)
@@ -457,7 +468,8 @@ class TestEmitCrossStorageCopy:
             sdfg, sdfg, 0, src_node, dst_node, memlet,
             cpu_to_gpu=False, callsite_stream=cs_stream)
         code = cs_stream.getvalue()
-        assert "cupy.asnumpy(src" in code
+        assert "src" in code
+        assert ".get(out=" in code
         assert "dst[" in code
 
     def test_cpu_to_gpu_direct_truly_no_subset(self):
@@ -480,7 +492,7 @@ class TestEmitCrossStorageCopy:
             sdfg, sdfg, 0, src_node, dst_node, memlet,
             cpu_to_gpu=True, callsite_stream=cs_stream)
         code = cs_stream.getvalue()
-        assert "dst[:] = cupy.asarray(src)" in code
+        assert "dst[:].set(src)" in code
 
     def test_gpu_to_cpu_direct_truly_no_subset(self):
         """Direct call with a memlet that has no subsets emits bare src name."""
@@ -501,7 +513,7 @@ class TestEmitCrossStorageCopy:
             sdfg, sdfg, 0, src_node, dst_node, memlet,
             cpu_to_gpu=False, callsite_stream=cs_stream)
         code = cs_stream.getvalue()
-        assert "dst[:] = cupy.asnumpy(src)" in code
+        assert "src.get(out=dst[:])" in code
 
     def test_subset_applied_to_source(self):
         """When memlet has src_subset, it is applied to the source expression."""
@@ -522,7 +534,8 @@ class TestEmitCrossStorageCopy:
             sdfg, sdfg, 0, src_node, dst_node, memlet,
             cpu_to_gpu=True, callsite_stream=cs_stream)
         code = cs_stream.getvalue()
-        assert "cupy.asarray(src[" in code
+        assert ".set(" in code
+        assert "src[" in code
         assert "dst[:]" in code
 
     def test_subset_applied_to_destination(self):
@@ -545,7 +558,8 @@ class TestEmitCrossStorageCopy:
             cpu_to_gpu=True, callsite_stream=cs_stream)
         code = cs_stream.getvalue()
         assert "dst[" in code
-        assert "cupy.asarray(src[" in code
+        assert ".set(" in code
+        assert "src[" in code
 
 
 # =============================================================================
@@ -558,11 +572,11 @@ class TestCopyMemoryDefaultStorage:
 
     Default storage resolves to CPU_Heap in practice.  Cross-storage
     copies between Default and GPU_Global should still emit
-    ``cupy.asarray`` / ``cupy.asnumpy``.
+    ``.set()`` / ``.get(out=...)``.
     """
 
-    def test_default_to_gpu_global_emits_cupy_asarray(self):
-        """Default -> GPU_Global emits cupy.asarray (treated as host)."""
+    def test_default_to_gpu_global_emits_set(self):
+        """Default -> GPU_Global emits .set() (treated as host)."""
         (sdfg, codegen, state, src, dst, edge,
          fn_stream, cs_stream) = _build_copy_sdfg_and_edge(
             "test_default_to_gpu",
@@ -574,11 +588,12 @@ class TestCopyMemoryDefaultStorage:
         codegen.copy_memory(sdfg, sdfg, state, 0, src, dst, edge,
                             fn_stream, cs_stream)
         code = cs_stream.getvalue()
-        assert "cupy.asarray(A_default" in code
+        assert ".set(" in code
+        assert "A_default" in code
         assert "A_gpu[" in code
 
-    def test_gpu_global_to_default_emits_cupy_asnumpy(self):
-        """GPU_Global -> Default emits cupy.asnumpy (treated as host)."""
+    def test_gpu_global_to_default_emits_get_out(self):
+        """GPU_Global -> Default emits .get(out=...) (treated as host)."""
         (sdfg, codegen, state, src, dst, edge,
          fn_stream, cs_stream) = _build_copy_sdfg_and_edge(
             "test_gpu_to_default",
@@ -590,7 +605,8 @@ class TestCopyMemoryDefaultStorage:
         codegen.copy_memory(sdfg, sdfg, state, 0, src, dst, edge,
                             fn_stream, cs_stream)
         code = cs_stream.getvalue()
-        assert "cupy.asnumpy(B_gpu" in code
+        assert "B_gpu" in code
+        assert ".get(out=" in code
         assert "B_default[" in code
 
     def test_default_to_default_is_same_storage(self):
@@ -608,6 +624,8 @@ class TestCopyMemoryDefaultStorage:
         code = cs_stream.getvalue()
         assert "cupy.asarray" not in code
         assert "cupy.asnumpy" not in code
+        assert ".set(" not in code
+        assert ".get(out=" not in code
         assert "C_default" in code
         assert "D_default" in code
 
@@ -626,7 +644,7 @@ class TestCopyMemoryDefaultStorage:
         codegen.copy_memory(sdfg, sdfg, state, 0, src, dst, edge,
                             fn_stream, cs_stream)
         code = cs_stream.getvalue()
-        assert "cupy.asarray" in code
+        assert ".set(" in code
         assert "E_def[" in code
         assert "E_gpu[" in code
 
@@ -645,3 +663,5 @@ class TestCopyMemoryDefaultStorage:
         code = cs_stream.getvalue()
         assert "cupy.asarray" not in code
         assert "cupy.asnumpy" not in code
+        assert ".set(" not in code
+        assert ".get(out=" not in code

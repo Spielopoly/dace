@@ -400,7 +400,7 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
 
         1. **Cross-storage CPU_Heap/Default <-> GPU_Global** (from
            ``CuTileInsertDataCopies`` copy-in/copy-out states): emits
-           ``cupy.asarray`` (host-to-device) or ``cupy.asnumpy``
+           ``.set()`` (host-to-device) or ``.get(out=...)``
            (device-to-host) transfers.  ``StorageType.Default`` is
            treated as host-side since it resolves to ``CPU_Heap``.
         2. **CuTile_Tile <-> other storage** inside a scope: data flows
@@ -478,11 +478,11 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
 
         For CPU_Heap -> GPU_Global (copy-in), emits::
 
-            dst[:] = cupy.asarray(src)
+            dst[:].set(src)
 
         For GPU_Global -> CPU_Heap (copy-out), emits::
 
-            dst[:] = cupy.asnumpy(src)
+            src.get(out=dst[:])
 
         When the memlet carries subsets, the subset is applied to both
         source and destination expressions.  For full-array copies
@@ -517,9 +517,9 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
             dst_lhs = f"{dst_node.data}[:]"
 
         if cpu_to_gpu:
-            callsite_stream.write(f"{dst_lhs} = cupy.asarray({src_expr})", cfg, state_id)
+            callsite_stream.write(f"{dst_lhs}.set({src_expr})", cfg, state_id)
         else:
-            callsite_stream.write(f"{dst_lhs} = cupy.asnumpy({src_expr})", cfg, state_id)
+            callsite_stream.write(f"{src_expr}.get(out={dst_lhs})", cfg, state_id)
 
     @staticmethod
     def _subset_to_python(subset: "subsets.Subset") -> str:

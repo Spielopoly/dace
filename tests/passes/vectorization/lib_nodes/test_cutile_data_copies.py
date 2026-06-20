@@ -6,8 +6,8 @@ Two layers:
 * **Structure / codegen tests (no GPU):** after applying the lowering pipeline
   through ``CuTileInsertDataCopies``, the SDFG has the expected copy-in /
   copy-out states, GPU_Global transient clones, CPU_Heap originals, and correct
-  AccessNode/Memlet references.  Codegen tests verify ``cupy.asarray`` /
-  ``cupy.asnumpy`` appear in the generated Python code.
+  AccessNode/Memlet references.  Codegen tests verify ``.set()`` /
+  ``.get(out=...)`` appear in the generated Python code.
 
 * **Runtime tests (``@pytest.mark.gpu``):** compile and run on GPU with
   **NumPy** (host) arrays directly — the whole point of data copies — and
@@ -499,24 +499,24 @@ class TestCuTileInsertDataCopiesStructure:
 class TestCuTileInsertDataCopiesCodegen:
     """Generated Python-backend code with data copies."""
 
-    def test_codegen_contains_cupy_asarray(self) -> None:
+    def test_codegen_contains_set(self) -> None:
         """After full pipeline with insert_data_copies=True, generated code
-        contains ``cupy.asarray``."""
-        sdfg = _build_vadd_sdfg("dc_codegen_asarray")
+        contains ``.set()``."""
+        sdfg = _build_vadd_sdfg("dc_codegen_set")
         VectorizeCuTile(widths=(8,), insert_data_copies=True).apply_pass(sdfg, {})
         code = _generate_code(sdfg)
-        assert "cupy.asarray" in code, (
-            "Generated code does not contain 'cupy.asarray'"
+        assert ".set(" in code, (
+            "Generated code does not contain '.set('"
         )
 
-    def test_codegen_contains_cupy_asnumpy(self) -> None:
+    def test_codegen_contains_get_out(self) -> None:
         """After full pipeline with insert_data_copies=True, generated code
-        contains ``cupy.asnumpy``."""
-        sdfg = _build_vadd_sdfg("dc_codegen_asnumpy")
+        contains ``.get(out=...)``."""
+        sdfg = _build_vadd_sdfg("dc_codegen_get_out")
         VectorizeCuTile(widths=(8,), insert_data_copies=True).apply_pass(sdfg, {})
         code = _generate_code(sdfg)
-        assert "cupy.asnumpy" in code, (
-            "Generated code does not contain 'cupy.asnumpy'"
+        assert ".get(out=" in code, (
+            "Generated code does not contain '.get(out='"
         )
 
     def test_codegen_valid_python(self) -> None:
@@ -526,12 +526,15 @@ class TestCuTileInsertDataCopiesCodegen:
         code = _generate_code(sdfg)
         ast.parse(code)
 
-    def test_codegen_no_data_copies_no_asarray(self) -> None:
+    def test_codegen_no_data_copies_no_set(self) -> None:
         """With insert_data_copies=False, generated code should NOT contain
-        ``cupy.asarray`` (no copy states)."""
+        ``.set()`` (no copy states)."""
         sdfg = _build_vadd_sdfg("dc_codegen_no_copies")
         VectorizeCuTile(widths=(8,), insert_data_copies=False).apply_pass(sdfg, {})
         code = _generate_code(sdfg)
+        assert ".set(" not in code, (
+            "Generated code contains '.set(' when data copies are disabled"
+        )
         assert "cupy.asarray" not in code, (
             "Generated code contains 'cupy.asarray' when data copies are disabled"
         )
@@ -542,8 +545,8 @@ class TestCuTileInsertDataCopiesCodegen:
         VectorizeCuTile(widths=(8, 4), insert_data_copies=True).apply_pass(sdfg, {})
         code = _generate_code(sdfg)
         ast.parse(code)
-        assert "cupy.asarray" in code
-        assert "cupy.asnumpy" in code
+        assert ".set(" in code
+        assert ".get(out=" in code
 
     def test_codegen_with_scalar_valid_python(self) -> None:
         """SDFG with a scalar parameter generates valid Python code with
