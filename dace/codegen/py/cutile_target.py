@@ -18,7 +18,6 @@ from dace.codegen.py.framecode import codeblock_to_python
 from dace.codegen.py.prettycode import PythonCodeIOStream
 from dace.codegen.py.target import PythonTargetCodeGenerator
 from dace.sdfg import nodes
-from dace.sdfg import utils as sdutil
 from dace.symbolic import symstr
 
 if TYPE_CHECKING:
@@ -35,10 +34,10 @@ _SCOPE_IN_PREFIX: str = "IN_"
 #: Prefix for inner (output) scope connectors on a MapEntry / MapExit.
 _SCOPE_OUT_PREFIX: str = "OUT_"
 
-
 # ---------------------------------------------------------------------------
 # Connector helpers
 # ---------------------------------------------------------------------------
+
 
 def _matching_inner_connector(outer_conn: str) -> str:
     """Convert an outer (input) scope connector name to the matching inner (output) name.
@@ -48,8 +47,7 @@ def _matching_inner_connector(outer_conn: str) -> str:
     :raises ValueError: If *outer_conn* does not start with the expected prefix.
     """
     if not outer_conn.startswith(_SCOPE_IN_PREFIX):
-        raise ValueError(
-            f"Expected connector starting with {_SCOPE_IN_PREFIX!r}, got {outer_conn!r}")
+        raise ValueError(f"Expected connector starting with {_SCOPE_IN_PREFIX!r}, got {outer_conn!r}")
     return _SCOPE_OUT_PREFIX + outer_conn[len(_SCOPE_IN_PREFIX):]
 
 
@@ -61,14 +59,14 @@ def _matching_outer_connector(inner_conn: str) -> str:
     :raises ValueError: If *inner_conn* does not start with the expected prefix.
     """
     if not inner_conn.startswith(_SCOPE_OUT_PREFIX):
-        raise ValueError(
-            f"Expected connector starting with {_SCOPE_OUT_PREFIX!r}, got {inner_conn!r}")
+        raise ValueError(f"Expected connector starting with {_SCOPE_OUT_PREFIX!r}, got {inner_conn!r}")
     return _SCOPE_IN_PREFIX + inner_conn[len(_SCOPE_OUT_PREFIX):]
 
 
 # ---------------------------------------------------------------------------
 # Existing helper functions (kept with type hint updates)
 # ---------------------------------------------------------------------------
+
 
 def _array_runtime_name(sdfg: "SDFG", name: str) -> str:
     """Return the runtime variable name for a data array.
@@ -84,9 +82,9 @@ def _array_runtime_name(sdfg: "SDFG", name: str) -> str:
     if desc is None:
         return name
     if desc.lifetime in (
-        dtypes.AllocationLifetime.Global,
-        dtypes.AllocationLifetime.Persistent,
-        dtypes.AllocationLifetime.External,
+            dtypes.AllocationLifetime.Global,
+            dtypes.AllocationLifetime.Persistent,
+            dtypes.AllocationLifetime.External,
     ):
         base = f"globals()[{root_name!r}]"
         return f"{base}.{suffix}" if sep else base
@@ -138,8 +136,7 @@ def _ordered_unique(items: Iterable[str]) -> List[str]:
     return sorted(list(seen.keys()))
 
 
-def _collect_free_symbols(entry: nodes.MapEntry, dfg_scope: object,
-                          sdfg: "SDFG") -> List[str]:
+def _collect_free_symbols(entry: nodes.MapEntry, dfg_scope: object, sdfg: "SDFG") -> List[str]:
     """Collect free symbols used in a map scope.
 
     Returns symbols that appear in the map range, memlet subsets, or
@@ -171,8 +168,7 @@ def _collect_free_symbols(entry: nodes.MapEntry, dfg_scope: object,
     return sorted(syms)
 
 
-def _enclosing_cutile_entry(state: "SDFGState",
-                            node: nodes.Node) -> Optional[nodes.MapEntry]:
+def _enclosing_cutile_entry(state: "SDFGState", node: nodes.Node) -> Optional[nodes.MapEntry]:
     """Find the nearest enclosing CuTile-scheduled MapEntry for a node.
 
     :param state: The SDFG state.
@@ -209,6 +205,7 @@ def _is_cutile_node(state: "SDFGState", node: nodes.Node) -> bool:
 # Code generator class
 # ---------------------------------------------------------------------------
 
+
 @registry.autoregister_params(name="cutile_python")
 class CuTilePythonCodeGen(PythonTargetCodeGenerator):
     """Python target for CuTile-scheduled map scopes.
@@ -222,8 +219,7 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
     target_name = "cutile_python"
     language = "python"
 
-    def __init__(self, frame_codegen: "DaCePythonCodeGenerator",
-                 sdfg: "SDFG") -> None:
+    def __init__(self, frame_codegen: "DaCePythonCodeGenerator", sdfg: "SDFG") -> None:
         self._frame = frame_codegen
         self._dispatcher = frame_codegen.dispatcher
         #: Tracks already-generated nested functions by position key to avoid duplicates.
@@ -231,8 +227,7 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
         # Register as the handler for CuTile map scopes.
         self._dispatcher.register_map_dispatcher(dtypes.ScheduleType.CuTile, self)
         # Register as node handler for all nodes inside CuTile scopes.
-        self._dispatcher.register_node_dispatcher(
-            self, predicate=self._is_in_cutile_scope)
+        self._dispatcher.register_node_dispatcher(self, predicate=self._is_in_cutile_scope)
         # Register copy dispatchers for transfers involving CuTile_Tile storage.
         # The actual loads/stores are emitted by _generate_AccessNode, not by
         # copy_memory, but the dispatcher's target-collection phase needs to
@@ -247,27 +242,21 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
         _copy_schedules = [dtypes.ScheduleType.CuTile, None]
         for peer_storage in _tile_peer_storages:
             for sched in _copy_schedules:
-                self._dispatcher.register_copy_dispatcher(
-                    peer_storage, dtypes.StorageType.CuTile_Tile, sched, self)
-                self._dispatcher.register_copy_dispatcher(
-                    dtypes.StorageType.CuTile_Tile, peer_storage, sched, self)
+                self._dispatcher.register_copy_dispatcher(peer_storage, dtypes.StorageType.CuTile_Tile, sched, self)
+                self._dispatcher.register_copy_dispatcher(dtypes.StorageType.CuTile_Tile, peer_storage, sched, self)
         # Also register tile-to-tile copies within a CuTile scope.
         for sched in _copy_schedules:
-            self._dispatcher.register_copy_dispatcher(
-                dtypes.StorageType.CuTile_Tile, dtypes.StorageType.CuTile_Tile,
-                sched, self)
+            self._dispatcher.register_copy_dispatcher(dtypes.StorageType.CuTile_Tile, dtypes.StorageType.CuTile_Tile,
+                                                      sched, self)
         # Register for cross-storage copies between CPU_Heap and GPU_Global.
         # These arise from CuTileInsertDataCopies copy-in/copy-out states
         # that transfer data between host and device outside any map scope.
-        self._dispatcher.register_copy_dispatcher(
-            dtypes.StorageType.CPU_Heap, dtypes.StorageType.GPU_Global,
-            None, self)
-        self._dispatcher.register_copy_dispatcher(
-            dtypes.StorageType.GPU_Global, dtypes.StorageType.CPU_Heap,
-            None, self)
+        self._dispatcher.register_copy_dispatcher(dtypes.StorageType.CPU_Heap, dtypes.StorageType.GPU_Global, None,
+                                                  self)
+        self._dispatcher.register_copy_dispatcher(dtypes.StorageType.GPU_Global, dtypes.StorageType.CPU_Heap, None,
+                                                  self)
         # Register array dispatcher for CuTile_Tile storage (allocation is a no-op).
-        self._dispatcher.register_array_dispatcher(
-            dtypes.StorageType.CuTile_Tile, self)
+        self._dispatcher.register_array_dispatcher(dtypes.StorageType.CuTile_Tile, self)
 
     def get_generated_codeobjects(self) -> list:
         """Return generated code objects (none for this target).
@@ -304,26 +293,54 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
     # Dispatcher predicates
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _is_in_cutile_scope(sdfg: "SDFG", state: "SDFGState",
-                            node: nodes.Node) -> bool:
+    def _sdfg_is_cutile_body(self, sdfg: "SDFG") -> bool:
+        """Whether *sdfg* is a NestedSDFG body emitted as a cuTile function.
+
+        A NestedSDFG body has no CuTile MapEntry in its own states, so this is
+        determined structurally by walking the nested-SDFG parent chain: the
+        body is a cuTile function iff the NestedSDFG node that owns it (at any
+        level) lives inside a CuTile-scheduled map.
+
+        :param sdfg: The (possibly nested) SDFG to check.
+        :returns: ``True`` if *sdfg* is a cuTile NestedSDFG body.
+        """
+        cur = sdfg
+        while cur.parent_nsdfg_node is not None:
+            if _is_cutile_node(cur.parent, cur.parent_nsdfg_node):
+                return True
+            cur = cur.parent_sdfg
+        return False
+
+    def _is_in_cutile_scope(self, sdfg: "SDFG", state: "SDFGState", node: nodes.Node) -> bool:
         """Predicate for the node dispatcher: return True for CuTile nodes.
+
+        A node is in a cuTile scope if it lives (transitively) inside a
+        CuTile-scheduled map, or if it belongs to a NestedSDFG body emitted as
+        a cuTile function (see :meth:`_sdfg_is_cutile_body`).
 
         :param sdfg: The SDFG.
         :param state: The SDFG state.
         :param node: The node to check.
         :returns: ``True`` if the node belongs to a CuTile scope.
         """
-        return _is_cutile_node(state, node)
+        return _is_cutile_node(state, node) or self._sdfg_is_cutile_body(sdfg)
+
+    def _in_cutile_context(self, sdfg: "SDFG", state: "SDFGState", node: nodes.Node) -> bool:
+        """Whether *node* is inside a cuTile scope, counting NestedSDFG bodies.
+
+        :param sdfg: The SDFG containing the node.
+        :param state: The state containing the node.
+        :param node: The node to check.
+        :returns: ``True`` if generating cuTile code is valid for this node.
+        """
+        return (_enclosing_cutile_entry(state, node) is not None or self._sdfg_is_cutile_body(sdfg))
 
     # ------------------------------------------------------------------
     # Array dispatcher methods (no-ops for tile arrays)
     # ------------------------------------------------------------------
 
-    def allocate_array(self, sdfg: "SDFG", cfg: object, dfg: object,
-                       state_id: int, node: nodes.Node, nodedesc: object,
-                       global_stream: PythonCodeIOStream,
-                       declaration_stream: PythonCodeIOStream,
+    def allocate_array(self, sdfg: "SDFG", cfg: object, dfg: object, state_id: int, node: nodes.Node, nodedesc: object,
+                       global_stream: PythonCodeIOStream, declaration_stream: PythonCodeIOStream,
                        allocation_stream: PythonCodeIOStream) -> None:
         """Tile arrays inside cuTile kernels are Python locals -- no allocation needed.
 
@@ -339,9 +356,8 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
         """
         pass
 
-    def deallocate_array(self, sdfg: "SDFG", cfg: object, dfg: object,
-                         state_id: int, node: nodes.Node, nodedesc: object,
-                         function_stream: PythonCodeIOStream,
+    def deallocate_array(self, sdfg: "SDFG", cfg: object, dfg: object, state_id: int, node: nodes.Node,
+                         nodedesc: object, function_stream: PythonCodeIOStream,
                          callsite_stream: PythonCodeIOStream) -> None:
         """Tile arrays inside cuTile kernels are Python locals -- no deallocation needed.
 
@@ -356,10 +372,8 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
         """
         pass
 
-    def declare_array(self, sdfg: "SDFG", cfg: object, dfg: object,
-                      state_id: int, node: nodes.Node, nodedesc: object,
-                      global_stream: PythonCodeIOStream,
-                      declaration_stream: PythonCodeIOStream) -> None:
+    def declare_array(self, sdfg: "SDFG", cfg: object, dfg: object, state_id: int, node: nodes.Node, nodedesc: object,
+                      global_stream: PythonCodeIOStream, declaration_stream: PythonCodeIOStream) -> None:
         """Tile arrays are not declared -- they are created by ct.load or tasklet output.
 
         :param sdfg: The SDFG.
@@ -377,10 +391,8 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
     # Copy dispatcher method
     # ------------------------------------------------------------------
 
-    def copy_memory(self, sdfg: "SDFG", cfg: object, dfg: object,
-                    state_id: int, src_node: nodes.Node,
-                    dst_node: nodes.Node, edge: object,
-                    function_stream: PythonCodeIOStream,
+    def copy_memory(self, sdfg: "SDFG", cfg: object, dfg: object, state_id: int, src_node: nodes.Node,
+                    dst_node: nodes.Node, edge: object, function_stream: PythonCodeIOStream,
                     callsite_stream: PythonCodeIOStream) -> None:
         """Handle copy operations between arrays.
 
@@ -411,19 +423,16 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
             AccessNodes.
         """
         memlet = edge.data
-        if not isinstance(src_node, nodes.AccessNode) or not isinstance(
-                dst_node, nodes.AccessNode):
-            raise NotImplementedError(
-                f"CuTile copy_memory only supports AccessNode-to-AccessNode "
-                f"copies, got {type(src_node).__name__} -> "
-                f"{type(dst_node).__name__}")
+        if not isinstance(src_node, nodes.AccessNode) or not isinstance(dst_node, nodes.AccessNode):
+            raise NotImplementedError(f"CuTile copy_memory only supports AccessNode-to-AccessNode "
+                                      f"copies, got {type(src_node).__name__} -> "
+                                      f"{type(dst_node).__name__}")
 
         src_storage = sdfg.arrays[src_node.data].storage
         dst_storage = sdfg.arrays[dst_node.data].storage
 
         # --- Cross-storage CPU <-> GPU transfers ---
-        _HOST_STORAGES = (dtypes.StorageType.CPU_Heap,
-                          dtypes.StorageType.Default)
+        _HOST_STORAGES = (dtypes.StorageType.CPU_Heap, dtypes.StorageType.Default)
         src_on_host = src_storage in _HOST_STORAGES
         dst_on_host = dst_storage in _HOST_STORAGES
         src_on_gpu = src_storage == dtypes.StorageType.GPU_Global
@@ -432,9 +441,8 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
         is_gpu_to_cpu = src_on_gpu and dst_on_host
 
         if is_cpu_to_gpu or is_gpu_to_cpu:
-            self._emit_cross_storage_copy(
-                sdfg, cfg, state_id, src_node, dst_node, memlet,
-                is_cpu_to_gpu, callsite_stream)
+            self._emit_cross_storage_copy(sdfg, cfg, state_id, src_node, dst_node, memlet, is_cpu_to_gpu,
+                                          callsite_stream)
             return
 
         # --- Same-storage / CuTile_Tile fallback copies ---
@@ -509,11 +517,9 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
             dst_lhs = f"{dst_node.data}[:]"
 
         if cpu_to_gpu:
-            callsite_stream.write(
-                f"{dst_lhs} = cupy.asarray({src_expr})", cfg, state_id)
+            callsite_stream.write(f"{dst_lhs} = cupy.asarray({src_expr})", cfg, state_id)
         else:
-            callsite_stream.write(
-                f"{dst_lhs} = cupy.asnumpy({src_expr})", cfg, state_id)
+            callsite_stream.write(f"{dst_lhs} = cupy.asnumpy({src_expr})", cfg, state_id)
 
     @staticmethod
     def _subset_to_python(subset: "subsets.Subset") -> str:
@@ -540,9 +546,7 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _needs_gather_for_tile(entry: nodes.MapEntry,
-                               tile_shape: Tuple[int, ...],
-                               sdfg: "SDFG") -> bool:
+    def _needs_gather_for_tile(entry: nodes.MapEntry, tile_shape: Tuple[int, ...], sdfg: "SDFG") -> bool:
         """Check if gather/scatter is needed for a specific tile.
 
         Returns ``True`` if the outer map's start is non-zero or the
@@ -570,8 +574,7 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _resolve_single_tile_shape(entry: nodes.MapEntry, tile_name: str,
-                                   sdfg: "SDFG") -> Tuple[int, ...]:
+    def _resolve_single_tile_shape(entry: nodes.MapEntry, tile_name: str, sdfg: "SDFG") -> Tuple[int, ...]:
         """Resolve the shape of a single tile transient to concrete integers.
 
         Reads the shape from the tile's array descriptor and substitutes
@@ -587,8 +590,7 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
         if desc is None:
             raise RuntimeError(f"Tile array {tile_name!r} not found in SDFG.")
 
-        _tile_subs = {sp.Symbol(p): r[0]
-                      for p, r in zip(entry.map.params, entry.map.range)}
+        _tile_subs = {sp.Symbol(p): r[0] for p, r in zip(entry.map.params, entry.map.range)}
         _sym_subs = {sp.Symbol(s): sp.Integer(2**31) for s in sdfg.symbols}
 
         resolved: List[int] = []
@@ -605,10 +607,7 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _validate_tile_shape(tile_shape: Tuple[int, ...],
-                             entry: nodes.MapEntry,
-                             tile_name: str,
-                             sdfg: "SDFG") -> None:
+    def _validate_tile_shape(tile_shape: Tuple[int, ...], entry: nodes.MapEntry, tile_name: str, sdfg: "SDFG") -> None:
         """Validate that the resolved tile shape is consistent with the map.
 
         Checks:
@@ -628,16 +627,14 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
         # 1. All dimensions must be positive.
         for d, dim in enumerate(tile_shape):
             if dim <= 0:
-                raise RuntimeError(
-                    f"Tile {tile_name!r} has non-positive dimension {dim} "
-                    f"at axis {d}. All tile dimensions must be positive.")
+                raise RuntimeError(f"Tile {tile_name!r} has non-positive dimension {dim} "
+                                   f"at axis {d}. All tile dimensions must be positive.")
 
         # 2. Tile dimensionality must not exceed map dimensionality.
         map_ndim = len(entry.map.range)
         if len(tile_shape) > map_ndim:
-            raise RuntimeError(
-                f"Tile {tile_name!r} has {len(tile_shape)} dimensions but "
-                f"the enclosing map has only {map_ndim} dimensions.")
+            raise RuntimeError(f"Tile {tile_name!r} has {len(tile_shape)} dimensions but "
+                               f"the enclosing map has only {map_ndim} dimensions.")
 
         # 3. Advisory: warn when tile dims don't match map steps.
         for d, (_, _, step) in enumerate(entry.map.range):
@@ -656,8 +653,7 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _trace_load_source(state: "SDFGState", entry: nodes.MapEntry,
-                           tile_node: nodes.AccessNode,
+    def _trace_load_source(state: "SDFGState", entry: nodes.MapEntry, tile_node: nodes.AccessNode,
                            in_edge: object) -> Optional[str]:
         """Trace through a MapEntry to find the global array feeding a tile.
 
@@ -681,8 +677,7 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
         return None
 
     @staticmethod
-    def _trace_store_target(state: "SDFGState", exit_node: nodes.MapExit,
-                            tile_node: nodes.AccessNode,
+    def _trace_store_target(state: "SDFGState", exit_node: nodes.MapExit, tile_node: nodes.AccessNode,
                             out_edge: object) -> Optional[str]:
         """Trace through a MapExit to find the global array receiving a tile.
 
@@ -709,11 +704,9 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
     # Gather / scatter emission helpers
     # ------------------------------------------------------------------
 
-    def _emit_gather_load(self, callsite_stream: PythonCodeIOStream,
-                          arr: str, tile_var: str,
-                          map_index_exprs: List[str],
-                          tile_shape: Tuple[int, ...],
-                          cfg: object, state_id: int) -> List[str]:
+    def _emit_gather_load(self, callsite_stream: PythonCodeIOStream, arr: str, tile_var: str,
+                          map_index_exprs: List[str], tile_shape: Tuple[int,
+                                                                        ...], cfg: object, state_id: int) -> List[str]:
         """Emit ``ct.gather`` with computed index tiles for non-aligned loads.
 
         Generates per-dimension index tiles via ``ct.arange`` and
@@ -737,42 +730,34 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
 
         for d in range(ndim):
             idx_var = f"__dace_ct_gidx_{tile_var}_{d}"
-            callsite_stream.write(
-                f"{idx_var} = {map_index_exprs[d]} + ct.arange({tile_shape[d]}, dtype=ct.int32)",
-                cfg, state_id)
+            callsite_stream.write(f"{idx_var} = {map_index_exprs[d]} + ct.arange({tile_shape[d]}, dtype=ct.int32)", cfg,
+                                  state_id)
             idx_vars.append(idx_var)
 
         if ndim > 1:
             broadcast_vars: List[str] = []
             shape_str = ", ".join(str(s) for s in tile_shape)
             for d, idx_var in enumerate(idx_vars):
-                reshape_dims = tuple(
-                    tile_shape[d] if i == d else 1
-                    for i in range(ndim))
+                reshape_dims = tuple(tile_shape[d] if i == d else 1 for i in range(ndim))
                 reshape_str = ", ".join(str(x) for x in reshape_dims)
                 bcast_var = f"{idx_var}_nd"
                 callsite_stream.write(
                     f"{bcast_var} = ct.broadcast_to("
                     f"ct.reshape({idx_var}, ({reshape_str},)), "
-                    f"({shape_str},))",
-                    cfg, state_id)
+                    f"({shape_str},))", cfg, state_id)
                 broadcast_vars.append(bcast_var)
             indices_str = ", ".join(broadcast_vars)
         else:
             indices_str = idx_vars[0]
             broadcast_vars = idx_vars
 
-        callsite_stream.write(
-            f"{tile_var} = ct.gather({arr}, ({indices_str},), "
-            f"padding_value=0)",
-            cfg, state_id)
+        callsite_stream.write(f"{tile_var} = ct.gather({arr}, ({indices_str},), "
+                              f"padding_value=0)", cfg, state_id)
 
         return broadcast_vars if ndim > 1 else idx_vars
 
-    def _emit_scatter_store(self, callsite_stream: PythonCodeIOStream,
-                            arr: str, tile_expr: str,
-                            gather_idx_vars: List[str],
-                            cfg: object, state_id: int) -> None:
+    def _emit_scatter_store(self, callsite_stream: PythonCodeIOStream, arr: str, tile_expr: str,
+                            gather_idx_vars: List[str], cfg: object, state_id: int) -> None:
         """Emit ``ct.scatter`` with precomputed index tiles.
 
         Reuses the index tile variables generated by
@@ -787,18 +772,14 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
         :param state_id: The state ID.
         """
         indices_str = ", ".join(gather_idx_vars)
-        callsite_stream.write(
-            f"ct.scatter({arr}, ({indices_str},), {tile_expr})",
-            cfg, state_id)
+        callsite_stream.write(f"ct.scatter({arr}, ({indices_str},), {tile_expr})", cfg, state_id)
 
     # ------------------------------------------------------------------
     # Node dispatch entry point
     # ------------------------------------------------------------------
 
-    def generate_node(self, sdfg: "SDFG", cfg: object, dfg: object,
-                      state_id: int, node: nodes.Node,
-                      function_stream: PythonCodeIOStream,
-                      callsite_stream: PythonCodeIOStream) -> None:
+    def generate_node(self, sdfg: "SDFG", cfg: object, dfg: object, state_id: int, node: nodes.Node,
+                      function_stream: PythonCodeIOStream, callsite_stream: PythonCodeIOStream) -> None:
         """Dispatch code generation for a single node inside a CuTile scope.
 
         :param sdfg: The SDFG.
@@ -812,18 +793,15 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
         """
         method = getattr(self, f"_generate_{type(node).__name__}", None)
         if method is None:
-            raise NotImplementedError(
-                f"CuTile backend has no handler for {type(node).__name__}.")
+            raise NotImplementedError(f"CuTile backend has no handler for {type(node).__name__}.")
         method(sdfg, cfg, dfg, state_id, node, function_stream, callsite_stream)
 
     # ------------------------------------------------------------------
     # MapEntry: PIDs + map variable bindings only
     # ------------------------------------------------------------------
 
-    def _generate_MapEntry(self, sdfg: "SDFG", cfg: object, dfg: object,
-                           state_id: int, node: nodes.MapEntry,
-                           function_stream: PythonCodeIOStream,
-                           callsite_stream: PythonCodeIOStream) -> None:
+    def _generate_MapEntry(self, sdfg: "SDFG", cfg: object, dfg: object, state_id: int, node: nodes.MapEntry,
+                           function_stream: PythonCodeIOStream, callsite_stream: PythonCodeIOStream) -> None:
         """Emit block IDs and map variable bindings for a cuTile kernel.
 
         In the AccessNode-centric design, MapEntry only sets up the
@@ -849,10 +827,8 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
     # MapExit: no-op (stores handled at AccessNode)
     # ------------------------------------------------------------------
 
-    def _generate_MapExit(self, sdfg: "SDFG", cfg: object, dfg: object,
-                          state_id: int, node: nodes.MapExit,
-                          function_stream: PythonCodeIOStream,
-                          callsite_stream: PythonCodeIOStream) -> None:
+    def _generate_MapExit(self, sdfg: "SDFG", cfg: object, dfg: object, state_id: int, node: nodes.MapExit,
+                          function_stream: PythonCodeIOStream, callsite_stream: PythonCodeIOStream) -> None:
         """No-op -- tile stores are handled at each AccessNode.
 
         :param sdfg: The SDFG.
@@ -869,10 +845,8 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
     # AccessNode: THE CORE of the AccessNode-centric redesign
     # ------------------------------------------------------------------
 
-    def _generate_AccessNode(self, sdfg: "SDFG", cfg: object, dfg: object,
-                             state_id: int, node: nodes.AccessNode,
-                             function_stream: PythonCodeIOStream,
-                             callsite_stream: PythonCodeIOStream) -> None:
+    def _generate_AccessNode(self, sdfg: "SDFG", cfg: object, dfg: object, state_id: int, node: nodes.AccessNode,
+                             function_stream: PythonCodeIOStream, callsite_stream: PythonCodeIOStream) -> None:
         """Generate code for an AccessNode inside a cuTile scope.
 
         Handles four cases:
@@ -907,9 +881,8 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
             return
 
         entry = _enclosing_cutile_entry(state, node)
-        if entry is None:
-            raise RuntimeError(
-                f"CuTile_Tile AccessNode {node.data!r} found outside a CuTile scope.")
+        if entry is None and not self._in_cutile_context(sdfg, state, node):
+            raise RuntimeError(f"CuTile_Tile AccessNode {node.data!r} found outside a CuTile scope.")
 
         # Process incoming edges -- handle loads and variable bindings
         for in_edge in state.in_edges(node):
@@ -924,31 +897,34 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
                 tile_shape = self._resolve_single_tile_shape(entry, node.data, sdfg)
                 self._validate_tile_shape(tile_shape, entry, node.data, sdfg)
                 map_index_exprs = _map_index_exprs(entry)
-                cutile_index = ", ".join(
-                    f"__pid{d}" for d in range(len(entry.map.range)))
+                cutile_index = ", ".join(f"__pid{d}" for d in range(len(entry.map.range)))
 
                 if self._needs_gather_for_tile(entry, tile_shape, sdfg):
-                    self._emit_gather_load(
-                        callsite_stream, global_arr, node.data,
-                        map_index_exprs, tile_shape, cfg, state_id)
+                    self._emit_gather_load(callsite_stream, global_arr, node.data, map_index_exprs, tile_shape, cfg,
+                                           state_id)
                 else:
                     shape_str = ", ".join(str(s) for s in tile_shape)
                     callsite_stream.write(
                         f"{node.data} = ct.load({global_arr}, "
-                        f"index=({cutile_index},), shape=({shape_str},))",
-                        cfg, state_id)
+                        f"index=({cutile_index},), shape=({shape_str},))", cfg, state_id)
 
             elif isinstance(src, (nodes.Tasklet, nodes.NestedSDFG)):
                 # Tasklet/NestedSDFG output -> tile: bind variable
                 src_conn = in_edge.src_conn
                 if src_conn is not None and src_conn != node.data:
-                    callsite_stream.write(
-                        f"{node.data} = {src_conn}", cfg, state_id)
+                    callsite_stream.write(f"{node.data} = {src_conn}", cfg, state_id)
 
             elif isinstance(src, nodes.AccessNode):
-                raise RuntimeError(
-                    f"AccessNode-to-AccessNode copy ({src.data!r} -> {node.data!r}) "
-                    f"is not supported in CuTile scope. Use library nodes for copies.")
+                # Tile-to-tile dataflow is a rename of an immutable value.
+                src_desc = sdfg.arrays.get(src.data)
+                if (src_desc is not None
+                        and src_desc.storage in (dtypes.StorageType.CuTile_Tile, dtypes.StorageType.Register)):
+                    # TODO: Add check that shpaes match and we move the full tile
+                    if src.data != node.data:
+                        callsite_stream.write(f"{node.data} = {src.data}", cfg, state_id)
+                else:
+                    raise RuntimeError(f"AccessNode-to-AccessNode copy ({src.data!r} -> {node.data!r}) "
+                                       f"is not supported in CuTile scope. Use library nodes for copies.")
 
         # Process outgoing edges -- handle stores
         for out_edge in state.out_edges(node):
@@ -963,41 +939,38 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
                 tile_shape = self._resolve_single_tile_shape(entry, node.data, sdfg)
                 self._validate_tile_shape(tile_shape, entry, node.data, sdfg)
                 map_index_exprs = _map_index_exprs(entry)
-                cutile_index = ", ".join(
-                    f"__pid{d}" for d in range(len(entry.map.range)))
+                cutile_index = ", ".join(f"__pid{d}" for d in range(len(entry.map.range)))
 
                 if self._needs_gather_for_tile(entry, tile_shape, sdfg):
                     # Build index tiles for scatter
-                    idx_vars = self._emit_gather_load(
-                        callsite_stream, global_arr,
-                        f"__ct_scatter_{node.data}",
-                        map_index_exprs, tile_shape, cfg, state_id)
-                    self._emit_scatter_store(
-                        callsite_stream, global_arr, node.data,
-                        idx_vars, cfg, state_id)
+                    idx_vars = self._emit_gather_load(callsite_stream, global_arr, f"__ct_scatter_{node.data}",
+                                                      map_index_exprs, tile_shape, cfg, state_id)
+                    self._emit_scatter_store(callsite_stream, global_arr, node.data, idx_vars, cfg, state_id)
                 else:
-                    callsite_stream.write(
-                        f"ct.store({global_arr}, index=({cutile_index},), "
-                        f"tile={node.data})",
-                        cfg, state_id)
+                    callsite_stream.write(f"ct.store({global_arr}, index=({cutile_index},), "
+                                          f"tile={node.data})", cfg, state_id)
 
             elif isinstance(dst, (nodes.Tasklet, nodes.NestedSDFG)):
                 # Tile -> tasklet: no code needed (tasklet reads the variable)
                 pass
 
             elif isinstance(dst, nodes.AccessNode):
-                raise RuntimeError(
-                    f"AccessNode-to-AccessNode copy ({node.data!r} -> {dst.data!r}) "
-                    f"is not supported in CuTile scope. Use library nodes for copies.")
+                # Tile-to-tile dataflow is a rename emitted at the destination
+                # AccessNode's incoming edge; nothing to do here.  Reject only
+                # genuinely unsupported cross-storage copies.
+                dst_desc = sdfg.arrays.get(dst.data)
+                if (dst_desc is None
+                        or dst_desc.storage not in (dtypes.StorageType.CuTile_Tile, dtypes.StorageType.Register)):
+                    # TODO: Add check that shpaes match and we move the full tile
+                    raise RuntimeError(f"AccessNode-to-AccessNode copy ({node.data!r} -> {dst.data!r}) "
+                                       f"is not supported in CuTile scope. Use library nodes for copies.")
 
     # ------------------------------------------------------------------
     # Tasklet
     # ------------------------------------------------------------------
 
-    def _generate_Tasklet(self, sdfg: "SDFG", cfg: object, dfg: object,
-                          state_id: int, node: nodes.Tasklet,
-                          function_stream: PythonCodeIOStream,
-                          callsite_stream: PythonCodeIOStream) -> None:
+    def _generate_Tasklet(self, sdfg: "SDFG", cfg: object, dfg: object, state_id: int, node: nodes.Tasklet,
+                          function_stream: PythonCodeIOStream, callsite_stream: PythonCodeIOStream) -> None:
         """Generate code for a Tasklet inside a cuTile scope.
 
         Binds input connectors from tile variables, emits the tasklet
@@ -1014,18 +987,15 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
         :raises RuntimeError: If the tasklet is not inside a CuTile scope.
         """
         if node.code.language != dtypes.Language.Python:
-            raise NotImplementedError(
-                "CuTile backend only supports Python tasklets.")
+            raise NotImplementedError("CuTile backend only supports Python tasklets.")
         state = cfg.state(state_id)
         entry = _enclosing_cutile_entry(state, node)
-        if entry is None:
-            raise RuntimeError(
-                "CuTile tasklet handler invoked outside a CuTile scope.")
+        if entry is None and not self._in_cutile_context(sdfg, state, node):
+            raise RuntimeError("CuTile tasklet handler invoked outside a CuTile scope.")
 
         if node.instrument != dtypes.InstrumentationType.No_Instrumentation:
-            raise RuntimeError(
-                "Node-level instrumentation is not supported inside cuTile kernels; "
-                "instrument the enclosing cuTile map (kernel) instead.")
+            raise RuntimeError("Node-level instrumentation is not supported inside cuTile kernels; "
+                               "instrument the enclosing cuTile map (kernel) instead.")
 
         init_code = codeblock_to_python(node.code_init).strip()
         if init_code:
@@ -1060,10 +1030,8 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
                     rhs = edge.src_conn
                 if rhs is None:
                     continue
-                callsite_stream.write(
-                    f"{edge.dst_conn} = {rhs}", cfg, state_id)
-                self._dispatcher.defined_vars.add(
-                    edge.dst_conn, dispatcher_mod.DefinedType.Scalar, "object")
+                callsite_stream.write(f"{edge.dst_conn} = {rhs}", cfg, state_id)
+                self._dispatcher.defined_vars.add(edge.dst_conn, dispatcher_mod.DefinedType.Scalar, "object")
 
             # Pre-bind output connectors that trace to actual (global) arrays.
             # This is needed for in-place operations like ct.scatter(_dst, ...)
@@ -1095,19 +1063,14 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
                                 dst_name = outer_edge.dst.data
                                 break
                 if dst_name and dst_name != edge.src_conn:
-                    callsite_stream.write(
-                        f"{edge.src_conn} = {dst_name}", cfg, state_id)
-                    self._dispatcher.defined_vars.add(
-                        edge.src_conn, dispatcher_mod.DefinedType.Scalar, "object")
+                    callsite_stream.write(f"{edge.src_conn} = {dst_name}", cfg, state_id)
+                    self._dispatcher.defined_vars.add(edge.src_conn, dispatcher_mod.DefinedType.Scalar, "object")
                     _prebind_outputs.add(edge.src_conn)
 
             # Emit tasklet body
-            callsite_stream.write(
-                f"\n####### Tasklet: {node.label}\n\n", cfg, state_id)
-            callsite_stream.write(
-                codeblock_to_python(node.code).strip() or "pass")
-            callsite_stream.write(
-                f"\n####### End of tasklet: {node.label}\n\n", cfg, state_id)
+            callsite_stream.write(f"\n####### Tasklet: {node.label}\n\n", cfg, state_id)
+            callsite_stream.write(codeblock_to_python(node.code).strip() or "pass")
+            callsite_stream.write(f"\n####### End of tasklet: {node.label}\n\n", cfg, state_id)
 
             # Bind outputs to downstream tile AccessNodes or through MapExit.
             # Skip connectors that were already pre-bound above — the in-place
@@ -1120,11 +1083,8 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
                         continue
                     if edge.src_conn in _prebind_outputs:
                         continue
-                    callsite_stream.write(
-                        f"{edge.dst.data} = {edge.src_conn}", cfg, state_id)
-                    self._dispatcher.defined_vars.add(
-                        edge.dst.data, dispatcher_mod.DefinedType.Scalar,
-                        "object")
+                    callsite_stream.write(f"{edge.dst.data} = {edge.src_conn}", cfg, state_id)
+                    self._dispatcher.defined_vars.add(edge.dst.data, dispatcher_mod.DefinedType.Scalar, "object")
                 elif isinstance(edge.dst, (nodes.MapExit, nodes.ConsumeExit)):
                     # Trace through the scope exit to find the actual
                     # destination array.  The inner connector (e.g. "IN_C")
@@ -1139,100 +1099,141 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
                                 if dst_name != edge.src_conn:
                                     if edge.src_conn in _prebind_outputs:
                                         break
-                                    callsite_stream.write(
-                                        f"{dst_name} = {edge.src_conn}", cfg, state_id)
-                                    self._dispatcher.defined_vars.add(
-                                        dst_name, dispatcher_mod.DefinedType.Scalar,
-                                        "object")
+                                    callsite_stream.write(f"{dst_name} = {edge.src_conn}", cfg, state_id)
+                                    self._dispatcher.defined_vars.add(dst_name, dispatcher_mod.DefinedType.Scalar,
+                                                                      "object")
                                 break
         finally:
             self._dispatcher.defined_vars.exit_scope(node)
 
     # ------------------------------------------------------------------
-    # NestedSDFG — generate as module-level function with return values
+    # NestedSDFG — emitted as a module-level function
     # ------------------------------------------------------------------
+    #
+    # A user helper function compiled by DaCe becomes a NestedSDFG.  It is
+    # emitted as a plain module-level Python function that the cuTile kernel
+    # (or an enclosing nested function) calls.  The body is generated by the
+    # SAME shared node dispatcher used for the kernel body, so every tile op
+    # routes back to ``_generate_Tasklet`` / ``_generate_AccessNode`` — there
+    # is no bespoke node walking here.  The boundary follows cuTile's value
+    # model (https://docs.nvidia.com/cuda/cutile-python/execution.html):
+    #
+    #   * Tiles (and registers) are immutable, so tile-valued outputs are
+    #     *returned* from the function.
+    #   * Global arrays are read/write views, so global-array-valued outputs
+    #     are passed in as destination parameters and written in place
+    #     (``ct.store`` / ``ct.scatter``); they are not returned.
+    #
+    # The inner (map-less) nodes are recognised as living in a cuTile scope
+    # structurally, via :meth:`_sdfg_is_cutile_body`.
 
-    def _generate_NestedSDFG(self, sdfg: "SDFG", cfg: object, dfg: object,
-                             state_id: int, node: nodes.NestedSDFG,
-                             function_stream: PythonCodeIOStream,
-                             callsite_stream: PythonCodeIOStream) -> None:
-        """Generate a module-level function for a NestedSDFG and emit a call.
+    #: Inner-SDFG storage types whose values are immutable Python locals
+    #: (returned from the generated function rather than written in place).
+    _RETURNED_OUTPUT_STORAGES = frozenset({
+        dtypes.StorageType.CuTile_Tile,
+        dtypes.StorageType.Register,
+    })
 
-        Tiles are immutable in cuTile, so output connectors are
-        *returned* from the generated function rather than passed as
-        mutable arguments.  The function is emitted to
-        *function_stream* (module level, before the ``@ct.kernel``)
-        and then called at *callsite_stream*.
+    def _is_returned_output(self, inner_sdfg: "SDFG", conn: str) -> bool:
+        """Whether an output connector is an immutable value (returned) rather
+        than a global-memory destination view (passed in, written in place).
 
-        :param sdfg: The SDFG.
-        :param cfg: The control flow graph.
-        :param dfg: The dataflow graph.
-        :param state_id: The state ID.
+        :param inner_sdfg: The nested SDFG.
+        :param conn: The output connector name (== inner array name).
+        :returns: ``True`` if the value must be returned from the function.
+        """
+        desc = inner_sdfg.arrays.get(conn)
+        return desc is not None and desc.storage in self._RETURNED_OUTPUT_STORAGES
+
+    def _generate_NestedSDFG(self, sdfg: "SDFG", cfg: object, dfg: object, state_id: int, node: nodes.NestedSDFG,
+                             function_stream: PythonCodeIOStream, callsite_stream: PythonCodeIOStream) -> None:
+        """Emit a module-level function for a NestedSDFG and call it.
+
+        :param sdfg: The containing SDFG.
+        :param cfg: The containing control-flow region.
+        :param dfg: The dataflow graph (unused; kept for the dispatcher signature).
+        :param state_id: The containing state ID.
         :param node: The NestedSDFG node.
-        :param function_stream: Stream for function-level code.
-        :param callsite_stream: Stream for call-site code.
+        :param function_stream: Stream for module-level code (the function def).
+        :param callsite_stream: Stream for the call site.
         """
         state = cfg.state(state_id)
         inner_sdfg = node.sdfg
 
-        # Expand any library nodes inside before generating code.
+        # Lower any tile-op library nodes to their cuTile tasklets first.
         inner_sdfg.expand_library_nodes(recursive=True)
 
-        # Determine a unique function name based on position in the graph.
-        func_name = (
-            f"__dace_nested_{inner_sdfg.name}_{cfg.cfg_id}_"
-            f"{state_id}_{state.node_id(node)}"
-        )
+        func_name = (f"__dace_nested_{inner_sdfg.name}_{cfg.cfg_id}_"
+                     f"{state_id}_{state.node_id(node)}")
 
-        # Determine input connectors (sorted, only those with edges).
-        input_conns: List[str] = sorted(
-            {e.dst_conn for e in state.in_edges(node) if e.dst_conn is not None}
-        )
-
-        # Determine output connectors (sorted, only those with edges).
-        output_conns: List[str] = sorted(
-            {e.src_conn for e in state.out_edges(node) if e.src_conn is not None}
-        )
-
-        # Determine symbols needed at runtime.
+        input_conns: List[str] = sorted({e.dst_conn for e in state.in_edges(node) if e.dst_conn is not None})
+        output_conns: List[str] = sorted({e.src_conn for e in state.out_edges(node) if e.src_conn is not None})
+        returned_outputs = [c for c in output_conns if self._is_returned_output(inner_sdfg, c)]
+        dest_outputs = [c for c in output_conns if not self._is_returned_output(inner_sdfg, c)]
         symbol_names = self._nsdfg_runtime_symbols(node)
 
-        # Generate the function definition (if not already generated).
-        position_key = func_name
-        if position_key not in self._generated_nested_functions:
-            self._generate_nsdfg_function(
-                node, state, function_stream, state_id, cfg,
-                func_name, input_conns, output_conns, symbol_names,
-            )
-            self._generated_nested_functions[position_key] = func_name
+        # Parameters: inputs, then global-array destinations, then symbols.
+        param_conns = list(dict.fromkeys(input_conns + dest_outputs))
+        params = param_conns + symbol_names
 
-        # --- Emit the call site ---
-        # Build argument list: input variable names + symbol expressions.
-        call_args: List[str] = []
-        for conn_name in input_conns:
-            call_args.append(self._resolve_nsdfg_input_var(state, node, conn_name))
+        if func_name not in self._generated_nested_functions:
+            self._emit_nsdfg_function(inner_sdfg, func_name, params, returned_outputs, function_stream)
+            self._generated_nested_functions[func_name] = func_name
+
+        # --- Call site ---
+        call_args: List[str] = [self._resolve_nsdfg_input_var(state, node, c) for c in input_conns]
+        call_args += [self._resolve_nsdfg_output_var(state, node, c) for c in dest_outputs]
         for sym_name in symbol_names:
             mapping_expr = node.symbol_mapping.get(sym_name)
-            if mapping_expr is not None:
-                call_args.append(symstr(mapping_expr))
-            else:
-                call_args.append(sym_name)
-
+            call_args.append(symstr(mapping_expr) if mapping_expr is not None else sym_name)
         args_str = ", ".join(call_args)
 
-        # Build LHS for output assignment.
-        if len(output_conns) == 0:
-            callsite_stream.write(f"{func_name}({args_str})", cfg, state_id)
-        elif len(output_conns) == 1:
-            out_var = self._resolve_nsdfg_output_var(state, node, output_conns[0])
-            callsite_stream.write(f"{out_var} = {func_name}({args_str})", cfg, state_id)
-        else:
-            out_vars = [
-                self._resolve_nsdfg_output_var(state, node, c)
-                for c in output_conns
-            ]
-            lhs = ", ".join(out_vars)
+        if returned_outputs:
+            lhs = ", ".join(returned_outputs)
             callsite_stream.write(f"{lhs} = {func_name}({args_str})", cfg, state_id)
+            for c in returned_outputs:
+                self._dispatcher.defined_vars.add(c, dispatcher_mod.DefinedType.Scalar, "object")
+        else:
+            callsite_stream.write(f"{func_name}({args_str})", cfg, state_id)
+
+    def _emit_nsdfg_function(self, inner_sdfg: "SDFG", func_name: str, params: List[str], returned_outputs: List[str],
+                             function_stream: PythonCodeIOStream) -> None:
+        """Write the module-level function definition for a NestedSDFG.
+
+        The body is generated through the shared node dispatcher — every node
+        routes back to the cuTile per-node handlers, since
+        :meth:`_sdfg_is_cutile_body` recognises *inner_sdfg* as a cuTile body.
+
+        :param inner_sdfg: The nested SDFG.
+        :param func_name: The generated function name.
+        :param params: Ordered parameter names (inputs, destinations, symbols).
+        :param returned_outputs: Output connectors returned (immutable values).
+        :param function_stream: Stream to append the function definition to.
+        """
+        body_stream = PythonCodeIOStream()
+
+        def dispatch_state(inner_state: "SDFGState") -> str:
+            tmp = PythonCodeIOStream()
+            self._dispatcher.dispatch_subgraph(inner_sdfg,
+                                               inner_state.parent_graph,
+                                               inner_state,
+                                               inner_state.block_id,
+                                               function_stream,
+                                               tmp,
+                                               skip_entry_node=False)
+            return tmp.getvalue()
+
+        py_cflow.control_flow_region_to_code(inner_sdfg, dispatch_state, self._frame, inner_sdfg.symbols, body_stream)
+
+        if returned_outputs:
+            body_stream.write(f"return {', '.join(returned_outputs)}")
+
+        function_stream.write("")
+        function_stream.write(f"def {func_name}({', '.join(params)}):")
+        with function_stream.indented():
+            body_code = body_stream.getvalue().rstrip("\n")
+            function_stream.write(body_code if body_code.strip() else "pass")
+        function_stream.write("")
 
     # ------------------------------------------------------------------
     # NestedSDFG helpers
@@ -1249,18 +1250,14 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
         :returns: Sorted list of symbol names.
         """
         inner_sdfg = node.sdfg
-        free_symbols = set(
-            str(s)
-            for s in inner_sdfg.used_symbols(all_symbols=False, keep_defined_in_mapping=True)
-        )
+        free_symbols = set(str(s) for s in inner_sdfg.used_symbols(all_symbols=False, keep_defined_in_mapping=True))
         return [
             sym_name for sym_name in sorted(node.symbol_mapping.keys())
             if sym_name in free_symbols and sym_name not in inner_sdfg.constants
         ]
 
     @staticmethod
-    def _resolve_nsdfg_input_var(state: "SDFGState", node: nodes.NestedSDFG,
-                                 conn_name: str) -> str:
+    def _resolve_nsdfg_input_var(state: "SDFGState", node: nodes.NestedSDFG, conn_name: str) -> str:
         """Resolve the variable name for a NestedSDFG input connector at the call site.
 
         Traces edges to find the actual source variable name.
@@ -1285,8 +1282,7 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
         return conn_name  # fallback: use connector name itself
 
     @staticmethod
-    def _resolve_nsdfg_output_var(state: "SDFGState", node: nodes.NestedSDFG,
-                                  conn_name: str) -> str:
+    def _resolve_nsdfg_output_var(state: "SDFGState", node: nodes.NestedSDFG, conn_name: str) -> str:
         """Resolve the variable name for a NestedSDFG output connector at the call site.
 
         Traces edges to find the actual destination variable name.
@@ -1310,303 +1306,12 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
                     return edge.dst_conn
         return conn_name  # fallback: use connector name itself
 
-    def _generate_nsdfg_function(self, nsdfg_node: nodes.NestedSDFG,
-                                 containing_state: "SDFGState",
-                                 function_stream: PythonCodeIOStream,
-                                 state_id: int, cfg: object,
-                                 func_name: str,
-                                 input_conns: List[str],
-                                 output_conns: List[str],
-                                 symbol_names: List[str]) -> None:
-        """Generate the module-level function definition for a NestedSDFG.
-
-        The function takes input connectors and symbols as parameters
-        and returns output connectors.  The body is generated by
-        walking the inner SDFG's states.
-
-        :param nsdfg_node: The NestedSDFG node.
-        :param containing_state: The state containing the NestedSDFG.
-        :param function_stream: Stream to emit the function definition into.
-        :param state_id: State ID in the parent CFG.
-        :param cfg: Parent control-flow region.
-        :param func_name: The generated function name.
-        :param input_conns: Sorted input connector names (function parameters).
-        :param output_conns: Sorted output connector names (return values).
-        :param symbol_names: Sorted symbol names (additional function parameters).
-        """
-        inner_sdfg = nsdfg_node.sdfg
-        params = input_conns + symbol_names
-        params_str = ", ".join(params)
-
-        # Build the function body in a temporary stream.
-        body_stream = PythonCodeIOStream()
-
-        # Create a dispatch_state closure for control_flow_region_to_code.
-        # Each inner state is generated via _generate_nsdfg_state.
-        def dispatch_state(inner_state: "SDFGState") -> str:
-            tmp_stream = PythonCodeIOStream()
-            self._generate_nsdfg_state(
-                inner_state, inner_sdfg, function_stream,
-                tmp_stream, state_id, cfg,
-            )
-            return tmp_stream.getvalue()
-
-        py_cflow.control_flow_region_to_code(
-            inner_sdfg, dispatch_state, self._frame,
-            inner_sdfg.symbols, body_stream
-        )
-
-        # Emit return statement.
-        if output_conns:
-            ret_str = ", ".join(output_conns)
-            body_stream.write(f"return {ret_str}")
-
-        # Write the function to function_stream.
-        function_stream.write("")
-        function_stream.write(f"def {func_name}({params_str}):")
-        with function_stream.indented():
-            body_code = body_stream.getvalue()
-            if body_code.strip():
-                function_stream.write(body_code.rstrip("\n"))
-            else:
-                function_stream.write("pass")
-        function_stream.write("")
-
-    def _generate_nsdfg_state(self, inner_state: "SDFGState",
-                              inner_sdfg: "SDFG",
-                              function_stream: PythonCodeIOStream,
-                              body_stream: PythonCodeIOStream,
-                              state_id: int, cfg: object) -> None:
-        """Generate code for a single state inside a NestedSDFG function body.
-
-        Walks nodes in topological order, emitting code for Tasklets,
-        recursive NestedSDFGs, and inner map scopes.  AccessNodes for
-        tile/register locals need no explicit code.
-
-        :param inner_state: The inner SDFG state.
-        :param inner_sdfg: The inner SDFG.
-        :param function_stream: Stream for module-level code (for recursive NestedSDFGs).
-        :param body_stream: Stream for the function body.
-        :param state_id: State ID in the parent CFG.
-        :param cfg: Parent control-flow region.
-        """
-        scope_dict = inner_state.scope_dict()
-        for inner_node in sdutil.dfs_topological_sort(inner_state):
-            # Only process top-level nodes (not inside an inner map).
-            if scope_dict[inner_node] is not None:
-                continue
-
-            if isinstance(inner_node, nodes.Tasklet):
-                self._emit_nsdfg_tasklet(inner_state, inner_node, body_stream,
-                                         state_id, cfg)
-            elif isinstance(inner_node, nodes.NestedSDFG):
-                self._emit_nsdfg_nested_call(
-                    inner_state, inner_node, inner_sdfg,
-                    function_stream, body_stream, state_id, cfg)
-            elif isinstance(inner_node, nodes.MapEntry):
-                self._generate_nsdfg_map_scope(
-                    inner_state, inner_node, inner_sdfg,
-                    function_stream, body_stream, state_id, cfg)
-            # AccessNodes: tile/register locals are Python locals, no code needed.
-
-    def _emit_nsdfg_tasklet(self, inner_state: "SDFGState",
-                            tasklet: nodes.Tasklet,
-                            body_stream: PythonCodeIOStream,
-                            state_id: int, cfg: object) -> None:
-        """Emit code for a Tasklet inside a NestedSDFG function.
-
-        Binds input connectors, emits the tasklet body, then binds
-        output connectors to their downstream AccessNode local names.
-
-        :param inner_state: The state containing the tasklet.
-        :param tasklet: The Tasklet node.
-        :param body_stream: Stream for the function body code.
-        :param state_id: The state ID in the parent CFG.
-        :param cfg: Parent control-flow region.
-        """
-        # Reject non-Python tasklets.
-        if tasklet.code.language != dtypes.Language.Python:
-            raise NotImplementedError(
-                "CuTile NestedSDFG backend only supports Python tasklets, "
-                f"but tasklet '{tasklet.label}' uses "
-                f"{tasklet.code.language.name}.")
-
-        # Handle init/exit code blocks.
-        init_code = codeblock_to_python(tasklet.code_init).strip()
-        if init_code:
-            self._frame._initcode.write(init_code)
-        exit_code = codeblock_to_python(tasklet.code_exit).strip()
-        if exit_code:
-            self._frame._exitcode.write(exit_code)
-
-        # Bind inputs.
-        for edge in inner_state.in_edges(tasklet):
-            if edge.dst_conn is None:
-                continue
-            if isinstance(edge.src, nodes.AccessNode):
-                src = edge.src.data
-            elif edge.data is not None and edge.data.data is not None:
-                src = edge.data.data
-            else:
-                continue
-            if edge.dst_conn != src:
-                body_stream.write(f"{edge.dst_conn} = {src}")
-
-        # Emit tasklet body.
-        code = codeblock_to_python(tasklet.code).strip()
-        if code:
-            body_stream.write(code)
-
-        # Bind outputs to downstream AccessNode locals.
-        for edge in inner_state.out_edges(tasklet):
-            if edge.src_conn is None:
-                continue
-            if (isinstance(edge.dst, nodes.AccessNode)
-                    and edge.dst.data != edge.src_conn):
-                body_stream.write(f"{edge.dst.data} = {edge.src_conn}")
-
-    def _emit_nsdfg_nested_call(self, inner_state: "SDFGState",
-                                nested_node: nodes.NestedSDFG,
-                                parent_sdfg: "SDFG",
-                                function_stream: PythonCodeIOStream,
-                                body_stream: PythonCodeIOStream,
-                                state_id: int, cfg: object) -> None:
-        """Handle a recursive NestedSDFG inside a NestedSDFG function.
-
-        Generates another module-level function and emits the call in
-        the current function body.
-
-        :param inner_state: The state containing the nested node.
-        :param nested_node: The recursive NestedSDFG node.
-        :param parent_sdfg: The parent (inner) SDFG.
-        :param function_stream: Stream for module-level code.
-        :param body_stream: Stream for the current function body.
-        :param state_id: State ID in the parent CFG.
-        :param cfg: Parent control-flow region.
-        """
-        nested_sdfg = nested_node.sdfg
-        nested_sdfg.expand_library_nodes(recursive=True)
-
-        # Build function name.
-        func_name = (
-            f"__dace_nested_{nested_sdfg.name}_inner_"
-            f"{inner_state.block_id}_{inner_state.node_id(nested_node)}"
-        )
-
-        # Determine connectors.
-        input_conns: List[str] = sorted(
-            {e.dst_conn for e in inner_state.in_edges(nested_node)
-             if e.dst_conn is not None}
-        )
-        output_conns: List[str] = sorted(
-            {e.src_conn for e in inner_state.out_edges(nested_node)
-             if e.src_conn is not None}
-        )
-        symbol_names = self._nsdfg_runtime_symbols(nested_node)
-
-        # Generate the function if not already done.
-        position_key = func_name
-        if position_key not in self._generated_nested_functions:
-            self._generate_nsdfg_function(
-                nested_node, inner_state, function_stream, state_id, cfg,
-                func_name, input_conns, output_conns, symbol_names,
-            )
-            self._generated_nested_functions[position_key] = func_name
-
-        # Build call arguments.
-        call_args: List[str] = []
-        for conn_name in input_conns:
-            call_args.append(
-                self._resolve_nsdfg_input_var(inner_state, nested_node, conn_name))
-        for sym_name in symbol_names:
-            mapping_expr = nested_node.symbol_mapping.get(sym_name)
-            if mapping_expr is not None:
-                call_args.append(symstr(mapping_expr))
-            else:
-                call_args.append(sym_name)
-
-        args_str = ", ".join(call_args)
-
-        # Emit call.
-        if len(output_conns) == 0:
-            body_stream.write(f"{func_name}({args_str})")
-        elif len(output_conns) == 1:
-            out_var = self._resolve_nsdfg_output_var(
-                inner_state, nested_node, output_conns[0])
-            body_stream.write(f"{out_var} = {func_name}({args_str})")
-        else:
-            out_vars = [
-                self._resolve_nsdfg_output_var(inner_state, nested_node, c)
-                for c in output_conns
-            ]
-            lhs = ", ".join(out_vars)
-            body_stream.write(f"{lhs} = {func_name}({args_str})")
-
-    def _generate_nsdfg_map_scope(self, inner_state: "SDFGState",
-                                  entry: nodes.MapEntry,
-                                  inner_sdfg: "SDFG",
-                                  function_stream: PythonCodeIOStream,
-                                  body_stream: PythonCodeIOStream,
-                                  state_id: int, cfg: object) -> None:
-        """Generate a sequential for-loop for an inner map scope.
-
-        Maps inside NestedSDFGs (e.g. from pure tileops expansion) are
-        emitted as Python for-loops.
-
-        :param inner_state: The state containing the map.
-        :param entry: The MapEntry node.
-        :param inner_sdfg: The inner SDFG.
-        :param function_stream: Stream for module-level code (for recursive NestedSDFGs).
-        :param body_stream: Stream for the function body.
-        :param state_id: State ID in the parent CFG.
-        :param cfg: Parent control-flow region.
-        """
-        # Emit for-loop headers (one per map dimension).
-        for param, (start, end, step) in zip(entry.map.params, entry.map.range):
-            start_s = symstr(start)
-            end_s = symstr(end + 1)
-            step_s = symstr(step)
-            if step_s == "1":
-                body_stream.write(f"for {param} in range({start_s}, {end_s}):")
-            else:
-                body_stream.write(f"for {param} in range({start_s}, {end_s}, {step_s}):")
-            body_stream.indent()
-
-        # Get scope children and process them in topological order.
-        scope_children = inner_state.scope_children()
-        children = scope_children.get(entry, [])
-        scope_child_set = set(children)
-        try:
-            for child in sdutil.dfs_topological_sort(inner_state, sources=children):
-                if child not in scope_child_set:
-                    continue
-                if isinstance(child, nodes.Tasklet):
-                    self._emit_nsdfg_tasklet(inner_state, child, body_stream,
-                                             state_id, cfg)
-                elif isinstance(child, nodes.NestedSDFG):
-                    self._emit_nsdfg_nested_call(
-                        inner_state, child, inner_sdfg,
-                        function_stream, body_stream, state_id, cfg)
-                elif isinstance(child, nodes.MapEntry):
-                    # Nested inner map — recurse.
-                    self._generate_nsdfg_map_scope(
-                        inner_state, child, inner_sdfg,
-                        function_stream, body_stream, state_id, cfg)
-                elif isinstance(child, nodes.MapExit):
-                    pass  # No-op; loop closing handled by dedent.
-                # AccessNodes: no code needed (Python locals).
-        finally:
-            # Close for-loop indentation (one dedent per dimension).
-            for _ in entry.map.params:
-                body_stream.dedent()
-
     # ------------------------------------------------------------------
     # Scope generation (kernel wrapper + launch)
     # ------------------------------------------------------------------
 
-    def generate_scope(self, sdfg: "SDFG", cfg: object, dfg_scope: object,
-                       state_id: int, function_stream: PythonCodeIOStream,
-                       callsite_stream: PythonCodeIOStream) -> None:
+    def generate_scope(self, sdfg: "SDFG", cfg: object, dfg_scope: object, state_id: int,
+                       function_stream: PythonCodeIOStream, callsite_stream: PythonCodeIOStream) -> None:
         """Generate the cuTile kernel wrapper and launch call for a map scope.
 
         Emits a ``@ct.kernel``-decorated function containing the scope body,
@@ -1628,14 +1333,10 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
         exit_node = state.exit_node(entry)
         grid_exprs = _grid_exprs_from_map_entry(entry)
 
-        input_arrays = _ordered_unique(
-            e.data.data for e in state.in_edges(entry)
-            if e.data and e.data.data
-            and isinstance(e.src, nodes.AccessNode))
-        output_arrays = _ordered_unique(
-            e.data.data for e in state.out_edges(exit_node)
-            if e.data and e.data.data
-            and isinstance(e.dst, nodes.AccessNode))
+        input_arrays = _ordered_unique(e.data.data for e in state.in_edges(entry)
+                                       if e.data and e.data.data and isinstance(e.src, nodes.AccessNode))
+        output_arrays = _ordered_unique(e.data.data for e in state.out_edges(exit_node)
+                                        if e.data and e.data.data and isinstance(e.dst, nodes.AccessNode))
         free_syms = _collect_free_symbols(entry, dfg_scope, sdfg)
         kernel_params = list(dict.fromkeys(input_arrays + output_arrays + free_syms))
 
@@ -1649,13 +1350,16 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
             # Emit MapEntry (pid setup) ourselves; the dispatcher's
             # topological walk treats MapEntry specially (dispatch_scope), so
             # we cannot rely on dispatch_subgraph to invoke our handler for it.
-            self.generate_node(sdfg, cfg, dfg_scope, state_id, entry,
-                               function_stream, kernel_stream)
+            self.generate_node(sdfg, cfg, dfg_scope, state_id, entry, function_stream, kernel_stream)
             # Walk the rest of the scope. Tasklets, MapExit, AccessNodes, and
             # NestedSDFGs are routed to our predicated handlers.
             self._dispatcher.dispatch_subgraph(
-                sdfg, cfg, dfg_scope, state_id,
-                function_stream, kernel_stream,
+                sdfg,
+                cfg,
+                dfg_scope,
+                state_id,
+                function_stream,
+                kernel_stream,
                 skip_entry_node=True,
             )
 
@@ -1669,31 +1373,26 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
             raise NotImplementedError("CuTile backend does not support >3D grids yet.")
         grid_tuple = f"({', '.join(padded_grid)})"
         deduped_arrays = list(dict.fromkeys(input_arrays + output_arrays))
-        launch_args = ([_array_runtime_name(sdfg, n) for n in deduped_arrays]
-                       + free_syms)
-        args_tuple = (f"({', '.join(launch_args)},)" if len(launch_args) == 1
-                      else f"({', '.join(launch_args)})")
-        instrumented = (entry.map.instrument
-                        != dtypes.InstrumentationType.No_Instrumentation)
+        launch_args = ([_array_runtime_name(sdfg, n) for n in deduped_arrays] + free_syms)
+        args_tuple = (f"({', '.join(launch_args)},)" if len(launch_args) == 1 else f"({', '.join(launch_args)})")
+        instrumented = (entry.map.instrument != dtypes.InstrumentationType.No_Instrumentation)
 
         # Instrumentation: kernel-scope begin (before launch)
         if instrumented:
             for instr in self._dispatcher.instrumentation.values():
                 if instr is not None:
-                    instr.on_scope_entry(sdfg, cfg, state, entry,
-                                         callsite_stream, callsite_stream,
-                                         function_stream)
+                    instr.on_scope_entry(sdfg, cfg, state, entry, callsite_stream, callsite_stream, function_stream)
 
         callsite_stream.write(
             f"ct.launch(cupy.cuda.get_current_stream(), {grid_tuple}, "
             f"{kernel_name}, {args_tuple})",
-            cfg, state_id,
+            cfg,
+            state_id,
         )
 
         # Always synchronize so the kernel completes before the host
         # continues (and before any timing measurement ends).
-        callsite_stream.write(
-            "cupy.cuda.get_current_stream().synchronize()", cfg, state_id)
+        callsite_stream.write("cupy.cuda.get_current_stream().synchronize()", cfg, state_id)
 
         # Instrumentation: kernel-scope end (after synchronize). The exit node
         # is passed so the provider resolves the matching entry node (and thus
@@ -1701,6 +1400,4 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
         if instrumented:
             for instr in self._dispatcher.instrumentation.values():
                 if instr is not None:
-                    instr.on_scope_exit(sdfg, cfg, state, exit_node,
-                                        callsite_stream, callsite_stream,
-                                        function_stream)
+                    instr.on_scope_exit(sdfg, cfg, state, exit_node, callsite_stream, callsite_stream, function_stream)
