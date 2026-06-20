@@ -116,7 +116,22 @@ class ExpandTileStorePure(ExpandTransformation):
 
 @library.expansion
 class ExpandTileStoreCutile(ExpandTransformation):
-    """TODO: docstring
+    """``cuda.tile``-Python expansion of :class:`TileStore`.
+
+    Three store paths:
+
+    * **Tile-fill** (widths-shaped transient dest): plain assignment (tiles
+      are SSA values in cuTile); masked fill uses ``ct.where``.
+    * **Gather-dims scatter** (``gather_dims`` non-empty): ``ct.scatter``
+      with ``_idx_{d}`` index tiles for scattered dims; structured dims get
+      ``ct.arange``-based indices.  Mirror of ``TileLoad`` gather path.
+    * **Structured store** (no gather_dims): aligned ``ct.store`` when
+      unmasked with unit coeffs; otherwise ``ct.scatter`` with per-dim
+      ``ct.arange`` indices, optionally masked and/or scaled by
+      ``dim_strides``.
+
+    WCR (atomic scatter) raises ``NotImplementedError`` --- not yet
+    supported by the cuTile backend.
     """
 
     environments = []
@@ -132,6 +147,12 @@ class ExpandTileStoreCutile(ExpandTransformation):
         :returns: A Python-language tasklet replacing the lib node.
         """
         from dace.symbolic import symstr
+
+        if node.wcr is not None:
+            raise NotImplementedError(
+                f"{node.label}: TileStore cuTile expansion does not support WCR "
+                f"(write-conflict resolution); atomic scatter is not yet implemented. "
+                f"Use the pure (CPP) expansion for WCR stores.")
 
         widths = tuple(node.widths)
         K = len(widths)
@@ -178,6 +199,55 @@ class ExpandTileStoreCutile(ExpandTransformation):
                 language=dace.dtypes.Language.Python,
             )
 
+        # --- gather_dims scatter path ---
+        # When gather_dims is non-empty the caller supplied explicit
+        # _idx_{d} index tiles for one or more destination dims.  Use
+        # ct.scatter with those tiles directly (mirrors the old
+        # ExpandTileScatterCutile).
+        gather_set = set(node.gather_dims)
+        if gather_set:
+            ndim = len(dst_arr.strides)
+            used_dimensions = tuple(node.dst_dims) if node.dst_dims else tuple(range(ndim - K, ndim))
+            coeffs = tuple(node.dim_strides) if node.dim_strides else tuple(1 for _ in range(K))
+
+            lines = [f"__pid{k} = ct.bid({k})" for k in range(K)]
+
+            idx_entries = []
+            for d in range(ndim):
+                if d in gather_set:
+                    idx_entries.append(f"_idx_{d}")
+                elif d in used_dimensions:
+                    k = used_dimensions.index(d)
+                    base = f"ct.arange({widths[k]}, dtype=ct.int32) + __pid{k} * {widths[k]}"
+                    if coeffs[k] != 1:
+                        base = f"({base}) * {coeffs[k]}"
+                    if K == 1:
+                        lines.append(f"__idx{k} = {base}")
+                    else:
+                        slicer = ", ".join(":" if a == k else "None" for a in range(K))
+                        lines.append(f"__idx{k} = ct.broadcast_to(({base})[{slicer}], {widths})")
+                    idx_entries.append(f"__idx{k}")
+                else:
+                    idx_entries.append("0")
+
+            if tile_expr != "_src":
+                lines.append(f"__tile = {tile_expr}")
+                tile_expr = "__tile"
+
+            mask_kw = ", mask=_mask" if node.has_mask else ""
+            lines.append(f"ct.scatter(_dst, ({', '.join(idx_entries)},), {tile_expr}{mask_kw})")
+
+            inputs |= {f"_idx_{d}" for d in node.gather_dims}
+
+            return nodes.Tasklet(
+                label=f"{node.label}_cutile",
+                inputs={c: None for c in inputs},
+                outputs={"_dst": None},
+                code="\n".join(lines),
+                language=dace.dtypes.Language.Python,
+            )
+
+        # --- structured store path (no gather_dims) ---
         ndim = len(dst_arr.strides)
         # Array dim each tile dim maps to (``dst_dims``); default to the
         # last K dims in order (a plain row-major tile). cuTile indexing

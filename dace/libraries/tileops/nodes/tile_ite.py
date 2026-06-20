@@ -129,28 +129,56 @@ class ExpandTileITEPure(ExpandTransformation):
 class ExpandTileITECutile(ExpandTransformation):
     """``cuda.tile``-Python expansion of :class:`TileITE`.
 
-    Primary (CI default): ``__output = ct.where(__mask, __then,
-    __else)`` — the cuTile select primitive. The surrounding iteration
-    mask is applied at the downstream ``ct.scatter`` store, not at the
-    select (matching the reference cuTile kernels).
-
-    Fallback (``ct.where`` known absent): an arithmetic blend
-    ``__m = __mask.astype(__then.dtype); __output = __m * __then +
-    (1.0 - __m) * __else``. This is exact for the ``0.0`` / ``1.0`` (or
-    ``bool``) condition encoding, but ``0.0 * inf = NaN`` would leak a
-    non-finite *unselected* lane into the result. So the fallback is
-    emitted only for an **integer** output dtype; a float output with
-    possibly-non-finite branches raises ``NotImplementedError`` because
-    cuTile offers no other confirmed safe select.
+    Emits ``_o = ct.where(<mask>, <then>, <else>)`` — the cuTile
+    per-lane select primitive.  Each operand (mask, then-arm, else-arm)
+    can be a Tile (per-lane connector), a Scalar (length-1 connector;
+    cuTile broadcasts automatically), or a Symbol (loop-invariant
+    expression embedded inline).  The surrounding iteration mask is
+    applied at the downstream ``ct.scatter`` store, not at the select
+    (matching the reference cuTile kernels).
     """
 
     environments = []
 
     @staticmethod
     def expansion(node: "TileITE", parent_state: dace.SDFGState, parent_sdfg: dace.SDFG) -> nodes.Tasklet:
-        raise NotImplementedError(
-            "ExpandTileITECutile: cuTile expansion stubbed out during G3 step 3 migration; the unified `TileLoad` / `TileStore` (with `gather_dims`) cuTile path will be reinstated after the per-source-dim gather contract lands per design "
-            "section 6.4. Pin a `pure` expansion via `sdfg.expand_library_nodes(implementation='pure')` to lower this node for now."
+        """Return a Python tasklet emitting the cuTile ``ct.where`` select.
+
+        :param node: The ``TileITE`` lib node being expanded.
+        :param parent_state: State that owns the lib node.
+        :param parent_sdfg: SDFG that owns ``parent_state``.
+        :returns: A Python-language tasklet replacing the lib node.
+        """
+        node.validate(parent_sdfg, parent_state)
+
+        def _cutile_operand(kind: str, conn: str, expr: str) -> str:
+            """cuTile operand reference: inline expr for Symbol, the
+            connector for Tile or Scalar (cuTile broadcasts automatically)."""
+            if kind == _SYMBOL:
+                from dace.symbolic import symstr
+                return symstr(expr)
+            return conn  # Tile or Scalar — cuTile handles broadcasting
+
+        mask_ref = _cutile_operand(node.kind_mask, "_mask", node.expr_mask)
+        t_ref = _cutile_operand(node.kind_t, "_t", node.expr_t)
+        e_ref = _cutile_operand(node.kind_e, "_e", node.expr_e)
+
+        body = f"_o = ct.where({mask_ref}, {t_ref}, {e_ref})"
+
+        inputs = set()
+        if node.kind_mask in (_TILE, _SCALAR):
+            inputs.add("_mask")
+        if node.kind_t in (_TILE, _SCALAR):
+            inputs.add("_t")
+        if node.kind_e in (_TILE, _SCALAR):
+            inputs.add("_e")
+
+        return nodes.Tasklet(
+            label=f"{node.label}_cutile",
+            inputs={c: None for c in inputs},
+            outputs={"_o": None},
+            code=body,
+            language=dace.dtypes.Language.Python,
         )
 
 

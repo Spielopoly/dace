@@ -30,7 +30,7 @@ import ast
 import pytest
 
 import dace
-from dace.libraries.tileops import (TileBinop, TileIota, TileLoad, TileMaskGen, TileReduce, TileStore)
+from dace.libraries.tileops import (TileBinop, TileIota, TileITE, TileLoad, TileMaskGen, TileMMA, TileReduce, TileStore)
 from dace.libraries.tileops.nodes import tile_reduce as _tile_reduce_mod
 
 
@@ -123,13 +123,13 @@ def test_tile_load_cutile_K2_emits_two_block_ids():
 
 
 def test_tile_load_cutile_pos_inf_pad_mode():
-    """``pad_mode='POS_INF'`` selects ``ct.PaddingMode.POSITIVE_INFINITY``."""
+    """``pad_mode='POS_INF'`` selects ``ct.PaddingMode.POS_INF``."""
     body, _ = _expand_cutile_with_edges(
         TileLoad(name="L", widths=(8, ), pad_mode="POS_INF"),
         in_arrays={"_src": ("src", (100,), dace.float32)},
     )
     _assert_parses_as_python(body)
-    assert "padding_mode=ct.PaddingMode.POSITIVE_INFINITY" in body
+    assert "padding_mode=ct.PaddingMode.POS_INF" in body
     assert "ct.PaddingMode.ZERO" not in body
 
 
@@ -508,3 +508,481 @@ def test_tile_iota_cutile_target_isa_property_default():
     assert node.target_isa == "SCALAR"
     node.target_isa = "CUTILE"
     assert node.target_isa == "CUTILE"
+
+
+# ============================================================
+# TileReduce cuTile expansion (bug fix verification)
+# ============================================================
+
+
+def test_tile_reduce_cutile_sum_unmasked():
+    """K=1, op='+', unmasked: emits ct.sum(_src, axis=None)."""
+    body, lang = _expand_cutile(TileReduce(name="R", widths=(8,), op="+"))
+    _assert_parses_as_python(body)
+    assert "ct.sum(_src" in body
+    assert lang == dace.dtypes.Language.Python
+
+
+def test_tile_reduce_cutile_sum_masked():
+    """K=1, op='+', masked: applies ct.where before reduction."""
+    body, _ = _expand_cutile_with_edges(
+        TileReduce(name="R", widths=(8,), op="+", has_mask=True),
+        in_arrays={
+            "_src": ("src", (8,), dace.float32),
+            "_mask": ("mask", (8,), dace.bool_),
+        },
+        out_arrays={"_dst": ("dst", (1,), dace.float32)},
+    )
+    _assert_parses_as_python(body)
+    assert "ct.where(_mask" in body
+    assert "ct.sum" in body
+
+
+def test_tile_reduce_cutile_prod():
+    """op='*' emits ct.prod."""
+    body, _ = _expand_cutile(TileReduce(name="R", widths=(8,), op="*"))
+    _assert_parses_as_python(body)
+    assert "ct.prod(" in body
+
+
+def test_tile_reduce_cutile_min():
+    """op='min' emits ct.min."""
+    body, _ = _expand_cutile(TileReduce(name="R", widths=(8,), op="min"))
+    _assert_parses_as_python(body)
+    assert "ct.min(" in body
+
+
+def test_tile_reduce_cutile_max():
+    """op='max' emits ct.max."""
+    body, _ = _expand_cutile(TileReduce(name="R", widths=(8,), op="max"))
+    _assert_parses_as_python(body)
+    assert "ct.max(" in body
+
+
+def test_tile_reduce_cutile_k2_axis0():
+    """K=2, axis=0: verify axis appears in emitted reduction."""
+    body, _ = _expand_cutile(TileReduce(name="R", widths=(4, 8), op="+", axis=0))
+    _assert_parses_as_python(body)
+    assert "axis=0" in body
+
+
+def test_tile_reduce_cutile_k2_axis1():
+    """K=2, axis=1: verify axis=1."""
+    body, _ = _expand_cutile(TileReduce(name="R", widths=(4, 8), op="+", axis=1))
+    _assert_parses_as_python(body)
+    assert "axis=1" in body
+
+
+def test_tile_reduce_cutile_inputs_include_mask_when_masked():
+    """Verify _mask is in tasklet inputs when has_mask=True."""
+    tasklet = _expand_cutile_tasklet_with_edges(
+        TileReduce(name="R", widths=(8,), op="+", has_mask=True),
+        in_arrays={
+            "_src": ("src", (8,), dace.float32),
+            "_mask": ("mask", (8,), dace.bool_),
+        },
+        out_arrays={"_dst": ("dst", (1,), dace.float32)},
+    )
+    assert "_mask" in tasklet.in_connectors
+    assert "_src" in tasklet.in_connectors
+
+
+# ============================================================
+# TileBinop ** operator
+# ============================================================
+
+
+def test_tile_binop_cutile_power_operator():
+    """op='**' emits Python power expression."""
+    body, lang = _expand_cutile(TileBinop(name="P", widths=(8,), op="**"))
+    _assert_parses_as_python(body)
+    assert "**" in body
+    assert lang == dace.dtypes.Language.Python
+
+
+# ============================================================
+# TileITE cuTile expansion
+# ============================================================
+
+
+def _ite_arrays(widths, kind_mask="Tile", kind_t="Tile", kind_e="Tile"):
+    """Build ``(in_arrays, out_arrays)`` dicts for a TileITE expansion test."""
+    shape = tuple(widths)
+    ins = {}
+    if kind_mask in ("Tile", "Scalar"):
+        ins["_mask"] = ("mask", shape, dace.bool_)
+    if kind_t in ("Tile", "Scalar"):
+        ins["_t"] = ("t", shape, dace.float32)
+    if kind_e in ("Tile", "Scalar"):
+        ins["_e"] = ("e", shape, dace.float32)
+    outs = {"_o": ("o", shape, dace.float32)}
+    return ins, outs
+
+
+def test_tile_ite_cutile_all_tile():
+    """All-Tile operands: basic ct.where(_mask, _t, _e)."""
+    node = TileITE(name="ITE", widths=(8,))
+    ins, outs = _ite_arrays((8,))
+    body, lang = _expand_cutile_with_edges(node, in_arrays=ins, out_arrays=outs)
+    _assert_parses_as_python(body)
+    assert "ct.where(_mask, _t, _e)" in body
+    assert lang == dace.dtypes.Language.Python
+
+
+def test_tile_ite_cutile_symbol_then():
+    """Symbol then-arm: inline expression in ct.where."""
+    node = TileITE(name="ITE", widths=(8,), kind_t="Symbol", expr_t="0.0")
+    ins, outs = _ite_arrays((8,), kind_t="Symbol")
+    body, _ = _expand_cutile_with_edges(node, in_arrays=ins, out_arrays=outs)
+    _assert_parses_as_python(body)
+    assert "ct.where(_mask, 0.0, _e)" in body
+
+
+def test_tile_ite_cutile_symbol_else():
+    """Symbol else-arm: inline expression."""
+    node = TileITE(name="ITE", widths=(8,), kind_e="Symbol", expr_e="1.0")
+    ins, outs = _ite_arrays((8,), kind_e="Symbol")
+    body, _ = _expand_cutile_with_edges(node, in_arrays=ins, out_arrays=outs)
+    _assert_parses_as_python(body)
+    assert "ct.where(_mask, _t, 1.0)" in body
+
+
+def test_tile_ite_cutile_all_symbol():
+    """All-Symbol operands: all three inlined, no connectors."""
+    node = TileITE(name="ITE", widths=(8,),
+                   kind_mask="Symbol", expr_mask="True",
+                   kind_t="Symbol", expr_t="1",
+                   kind_e="Symbol", expr_e="0")
+    ins, outs = _ite_arrays((8,), kind_mask="Symbol", kind_t="Symbol", kind_e="Symbol")
+    body, _ = _expand_cutile_with_edges(node, in_arrays=ins, out_arrays=outs)
+    _assert_parses_as_python(body)
+    assert "ct.where(True, 1, 0)" in body
+
+
+def test_tile_ite_cutile_mixed_kinds():
+    """Mixed: mask=Tile, then=Symbol, else=Tile -- verify connectors."""
+    node = TileITE(name="ITE", widths=(8,), kind_t="Symbol", expr_t="42")
+    ins, outs = _ite_arrays((8,), kind_t="Symbol")
+    tasklet = _expand_cutile_tasklet_with_edges(node, in_arrays=ins, out_arrays=outs)
+    assert "_mask" in tasklet.in_connectors  # Tile mask
+    assert "_t" not in tasklet.in_connectors  # Symbol -- no connector
+    assert "_e" in tasklet.in_connectors  # Tile else
+
+
+def test_tile_ite_cutile_scalar_mask():
+    """Scalar mask: connector present but value is passed through."""
+    node = TileITE(name="ITE", widths=(8,), kind_mask="Scalar")
+    ins, outs = _ite_arrays((8,), kind_mask="Scalar")
+    tasklet = _expand_cutile_tasklet_with_edges(node, in_arrays=ins, out_arrays=outs)
+    assert "_mask" in tasklet.in_connectors
+
+
+def test_tile_ite_cutile_k2():
+    """K=2 tile: body is valid Python."""
+    node = TileITE(name="ITE", widths=(4, 8))
+    ins, outs = _ite_arrays((4, 8))
+    body, lang = _expand_cutile_with_edges(node, in_arrays=ins, out_arrays=outs)
+    _assert_parses_as_python(body)
+    assert "ct.where" in body
+    assert lang == dace.dtypes.Language.Python
+
+
+# ============================================================
+# TileMMA cuTile expansion
+# ============================================================
+
+
+def _mma_arrays(M, K_inner, N, beta):
+    """Build in/out array dicts for TileMMA expansion."""
+    ins = {
+        "_a": ("a", (M, K_inner), dace.float32),
+        "_b": ("b", (K_inner, N), dace.float32),
+    }
+    if beta != 0:
+        ins["_cin"] = ("cin", (M, N), dace.float32)
+    outs = {"_c": ("c", (M, N), dace.float32)}
+    return ins, outs
+
+
+def test_tile_mma_cutile_alpha1_beta0():
+    """alpha=1, beta=0: overwrite, no _cin."""
+    node = TileMMA(name="MMA", widths=(16, 8, 16), alpha=1, beta=0)
+    ins, outs = _mma_arrays(16, 8, 16, 0)
+    body, lang = _expand_cutile_with_edges(node, in_arrays=ins, out_arrays=outs)
+    _assert_parses_as_python(body)
+    assert "_c = ct.mma(_a, _b)" in body
+    assert "_cin" not in body
+    assert lang == dace.dtypes.Language.Python
+
+
+def test_tile_mma_cutile_alpha1_beta1():
+    """alpha=1, beta=1: accumulate via ct.mma's third arg."""
+    node = TileMMA(name="MMA", widths=(16, 8, 16), alpha=1, beta=1)
+    ins, outs = _mma_arrays(16, 8, 16, 1)
+    body, _ = _expand_cutile_with_edges(node, in_arrays=ins, out_arrays=outs)
+    _assert_parses_as_python(body)
+    assert "_c = ct.mma(_a, _b, _cin)" in body
+
+
+def test_tile_mma_cutile_alpha2_beta0():
+    """alpha=2, beta=0: scaled overwrite."""
+    node = TileMMA(name="MMA", widths=(16, 8, 16), alpha=2, beta=0)
+    ins, outs = _mma_arrays(16, 8, 16, 0)
+    body, _ = _expand_cutile_with_edges(node, in_arrays=ins, out_arrays=outs)
+    _assert_parses_as_python(body)
+    assert "2 * ct.mma(_a, _b)" in body
+
+
+def test_tile_mma_cutile_alpha1_beta2():
+    """alpha=1, beta=2: scaled accumulate."""
+    node = TileMMA(name="MMA", widths=(16, 8, 16), alpha=1, beta=2)
+    ins, outs = _mma_arrays(16, 8, 16, 2)
+    body, _ = _expand_cutile_with_edges(node, in_arrays=ins, out_arrays=outs)
+    _assert_parses_as_python(body)
+    assert "ct.mma(_a, _b)" in body
+    assert "2 * _cin" in body
+
+
+def test_tile_mma_cutile_general():
+    """General: alpha=3, beta=2."""
+    node = TileMMA(name="MMA", widths=(16, 8, 16), alpha=3, beta=2)
+    ins, outs = _mma_arrays(16, 8, 16, 2)
+    body, _ = _expand_cutile_with_edges(node, in_arrays=ins, out_arrays=outs)
+    _assert_parses_as_python(body)
+    assert "3 * ct.mma(_a, _b)" in body
+    assert "2 * _cin" in body
+
+
+def test_tile_mma_cutile_connectors_beta0():
+    """beta=0: _cin NOT in inputs."""
+    node = TileMMA(name="MMA", widths=(16, 8, 16), alpha=1, beta=0)
+    ins, outs = _mma_arrays(16, 8, 16, 0)
+    tasklet = _expand_cutile_tasklet_with_edges(node, in_arrays=ins, out_arrays=outs)
+    assert "_cin" not in tasklet.in_connectors
+
+
+def test_tile_mma_cutile_connectors_beta1():
+    """beta=1: _cin IS in inputs."""
+    node = TileMMA(name="MMA", widths=(16, 8, 16), alpha=1, beta=1)
+    ins, outs = _mma_arrays(16, 8, 16, 1)
+    tasklet = _expand_cutile_tasklet_with_edges(node, in_arrays=ins, out_arrays=outs)
+    assert "_cin" in tasklet.in_connectors
+
+
+# ============================================================
+# TileLoad gather_dims cuTile expansion
+# ============================================================
+
+
+def test_tile_load_cutile_gather_1d():
+    """1-D source, gather_dims=(0,): emit ct.gather with _idx_0."""
+    node = TileLoad(name="L", widths=(8,), gather_dims=(0,))
+    ins = {
+        "_src": ("src", (64,), dace.float32),
+        "_idx_0": ("idx0", (8,), dace.int32),
+    }
+    outs = {"_dst": ("dst", (8,), dace.float32)}
+    body, lang = _expand_cutile_with_edges(node, in_arrays=ins, out_arrays=outs, transients=("dst",))
+    _assert_parses_as_python(body)
+    assert "ct.gather" in body
+    assert "_idx_0" in body
+    assert "ct.load" not in body
+    assert lang == dace.dtypes.Language.Python
+
+
+def test_tile_load_cutile_gather_2d():
+    """2-D source, gather_dims=(0,1): both dims gathered."""
+    node = TileLoad(name="L", widths=(8,), gather_dims=(0, 1))
+    ins = {
+        "_src": ("src", (64, 64), dace.float32),
+        "_idx_0": ("idx0", (8,), dace.int32),
+        "_idx_1": ("idx1", (8,), dace.int32),
+    }
+    outs = {"_dst": ("dst", (8,), dace.float32)}
+    body, _ = _expand_cutile_with_edges(node, in_arrays=ins, out_arrays=outs, transients=("dst",))
+    _assert_parses_as_python(body)
+    assert "ct.gather" in body
+    assert "_idx_0" in body
+    assert "_idx_1" in body
+
+
+def test_tile_load_cutile_gather_partial():
+    """2-D source, gather_dims=(0,): dim 0 gathered, dim 1 structured."""
+    node = TileLoad(name="L", widths=(8,), gather_dims=(0,), src_dims=(1,))
+    ins = {
+        "_src": ("src", (64, 64), dace.float32),
+        "_idx_0": ("idx0", (8,), dace.int32),
+    }
+    outs = {"_dst": ("dst", (8,), dace.float32)}
+    body, _ = _expand_cutile_with_edges(node, in_arrays=ins, out_arrays=outs, transients=("dst",))
+    _assert_parses_as_python(body)
+    assert "ct.gather" in body
+    assert "_idx_0" in body
+    assert "ct.arange" in body  # structured contribution for dim 1
+
+
+def test_tile_load_cutile_gather_masked():
+    """gather + has_mask: mask passed to ct.gather via mask= kwarg."""
+    node = TileLoad(name="L", widths=(8,), gather_dims=(0,), has_mask=True)
+    ins = {
+        "_src": ("src", (64,), dace.float32),
+        "_idx_0": ("idx0", (8,), dace.int32),
+        "_mask": ("mask", (8,), dace.bool_),
+    }
+    outs = {"_dst": ("dst", (8,), dace.float32)}
+    body, _ = _expand_cutile_with_edges(node, in_arrays=ins, out_arrays=outs, transients=("dst",))
+    _assert_parses_as_python(body)
+    assert "mask=_mask" in body
+    # On the gather_dims path, mask is passed to ct.gather directly, NOT ct.where
+    assert "ct.where" not in body
+
+
+def test_tile_load_cutile_gather_idx_connectors():
+    """_idx_{d} are in tasklet input connectors."""
+    node = TileLoad(name="L", widths=(8,), gather_dims=(0, 1))
+    ins = {
+        "_src": ("src", (64, 64), dace.float32),
+        "_idx_0": ("idx0", (8,), dace.int32),
+        "_idx_1": ("idx1", (8,), dace.int32),
+    }
+    outs = {"_dst": ("dst", (8,), dace.float32)}
+    tasklet = _expand_cutile_tasklet_with_edges(node, in_arrays=ins, out_arrays=outs, transients=("dst",))
+    assert "_idx_0" in tasklet.in_connectors
+    assert "_idx_1" in tasklet.in_connectors
+
+
+# ============================================================
+# TileLoad replicate cuTile expansion
+# ============================================================
+
+
+def test_tile_load_cutile_replicate_factor_2():
+    """replicate_factor=(2,): forces ct.gather with // 2 in index."""
+    node = TileLoad(name="L", widths=(8,), replicate_factor_per_dim=(2,))
+    ins = {"_src": ("src", (64,), dace.float32)}
+    outs = {"_dst": ("dst", (8,), dace.float32)}
+    body, _ = _expand_cutile_with_edges(node, in_arrays=ins, out_arrays=outs, transients=("dst",))
+    _assert_parses_as_python(body)
+    assert "ct.gather" in body  # NOT ct.load -- replicate forces gather
+    assert "// 2" in body
+    assert "ct.load" not in body
+
+
+def test_tile_load_cutile_replicate_no_replicate_uses_load():
+    """No replicate (all 1s): should use ct.load, not ct.gather."""
+    node = TileLoad(name="L", widths=(8,), replicate_factor_per_dim=(1,))
+    ins = {"_src": ("src", (64,), dace.float32)}
+    outs = {"_dst": ("dst", (8,), dace.float32)}
+    body, _ = _expand_cutile_with_edges(node, in_arrays=ins, out_arrays=outs, transients=("dst",))
+    _assert_parses_as_python(body)
+    assert "ct.load" in body  # Should use the aligned load path
+
+
+# ============================================================
+# TileLoad NEG_INF padding
+# ============================================================
+
+
+def test_tile_load_cutile_neg_inf_pad_mode():
+    """NEG_INF padding mode: emits ct.PaddingMode.NEG_INF."""
+    node = TileLoad(name="L", widths=(8,), pad_mode="NEG_INF")
+    ins = {"_src": ("src", (64,), dace.float32)}
+    outs = {"_dst": ("dst", (8,), dace.float32)}
+    body, _ = _expand_cutile_with_edges(node, in_arrays=ins, out_arrays=outs, transients=("dst",))
+    _assert_parses_as_python(body)
+    assert "NEG_INF" in body
+
+
+# ============================================================
+# TileStore gather_dims cuTile expansion
+# ============================================================
+
+
+def test_tile_store_cutile_gather_1d():
+    """1-D dest, gather_dims=(0,): emit ct.scatter with _idx_0."""
+    node = TileStore(name="S", widths=(8,), gather_dims=(0,))
+    ins = {
+        "_src": ("src", (8,), dace.float32),
+        "_idx_0": ("idx0", (8,), dace.int32),
+    }
+    outs = {"_dst": ("dst", (64,), dace.float32)}
+    body, lang = _expand_cutile_with_edges(node, in_arrays=ins, out_arrays=outs)
+    _assert_parses_as_python(body)
+    assert "ct.scatter" in body
+    assert "_idx_0" in body
+    assert "ct.store" not in body
+    assert lang == dace.dtypes.Language.Python
+
+
+def test_tile_store_cutile_gather_2d():
+    """2-D dest, gather_dims=(0,1): both dims scattered."""
+    node = TileStore(name="S", widths=(8,), gather_dims=(0, 1))
+    ins = {
+        "_src": ("src", (8,), dace.float32),
+        "_idx_0": ("idx0", (8,), dace.int32),
+        "_idx_1": ("idx1", (8,), dace.int32),
+    }
+    outs = {"_dst": ("dst", (64, 64), dace.float32)}
+    body, _ = _expand_cutile_with_edges(node, in_arrays=ins, out_arrays=outs)
+    _assert_parses_as_python(body)
+    assert "ct.scatter" in body
+    assert "_idx_0" in body
+    assert "_idx_1" in body
+
+
+def test_tile_store_cutile_gather_masked():
+    """gather + has_mask: verify mask=_mask on ct.scatter."""
+    node = TileStore(name="S", widths=(8,), gather_dims=(0,), has_mask=True)
+    ins = {
+        "_src": ("src", (8,), dace.float32),
+        "_idx_0": ("idx0", (8,), dace.int32),
+        "_mask": ("mask", (8,), dace.bool_),
+    }
+    outs = {"_dst": ("dst", (64,), dace.float32)}
+    body, _ = _expand_cutile_with_edges(node, in_arrays=ins, out_arrays=outs)
+    _assert_parses_as_python(body)
+    assert "mask=_mask" in body
+
+
+def test_tile_store_cutile_gather_idx_connectors():
+    """_idx_{d} in tasklet input connectors."""
+    node = TileStore(name="S", widths=(8,), gather_dims=(0,))
+    ins = {
+        "_src": ("src", (8,), dace.float32),
+        "_idx_0": ("idx0", (8,), dace.int32),
+    }
+    outs = {"_dst": ("dst", (64,), dace.float32)}
+    tasklet = _expand_cutile_tasklet_with_edges(node, in_arrays=ins, out_arrays=outs)
+    assert "_idx_0" in tasklet.in_connectors
+
+
+# ============================================================
+# TileStore WCR guard
+# ============================================================
+
+
+def test_tile_store_cutile_wcr_raises():
+    """WCR set on TileStore: cuTile expansion raises NotImplementedError."""
+    node = TileStore(name="S", widths=(8,), gather_dims=(0,), dim_strides=(0,),
+                     wcr="lambda a, b: a + b")
+    ins = {
+        "_src": ("src", (8,), dace.float32),
+        "_idx_0": ("idx0", (8,), dace.int32),
+    }
+    outs = {"_dst": ("dst", (64,), dace.float32)}
+    with pytest.raises(NotImplementedError, match="WCR"):
+        _expand_cutile_with_edges(node, in_arrays=ins, out_arrays=outs)
+
+
+# ============================================================
+# Pipeline registration
+# ============================================================
+
+
+def test_cutile_lowering_tile_node_types_includes_ite_and_mma():
+    """_tile_node_types() includes TileITE and TileMMA."""
+    from dace.transformation.passes.vectorization.cutile_lowering import _tile_node_types
+    types = _tile_node_types()
+    type_names = {t.__name__ for t in types}
+    assert "TileITE" in type_names
+    assert "TileMMA" in type_names

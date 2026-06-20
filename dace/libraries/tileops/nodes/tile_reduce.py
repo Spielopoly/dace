@@ -274,7 +274,8 @@ class ExpandTileReduceCutile(ExpandTransformation):
             raise NotImplementedError(f"unsupported op: {op!r}")
         
         body = f"_dst = {reduce_expr}"
-        
+
+        inputs = {"_src"} | ({"_mask"} if node.has_mask else set())
         return nodes.Tasklet(
             label=f"{node.label}_cutile",
             inputs={c: None

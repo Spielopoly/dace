@@ -41,9 +41,8 @@ for (size_t i = 0; i < M; ++i) {
 }
 ```
 
-The cuTile expansion will lower to ``cuda.tile.mma`` once the cuTile
-backend lands (stub raises ``NotImplementedError`` mirroring the existing
-``ExpandTileBinopCutile`` placeholder).
+The cuTile expansion emits a Python tasklet calling ``ct.mma(a, b[, acc])``
+with the same alpha/beta specializations as the pure expansion.
 """
 from typing import Optional, Tuple
 
@@ -108,16 +107,57 @@ class ExpandTileMMAPure(ExpandTransformation):
 
 @library.expansion
 class ExpandTileMMACutile(ExpandTransformation):
-    """cuTile expansion: lowers to ``cuda.tile.mma(a, b, c)`` (stubbed)."""
+    """cuTile expansion: emits a Python tasklet calling ``ct.mma(a, b[, acc])``.
+
+    Five alpha/beta specializations (matching the pure expansion):
+
+    * ``alpha=1, beta=0``: ``_c = ct.mma(_a, _b)`` -- overwrite, no ``_cin``.
+    * ``alpha=1, beta=1``: ``_c = ct.mma(_a, _b, _cin)`` -- accumulate.
+    * ``alpha!=1, beta=0``: ``_c = alpha * ct.mma(_a, _b)`` -- scaled overwrite.
+    * ``alpha=1, beta!=0``: ``_c = ct.mma(_a, _b) + beta * _cin`` -- scaled acc.
+    * General: ``_c = alpha * ct.mma(_a, _b) + beta * _cin`` -- full GEMM.
+    """
 
     environments = []
 
     @staticmethod
     def expansion(node: "TileMMA", parent_state: dace.SDFGState, parent_sdfg: dace.SDFG) -> nodes.Tasklet:
-        raise NotImplementedError(
-            "ExpandTileMMACutile: cuTile expansion pending -- lowering will emit ``ct.mma(_a, _b, _c)`` "
-            "wrapped in the alpha/beta arithmetic (alpha=1, beta=1 collapses to the bare ``ct.mma`` call). "
-            "Pin a ``pure`` expansion via ``sdfg.expand_library_nodes(implementation='pure')`` for now.")
+        """Return a Python tasklet emitting ``ct.mma``.
+
+        Five alpha/beta specializations (matching the pure expansion):
+
+        * ``alpha=1, beta=0``: ``_c = ct.mma(_a, _b)`` -- overwrite, no ``_cin``.
+        * ``alpha=1, beta=1``: ``_c = ct.mma(_a, _b, _cin)`` -- accumulate.
+        * ``alpha!=1, beta=0``: ``_c = alpha * ct.mma(_a, _b)`` -- scaled overwrite.
+        * ``alpha=1, beta!=0``: ``_c = ct.mma(_a, _b) + beta * _cin`` -- scaled accumulate.
+        * General: ``_c = alpha * ct.mma(_a, _b) + beta * _cin`` -- full GEMM.
+
+        :param node: The lib node being expanded.
+        :param parent_state: State that owns the lib node.
+        :param parent_sdfg: SDFG that owns ``parent_state``.
+        :returns: A Python-language tasklet with the ``ct.mma`` body.
+        """
+        node.validate(parent_sdfg, parent_state)
+        alpha = node.alpha
+        beta = node.beta
+        if alpha == 1 and beta == 0:
+            body = "_c = ct.mma(_a, _b)"
+        elif alpha == 1 and beta == 1:
+            body = "_c = ct.mma(_a, _b, _cin)"
+        elif beta == 0:
+            body = f"_c = {alpha} * ct.mma(_a, _b)"
+        elif alpha == 1:
+            body = f"_c = ct.mma(_a, _b) + {beta} * _cin"
+        else:
+            body = f"_c = {alpha} * ct.mma(_a, _b) + {beta} * _cin"
+        inputs = {"_a", "_b"} | ({"_cin"} if beta != 0 else set())
+        return nodes.Tasklet(
+            label=f"{node.label}_cutile",
+            inputs={c: None for c in inputs},
+            outputs={"_c": None},
+            code=body,
+            language=dace.dtypes.Language.Python,
+        )
 
 
 @library.node
