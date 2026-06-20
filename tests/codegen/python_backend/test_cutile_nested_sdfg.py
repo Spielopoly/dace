@@ -1241,7 +1241,7 @@ class TestNestedSDFGGpuIntegration:
         from dace.transformation.passes.vectorization.vectorize_cutile import VectorizeCuTile
 
         sdfg = _build_vadd_sdfg(f"nsdfg_rt_vadd_{n}")
-        VectorizeCuTile(widths=(8, ), insert_data_copies=True).apply_pass(sdfg, {})
+        VectorizeCuTile(widths=(8, )).apply_pass(sdfg, {})
 
         rng = np.random.default_rng(42)
         A = rng.random(n)
