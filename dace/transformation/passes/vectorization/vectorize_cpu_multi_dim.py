@@ -75,7 +75,13 @@ from dace.transformation.passes.vectorization.split_map_for_tile_remainder impor
 # pending; for now the SDFG returns with raw tasklets between staged tile transients and lib-node
 # expansion handles only TileLoad / TileStore / TileMaskGen.
 from dace.transformation.dataflow import MapCollapse, WCRToAugAssign
-from dace.transformation.interstate import (InlineMultistateSDFG, InlineSDFG, LoopToMap, RefineNestedAccess)
+# NOTE: import directly from the submodules (not the ``interstate`` package
+# ``__init__``) to avoid a circular import: ``interstate/__init__`` -> ``loop_unroll``
+# -> ``passes.analysis`` -> ``passes/__init__`` -> ``canonicalize`` -> ``vectorization``
+# -> this module would re-enter the partially-initialized ``interstate`` package.
+from dace.transformation.interstate.multistate_inline import InlineMultistateSDFG
+from dace.transformation.interstate.sdfg_nesting import InlineSDFG, RefineNestedAccess
+from dace.transformation.interstate.loop_to_map import LoopToMap
 from dace.transformation.interstate.expand_nested_sdfg_inputs import ExpandNestedSDFGInputs
 from dace.libraries.tileops.nodes import (TileBinop, TileLoad, TileMaskGen, TileITE, TileReduce, TileStore, TileUnop)
 from dace.libraries.tileops._dispatch import select_tile_implementation
