@@ -302,6 +302,7 @@ _CUTE_OP_EXPR = {
     "^": "({lhs} ^ {rhs})",
     "min": "ct.minimum({lhs}, {rhs})",
     "max": "ct.maximum({lhs}, {rhs})",
+    "**": "({lhs} ** {rhs})",
 }
 
 

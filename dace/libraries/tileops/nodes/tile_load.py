@@ -17,16 +17,17 @@ from .. import _isa_codegen
 
 #: Map the :attr:`TileLoad.pad_mode` property values to the cuTile
 #: ``ct.PaddingMode`` enum members. cuTile's padding enum offers ``+inf``
-#: (good for a downstream ``min`` reduction) but has **no** ``-inf`` / ``1``
-#: member (so ``max`` / ``prod`` partial-tile identities cannot be installed
-#: by load padding alone — they are routed to the reduction's pre-select;
-#: see the L-pad-identity note in ``CUTILE_EXPANSION_DESIGN.md``).
+#: and ``-inf`` (good for downstream ``min`` / ``max`` reductions) but has
+#: **no** ``1`` member (so ``prod`` partial-tile identities cannot be
+#: installed by load padding alone — they are routed to the reduction's
+#: pre-select; see the L-pad-identity note in ``CUTILE_EXPANSION_DESIGN.md``).
 _PAD_MODE_CUTILE = {
     "ZERO": "ct.PaddingMode.ZERO",
     "NAN": "ct.PaddingMode.NAN",
-    "POS_INF": "ct.PaddingMode.POSITIVE_INFINITY",
-    "NEG_ZERO": "ct.PaddingMode.NEGATIVE_ZERO",
+    "POS_INF": "ct.PaddingMode.POS_INF",
+    "NEG_ZERO": "ct.PaddingMode.NEG_ZERO",
     "UNDETERMINED": "ct.PaddingMode.UNDETERMINED",
+    "NEG_INF": "ct.PaddingMode.NEG_INF",
 }
 
 #: Scalar padding values for the ``ct.gather`` general-load path. ``ct.gather``
@@ -39,6 +40,7 @@ _PAD_VALUE_CUTILE = {
     "POS_INF": "float('inf')",
     "NEG_ZERO": "-0.0",
     "UNDETERMINED": "0",
+    "NEG_INF": "float('-inf')",
 }
 
 
@@ -255,9 +257,43 @@ class ExpandTileLoadCutile(ExpandTransformation):
             else:
                 coeffs = tuple(1 for _ in range(K))
                 is_default_coeffs = True
-            
-            if is_default_coeffs:
-                # Simple case: direct load with no striding
+
+            replicate = list(node.replicate_factor_per_dim) if node.replicate_factor_per_dim else [1] * K
+            has_replicate = any(r != 1 for r in replicate)
+
+            gather_set = set(node.gather_dims)
+            if gather_set:
+                # Gather path: use provided _idx_{d} index tiles directly.
+                # For each source dim k:
+                #   - k in gather_dims: use _idx_{k} (the pre-computed index tile)
+                #   - k mapped to tile dim d via src_dims: structured ct.arange contribution
+                #   - else: fixed 0 (outer memlet base pointer covers it)
+                pad_value = _PAD_VALUE_CUTILE[node.pad_mode]
+                src_to_tile = {used_dimensions[d]: d for d in range(K)}
+                idx_entries = []
+                for k in range(ndim):
+                    if k in gather_set:
+                        idx_entries.append(f"_idx_{k}")
+                    elif k in src_to_tile:
+                        d = src_to_tile[k]
+                        arange = f"ct.arange({widths[d]}, dtype=ct.int32)"
+                        if replicate[d] != 1:
+                            arange = f"({arange} // {replicate[d]})"
+                        base = f"({arange} + __pid{d} * {widths[d]})"
+                        if coeffs[d] != 1:
+                            base = f"({base}) * {coeffs[d]}"
+                        if K > 1:
+                            slicer = ", ".join(":" if a == d else "None" for a in range(K))
+                            idx_entries.append(f"ct.broadcast_to(({base})[{slicer}], {widths})")
+                        else:
+                            idx_entries.append(base)
+                    else:
+                        idx_entries.append("0")
+                idx_tuple = ", ".join(idx_entries)
+                mask_kw = f", mask=_mask" if node.has_mask else ""
+                src_code = f"ct.gather(_src, ({idx_tuple},), padding_value={pad_value}{mask_kw})"
+            elif is_default_coeffs and not has_replicate:
+                # Simple case: direct load with no striding and no replication
                 index_expr = "("
                 width_expr = "("
                 for d in range(ndim):
@@ -272,21 +308,24 @@ class ExpandTileLoadCutile(ExpandTransformation):
                 width_expr += ")"
                 src_code = f"ct.load(_src, index={index_expr}, shape={width_expr}, padding_mode={pad_mode})"
             else:
-                # General case: a non-unit per-tile-dim coefficient ⇒ no aligned
-                # block tile, so build explicit per-source-dim index tiles and
-                # ct.gather. ct.gather wants `ndim` index entries (one per source
-                # dim) that broadcast to the output shape `widths`; its result IS
-                # the broadcasted shape, so the tile comes out already in
-                # tile-dim order (no ct.permute needed on this path).
+                # General case: a non-unit per-tile-dim coefficient or
+                # replication ⇒ no aligned block tile, so build explicit
+                # per-source-dim index tiles and ct.gather. ct.gather wants
+                # `ndim` index entries (one per source dim) that broadcast to
+                # the output shape `widths`; its result IS the broadcasted
+                # shape, so the tile comes out already in tile-dim order (no
+                # ct.permute needed on this path).
                 pad_value = _PAD_VALUE_CUTILE[node.pad_mode]
                 idx_entries = []
                 for d in range(ndim):
                     if d in used_dimensions:
                         dim_idx = used_dimensions.index(d)
                         # global element index along this axis:
-                        # (tile_start + lane) * coeff.
-                        base = (f"(ct.arange({widths[dim_idx]}, dtype=ct.int32) "
-                                f"+ __pid{dim_idx} * {widths[dim_idx]}) * {coeffs[dim_idx]}")
+                        # (tile_start + lane) * coeff, with optional replicate.
+                        arange = f"ct.arange({widths[dim_idx]}, dtype=ct.int32)"
+                        if replicate[dim_idx] != 1:
+                            arange = f"({arange} // {replicate[dim_idx]})"
+                        base = f"({arange} + __pid{dim_idx} * {widths[dim_idx]}) * {coeffs[dim_idx]}"
                         # place the W arange on tile axis dim_idx (singleton elsewhere)
                         slicer = ", ".join(":" if a == dim_idx else "None" for a in range(K))
                         idx_entries.append(f"ct.broadcast_to(({base})[{slicer}], {widths})")
@@ -294,13 +333,15 @@ class ExpandTileLoadCutile(ExpandTransformation):
                         idx_entries.append("0")  # fixed index 0 along unused source dims
                 idx_tuple = ", ".join(idx_entries)
                 src_code = f"ct.gather(_src, ({idx_tuple},), padding_value={pad_value})"
-            
+
             if all_dimensions != tuple(sorted(all_dimensions)):
                 # We need to permute the loaded tile to match the expected layout
                 permute_order = tuple(all_dimensions.index(d) for d in range(ndim))
                 src_code = f"ct.permute({src_code}, axes={permute_order})"
-            
-            if node.has_mask:
+
+            # Mask gating: on the gather_dims path, ct.gather handles mask
+            # directly via mask= kwarg. On other paths, use ct.where post-load.
+            if node.has_mask and not gather_set:
                 src_code = f"ct.where(_mask, {src_code}, {_PAD_VALUE_CUTILE[node.pad_mode]})"
                 
         else:
@@ -309,6 +350,7 @@ class ExpandTileLoadCutile(ExpandTransformation):
         code = ''.join(f"__pid{d} = ct.bid({d})\n" for d in range(K))
         code += f"_dst = {src_code}"
         inputs = (set() if node.src_kind == "Symbol" else {"_src"}) | ({"_mask"} if node.has_mask else set())
+        inputs |= {f"_idx_{d}" for d in node.gather_dims}
         return nodes.Tasklet(
             label=f"{node.label}_cutile",
             inputs={c: None
@@ -383,11 +425,12 @@ class TileLoad(nodes.LibraryNode):
         allow_none=False,
         default="ZERO",
         desc="cuTile OOB padding mode for the partial last tile, one of "
-        "``ZERO | NAN | POS_INF | NEG_ZERO | UNDETERMINED`` mapping to the "
-        "``ct.PaddingMode`` enum. Only the ``cutile`` expansion reads it. The "
-        "orchestrator fusing a load into a reduction sets the right identity "
-        "(``+`` → ZERO, ``min`` → POS_INF); ``max`` / ``prod`` have no padding "
-        "identity in cuTile and rely on the reduction's pre-select instead.",
+        "``ZERO | NAN | POS_INF | NEG_INF | NEG_ZERO | UNDETERMINED`` mapping "
+        "to the ``ct.PaddingMode`` enum. Only the ``cutile`` expansion reads "
+        "it. The orchestrator fusing a load into a reduction sets the right "
+        "identity (``+`` → ZERO, ``min`` → POS_INF, ``max`` → NEG_INF); "
+        "``prod`` has no padding identity in cuTile and relies on the "
+        "reduction's pre-select instead.",
     )
     src_kind = properties.Property(
         dtype=str,
@@ -456,8 +499,8 @@ class TileLoad(nodes.LibraryNode):
             last K dims in order).
         :param has_mask: When True, declare the ``_mask`` input.
         :param pad_mode: cuTile OOB padding mode (``ZERO | NAN | POS_INF
-            | NEG_ZERO | UNDETERMINED``); only the ``cutile`` expansion uses
-            it.
+            | NEG_INF | NEG_ZERO | UNDETERMINED``); only the ``cutile``
+            expansion uses it.
         :param src_kind: ``"Tile"`` (default; per-lane indexed read of a
             tile-shape ``_src``), ``"Scalar"`` (broadcast a length-1 array
             / ``dace.data.Scalar`` value read via ``_src``), or ``"Symbol"``
