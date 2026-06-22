@@ -151,6 +151,74 @@ class ExpandDotCuBLAS(ExpandTransformation):
         return tasklet
 
 
+@dace.library.expansion
+class ExpandDotCuPy(ExpandTransformation):
+    """CuPy-based GPU dot product: result = x . y.
+
+    Produces a nested SDFG with a Python-language tasklet calling
+    ``cupy.dot``.
+    """
+
+    environments = []
+
+    @staticmethod
+    def expansion(node: 'Dot', state: SDFGState,
+                  sdfg: SDFG) -> SDFG:
+        (desc_x, stride_x), (desc_y, stride_y), desc_res, sz = \
+            node.validate(sdfg, state)
+
+        n = node.n or sz
+
+        dtype_x = desc_x.dtype.type
+        dtype_y = desc_y.dtype.type
+        dtype_res = desc_res.dtype.type
+
+        # Create nested SDFG.
+        nsdfg = dace.SDFG(node.label + '_cupy')
+        nstate = nsdfg.add_state()
+
+        nsdfg.add_array('_x', [n], dtype_x, strides=[stride_x],
+                        storage=desc_x.storage)
+        nsdfg.add_array('_y', [n], dtype_y, strides=[stride_y],
+                        storage=desc_y.storage)
+        nsdfg.add_array('_result', [1], dtype_res,
+                        storage=desc_res.storage)
+
+        # Build tasklet code.  The dot product is a scalar; the Python
+        # backend memlet write does ``_result[0] = __result_out`` so we
+        # must produce a plain Python float (or int), not a cupy scalar
+        # or numpy array.
+        code = '\n'.join([
+            'import cupy',
+            ('__result_out = float(cupy.dot('
+             'cupy.asarray(__x), cupy.asarray(__y)))'),
+        ])
+
+        tasklet = dace.sdfg.nodes.Tasklet(
+            node.label + '_cupy_tasklet',
+            {'__x': None, '__y': None},
+            {'__result_out': None},
+            code,
+            language=dace.dtypes.Language.Python,
+        )
+        nstate.add_node(tasklet)
+
+        # Wire edges.
+        x_read = nstate.add_read('_x')
+        y_read = nstate.add_read('_y')
+        res_write = nstate.add_write('_result')
+
+        nstate.add_edge(x_read, None, tasklet, '__x',
+                        dace.Memlet.from_array('_x', nsdfg.arrays['_x']))
+        nstate.add_edge(y_read, None, tasklet, '__y',
+                        dace.Memlet.from_array('_y', nsdfg.arrays['_y']))
+        nstate.add_edge(tasklet, '__result_out', res_write, None,
+                        dace.Memlet.from_array('_result',
+                                               nsdfg.arrays['_result']))
+
+        return nsdfg
+
+
 @dace.library.node
 class Dot(dace.sdfg.nodes.LibraryNode):
 
@@ -160,6 +228,7 @@ class Dot(dace.sdfg.nodes.LibraryNode):
         "OpenBLAS": ExpandDotOpenBLAS,
         "MKL": ExpandDotMKL,
         "cuBLAS": ExpandDotCuBLAS,
+        "CuPy": ExpandDotCuPy,
     }
     default_implementation = None
 

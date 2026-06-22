@@ -4,6 +4,7 @@ import dace.properties
 import dace.sdfg.nodes
 from dace.transformation.transformation import ExpandTransformation
 from dace import data as dt, memlet as mm, SDFG, SDFGState
+from dace.symbolic import equal_valued, symstr
 from dace.frontend.common import op_repository as oprepo
 
 
@@ -80,6 +81,94 @@ class ExpandAxpyVectorized(ExpandTransformation):
         return axpy_sdfg
 
 
+@dace.library.expansion
+class ExpandAxpyCuPy(ExpandTransformation):
+    """CuPy-based GPU AXPY: res = a * x + y.
+
+    Produces a nested SDFG with a Python-language tasklet calling
+    CuPy array operations.
+    """
+
+    environments = []
+
+    @staticmethod
+    def expansion(node: 'Axpy', state: SDFGState,
+                  sdfg: SDFG) -> SDFG:
+        node.validate(sdfg, state)
+
+        # Collect array descriptors from edges.
+        xdesc = ydesc = resdesc = None
+        shape_x = shape_y = shape_res = None
+        for e in state.in_edges(node):
+            if e.dst_conn == '_x':
+                xdesc = sdfg.arrays[e.data.data]
+                shape_x = e.data.subset.size()
+            elif e.dst_conn == '_y':
+                ydesc = sdfg.arrays[e.data.data]
+                shape_y = e.data.subset.size()
+        for e in state.out_edges(node):
+            if e.src_conn == '_res':
+                resdesc = sdfg.arrays[e.data.data]
+                shape_res = e.data.subset.size()
+
+        dtype_x = xdesc.dtype.type
+        dtype_y = ydesc.dtype.type
+        dtype_res = resdesc.dtype.type
+
+        # Create nested SDFG.
+        nsdfg = dace.SDFG(node.label + '_cupy')
+        nstate = nsdfg.add_state()
+
+        nsdfg.add_array('_x', shape_x, dtype_x, strides=xdesc.strides,
+                        storage=xdesc.storage)
+        nsdfg.add_array('_y', shape_y, dtype_y, strides=ydesc.strides,
+                        storage=ydesc.storage)
+        nsdfg.add_array('_res', shape_res, dtype_res,
+                        strides=resdesc.strides,
+                        storage=resdesc.storage)
+
+        # Build tasklet code.
+        a = node.a
+        code_lines = ['import cupy']
+        if equal_valued(1, a):
+            code_lines.append(
+                '__res_out = cupy.asnumpy('
+                'cupy.asarray(__x) + cupy.asarray(__y))')
+        elif equal_valued(0, a):
+            code_lines.append(
+                '__res_out = cupy.asnumpy(cupy.asarray(__y))')
+        else:
+            a_str = symstr(a)
+            code_lines.append(
+                f'__res_out = cupy.asnumpy({a_str} '
+                f'* cupy.asarray(__x) + cupy.asarray(__y))')
+
+        code = '\n'.join(code_lines)
+
+        tasklet = dace.sdfg.nodes.Tasklet(
+            node.label + '_cupy_tasklet',
+            {'__x': None, '__y': None},
+            {'__res_out': None},
+            code,
+            language=dace.dtypes.Language.Python,
+        )
+        nstate.add_node(tasklet)
+
+        # Wire edges.
+        x_read = nstate.add_read('_x')
+        y_read = nstate.add_read('_y')
+        res_write = nstate.add_write('_res')
+
+        nstate.add_edge(x_read, None, tasklet, '__x',
+                        dace.Memlet.from_array('_x', nsdfg.arrays['_x']))
+        nstate.add_edge(y_read, None, tasklet, '__y',
+                        dace.Memlet.from_array('_y', nsdfg.arrays['_y']))
+        nstate.add_edge(tasklet, '__res_out', res_write, None,
+                        dace.Memlet.from_array('_res', nsdfg.arrays['_res']))
+
+        return nsdfg
+
+
 @dace.library.node
 class Axpy(dace.sdfg.nodes.LibraryNode):
     """
@@ -91,6 +180,7 @@ class Axpy(dace.sdfg.nodes.LibraryNode):
     # Global properties
     implementations = {
         "pure": ExpandAxpyVectorized,
+        "CuPy": ExpandAxpyCuPy,
     }
     default_implementation = None
 
