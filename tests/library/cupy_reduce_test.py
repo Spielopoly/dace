@@ -308,6 +308,23 @@ class TestCuPyReduceGPU:
 
         np.testing.assert_allclose(b, np.min(a, axis=1), rtol=1e-12)
 
+    def test_min_int32(self):
+        """Min reduction on an integer dtype (CuPy path, not the bitwise fallback)."""
+        sdfg, rnode = _make_reduce_sdfg(
+            [40, 16], [0], 'lambda a, b: min(a, b)',
+            dtype=dace.int32,
+        )
+        rnode.implementation = 'CuPy'
+
+        a = np.random.randint(-1000, 1000, size=[40, 16]).astype(np.int32)
+        b = np.zeros(16, dtype=np.int32)
+
+        csdfg = sdfg.compile()
+        csdfg(A=a, B=b)
+        del csdfg
+
+        np.testing.assert_array_equal(b, np.min(a, axis=0))
+
     # ------------------------------------------------------------------ max
     def test_max(self):
         """Max reduction along first axis."""
