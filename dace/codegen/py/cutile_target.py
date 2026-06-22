@@ -249,7 +249,7 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
             self._dispatcher.register_copy_dispatcher(dtypes.StorageType.CuTile_Tile, dtypes.StorageType.CuTile_Tile,
                                                       sched, self)
         # Register for cross-storage copies between CPU_Heap and GPU_Global.
-        # These arise from CuTileInsertDataCopies copy-in/copy-out states
+        # These arise from apply_gpu_transformations() copy-in/copy-out states
         # that transfer data between host and device outside any map scope.
         self._dispatcher.register_copy_dispatcher(dtypes.StorageType.CPU_Heap, dtypes.StorageType.GPU_Global, None,
                                                   self)
@@ -399,7 +399,7 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
         Supports three categories of copies:
 
         1. **Cross-storage CPU_Heap/Default <-> GPU_Global** (from
-           ``CuTileInsertDataCopies`` copy-in/copy-out states): emits
+           ``apply_gpu_transformations()`` copy-in/copy-out states): emits
            ``.set()`` (host-to-device) or ``.get(out=...)``
            (device-to-host) transfers.  ``StorageType.Default`` is
            treated as host-side since it resolves to ``CPU_Heap``.
@@ -486,7 +486,7 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
 
         When the memlet carries subsets, the subset is applied to both
         source and destination expressions.  For full-array copies
-        (typical of ``CuTileInsertDataCopies``), the ``[:]`` ensures
+        (typical of ``apply_gpu_transformations()``), the ``[:]`` ensures
         the data is copied into the pre-allocated array.
 
         :param sdfg: The SDFG.

@@ -33,40 +33,23 @@ def _apply_cutile_pipeline(sdfg: SDFG, widths=(8, )) -> None:
     :param sdfg: The SDFG to transform (modified in-place).
     :param widths: Tile widths for vectorization (must be powers of two).
     """
-    VectorizeCuTile(widths=widths, insert_data_copies=False).apply_pass(sdfg, {})
+    VectorizeCuTile(widths=widths).apply_pass(sdfg, {})
 
 
 def _run_cutile(sdfg, **kwargs):
     """Compile and run a cuTile SDFG, returning results as numpy arrays.
 
-    Uses cupy arrays for GPU execution. Converts numpy inputs to cupy,
-    runs, and converts cupy outputs back to numpy.
+    With the new pipeline, ``VectorizeCuTile`` always includes data copies
+    via ``apply_gpu_transformations()``, so the SDFG expects NumPy (host)
+    arrays and handles device transfer internally.
 
     :param sdfg: The SDFG to compile and run.
     :param kwargs: Named arguments for the SDFG (arrays and symbols).
     :returns: Dictionary mapping array names to numpy results.
     """
-    import cupy as cp
-
-    # Convert numpy arrays to cupy
-    cp_kwargs = {}
-    for k, v in kwargs.items():
-        if isinstance(v, np.ndarray):
-            cp_kwargs[k] = cp.asarray(v)
-        else:
-            cp_kwargs[k] = v
-
     csdfg = sdfg.compile()
-    csdfg(**cp_kwargs)
-
-    # Convert cupy outputs back to numpy
-    results = {}
-    for k, v in cp_kwargs.items():
-        if isinstance(v, cp.ndarray):
-            results[k] = cp.asnumpy(v)
-        else:
-            results[k] = v
-    return results
+    csdfg(**kwargs)
+    return dict(kwargs)
 
 
 def _build_vadd_sdfg(name, dtype=dace.float64):
@@ -356,19 +339,6 @@ class TestOpSizeCombinations:
 # ============================================================
 
 
-@pytest.mark.gpu  # Override: remove the module-level gpu mark for this class
-class _CodegenBase:
-    """Base for codegen tests; the actual class below overrides the marker."""
-    pass
-
-
-# We use a separate unmarked class for codegen tests. The pytestmark at module
-# level applies @pytest.mark.gpu, but we want these to run without a GPU.
-# Unfortunately, module-level pytestmark applies to all tests in the module.
-# We work around this by NOT removing the mark (it's fine to require GPU for
-# the whole file since the user instructions say to mark all with gpu) but
-# still keeping the tests lightweight -- they just parse generated code.
-
 class TestCodegenOnly:
     """Tests that verify codegen output structure.
 
@@ -507,17 +477,24 @@ class TestPipelineStructure:
                         found_cutile_map = True
         assert found_cutile_map, "No CuTile-scheduled map found after pipeline"
 
-    def test_global_arrays_are_gpu_global(self):
-        """After pipeline, non-transient arrays should be GPU_Global."""
+    def test_global_arrays_have_gpu_clones(self):
+        """After pipeline, original non-transient arrays have host storage
+        (Default or CPU_Heap) with GPU_Global transient clones."""
         sdfg = _build_vadd_sdfg("cutile_struct_storage")
         _apply_cutile_pipeline(sdfg, widths=(8,))
 
-        for name, desc in sdfg.arrays.items():
-            if not desc.transient:
-                assert desc.storage == dtypes.StorageType.GPU_Global, (
-                    f"Array {name} has storage {desc.storage}, "
-                    f"expected GPU_Global"
-                )
+        host_storages = {dtypes.StorageType.Default, dtypes.StorageType.CPU_Heap}
+        for name in ("A", "B", "C"):
+            assert sdfg.arrays[name].storage in host_storages, (
+                f"Array {name} has storage {sdfg.arrays[name].storage}, "
+                f"expected Default or CPU_Heap"
+            )
+        # GPU_Global transient clones exist
+        gpu_clones = {
+            name for name, desc in sdfg.arrays.items()
+            if desc.storage == dtypes.StorageType.GPU_Global and desc.transient
+        }
+        assert len(gpu_clones) >= 3, f"Expected at least 3 GPU clones, found {gpu_clones}"
 
     def test_tile_transients_are_cutile_tile(self):
         """After pipeline, tile transients should have CuTile_Tile storage."""

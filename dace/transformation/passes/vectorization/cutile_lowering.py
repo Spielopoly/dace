@@ -2,20 +2,19 @@
 """cuTile lowering passes: tileops-anchored schedule, storage, and
 implementation stamping for the Python/cuTile backend.
 
-The six passes lower a tile-op SDFG — produced by
+The passes in this module lower a tile-op SDFG — produced by
 ``VectorizeCPUMultiDim(target_isa="CUTILE", expand_tile_nodes=False)`` —
 into the form the cuTile code generator (``dace/codegen/py/cutile_target.py``)
-consumes. All stamping is anchored on the emitted ``tileops`` library nodes,
-never on map-range heuristics (a pre-existing strided map such as
-``A[i*2, j]`` must NOT become a kernel just because its step is > 1).
+consumes.  GPU scheduling, storage stamping, and host/device data copies are
+delegated to ``sdfg.apply_gpu_transformations()``; the passes here handle the
+tileops-specific concerns that the generic GPU transform does not cover.
 
 Required order::
 
     CuTileValidateTiles        # tile-op anchors exist; widths are powers of 2
-    CuTileSetSchedules         # outermost enclosing map -> CuTile, inner -> Sequential
+    sdfg.apply_gpu_transformations(...)  # GPU scheduling, storage, data copies
+    GPUDeviceToCuTile          # re-stamp tileops-anchored maps GPU_Device -> CuTile
     CuTileSetTileStorage       # Register tile transients -> CuTile_Tile
-    CuTileSetGlobalStorage     # kernel-touched non-transients -> GPU_Global
-    CuTileInsertDataCopies     # (optional) clone GPU_Global non-transients, add copy states
     CuTileSetImplementations   # lib nodes -> target_isa="CUTILE", implementation="cutile"
 
 followed by ``sdfg.expand_library_nodes()`` and
@@ -27,8 +26,8 @@ Out-of-order behavior (every pass cheaply validates its preconditions and
 warns by default; ``strict=True`` raises instead):
 
 - A pass run before the vectorizer finds no tile-op anchors -> warn/no-op.
-- A storage pass run before ``CuTileSetSchedules`` finds no CuTile-scheduled
-  map -> warn/no-op.
+- A storage/adapter pass run before ``apply_gpu_transformations()`` finds no
+  GPU_Device-scheduled map -> warn/no-op.
 - ``CuTileSetImplementations`` run after ``expand_library_nodes()`` finds no
   library nodes -> warn/no-op.
 - Every pass is idempotent: re-running the whole sequence changes nothing.
@@ -41,9 +40,8 @@ instead of a silent ``'pure'`` fallback).
 import warnings
 from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, Type
 
-from dace import SDFG, data, dtypes, memlet as mmlt, properties, transformation
+from dace import SDFG, data, dtypes, properties, transformation
 from dace.sdfg import nodes
-from dace.sdfg.sdfg import InterstateEdge
 from dace.sdfg.state import SDFGState
 from dace.transformation import pass_pipeline as ppl
 
@@ -152,7 +150,7 @@ def _warn_or_raise(message: str, strict: bool) -> None:
 
 @properties.make_properties
 class _CuTileLoweringPass(ppl.Pass):
-    """Shared base of the five cuTile lowering passes.
+    """Shared base of the cuTile lowering passes.
 
     Provides the ``strict`` knob (precondition violations warn by default and
     raise when ``strict=True``) and the common Pass plumbing.
@@ -222,69 +220,6 @@ class CuTileValidateTiles(_CuTileLoweringPass):
 
 @properties.make_properties
 @transformation.explicit_cf_compatible
-class CuTileSetSchedules(_CuTileLoweringPass):
-    """Tileops-anchored schedule stamping.
-
-    For every tileops anchor, the chain of enclosing maps (walked across
-    NestedSDFG boundaries) is stamped: the outermost MapEntry becomes the
-    cuTile kernel (``ScheduleType.CuTile``); every inner MapEntry in the chain
-    becomes ``ScheduleType.Sequential``. Maps that enclose no anchor are left
-    untouched; a trailing audit warns about any map that is neither CuTile,
-    nor Sequential, nor inside a CuTile scope (a partially-vectorized SDFG —
-    such maps are emitted as plain Python loops by the Python backend).
-    """
-
-    def apply_pass(self, sdfg: SDFG, pipeline_results: Dict[str, Any]) -> Optional[int]:
-        """Stamp kernel and sequential schedules anchored on tile-op nodes.
-
-        :param sdfg: The SDFG to stamp in place.
-        :param pipeline_results: Unused pipeline results.
-        :returns: The number of maps stamped ``ScheduleType.CuTile``, or
-            ``None`` if there were no anchors / no enclosing maps.
-        :raises ValueError: When ``strict`` and a precondition or the trailing
-            audit fails.
-        """
-        anchors = _collect_tile_nodes(sdfg)
-        if not anchors:
-            _warn_or_raise(
-                "CuTileSetSchedules: no tileops library nodes found; run "
-                "VectorizeCPUMultiDim(target_isa='CUTILE', expand_tile_nodes=False) first", self.strict)
-            return None
-
-        scope_cache: _ScopeCache = {}
-        cutile_entries: Set[nodes.MapEntry] = set()
-        for node, state in anchors:
-            chain = _enclosing_map_chain(node, state, scope_cache)
-            if not chain:
-                _warn_or_raise(
-                    f"CuTileSetSchedules: tileops node '{node.label}' has no enclosing map at any "
-                    "level; it cannot be placed inside a cuTile kernel", self.strict)
-                continue
-            for entry, _ in chain[:-1]:
-                entry.map.schedule = dtypes.ScheduleType.Sequential
-            outermost_entry = chain[-1][0]
-            outermost_entry.map.schedule = dtypes.ScheduleType.CuTile
-            cutile_entries.add(outermost_entry)
-
-        # Trailing audit: maps untouched by the anchored stamping.
-        for node, graph in sdfg.all_nodes_recursive():
-            if not isinstance(node, nodes.MapEntry):
-                continue
-            if node.map.schedule in (dtypes.ScheduleType.CuTile, dtypes.ScheduleType.Sequential):
-                continue
-            chain = _enclosing_map_chain(node, graph, scope_cache)
-            if any(entry.map.schedule == dtypes.ScheduleType.CuTile for entry, _ in chain):
-                continue
-            _warn_or_raise(
-                f"CuTileSetSchedules: map '{node.map.label}' encloses no tileops node and keeps "
-                f"schedule {node.map.schedule.name} (partially-vectorized SDFG; it will be emitted "
-                "as plain Python loops by the Python backend)", self.strict)
-
-        return len(cutile_entries) if cutile_entries else None
-
-
-@properties.make_properties
-@transformation.explicit_cf_compatible
 class CuTileSetTileStorage(_CuTileLoweringPass):
     """Stamp tile/mask transients with ``StorageType.CuTile_Tile``.
 
@@ -316,7 +251,7 @@ class CuTileSetTileStorage(_CuTileLoweringPass):
             exists.
         """
         if next(_iter_cutile_scopes(sdfg), None) is None:
-            _warn_or_raise("CuTileSetTileStorage: no CuTile-scheduled map found; run CuTileSetSchedules first",
+            _warn_or_raise("CuTileSetTileStorage: no CuTile-scheduled map found; run sdfg.apply_gpu_transformations() + GPUDeviceToCuTile first",
                            self.strict)
             return None
 
@@ -398,132 +333,55 @@ class CuTileSetTileStorage(_CuTileLoweringPass):
 
 @properties.make_properties
 @transformation.explicit_cf_compatible
-class CuTileSetGlobalStorage(_CuTileLoweringPass):
-    """Stamp kernel-touched non-transient Arrays with ``GPU_Global``.
+class GPUDeviceToCuTile(_CuTileLoweringPass):
+    """Convert GPU_Device-scheduled maps containing tileops anchors to CuTile.
 
-    Only non-transients actually accessed inside a CuTile kernel scope
-    (including transitively through NestedSDFG connectors) are stamped; other
-    non-transients are left untouched (they resolve to host storage at
-    codegen). Non-transient Scalars are left untouched as well — cuTile
-    kernels take scalars as plain Python arguments. When a touched
-    non-transient lives in a nested SDFG, the stamp is propagated outward
-    through the NSDFG connector mapping up to the top-level argument array.
+    This adapter pass runs AFTER ``sdfg.apply_gpu_transformations()``, which
+    stamps top-level maps as ``ScheduleType.GPU_Device`` and inner maps as
+    ``ScheduleType.Sequential``.  This pass re-stamps only those outermost
+    maps that enclose tileops library nodes from ``GPU_Device`` to ``CuTile``,
+    leaving non-tileops maps (e.g. free-tasklet wrappers added by
+    :class:`~dace.transformation.interstate.gpu_transform_sdfg.GPUTransformSDFG`)
+    at their original schedule.
 
-    Descriptors whose storage is already ``StorageType.CuTile_Tile`` are never
-    overwritten (neither directly nor during outward propagation) — those are
-    owned by :class:`CuTileSetTileStorage`. In particular, a non-transient
-    tile-connector array inside a NestedSDFG (e.g. the connector view of a
-    mask tile) keeps ``CuTile_Tile`` storage; skipped descriptors are not
-    counted in the return value.
+    The pass is tileops-anchored: for each tileops library node the chain
+    of enclosing maps (walked across NestedSDFG boundaries via
+    :func:`_enclosing_map_chain`) is inspected; if the outermost map has
+    ``ScheduleType.GPU_Device`` it is re-stamped ``ScheduleType.CuTile``.
     """
 
     def apply_pass(self, sdfg: SDFG, pipeline_results: Dict[str, Any]) -> Optional[int]:
-        """Stamp global-array storage for cuTile kernel operands.
+        """Re-stamp GPU_Device maps containing tile-ops to CuTile.
 
-        :param sdfg: The SDFG to stamp in place.
+        :param sdfg: The SDFG to transform in place.
         :param pipeline_results: Unused pipeline results.
-        :returns: The number of data descriptors whose storage was changed to
-            ``GPU_Global``, or ``None`` if none were.
-        :raises ValueError: When ``strict`` and no CuTile-scheduled map
-            exists.
+        :returns: The number of maps re-stamped to ``CuTile``, or ``None``
+            if there were no tileops anchors.
+        :raises ValueError: When ``strict`` and no tileops anchors exist.
         """
-        cutile_scopes = list(_iter_cutile_scopes(sdfg))
-        if not cutile_scopes:
-            _warn_or_raise("CuTileSetGlobalStorage: no CuTile-scheduled map found; run CuTileSetSchedules first",
-                           self.strict)
+        anchors = _collect_tile_nodes(sdfg)
+        if not anchors:
+            _warn_or_raise(
+                "GPUDeviceToCuTile: no tileops library nodes found; run "
+                "VectorizeCPUMultiDim(target_isa='CUTILE', expand_tile_nodes=False) first", self.strict)
             return None
 
-        # Collect (owning_sdfg, data_name) pairs touched inside any kernel.
-        touched: List[Tuple[SDFG, str]] = []
-        seen: Set[Tuple[int, str]] = set()
-
-        def _add(owning_sdfg: SDFG, name: Optional[str]) -> None:
-            """Record a touched data name of ``owning_sdfg`` (deduplicated)."""
-            if name is None:
-                return
-            key = (id(owning_sdfg), name)
-            if key not in seen:
-                seen.add(key)
-                touched.append((owning_sdfg, name))
-
-        def _collect_nsdfg(nsdfg_node: nodes.NestedSDFG) -> None:
-            """Collect every data name accessed anywhere inside ``nsdfg_node``
-            (all inner states execute inside the kernel), recursively."""
-            inner_sdfg = nsdfg_node.sdfg
-            for inner_state in inner_sdfg.states():
-                for inner_node in inner_state.nodes():
-                    if isinstance(inner_node, nodes.AccessNode):
-                        _add(inner_sdfg, inner_node.data)
-                    elif isinstance(inner_node, nodes.NestedSDFG):
-                        _collect_nsdfg(inner_node)
-                for inner_edge in inner_state.edges():
-                    _add(inner_sdfg, inner_edge.data.data)
-
-        for entry, state in cutile_scopes:
-            owning_sdfg = state.sdfg
-            subgraph = state.scope_subgraph(entry, include_entry=True, include_exit=True)
-            for node in subgraph.nodes():
-                if isinstance(node, nodes.AccessNode):
-                    _add(owning_sdfg, node.data)
-                elif isinstance(node, nodes.NestedSDFG):
-                    _collect_nsdfg(node)
-            for edge in subgraph.edges():
-                # ``SubgraphView.edges()`` only yields edges with both
-                # endpoints inside the scope, so the global container name is
-                # captured here via the entry node's inner out-edge memlets
-                # (whose ``.data`` references the global array), not via any
-                # boundary edge crossing the scope.
-                _add(owning_sdfg, edge.data.data)
-
-        stamped: Set[int] = set()  # id() of changed descriptors
-
-        def _stamp(desc: data.Data) -> None:
-            """Set ``desc.storage = GPU_Global`` and record the change.
-
-            Descriptors already ``CuTile_Tile`` (owned by
-            :class:`CuTileSetTileStorage`) are left untouched and not counted.
-            """
-            if desc.storage in (dtypes.StorageType.GPU_Global, dtypes.StorageType.CuTile_Tile):
-                return
-            desc.storage = dtypes.StorageType.GPU_Global
-            stamped.add(id(desc))
-
-        for owning_sdfg, name in touched:
-            desc = owning_sdfg.arrays.get(name)
-            if desc is None or desc.transient or not isinstance(desc, data.Array):
+        scope_cache: _ScopeCache = {}
+        cutile_entries: Set[nodes.MapEntry] = set()
+        for node, state in anchors:
+            chain = _enclosing_map_chain(node, state, scope_cache)
+            if not chain:
+                _warn_or_raise(
+                    f"GPUDeviceToCuTile: tileops node '{node.label}' has no "
+                    "enclosing map at any level; it cannot be placed inside "
+                    "a cuTile kernel", self.strict)
                 continue
-            if desc.storage == dtypes.StorageType.CuTile_Tile:
-                # Tile-connector view stamped by CuTileSetTileStorage; not a
-                # global array — skip it (and do not propagate outward).
-                continue
-            _stamp(desc)
-            # Propagate outward through NSDFG connector mappings up to the
-            # top-level argument array.
-            current_sdfg, current_name = owning_sdfg, name
-            while current_sdfg.parent_nsdfg_node is not None and current_sdfg.parent is not None:
-                nsdfg_node = current_sdfg.parent_nsdfg_node
-                parent_state = current_sdfg.parent
-                parent_sdfg = parent_state.sdfg
-                outer_name: Optional[str] = None
-                for edge in parent_state.in_edges(nsdfg_node):
-                    if edge.dst_conn == current_name and edge.data.data is not None:
-                        outer_name = edge.data.data
-                        break
-                if outer_name is None:
-                    for edge in parent_state.out_edges(nsdfg_node):
-                        if edge.src_conn == current_name and edge.data.data is not None:
-                            outer_name = edge.data.data
-                            break
-                if outer_name is None:
-                    break
-                outer_desc = parent_sdfg.arrays.get(outer_name)
-                if (outer_desc is None or outer_desc.transient or not isinstance(outer_desc, data.Array)
-                        or outer_desc.storage == dtypes.StorageType.CuTile_Tile):
-                    break
-                _stamp(outer_desc)
-                current_sdfg, current_name = parent_sdfg, outer_name
+            outermost_entry = chain[-1][0]
+            if outermost_entry.map.schedule == dtypes.ScheduleType.GPU_Device:
+                outermost_entry.map.schedule = dtypes.ScheduleType.CuTile
+                cutile_entries.add(outermost_entry)
 
-        return len(stamped) if stamped else None
+        return len(cutile_entries) if cutile_entries else None
 
 
 @properties.make_properties
@@ -564,144 +422,3 @@ class CuTileSetImplementations(_CuTileLoweringPass):
             node.target_isa = "CUTILE"
             node.implementation = "cutile"
         return len(anchors)
-
-
-@properties.make_properties
-@transformation.explicit_cf_compatible
-class CuTileInsertDataCopies(_CuTileLoweringPass):
-    """Insert host-to-device and device-to-host copy states around cuTile
-    computation, so callers can pass NumPy (host) arrays instead of CuPy
-    (device) arrays.
-
-    The pass operates on the top-level SDFG only and targets non-transient
-    ``data.Array`` descriptors whose storage was stamped ``GPU_Global`` by
-    :class:`CuTileSetGlobalStorage`. For each such array the pass:
-
-    1. Creates a ``gpu_<name>`` transient clone with ``GPU_Global`` storage.
-    2. Reverts the original descriptor to ``CPU_Heap`` (host-accessible).
-    3. Replaces every in-graph reference (``AccessNode.data``, ``Memlet.data``,
-       interstate edge expressions) to use the clone.
-    4. Inserts a **copy-in state** before the current start block that copies
-       every candidate array from host to device (conservative — avoids
-       uninitialized device memory for partial writes).
-    5. Inserts a **copy-out state** after all sink nodes that copies written
-       candidates back from device to host.
-
-    The pass is idempotent: a second run finds no ``GPU_Global`` non-transients
-    (they were already cloned and reverted to ``CPU_Heap``) and returns
-    ``None``.
-
-    Must run after :class:`CuTileSetGlobalStorage` (the source of
-    ``GPU_Global`` stamps on non-transients). Has no effect on transients,
-    Scalars, or ``CuTile_Tile`` descriptors.
-    """
-
-    def apply_pass(self, sdfg: SDFG, pipeline_results: Dict[str, Any]) -> Optional[int]:
-        """Clone GPU_Global non-transients and insert copy-in / copy-out states.
-
-        :param sdfg: The top-level SDFG to transform in place.
-        :param pipeline_results: Unused pipeline results.
-        :returns: The number of arrays cloned (with copy states inserted), or
-            ``None`` if nothing was done (no candidates, or already applied).
-        :raises ValueError: When ``strict`` and no CuTile-scheduled map exists
-            (the pass is pointless without kernel computation).
-        """
-        # Precondition: at least one CuTile-scheduled map must exist.
-        if next(_iter_cutile_scopes(sdfg), None) is None:
-            _warn_or_raise(
-                "CuTileInsertDataCopies: no CuTile-scheduled map found; "
-                "run CuTileSetSchedules first", self.strict)
-            return None
-
-        # -- Step 1: Identify candidates ---------------------------------
-        # Non-transient Arrays with GPU_Global storage (stamped by
-        # CuTileSetGlobalStorage).  Scalars and CuTile_Tile are skipped.
-        candidates: Dict[str, data.Data] = {}
-        for name, desc in sdfg.arrays.items():
-            if (not desc.transient and isinstance(desc, data.Array)
-                    and desc.storage == dtypes.StorageType.GPU_Global):
-                candidates[name] = desc
-
-        if not candidates:
-            return None
-
-        # -- Step 2: Classify as input / output --------------------------
-        input_names: Set[str] = set()
-        output_names: Set[str] = set()
-        for state in sdfg.states():
-            for node in state.nodes():
-                if isinstance(node, nodes.AccessNode) and node.data in candidates:
-                    if state.out_degree(node) > 0:
-                        input_names.add(node.data)
-                    if state.in_degree(node) > 0:
-                        output_names.add(node.data)
-
-        # Conservative: include all candidates in copy-in to avoid
-        # uninitialized device memory for partial writes.
-        copyin_names = set(candidates.keys())
-        copyout_names = output_names
-
-        # -- Step 3: Clone arrays ----------------------------------------
-        cloned: Dict[str, str] = {}  # original name -> gpu clone name
-        for name, desc in candidates.items():
-            newdesc = desc.clone()
-            newdesc.storage = dtypes.StorageType.GPU_Global
-            newdesc.transient = True
-            gpu_name = sdfg.add_datadesc('gpu_' + name, newdesc,
-                                         find_new_name=True)
-            cloned[name] = gpu_name
-
-        # Revert originals to CPU_Heap.
-        for name in cloned:
-            sdfg.arrays[name].storage = dtypes.StorageType.CPU_Heap
-
-        # -- Step 4: Replace all internal references ---------------------
-        for state in sdfg.states():
-            for node in state.nodes():
-                if isinstance(node, nodes.AccessNode) and node.data in cloned:
-                    node.data = cloned[node.data]
-            for edge in state.edges():
-                if edge.data.data in cloned:
-                    edge.data.data = cloned[edge.data.data]
-
-        # Interstate edges (condition / assignment expressions).
-        for edge in sdfg.all_interstate_edges():
-            for orig, gpu in cloned.items():
-                edge.data.replace(orig, gpu)
-
-        # -- Step 5: Create copy-in state --------------------------------
-        start_block = sdfg.start_block
-        copyin_state = sdfg.add_state(sdfg.label + '_copyin')
-        # Wire copyin -> old start block.
-        sdfg.add_edge(copyin_state, start_block, InterstateEdge())
-        # Make copyin the new start.
-        sdfg.start_block = sdfg.node_id(copyin_state)
-        for name in sorted(copyin_names):
-            gpu_name = cloned[name]
-            src = nodes.AccessNode(name)
-            dst = nodes.AccessNode(gpu_name)
-            copyin_state.add_node(src)
-            copyin_state.add_node(dst)
-            copyin_state.add_nedge(
-                src, dst,
-                mmlt.Memlet.from_array(name, sdfg.arrays[name]))
-
-        # -- Step 6: Create copy-out state -------------------------------
-        if copyout_names:
-            copyout_state = sdfg.add_state(sdfg.label + '_copyout')
-            # Connect every sink to the copy-out state.
-            # Recompute sink nodes excluding the copyout state itself.
-            for sink in sdfg.sink_nodes():
-                if sink is not copyout_state:
-                    sdfg.add_edge(sink, copyout_state, InterstateEdge())
-            for name in sorted(copyout_names):
-                gpu_name = cloned[name]
-                src = nodes.AccessNode(gpu_name)
-                dst = nodes.AccessNode(name)
-                copyout_state.add_node(src)
-                copyout_state.add_node(dst)
-                copyout_state.add_nedge(
-                    src, dst,
-                    mmlt.Memlet.from_array(gpu_name, sdfg.arrays[gpu_name]))
-
-        return len(cloned)

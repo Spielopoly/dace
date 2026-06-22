@@ -545,7 +545,7 @@ def _apply_cutile_pipeline(sdfg: SDFG, widths=(8, )) -> None:
     :param sdfg: SDFG to transform in place.
     :param widths: Per-dim tile widths (must be powers of two).
     """
-    VectorizeCuTile(widths=widths, insert_data_copies=False).apply_pass(sdfg, {})
+    VectorizeCuTile(widths=widths).apply_pass(sdfg, {})
 
 
 def _build_cutile_vadd_sdfg(name: str, dtype=dace.float64) -> SDFG:
@@ -578,21 +578,17 @@ def _instrument_cutile_map(sdfg: SDFG) -> int:
 
 
 def _run_cutile(sdfg: SDFG, **kwargs) -> dict:
-    """Compile and run a cuTile SDFG on the GPU; numpy arrays are moved to/from
-    the device via cupy. Returns a dict of array-name -> numpy result."""
-    import cupy as cp
+    """Compile and run a cuTile SDFG on the GPU.
 
-    cp_kwargs = {}
-    for k, v in kwargs.items():
-        cp_kwargs[k] = cp.asarray(v) if isinstance(v, np.ndarray) else v
+    With the new pipeline, ``VectorizeCuTile`` always includes data copies
+    via ``apply_gpu_transformations()``, so the SDFG expects NumPy (host)
+    arrays and handles device transfer internally.
 
+    Returns a dict of array-name -> numpy result.
+    """
     csdfg = sdfg.compile()
-    csdfg(**cp_kwargs)
-
-    results = {}
-    for k, v in cp_kwargs.items():
-        results[k] = cp.asnumpy(v) if isinstance(v, cp.ndarray) else v
-    return results
+    csdfg(**kwargs)
+    return dict(kwargs)
 
 
 def _cutile_available() -> bool:
