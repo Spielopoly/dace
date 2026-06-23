@@ -365,6 +365,131 @@ class ExpandGemvPBLAS(ExpandTransformation):
         return sdfg
 
 
+@dace.library.expansion
+class ExpandGemvCuPy(ExpandTransformation):
+    """CuPy-based GPU GEMV: y = alpha * op(A) @ x + beta * y.
+
+    Produces a nested SDFG with a Python-language tasklet calling
+    ``cupy.matmul``.  Handles alpha/beta scaling and transposition.
+    """
+
+    environments = []
+
+    @staticmethod
+    def expansion(node: 'Gemv', state: SDFGState,
+                  sdfg: SDFG) -> SDFG:
+        node.validate(sdfg, state)
+
+        # Collect array descriptors from edges.
+        adesc = xdesc = ydesc = None
+        shape_a = shape_x = shape_y = None
+        strides_a = strides_x = strides_y = None
+        for e in state.in_edges(node):
+            if e.dst_conn == '_A':
+                adesc = sdfg.arrays[e.data.data]
+                shape_a = e.data.subset.size()
+                strides_a = adesc.strides
+            elif e.dst_conn == '_x':
+                xdesc = sdfg.arrays[e.data.data]
+                shape_x = e.data.subset.size()
+                strides_x = xdesc.strides
+        for e in state.out_edges(node):
+            if e.src_conn == '_y':
+                ydesc = sdfg.arrays[e.data.data]
+                shape_y = e.data.subset.size()
+                strides_y = ydesc.strides
+
+        dtype_a = adesc.dtype.type
+        dtype_x = xdesc.dtype.type
+        dtype_y = ydesc.dtype.type
+
+        # Create nested SDFG.
+        nsdfg = dace.SDFG(node.label + '_cupy')
+        nstate = nsdfg.add_state()
+
+        nsdfg.add_array('_A', shape_a, dtype_a, strides=strides_a,
+                        storage=adesc.storage)
+        nsdfg.add_array('_x', shape_x, dtype_x, strides=strides_x,
+                        storage=xdesc.storage)
+        nsdfg.add_array('_y', shape_y, dtype_y, strides=strides_y,
+                        storage=ydesc.storage)
+
+        # Build tasklet code.
+        code_lines = ['import cupy']
+
+        if node.transA:
+            code_lines.append('__A_t = cupy.asarray(__A).T')
+        else:
+            code_lines.append('__A_t = cupy.asarray(__A)')
+
+        alpha = node.alpha
+        if symbolic.equal_valued(1, alpha):
+            code_lines.append('__result = cupy.matmul(__A_t, cupy.asarray(__x))')
+        elif symbolic.equal_valued(0, alpha):
+            if node.transA:
+                code_lines.append(
+                    '__result = cupy.zeros(cupy.asarray(__A).shape[1], '
+                    'dtype=cupy.asarray(__A).dtype)')
+            else:
+                code_lines.append(
+                    '__result = cupy.zeros(cupy.asarray(__A).shape[0], '
+                    'dtype=cupy.asarray(__A).dtype)')
+        else:
+            alpha_str = symbolic.symstr(alpha)
+            code_lines.append(
+                f'__result = {alpha_str} * cupy.matmul(__A_t, cupy.asarray(__x))')
+
+        beta = node.beta
+        has_yin = not symbolic.equal_valued(0, beta)
+
+        if has_yin:
+            if symbolic.equal_valued(1, beta):
+                code_lines.append('__result = __result + cupy.asarray(__yin)')
+            else:
+                beta_str = symbolic.symstr(beta)
+                code_lines.append(
+                    f'__result = __result + {beta_str} * cupy.asarray(__yin)')
+
+        code_lines.append('__y_out = cupy.asnumpy(__result)')
+
+        code = '\n'.join(code_lines)
+
+        # Connector setup.
+        in_connectors = {'__A': None, '__x': None}
+        out_connectors = {'__y_out': None}
+        if has_yin:
+            in_connectors['__yin'] = None
+
+        tasklet = dace.sdfg.nodes.Tasklet(
+            node.label + '_cupy_tasklet',
+            in_connectors,
+            out_connectors,
+            code,
+            language=dace.dtypes.Language.Python,
+        )
+        nstate.add_node(tasklet)
+
+        # Wire edges.
+        a_read = nstate.add_read('_A')
+        x_read = nstate.add_read('_x')
+        y_write = nstate.add_write('_y')
+
+        nstate.add_edge(a_read, None, tasklet, '__A',
+                        dace.Memlet.from_array('_A', nsdfg.arrays['_A']))
+        nstate.add_edge(x_read, None, tasklet, '__x',
+                        dace.Memlet.from_array('_x', nsdfg.arrays['_x']))
+        nstate.add_edge(tasklet, '__y_out', y_write, None,
+                        dace.Memlet.from_array('_y', nsdfg.arrays['_y']))
+
+        if has_yin:
+            y_read = nstate.add_read('_y')
+            nstate.add_edge(
+                y_read, None, tasklet, '__yin',
+                dace.Memlet.from_array('_y', nsdfg.arrays['_y']))
+
+        return nsdfg
+
+
 @dace.library.node
 class Gemv(dace.sdfg.nodes.LibraryNode):
 
@@ -374,7 +499,8 @@ class Gemv(dace.sdfg.nodes.LibraryNode):
         "OpenBLAS": ExpandGemvOpenBLAS,
         "MKL": ExpandGemvMKL,
         "cuBLAS": ExpandGemvCuBLAS,
-        "PBLAS": ExpandGemvPBLAS
+        "PBLAS": ExpandGemvPBLAS,
+        "CuPy": ExpandGemvCuPy,
     }
     default_implementation = None
 

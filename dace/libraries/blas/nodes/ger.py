@@ -5,6 +5,7 @@ from dace.frontend.common import op_repository as oprepo
 from dace.sdfg.nodes import LibraryNode
 import dace.library as library
 from dace.sdfg import SDFG, SDFGState, nodes
+from dace.symbolic import equal_valued, symstr
 from dace import data as dt, memlet as mm, subsets as sbs
 import dace
 import copy
@@ -76,6 +77,103 @@ class ExpandGerPure(ExpandTransformation):
         return nsdfg_node
 
 
+@library.expansion
+class ExpandGerCuPy(ExpandTransformation):
+    """CuPy-based GPU GER: res = alpha * outer(x, y) + A.
+
+    Produces a nested SDFG with a Python-language tasklet calling
+    ``cupy.outer``.
+    """
+
+    environments = []
+
+    @staticmethod
+    def expansion(node: 'Ger', state: SDFGState,
+                  sdfg: SDFG) -> SDFG:
+        node.validate(sdfg, state)
+
+        # Collect array descriptors from edges.
+        adesc = xdesc = ydesc = resdesc = None
+        shape_a = shape_x = shape_y = shape_res = None
+        for e in state.in_edges(node):
+            if e.dst_conn == '_A':
+                adesc = sdfg.arrays[e.data.data]
+                shape_a = e.data.subset.size()
+            elif e.dst_conn == '_x':
+                xdesc = sdfg.arrays[e.data.data]
+                shape_x = e.data.subset.size()
+            elif e.dst_conn == '_y':
+                ydesc = sdfg.arrays[e.data.data]
+                shape_y = e.data.subset.size()
+        for e in state.out_edges(node):
+            if e.src_conn == '_res':
+                resdesc = sdfg.arrays[e.data.data]
+                shape_res = e.data.subset.size()
+
+        dtype_a = adesc.dtype.type
+        dtype_x = xdesc.dtype.type
+        dtype_y = ydesc.dtype.type
+        dtype_res = resdesc.dtype.type
+
+        # Create nested SDFG.
+        nsdfg = dace.SDFG(node.label + '_cupy')
+        nstate = nsdfg.add_state()
+
+        nsdfg.add_array('_A', shape_a, dtype_a, strides=adesc.strides,
+                        storage=adesc.storage)
+        nsdfg.add_array('_x', shape_x, dtype_x, strides=xdesc.strides,
+                        storage=xdesc.storage)
+        nsdfg.add_array('_y', shape_y, dtype_y, strides=ydesc.strides,
+                        storage=ydesc.storage)
+        nsdfg.add_array('_res', shape_res, dtype_res, strides=resdesc.strides,
+                        storage=resdesc.storage)
+
+        # Build tasklet code.
+        alpha = node.alpha
+        code_lines = ['import cupy']
+        if equal_valued(1, alpha):
+            code_lines.append(
+                '__res_out = cupy.asnumpy(cupy.outer(cupy.asarray(__x), '
+                'cupy.asarray(__y)) + cupy.asarray(__A))')
+        elif equal_valued(0, alpha):
+            code_lines.append(
+                '__res_out = cupy.asnumpy(cupy.asarray(__A))')
+        else:
+            alpha_str = symstr(alpha)
+            code_lines.append(
+                f'__res_out = cupy.asnumpy({alpha_str} '
+                f'* cupy.outer(cupy.asarray(__x), '
+                f'cupy.asarray(__y)) + cupy.asarray(__A))')
+
+        code = '\n'.join(code_lines)
+
+        tasklet = dace.sdfg.nodes.Tasklet(
+            node.label + '_cupy_tasklet',
+            {'__A': None, '__x': None, '__y': None},
+            {'__res_out': None},
+            code,
+            language=dace.dtypes.Language.Python,
+        )
+        nstate.add_node(tasklet)
+
+        # Wire edges.
+        a_read = nstate.add_read('_A')
+        x_read = nstate.add_read('_x')
+        y_read = nstate.add_read('_y')
+        res_write = nstate.add_write('_res')
+
+        nstate.add_edge(a_read, None, tasklet, '__A',
+                        dace.Memlet.from_array('_A', nsdfg.arrays['_A']))
+        nstate.add_edge(x_read, None, tasklet, '__x',
+                        dace.Memlet.from_array('_x', nsdfg.arrays['_x']))
+        nstate.add_edge(y_read, None, tasklet, '__y',
+                        dace.Memlet.from_array('_y', nsdfg.arrays['_y']))
+        nstate.add_edge(tasklet, '__res_out', res_write, None,
+                        dace.Memlet.from_array('_res', nsdfg.arrays['_res']))
+
+        return nsdfg
+
+
 @library.node
 class Ger(LibraryNode):
     """
@@ -87,7 +185,7 @@ class Ger(LibraryNode):
     """
 
     # Global properties
-    implementations = {"pure": ExpandGerPure}
+    implementations = {"pure": ExpandGerPure, "CuPy": ExpandGerCuPy}
     default_implementation = None
 
     # Object fields
