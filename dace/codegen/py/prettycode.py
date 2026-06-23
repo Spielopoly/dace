@@ -8,12 +8,54 @@ whitespace-significant blocks.
 """
 
 import io
+import os
 import inspect
 from contextlib import contextmanager
+from typing import Dict, Union
 
 from dace.config import Config
 from dace.sdfg.graph import NodeNotFoundError
 from dace.sdfg.state import ControlFlowRegion
+
+
+def _yapf_style_config() -> Union[str, Dict[str, Union[str, int]]]:
+    """Resolve the yapf style to use for generated Python code.
+
+    Prefers the project's ``.style.yapf`` at the DaCe repository root so that
+    generated code matches the DaCe code style.  Falls back to an
+    equivalent inline style when the file is not present
+
+    :returns: A path to ``.style.yapf`` if found, otherwise a yapf style dict.
+    """
+    # prettycode.py lives at <repo>/dace/codegen/py/prettycode.py, so the
+    # repository root (which holds .style.yapf) is four directories up.
+    import pathlib
+    repo_root = pathlib.Path(__file__).resolve().parents[4]
+    style_file = repo_root / '.style.yapf'
+    if style_file.is_file():
+        return str(style_file)
+    return {'based_on_style': 'pep8', 'column_limit': 120}
+
+
+def format_python_code(code: str) -> str:
+    """Format generated Python/cuTile source code for readability.
+
+    Reflows the long, densely composed lines that the code generator emits
+    using yapf with the DaCe project style (:func:`_yapf_style_config`).
+    Formatting is purely cosmetic, so any failure — yapf not being installed,
+    or syntactically invalid input — is swallowed and the original *code* is
+    returned unchanged, ensuring formatting can never break code generation.
+
+    :param code: The generated Python source code.
+    :returns: The formatted source, or the original *code* if formatting failed.
+    """
+    try:
+        from yapf.yapflib.yapf_api import FormatCode
+        formatted, _ = FormatCode(code, style_config=_yapf_style_config())
+        return formatted
+    except Exception:
+        # Never let cosmetic formatting break code generation.
+        return code
 
 
 class PythonCodeIOStream(io.StringIO):

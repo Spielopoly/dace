@@ -340,6 +340,12 @@ def generate_code(sdfg: SDFG, validate=True) -> List[CodeObject]:
                            linkable=False)
         target_objects.append(dummy)
 
+    if sdfg.backend == dtypes.BackendLanguage.Python:
+        from dace.codegen.py.prettycode import format_python_code
+        for code_object in target_objects:
+            if code_object.language == 'py':
+                code_object.code = format_python_code(code_object.code)
+
     return target_objects
 
 
