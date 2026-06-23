@@ -565,6 +565,92 @@ class TestPipelineStructure:
 
 
 # ============================================================
+# Multi-dim (K=2) data-dependent gather + outer block loop
+# ============================================================
+
+
+class TestMultiDimGather:
+    """End-to-end K=2 structured gather with an OUTER non-tiled loop.
+
+    Mirrors the ICON ``velocity_zekinh`` cell-from-edges interpolation: a
+    3-edge data-dependent gather ``z[edge_blk[jb,jc,e], jk, edge_idx[jb,jc,e]]``
+    weighted by per-edge constants ``e_bln[jb,e,jc]``, with the outer block
+    loop ``jb`` left UNTILED. This exercises, together:
+
+    * ``ct.gather`` with per-source-dim ``_idx_<d>`` index tiles whose
+      ``(ONE, W)`` descriptor is honoured (index-tile reshape);
+    * the grid-dim offset so the body's tile block ids skip the outer ``jb``
+      grid axis;
+    * non-tile dims indexed by their memlet begin (``jb`` / constant edge
+      index) instead of a hard ``0``;
+    * stride-0 broadcast of the constant ``e_bln`` weights across ``jk``.
+    """
+
+    @staticmethod
+    def _build():
+        NB = dace.symbol("NB")
+        NLEV = dace.symbol("NLEV")
+        NPROMA = dace.symbol("NPROMA")
+
+        @dace.program
+        def icon_zekinh_gather(e_bln: dace.float64[(NB * 8), 3, (NPROMA * 8)],
+                               edge_idx: dace.int32[(NB * 8), (NPROMA * 8), 3],
+                               edge_blk: dace.int32[(NB * 8), (NPROMA * 8), 3],
+                               z_kin_hor_e: dace.float64[(NB * 8), (NLEV * 8), (NPROMA * 8)],
+                               z_ekinh: dace.float64[(NB * 8), (NLEV * 8), (NPROMA * 8)]):
+            for jb in range((NB * 8)):
+                for jk in range((NLEV * 8)):
+                    for jc in range((NPROMA * 8)):
+                        z_ekinh[jb, jk, jc] = (
+                            e_bln[jb, 0, jc] * z_kin_hor_e[edge_blk[jb, jc, 0], jk, edge_idx[jb, jc, 0]] +
+                            e_bln[jb, 1, jc] * z_kin_hor_e[edge_blk[jb, jc, 1], jk, edge_idx[jb, jc, 1]] +
+                            e_bln[jb, 2, jc] * z_kin_hor_e[edge_blk[jb, jc, 2], jk, edge_idx[jb, jc, 2]])
+
+        return icon_zekinh_gather.to_sdfg()
+
+    @staticmethod
+    def _reference(e_bln, edge_idx, edge_blk, z):
+        NB8, NLEV8, NPROMA8 = z.shape
+        out = np.zeros((NB8, NLEV8, NPROMA8))
+        for jb in range(NB8):
+            for jk in range(NLEV8):
+                for jc in range(NPROMA8):
+                    out[jb, jk, jc] = sum(e_bln[jb, e, jc] * z[edge_blk[jb, jc, e], jk, edge_idx[jb, jc, e]]
+                                          for e in range(3))
+        return out
+
+    @pytest.mark.parametrize("NB_val", [1, 2])
+    def test_zekinh_gather_matches_numpy(self, NB_val):
+        sdfg = self._build()
+        VectorizeCuTile(widths=(8, 8), branch_mode="merge", nest_map_bodies=False,
+                        insert_data_copies=False).apply_pass(sdfg, {})
+
+        NLEV_val, NPROMA_val = 2, 2
+        NB8, NLEV8, NPROMA8 = NB_val * 8, NLEV_val * 8, NPROMA_val * 8
+        rng = np.random.default_rng(0)
+        e_bln = rng.standard_normal((NB8, 3, NPROMA8))
+        edge_idx = rng.integers(0, NPROMA8, size=(NB8, NPROMA8, 3)).astype(np.int32)
+        edge_blk = rng.integers(0, NB8, size=(NB8, NPROMA8, 3)).astype(np.int32)
+        z = rng.standard_normal((NB8, NLEV8, NPROMA8))
+        ref = self._reference(e_bln, edge_idx, edge_blk, z)
+
+        results = _run_cutile(sdfg, e_bln=e_bln, edge_idx=edge_idx, edge_blk=edge_blk,
+                              z_kin_hor_e=z, z_ekinh=np.zeros((NB8, NLEV8, NPROMA8)),
+                              NB=NB_val, NLEV=NLEV_val, NPROMA=NPROMA_val)
+        np.testing.assert_allclose(results["z_ekinh"], ref, rtol=1e-12, atol=1e-12)
+
+    def test_gather_code_is_pure_cutile(self):
+        """No C++/scalar host index reads survive: the gather lowers to
+        ``ct.gather`` + ``ct.load`` index tiles, no ``std::`` / for-loops."""
+        sdfg = self._build()
+        VectorizeCuTile(widths=(8, 8), branch_mode="merge", nest_map_bodies=False,
+                        insert_data_copies=False).apply_pass(sdfg, {})
+        code = "".join(c.clean_code for c in sdfg.generate_code())
+        assert "ct.gather" in code
+        assert "std::" not in code and "for (" not in code
+
+
+# ============================================================
 # Entry point
 # ============================================================
 

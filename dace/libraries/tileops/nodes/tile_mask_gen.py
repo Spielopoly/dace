@@ -15,7 +15,7 @@ from dace.sdfg import nodes
 from dace.transformation.transformation import ExpandTransformation
 
 from .. import _isa_codegen
-from .._pure_codegen import nested_loops, tile_offset
+from .._pure_codegen import cutile_grid_dim_offset, nested_loops, tile_offset
 
 
 @library.expansion
@@ -76,7 +76,8 @@ class ExpandTileMaskGenCutile(ExpandTransformation):
         global_ubs = list(node.global_ubs)
         K = len(widths)
         shape_tuple = ", ".join(str(w) for w in widths)
-        lines = [f"__pid{k} = ct.bid({k})" for k in range(K)]
+        _goff = cutile_grid_dim_offset(node, parent_state, parent_sdfg, K)
+        lines = [f"__pid{k} = ct.bid({_goff + k})" for k in range(K)]
         for k, (ub, w) in enumerate(zip(global_ubs, widths)):
             lines.append(f"__offsets{k} = ct.arange({w}, dtype=ct.int32)")
             lines.append(f"__mask{k} = __offsets{k} + __pid{k} * {w} < ({ub})")

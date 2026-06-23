@@ -22,6 +22,7 @@ from dace.transformation.passes.vectorization.cutile_lowering import (
     CuTileSetTileStorage,
     CuTileValidateTiles,
 )
+from dace.transformation.passes.vectorization.remove_unused_per_lane_symbols import RemoveUnusedPerLaneSymbols
 from dace.transformation.passes.vectorization.vectorize_cpu_multi_dim import VectorizeCPUMultiDim
 
 
@@ -166,6 +167,16 @@ class VectorizeCuTile(ppl.Pass):
 
         debug_save_sdfg()
         self._vectorizer.apply_pass(sdfg, {})
+        # The inner vectorizer runs with ``expand_tile_nodes=False``, so it
+        # skips its own post-expansion ``RemoveUnusedPerLaneSymbols`` sweep.
+        # The cuTile gather lowering materialises indices as ``_idx_<d>`` index
+        # tiles (consumed by ``ct.gather``), which makes the per-lane scalar
+        # fan-out symbols dead -- their *defining* interstate-edge assignments
+        # still read the index arrays in host code, which validation rejects
+        # once those arrays become ``GPU_Global``. Sweep them here. The pass
+        # only removes symbols with zero remaining references, so it is a no-op
+        # for paths where the per-lane symbols are genuinely used.
+        RemoveUnusedPerLaneSymbols(sweep_dead_index_symbols=True).apply_pass(sdfg, {})
         debug_save_sdfg()
         CuTileValidateTiles(strict=self.strict).apply_pass(sdfg, {})
         debug_save_sdfg()

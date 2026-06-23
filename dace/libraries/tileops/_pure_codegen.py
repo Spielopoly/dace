@@ -32,6 +32,50 @@ def nested_loops(widths: Sequence[int], body: str, indent: str = "    ") -> str:
     return "\n".join(lines)
 
 
+def cutile_grid_dim_offset(node, parent_state, parent_sdfg, K: int) -> int:
+    """Number of enclosing CuTile-map grid dims that precede the K tile dims.
+
+    A tile op runs inside the body of the innermost (tiled) loops, but the
+    enclosing ``CuTile``-scheduled map may also carry OUTER, non-tiled point
+    dims (e.g. an ICON block loop ``jb`` that the K-dim descent leaves
+    untiled). Those become the LEADING grid dimensions of the launched kernel,
+    so the K tile dims occupy grid dims ``offset .. offset + K - 1`` with
+    ``offset = len(map.range) - K``. The cuTile expansions emit
+    ``ct.bid(offset + d)`` for tile dim ``d`` so each per-lane block id reads
+    the correct grid axis.
+
+    The enclosing CuTile map is found by walking the in-state scope chain of
+    ``node`` and, when ``node`` lives in a NestedSDFG body, continuing up
+    through ``parent_nsdfg_node`` to the owning state.
+
+    :param node: The tile-op library node being expanded.
+    :param parent_state: The state that owns ``node``.
+    :param parent_sdfg: The SDFG that owns ``parent_state``.
+    :param K: The tile-op's tile-dim count (``len(widths)``).
+    :returns: The grid-dim offset, or 0 when there is no enclosing CuTile map
+        or it has exactly K dims (the common fully-tiled case, e.g. cuTile V1).
+    """
+    from dace.sdfg import nodes as _nodes
+    from dace import dtypes as _dtypes
+    cur_node = node
+    cur_state = parent_state
+    cur_sdfg = parent_sdfg
+    while cur_state is not None:
+        scope = cur_state.scope_dict()
+        m = scope.get(cur_node)
+        while m is not None:
+            if isinstance(m, _nodes.MapEntry) and m.map.schedule == _dtypes.ScheduleType.CuTile:
+                return max(0, len(m.map.range) - K)
+            m = scope.get(m)
+        nsdfg_node = cur_sdfg.parent_nsdfg_node if cur_sdfg is not None else None
+        if nsdfg_node is None or cur_sdfg.parent is None:
+            break
+        cur_node = nsdfg_node
+        cur_state = cur_sdfg.parent
+        cur_sdfg = cur_state.sdfg
+    return 0
+
+
 def tile_offset(widths: Sequence[int]) -> str:
     """Return the row-major flat offset expression for a register tile.
 

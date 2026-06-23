@@ -1181,8 +1181,14 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
             self._generated_nested_functions[func_name] = func_name
 
         # --- Call site ---
-        call_args: List[str] = [self._resolve_nsdfg_input_var(state, node, c) for c in input_conns]
-        call_args += [self._resolve_nsdfg_output_var(state, node, c) for c in dest_outputs]
+        # Mirror the deduplicated ``param_conns`` order so an in-out array
+        # (a connector that is both an input and a destination output) is
+        # passed exactly once, matching the function's parameter list.
+        input_conn_set = set(input_conns)
+        call_args: List[str] = [
+            self._resolve_nsdfg_input_var(state, node, c)
+            if c in input_conn_set else self._resolve_nsdfg_output_var(state, node, c) for c in param_conns
+        ]
         for sym_name in symbol_names:
             mapping_expr = node.symbol_mapping.get(sym_name)
             call_args.append(symstr(mapping_expr) if mapping_expr is not None else sym_name)

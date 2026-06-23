@@ -11,7 +11,8 @@ from dace import library, properties
 from dace.sdfg import nodes
 from dace.transformation.transformation import ExpandTransformation
 
-from .._pure_codegen import (gather_lane_offset, nested_loops, offset_via_strides, resolve_gather_deps, tile_offset)
+from .._pure_codegen import (cutile_grid_dim_offset, gather_lane_offset, nested_loops, offset_via_strides,
+                             resolve_gather_deps, tile_offset)
 from .. import _isa_codegen
 
 
@@ -159,6 +160,20 @@ class ExpandTileStoreCutile(ExpandTransformation):
 
         dst_edge = next(e for e in parent_state.out_edges(node) if e.src_conn == "_dst")
         dst_arr = parent_sdfg.arrays[dst_edge.data.data]
+        # Absolute element index for each NON-tile destination dim: the memlet's
+        # per-dim begin (e.g. an outer block-loop variable ``jb``). cuTile
+        # indexing spans ALL array dims, so these dims must carry their real
+        # base index, NOT a hard ``0`` (which would pin every block to slice 0
+        # of an outer dim and overwrite the same rows across blocks).
+        try:
+            _dst_begins = [symstr(r[0]) for r in dst_edge.data.subset.ranges]
+        except Exception:  # noqa: BLE001 - fall back to 0 if no usable subset
+            _dst_begins = None
+
+        def _unused_dim_index(d: int) -> str:
+            if _dst_begins is not None and d < len(_dst_begins):
+                return _dst_begins[d]
+            return "0"
 
         # Resolve the stored tile expression per src_kind (mirrors TileLoad).
         if node.src_kind == "Scalar":
@@ -210,12 +225,18 @@ class ExpandTileStoreCutile(ExpandTransformation):
             used_dimensions = tuple(node.dst_dims) if node.dst_dims else tuple(range(ndim - K, ndim))
             coeffs = tuple(node.dim_strides) if node.dim_strides else tuple(1 for _ in range(K))
 
-            lines = [f"__pid{k} = ct.bid({k})" for k in range(K)]
+            _goff = cutile_grid_dim_offset(node, parent_state, parent_sdfg, K)
+            lines = [f"__pid{k} = ct.bid({_goff + k})" for k in range(K)]
 
             idx_entries = []
             for d in range(ndim):
                 if d in gather_set:
                     idx_entries.append(f"_idx_{d}")
+                elif d in used_dimensions and coeffs[used_dimensions.index(d)] == 0:
+                    # Stride-0 = broadcast: tile dim does NOT advance dest dim
+                    # ``d``; the index is the constant memlet begin (a scalar
+                    # ct.scatter broadcasts), mirroring the TileLoad gather path.
+                    idx_entries.append(_unused_dim_index(d))
                 elif d in used_dimensions:
                     k = used_dimensions.index(d)
                     base = f"ct.arange({widths[k]}, dtype=ct.int32) + __pid{k} * {widths[k]}"
@@ -228,7 +249,7 @@ class ExpandTileStoreCutile(ExpandTransformation):
                         lines.append(f"__idx{k} = ct.broadcast_to(({base})[{slicer}], {widths})")
                     idx_entries.append(f"__idx{k}")
                 else:
-                    idx_entries.append("0")
+                    idx_entries.append(_unused_dim_index(d))
 
             if tile_expr != "_src":
                 lines.append(f"__tile = {tile_expr}")
@@ -264,7 +285,8 @@ class ExpandTileStoreCutile(ExpandTransformation):
             coeffs = tuple(1 for _ in range(K))
             is_default_coeffs = True
 
-        lines = [f"__pid{k} = ct.bid({k})" for k in range(K)]
+        _goff = cutile_grid_dim_offset(node, parent_state, parent_sdfg, K)
+        lines = [f"__pid{k} = ct.bid({_goff + k})" for k in range(K)]
 
         if is_default_coeffs and not node.has_mask:
             # Aligned block store. The stored tile must be in array-dim
@@ -282,7 +304,7 @@ class ExpandTileStoreCutile(ExpandTransformation):
                 if d in used_dimensions:
                     index_entries.append(f"__pid{used_dimensions.index(d)}")
                 else:
-                    index_entries.append("0")  # TODO: Where should we get the index for the unused dimensions?
+                    index_entries.append(_unused_dim_index(d))
             if tile_expr != "_src":
                 lines.append(f"__tile = {tile_expr}")
                 tile_expr = "__tile"
@@ -296,7 +318,12 @@ class ExpandTileStoreCutile(ExpandTransformation):
             # tile-dim order (no ct.permute on this path; mirrors ct.gather).
             idx_entries = []
             for d in range(ndim):
-                if d in used_dimensions:
+                if d in used_dimensions and coeffs[used_dimensions.index(d)] == 0:
+                    # Stride-0 = broadcast: tile dim does NOT advance dest dim
+                    # ``d``; the index is the constant memlet begin (a scalar
+                    # ct.scatter broadcasts), mirroring the TileLoad gather path.
+                    idx_entries.append(_unused_dim_index(d))
+                elif d in used_dimensions:
                     k = used_dimensions.index(d)
                     # global element index along this axis:
                     # (tile_start + lane) * coeff.
@@ -311,7 +338,7 @@ class ExpandTileStoreCutile(ExpandTransformation):
                         lines.append(f"__idx{k} = ct.broadcast_to(({base})[{slicer}], {widths})")
                     idx_entries.append(f"__idx{k}")
                 else:
-                    idx_entries.append("0")  # fixed index 0 along unused destination dims
+                    idx_entries.append(_unused_dim_index(d))  # base index along unused destination dims
             if tile_expr != "_src":
                 lines.append(f"__tile = {tile_expr}")
                 tile_expr = "__tile"
