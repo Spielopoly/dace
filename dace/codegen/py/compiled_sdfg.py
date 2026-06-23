@@ -4,7 +4,9 @@
 import builtins
 import linecache
 import types
-from typing import Any, Dict, Optional, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
+
+import numpy as np
 
 if TYPE_CHECKING:
     from dace.codegen.codeobject import CodeObject
@@ -93,6 +95,29 @@ class PythonCompiledSDFG:
         self._init = self._namespace.get(f'__dace_init_{func_name}')
         self._exit = self._namespace.get(f'__dace_exit_{func_name}')
 
+        # --- Return-value metadata ---
+        # Single return (__return) vs tuple return (__return_0, __return_1, ...)
+        self._is_single_value_ret: bool = False
+        if '__return' in self._sdfg.arrays:
+            assert not any(
+                aname.startswith('__return_')
+                for aname in self._sdfg.arrays.keys()
+            )
+            self._is_single_value_ret = True
+
+        # Whether the SDFG has any __return* arrays (cached for fast __call__)
+        self._has_returns: bool = any(
+            aname.startswith('__return') for aname in self._sdfg.arrays
+        )
+
+        # Argument name list for positional arg conversion (includes __return*).
+        # Computed lazily by _get_argnames() because arglist() can fail on
+        # nested SDFGs with undeclared runtime symbols.
+        self._argnames: Optional[List[str]] = None
+
+        # Sorted __return* array names (lazy cache).
+        self._return_names: Optional[List[str]] = None
+
         # Create cached cfunc wrapper for profiler compatibility
         func = self._func
         def _cfunc_wrapper(_handle, *args, **kwargs):
@@ -129,6 +154,18 @@ class PythonCompiledSDFG:
         """
         return self._cfunc_cached
 
+    def _get_argnames(self) -> List[str]:
+        """Return cached arglist keys, computing them lazily.
+
+        Returns ``sdfg.arglist().keys()`` which is equivalent to
+        ``CompiledSDFG.argnames`` for positional-arg mapping.
+        Computed lazily because ``arglist()`` can raise on nested SDFGs
+        with undeclared runtime symbols during ``__init__``.
+        """
+        if self._argnames is None:
+            self._argnames = list(self._sdfg.arglist().keys())
+        return self._argnames
+
     def initialize(self, *args, **kwargs):
         if self._initialized:
             return
@@ -150,11 +187,80 @@ class PythonCompiledSDFG:
         self._initialized = False
         self._finalized = True
 
+    def _get_return_names(self) -> List[str]:
+        """Sorted names of ``__return*`` arrays in the SDFG."""
+        if self._return_names is None:
+            self._return_names = sorted(
+                n for n in self._sdfg.arrays if n.startswith('__return')
+            )
+        return self._return_names
+
+    def _allocate_return_array(self, name: str, syms: Dict[str, Any]) -> np.ndarray:
+        """Allocate a return-value array, evaluating symbolic shapes.
+
+        :param name: The ``__return*`` array name in the SDFG.
+        :param syms: Symbol-to-value mapping for shape evaluation.
+        :returns: A newly allocated numpy (or cupy) array.
+        """
+        from dace import dtypes, symbolic
+
+        desc = self._sdfg.arrays[name]
+        if desc.transient:
+            raise ValueError(
+                f'Used the special array name "{name}" as transient.')
+        shape = tuple(int(symbolic.evaluate(s, syms)) for s in desc.shape)
+        dtype = desc.dtype.as_numpy_dtype()
+        if desc.storage is dtypes.StorageType.GPU_Global:
+            try:
+                import cupy
+                return cupy.empty(shape, dtype=dtype)
+            except (ImportError, ModuleNotFoundError):
+                raise NotImplementedError(
+                    'GPU return values require cupy to be installed')
+        return np.empty(shape, dtype=dtype)
+
     def __call__(self, *args, **kwargs):
-        self.initialize(*args, **kwargs)
-        if self.do_not_execute:
-            return
-        return self._func(*args, **kwargs)
+        # Fast path: no return values -- forward directly
+        if not self._has_returns:
+            self.initialize(*args, **kwargs)
+            if self.do_not_execute:
+                return None
+            return self._func(*args, **kwargs)
+
+        # Convert positional args to keyword args
+        if args:
+            argnames = self._get_argnames()
+            if not argnames:
+                raise KeyError(
+                    "Passed positional arguments to an SDFG that does "
+                    "not accept them.")
+            positional = dict(zip(argnames, args))
+            if not positional.keys().isdisjoint(kwargs.keys()):
+                raise ValueError(
+                    "Arguments passed as both positional and keyword: "
+                    f"{set(positional) & set(kwargs)}")
+            kwargs.update(positional)
+
+        # Resolve symbols for shape evaluation
+        syms = {k: v for k, v in kwargs.items()
+                if k not in self._sdfg.arrays}
+        syms.update(self._sdfg.constants)
+
+        # Allocate (or reuse user-provided) return arrays
+        return_arrays = []
+        for name in self._get_return_names():
+            if name not in kwargs:
+                kwargs[name] = self._allocate_return_array(name, syms)
+            return_arrays.append(kwargs[name])
+
+        self.initialize(**kwargs)
+        if not self.do_not_execute:
+            self._func(**kwargs)
+
+        # Marshal return values
+        if self._is_single_value_ret:
+            return return_arrays[0]
+        return tuple(return_arrays)
 
     def __del__(self):
         try:
