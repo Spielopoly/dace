@@ -908,11 +908,19 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
                         f"{node.data} = ct.load({global_arr}, "
                         f"index=({cutile_index},), shape=({shape_str},))", cfg, state_id)
 
-            elif isinstance(src, (nodes.Tasklet, nodes.NestedSDFG)):
-                # Tasklet/NestedSDFG output -> tile: bind variable
+            elif isinstance(src, nodes.NestedSDFG):
+                # NestedSDFG output -> tile: bind variable. The nested-function
+                # call site only assigns the *connector* name (``conn = func(...)``),
+                # so the rename to this tile's data name must happen here.
                 src_conn = in_edge.src_conn
                 if src_conn is not None and src_conn != node.data:
                     callsite_stream.write(f"{node.data} = {src_conn}", cfg, state_id)
+
+            elif isinstance(src, nodes.Tasklet):
+                # Tasklet output -> tile: the binding (``tile = conn``) is already
+                # emitted by ``_generate_Tasklet``'s output post-bind. Emitting it
+                # here too would duplicate the assignment.
+                pass
 
             elif isinstance(src, nodes.AccessNode):
                 # Tile-to-tile dataflow is a rename of an immutable value.
