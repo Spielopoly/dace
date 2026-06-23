@@ -12,8 +12,8 @@ from dace import library, properties
 from dace.sdfg import nodes
 from dace.transformation.transformation import ExpandTransformation
 
-from .._pure_codegen import (cutile_grid_dim_offset, gather_lane_offset, nested_loops, offset_via_strides,
-                             resolve_gather_deps, tile_offset)
+from .._pure_codegen import (cutile_grid_dim_offset, cutile_tile_dim_bids, gather_lane_offset, nested_loops,
+                             offset_via_strides, resolve_gather_deps, tile_offset)
 from .. import _isa_codegen
 
 #: Map the :attr:`TileLoad.pad_mode` property values to the cuTile
@@ -260,6 +260,12 @@ class ExpandTileLoadCutile(ExpandTransformation):
                 return "0"
 
             used_dimensions = tuple(node.src_dims) if node.src_dims else tuple(range(ndim - K, ndim))
+            # Per-tile-dim grid axis (ct.bid index): resolve each tile dim's
+            # iteration variable to its position in the enclosing CuTile map so a
+            # gather index tile that walks a non-innermost loop reads the right
+            # block id (the positional trailing-K offset is wrong there).
+            _tile_bids = cutile_tile_dim_bids(node, parent_state, parent_sdfg, used_dimensions,
+                                              _src_begins if _src_begins is not None else [], K)
             # cutile currently does not offer a way to reduce the number of indexing dimensions so we need to specify
             # all dimensions
             unused_dimensions = tuple(sorted(set(range(ndim)) - set(used_dimensions)))
@@ -402,8 +408,10 @@ class ExpandTileLoadCutile(ExpandTransformation):
         else:
             raise ValueError(f"TileLoad cutile expansion: unrecognized src_kind {node.src_kind!r}")
         
-        _goff = cutile_grid_dim_offset(node, parent_state, parent_sdfg, K)
-        code = ''.join(f"__pid{d} = ct.bid({_goff + d})\n" for d in range(K))
+        _bids = _tile_bids if node.src_kind == "Tile" else [
+            cutile_grid_dim_offset(node, parent_state, parent_sdfg, K) + d for d in range(K)
+        ]
+        code = ''.join(f"__pid{d} = ct.bid({_bids[d]})\n" for d in range(K))
         code += f"_dst = {src_code}"
         inputs = (set() if node.src_kind == "Symbol" else {"_src"}) | ({"_mask"} if node.has_mask else set())
         inputs |= {f"_idx_{d}" for d in node.gather_dims}

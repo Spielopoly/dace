@@ -137,23 +137,6 @@ class RemoveUnusedPerLaneSymbols(ppl.Pass):
 
     CATEGORY: str = "Vectorization Cleanup"
 
-    sweep_dead_index_symbols = properties.Property(
-        dtype=bool,
-        default=False,
-        desc="Also remove non-lane-id symbols that are defined by an "
-        "interstate-edge assignment and have no remaining reference. The "
-        "indirect-access (gather) frontend stages each index as a "
-        "``<array>_index`` symbol read on an interstate edge; once the cuTile "
-        "gather lowering materialises those indices as ``_idx_<d>`` index "
-        "tiles, the scalar reads are dead. Their defining assignments still "
-        "read the index arrays in host code, which validation rejects once "
-        "those arrays become ``GPU_Global`` -- so the cuTile front door sweeps "
-        "them. Off by default (the CPU path keeps these symbols live).")
-
-    def __init__(self, sweep_dead_index_symbols: bool = False):
-        super().__init__()
-        self.sweep_dead_index_symbols = sweep_dead_index_symbols
-
     def modifies(self) -> ppl.Modifies:
         return ppl.Modifies.Symbols
 
@@ -170,14 +153,6 @@ class RemoveUnusedPerLaneSymbols(ppl.Pass):
         referenced = _collect_referenced_symbols(sdfg)
         # Lane-encoded symbols that are NOT referenced are dead.
         candidates = [s for s in list(sdfg.symbols) if LaneIdScheme.is_laneid(s)]
-        if self.sweep_dead_index_symbols:
-            # Symbols defined only by an interstate-edge assignment (and thus
-            # internal, never a kernel argument) are safe to remove when
-            # unreferenced. ``_collect_referenced_symbols`` is conservative
-            # (over-reports), so a candidate absent from it is provably dead.
-            for edge in sdfg.all_interstate_edges():
-                candidates.extend(edge.data.assignments.keys())
-            candidates = list(dict.fromkeys(candidates))
         for sym in candidates:
             if sym in referenced:
                 # Still referenced somewhere; keep.

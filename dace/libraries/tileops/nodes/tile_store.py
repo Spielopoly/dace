@@ -11,7 +11,7 @@ from dace import library, properties
 from dace.sdfg import nodes
 from dace.transformation.transformation import ExpandTransformation
 
-from .._pure_codegen import (cutile_grid_dim_offset, gather_lane_offset, nested_loops, offset_via_strides,
+from .._pure_codegen import (cutile_tile_dim_bids, gather_lane_offset, nested_loops, offset_via_strides,
                              resolve_gather_deps, tile_offset)
 from .. import _isa_codegen
 
@@ -225,8 +225,9 @@ class ExpandTileStoreCutile(ExpandTransformation):
             used_dimensions = tuple(node.dst_dims) if node.dst_dims else tuple(range(ndim - K, ndim))
             coeffs = tuple(node.dim_strides) if node.dim_strides else tuple(1 for _ in range(K))
 
-            _goff = cutile_grid_dim_offset(node, parent_state, parent_sdfg, K)
-            lines = [f"__pid{k} = ct.bid({_goff + k})" for k in range(K)]
+            _bids = cutile_tile_dim_bids(node, parent_state, parent_sdfg, used_dimensions,
+                                         _dst_begins if _dst_begins is not None else [], K)
+            lines = [f"__pid{k} = ct.bid({_bids[k]})" for k in range(K)]
 
             idx_entries = []
             for d in range(ndim):
@@ -285,8 +286,9 @@ class ExpandTileStoreCutile(ExpandTransformation):
             coeffs = tuple(1 for _ in range(K))
             is_default_coeffs = True
 
-        _goff = cutile_grid_dim_offset(node, parent_state, parent_sdfg, K)
-        lines = [f"__pid{k} = ct.bid({_goff + k})" for k in range(K)]
+        _bids = cutile_tile_dim_bids(node, parent_state, parent_sdfg, used_dimensions,
+                                     _dst_begins if _dst_begins is not None else [], K)
+        lines = [f"__pid{k} = ct.bid({_bids[k]})" for k in range(K)]
 
         if is_default_coeffs and not node.has_mask:
             # Aligned block store. The stored tile must be in array-dim

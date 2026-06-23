@@ -32,28 +32,17 @@ def nested_loops(widths: Sequence[int], body: str, indent: str = "    ") -> str:
     return "\n".join(lines)
 
 
-def cutile_grid_dim_offset(node, parent_state, parent_sdfg, K: int) -> int:
-    """Number of enclosing CuTile-map grid dims that precede the K tile dims.
+def _enclosing_cutile_map(node, parent_state, parent_sdfg):
+    """Return the ``MapEntry`` of the enclosing ``CuTile``-scheduled map.
 
-    A tile op runs inside the body of the innermost (tiled) loops, but the
-    enclosing ``CuTile``-scheduled map may also carry OUTER, non-tiled point
-    dims (e.g. an ICON block loop ``jb`` that the K-dim descent leaves
-    untiled). Those become the LEADING grid dimensions of the launched kernel,
-    so the K tile dims occupy grid dims ``offset .. offset + K - 1`` with
-    ``offset = len(map.range) - K``. The cuTile expansions emit
-    ``ct.bid(offset + d)`` for tile dim ``d`` so each per-lane block id reads
-    the correct grid axis.
-
-    The enclosing CuTile map is found by walking the in-state scope chain of
-    ``node`` and, when ``node`` lives in a NestedSDFG body, continuing up
-    through ``parent_nsdfg_node`` to the owning state.
+    Walks the in-state scope chain of ``node`` and, when ``node`` lives in a
+    NestedSDFG body, continues up through ``parent_nsdfg_node`` to the owning
+    state.
 
     :param node: The tile-op library node being expanded.
     :param parent_state: The state that owns ``node``.
     :param parent_sdfg: The SDFG that owns ``parent_state``.
-    :param K: The tile-op's tile-dim count (``len(widths)``).
-    :returns: The grid-dim offset, or 0 when there is no enclosing CuTile map
-        or it has exactly K dims (the common fully-tiled case, e.g. cuTile V1).
+    :returns: The enclosing CuTile ``MapEntry``, or ``None`` if there is none.
     """
     from dace.sdfg import nodes as _nodes
     from dace import dtypes as _dtypes
@@ -65,7 +54,7 @@ def cutile_grid_dim_offset(node, parent_state, parent_sdfg, K: int) -> int:
         m = scope.get(cur_node)
         while m is not None:
             if isinstance(m, _nodes.MapEntry) and m.map.schedule == _dtypes.ScheduleType.CuTile:
-                return max(0, len(m.map.range) - K)
+                return m
             m = scope.get(m)
         nsdfg_node = cur_sdfg.parent_nsdfg_node if cur_sdfg is not None else None
         if nsdfg_node is None or cur_sdfg.parent is None:
@@ -73,7 +62,83 @@ def cutile_grid_dim_offset(node, parent_state, parent_sdfg, K: int) -> int:
         cur_node = nsdfg_node
         cur_state = cur_sdfg.parent
         cur_sdfg = cur_state.sdfg
-    return 0
+    return None
+
+
+def cutile_grid_dim_offset(node, parent_state, parent_sdfg, K: int) -> int:
+    """Number of enclosing CuTile-map grid dims that precede the K tile dims.
+
+    The cuTile codegen binds ``__pid{d} = ct.bid(d)`` positionally for each
+    dim of the enclosing ``CuTile`` map (``map.range[d]`` -> grid axis ``d``).
+    A tile op runs inside the body of the innermost (tiled) loops; when the map
+    also carries OUTER, non-tiled point dims (e.g. an ICON block loop ``jb``),
+    those are the LEADING grid axes, so a tile op spanning ALL ``K`` tiled dims
+    occupies grid axes ``offset .. offset + K - 1`` with
+    ``offset = len(map.range) - K``.
+
+    This is correct only for a tile op whose K dims ARE the innermost K (the
+    common case: the iteration mask, the main data load/store). For a tile op
+    that tiles a STRICT SUBSET of the tiled dims (e.g. a 1-D gather index tile
+    that depends on a non-innermost loop) use :func:`cutile_tile_dim_bids`,
+    which resolves each tile dim's grid axis individually.
+
+    :param node: The tile-op library node being expanded.
+    :param parent_state: The state that owns ``node``.
+    :param parent_sdfg: The SDFG that owns ``parent_state``.
+    :param K: The tile-op's tile-dim count (``len(widths)``).
+    :returns: The grid-dim offset, or 0 when there is no enclosing CuTile map
+        or it has exactly K dims (the common fully-tiled case, e.g. cuTile V1).
+    """
+    m = _enclosing_cutile_map(node, parent_state, parent_sdfg)
+    return max(0, len(m.map.range) - K) if m is not None else 0
+
+
+def cutile_tile_dim_bids(node, parent_state, parent_sdfg, used_dimensions: Sequence[int],
+                         src_begins: Sequence[str], K: int) -> list:
+    """Resolve the ``ct.bid`` grid axis for each of a load/store's K tile dims.
+
+    The grid axis for tile dim ``d`` is the position, in the enclosing CuTile
+    map's ``params``, of the iteration variable that tile dim ``d`` walks. That
+    variable is the memlet begin of the source/dest array dim the tile dim maps
+    to (``src_begins[used_dimensions[d]]`` -- e.g. ``A[jb, jk:jk+8]`` gives
+    begin ``jk`` for the tiled dim). Matching it to ``map.params`` yields the
+    exact grid axis even when the tile dim is NOT the innermost loop (the
+    positional :func:`cutile_grid_dim_offset` is wrong in that case).
+
+    Falls back to the trailing-K offset for any dim whose variable cannot be
+    matched (e.g. a constant/broadcast dim, whose ``__pid`` is unused anyway),
+    and entirely when there is no resolvable enclosing CuTile map.
+
+    :param node: The tile-op library node being expanded.
+    :param parent_state: The state that owns ``node``.
+    :param parent_sdfg: The SDFG that owns ``parent_state``.
+    :param used_dimensions: Per-tile-dim source/dest array dim index.
+    :param src_begins: Per-source-dim memlet begin expression (as strings).
+    :param K: The tile-op's tile-dim count.
+    :returns: List of ``K`` grid-axis indices, one per tile dim.
+    """
+    import dace.symbolic as _sym
+    m = _enclosing_cutile_map(node, parent_state, parent_sdfg)
+    offset = max(0, len(m.map.range) - K) if m is not None else 0
+    fallback = [offset + d for d in range(K)]
+    if m is None:
+        return fallback
+    params = [str(p) for p in m.map.params]
+    bids = []
+    for d in range(K):
+        sd = used_dimensions[d] if d < len(used_dimensions) else None
+        pos = None
+        if sd is not None and sd < len(src_begins):
+            try:
+                syms = {str(s) for s in _sym.pystr_to_symbolic(str(src_begins[sd])).free_symbols}
+            except Exception:  # noqa: BLE001 - non-symbolic begin -> use the raw string
+                syms = {str(src_begins[sd])}
+            for i, p in enumerate(params):
+                if p in syms:
+                    pos = i
+                    break
+        bids.append(pos if pos is not None else fallback[d])
+    return bids
 
 
 def tile_offset(widths: Sequence[int]) -> str:

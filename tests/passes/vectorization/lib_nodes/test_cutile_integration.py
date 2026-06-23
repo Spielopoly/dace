@@ -599,8 +599,7 @@ class TestMultiDimGather:
     @pytest.mark.parametrize("NB_val", [1, 2])
     def test_zekinh_gather_matches_numpy(self, NB_val):
         sdfg = self._build()
-        VectorizeCuTile(widths=(8, 8), branch_mode="merge", nest_map_bodies=False,
-                        insert_data_copies=False).apply_pass(sdfg, {})
+        VectorizeCuTile(widths=(8, 8), branch_mode="merge").apply_pass(sdfg, {})
 
         NLEV_val, NPROMA_val = 2, 2
         NB8, NLEV8, NPROMA8 = NB_val * 8, NLEV_val * 8, NPROMA_val * 8
@@ -620,11 +619,47 @@ class TestMultiDimGather:
         """No C++/scalar host index reads survive: the gather lowers to
         ``ct.gather`` + ``ct.load`` index tiles, no ``std::`` / for-loops."""
         sdfg = self._build()
-        VectorizeCuTile(widths=(8, 8), branch_mode="merge", nest_map_bodies=False,
-                        insert_data_copies=False).apply_pass(sdfg, {})
+        VectorizeCuTile(widths=(8, 8), branch_mode="merge").apply_pass(sdfg, {})
         code = "".join(c.clean_code for c in sdfg.generate_code())
         assert "ct.gather" in code
         assert "std::" not in code and "for (" not in code
+
+    @pytest.mark.parametrize("NB_val", [1, 2])
+    def test_gather_indexed_by_non_innermost_dim(self, NB_val):
+        """Gather whose index tile walks the MIDDLE tiled loop (``jk``), not the
+        innermost (``jc``). The index ``TileLoad`` is K=1 on a non-trailing tile
+        dim, so the per-lane block id must resolve ``jk``'s grid axis -- the
+        positional trailing-K offset would read the wrong ``ct.bid`` axis."""
+        NB = dace.symbol("NB")
+        NLEV = dace.symbol("NLEV")
+        NPROMA = dace.symbol("NPROMA")
+
+        @dace.program
+        def gather_by_row(row_idx: dace.int32[(NB * 8), (NLEV * 8)],
+                          src: dace.float64[(NB * 8), (NLEV * 8), (NPROMA * 8)],
+                          out: dace.float64[(NB * 8), (NLEV * 8), (NPROMA * 8)]):
+            for jb in range((NB * 8)):
+                for jk in range((NLEV * 8)):
+                    for jc in range((NPROMA * 8)):
+                        out[jb, jk, jc] = src[jb, row_idx[jb, jk], jc]
+
+        sdfg = gather_by_row.to_sdfg()
+        VectorizeCuTile(widths=(8, 8), branch_mode="merge").apply_pass(sdfg, {})
+
+        NLEV_val, NPROMA_val = 2, 2
+        NB8, NLEV8, NPROMA8 = NB_val * 8, NLEV_val * 8, NPROMA_val * 8
+        rng = np.random.default_rng(7)
+        row_idx = rng.integers(0, NLEV8, size=(NB8, NLEV8)).astype(np.int32)
+        src = rng.standard_normal((NB8, NLEV8, NPROMA8))
+        ref = np.zeros((NB8, NLEV8, NPROMA8))
+        for jb in range(NB8):
+            for jk in range(NLEV8):
+                for jc in range(NPROMA8):
+                    ref[jb, jk, jc] = src[jb, row_idx[jb, jk], jc]
+
+        results = _run_cutile(sdfg, row_idx=row_idx, src=src, out=np.zeros((NB8, NLEV8, NPROMA8)),
+                              NB=NB_val, NLEV=NLEV_val, NPROMA=NPROMA_val)
+        np.testing.assert_allclose(results["out"], ref, rtol=1e-12, atol=1e-12)
 
 
 # ============================================================

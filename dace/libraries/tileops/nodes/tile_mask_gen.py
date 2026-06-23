@@ -76,6 +76,12 @@ class ExpandTileMaskGenCutile(ExpandTransformation):
         global_ubs = list(node.global_ubs)
         K = len(widths)
         shape_tuple = ", ".join(str(w) for w in widths)
+        # The iteration mask always spans ALL K tiled dims, which are the
+        # innermost K loops (the ``widths`` innermost-last tiling contract), so
+        # they are the TRAILING K grid axes and any outer/point dims lead. The
+        # positional ``offset = len(map.range) - K`` is therefore exact here.
+        # (The sub-K gather index tiles in TileLoad/TileStore, which may walk a
+        # non-innermost loop, instead resolve each axis via cutile_tile_dim_bids.)
         _goff = cutile_grid_dim_offset(node, parent_state, parent_sdfg, K)
         lines = [f"__pid{k} = ct.bid({_goff + k})" for k in range(K)]
         for k, (ub, w) in enumerate(zip(global_ubs, widths)):
