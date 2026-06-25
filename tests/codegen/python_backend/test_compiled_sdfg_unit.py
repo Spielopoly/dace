@@ -390,3 +390,75 @@ def test_profiler_interface_complete():
     #   compiled_sdfg.do_not_execute = old_dne
     csdfg.do_not_execute = old_dne
     assert csdfg(42) == 42  # back to normal
+
+
+# ---------------------------------------------------------------------------
+# Positional-argument binding (regression: signature order vs arglist order)
+# ---------------------------------------------------------------------------
+#
+# The Python backend used to map positional call args by ``arglist()`` order
+# (canonical/sorted), while the generated function and the C++ backend use
+# ``@dace.program`` *signature* order. A positional call therefore misbound
+# arguments whenever the two orders differed. These tests pin the calling
+# convention: positional args bind by signature order on both code paths
+# (no-returns fast path AND the with-returns path).
+
+def test_positional_args_bind_by_signature_order_no_returns():
+    """Fast path (no return values): positional args bind by signature order."""
+    N = dace.symbol("N")
+
+    # Signature order (zz, aa, out) is deliberately NOT alphabetical, so it
+    # differs from arglist() order; subtraction is asymmetric so a swap shows.
+    @dace.program
+    def prog(zz: dace.float64[N], aa: dace.float64[N], out: dace.float64[N]):
+        out[:] = zz - aa
+
+    sdfg = prog.to_sdfg(simplify=True)
+    sdfg.backend = dace.dtypes.BackendLanguage.Python
+    # Precondition: the two orders really do differ (otherwise the test is moot).
+    assert list(sdfg.arg_names) != list(sdfg.arglist().keys())
+
+    n = 16
+    zz = np.arange(n, dtype=np.float64) + 100.0
+    aa = np.arange(n, dtype=np.float64)
+    out = np.zeros(n)
+    csdfg = sdfg.compile()
+    csdfg(zz, aa, out, N=n)  # positional, signature order
+    np.testing.assert_allclose(out, zz - aa)
+
+
+def test_positional_args_bind_by_signature_order_with_returns():
+    """With return values: positional args still bind by signature order."""
+    N = dace.symbol("N")
+
+    @dace.program
+    def prog(zz: dace.float64[N], aa: dace.float64[N]):
+        return zz - aa
+
+    sdfg = prog.to_sdfg(simplify=True)
+    sdfg.backend = dace.dtypes.BackendLanguage.Python
+
+    n = 16
+    zz = np.arange(n, dtype=np.float64) + 100.0
+    aa = np.arange(n, dtype=np.float64)
+    csdfg = sdfg.compile()
+    result = csdfg(zz, aa, N=n)  # positional, signature order
+    np.testing.assert_allclose(result, zz - aa)
+
+
+def test_positional_keyword_collision_still_raises():
+    """A name passed both positionally and by keyword is rejected."""
+    N = dace.symbol("N")
+
+    @dace.program
+    def prog(aa: dace.float64[N], out: dace.float64[N]):
+        out[:] = aa + 1.0
+
+    sdfg = prog.to_sdfg(simplify=True)
+    sdfg.backend = dace.dtypes.BackendLanguage.Python
+    n = 8
+    aa = np.ones(n)
+    out = np.zeros(n)
+    csdfg = sdfg.compile()
+    with pytest.raises(ValueError, match="both positional and keyword"):
+        csdfg(aa, out, aa=aa, N=n)

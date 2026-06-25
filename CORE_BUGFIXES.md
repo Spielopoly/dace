@@ -514,3 +514,25 @@ bugs.
 - **Use:** several TSVC benchmarks need front/back peeling before the steady-
   state middle vectorizes. Try small ``X``, ``Y`` and keep the peeling only if
   the middle becomes a clean parallel map. (User-requested 2026-05-21.)
+
+### 13. `InvalidSDFGEdgeError.__str__` crashed on a stale edge/state id, masking the real validation error
+- **File:** `dace/sdfg/validation.py` (`InvalidSDFGEdgeError.__str__`)
+- **Bug:** `__str__` did `state = self.sdfg.node(self.state_id)` and
+  `e = state.edges()[self.edge_id]` with no guards. When the graph was mutated
+  between raising the error and formatting it (common when a pass validates,
+  fails, and the message is built later — e.g. the vectorizer's
+  `apply_subpass` wrapper does `f"...: {ex}"`), `edge_id`/`state_id` are stale,
+  so formatting raised `IndexError` / `NodeNotFoundError`. That secondary crash
+  **replaced** the real message (`Memlet subset does not match node dimension
+  (expected 1, got 2)`), turning every such failure into an opaque
+  `IndexError: list index out of range` from deep inside `__str__`.
+- **Fix:** make `__str__` defensive — bounds-check the edge index, guard the
+  state lookup with `except Exception` (a `__str__` must never raise), and fall
+  back to `edge #<id> (no longer present)` / `state #<id>` so `self.message`
+  always surfaces. No behavior change when the indices are valid.
+- **Impact:** unmasked the true errors for 8 NPBench cuTile kernels in the
+  coverage probe (5 `ConvertLengthOneArraysToScalars` + 3 "SDFG invalid after
+  preprocessing" were all this masked crash).
+- **Reproducer:** `tests/sdfg/validation/invalid_edge_error_str_test.py`
+  (build an `InvalidSDFGEdgeError` with an out-of-range `edge_id` and a stale
+  `state_id`; assert `str(err)` does not raise and contains the message).

@@ -1119,20 +1119,32 @@ class InvalidSDFGEdgeError(InvalidSDFGError):
         return dict(message=self.message, cfg_id=self.sdfg.cfg_id, state_id=self.state_id, edge_id=self.edge_id)
 
     def __str__(self):
-        state = self.sdfg.node(self.state_id)
+        # __str__ must never raise: it formats an error message, and a crash
+        # here masks the real validation failure (self.message). The state /
+        # edge indices can be stale if the graph was mutated since the error
+        # was constructed, so every lookup is bounds-/exception-guarded.
+        try:
+            state = self.sdfg.node(self.state_id)
+        except Exception:  # noqa: BLE001 - __str__ must never raise (it formats an error)
+            state = None
 
-        if self.edge_id is not None:
-            e = state.edges()[self.edge_id]
-            edgestr = ", edge %s (%s:%s -> %s:%s)" % (
-                str(e.data),
-                str(e.src),
-                e.src_conn,
-                str(e.dst),
-                e.dst_conn,
-            )
-            locinfo = self._getlineinfo(e.data)
-        else:
-            edgestr = ''
+        edgestr = ''
+        locinfo = ''
+        if state is not None and self.edge_id is not None:
+            edges = state.edges()
+            if 0 <= self.edge_id < len(edges):
+                e = edges[self.edge_id]
+                edgestr = ", edge %s (%s:%s -> %s:%s)" % (
+                    str(e.data),
+                    str(e.src),
+                    e.src_conn,
+                    str(e.dst),
+                    e.dst_conn,
+                )
+                locinfo = self._getlineinfo(e.data)
+            else:
+                edgestr = ", edge #%s (no longer present)" % self.edge_id
+        elif state is not None:
             locinfo = self._getlineinfo(state)
 
         if locinfo:
@@ -1141,7 +1153,8 @@ class InvalidSDFGEdgeError(InvalidSDFGError):
         if self.path:
             locinfo += f'\nInvalid SDFG saved for inspection in {os.path.abspath(self.path)}'
 
-        return f'{self.message} (at state {state.label}{edgestr}){locinfo}'
+        statelabel = state.label if state is not None else ('#%s' % self.state_id)
+        return f'{self.message} (at state {statelabel}{edgestr}){locinfo}'
 
 
 def validate_memlet_data(memlet_data: str, access_data: str) -> bool:

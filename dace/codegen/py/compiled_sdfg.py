@@ -155,15 +155,23 @@ class PythonCompiledSDFG:
         return self._cfunc_cached
 
     def _get_argnames(self) -> List[str]:
-        """Return cached arglist keys, computing them lazily.
+        """Return the ordered argument names for positional-arg mapping.
 
-        Returns ``sdfg.arglist().keys()`` which is equivalent to
-        ``CompiledSDFG.argnames`` for positional-arg mapping.
-        Computed lazily because ``arglist()`` can raise on nested SDFGs
-        with undeclared runtime symbols during ``__init__``.
+        Prefers ``sdfg.arg_names`` (the ``@dace.program`` signature order),
+        matching the C++ :class:`~dace.codegen.compiled_sdfg.CompiledSDFG`
+        calling convention, so a positional call ``csdfg(a, b, c)`` binds the
+        same way on both backends. Falls back to ``sdfg.arglist().keys()``
+        (canonical/sorted order) only when ``arg_names`` is empty (e.g. an
+        SDFG built directly via the API rather than from a ``@dace.program``).
+
+        Computed lazily because ``arglist()`` can raise on nested SDFGs with
+        undeclared runtime symbols during ``__init__``.
         """
         if self._argnames is None:
-            self._argnames = list(self._sdfg.arglist().keys())
+            if self._sdfg.arg_names:
+                self._argnames = list(self._sdfg.arg_names)
+            else:
+                self._argnames = list(self._sdfg.arglist().keys())
         return self._argnames
 
     def initialize(self, *args, **kwargs):
@@ -220,26 +228,31 @@ class PythonCompiledSDFG:
         return np.empty(shape, dtype=dtype)
 
     def __call__(self, *args, **kwargs):
+        # Convert positional args to keyword args by signature order. This must
+        # happen for BOTH the fast (no-returns) and slow paths: the generated
+        # ``self._func`` lists its parameters in arglist (canonical) order, not
+        # ``@dace.program`` signature order, so forwarding positional args raw
+        # would misbind them. Binding by name via ``_get_argnames`` is
+        # order-independent and matches the C++ backend's calling convention.
+        # When the SDFG declares no argument names (an API-built SDFG / raw
+        # code object), fall back to forwarding the positional args unchanged.
+        if args:
+            argnames = self._get_argnames()
+            if argnames:
+                positional = dict(zip(argnames, args))
+                if not positional.keys().isdisjoint(kwargs.keys()):
+                    raise ValueError(
+                        "Arguments passed as both positional and keyword: "
+                        f"{set(positional) & set(kwargs)}")
+                kwargs.update(positional)
+                args = ()
+
         # Fast path: no return values -- forward directly
         if not self._has_returns:
             self.initialize(*args, **kwargs)
             if self.do_not_execute:
                 return None
             return self._func(*args, **kwargs)
-
-        # Convert positional args to keyword args
-        if args:
-            argnames = self._get_argnames()
-            if not argnames:
-                raise KeyError(
-                    "Passed positional arguments to an SDFG that does "
-                    "not accept them.")
-            positional = dict(zip(argnames, args))
-            if not positional.keys().isdisjoint(kwargs.keys()):
-                raise ValueError(
-                    "Arguments passed as both positional and keyword: "
-                    f"{set(positional) & set(kwargs)}")
-            kwargs.update(positional)
 
         # Resolve symbols for shape evaluation
         syms = {k: v for k, v in kwargs.items()
