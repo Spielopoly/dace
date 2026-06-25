@@ -558,6 +558,12 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
         :param sdfg: The SDFG (for symbol resolution).
         :returns: ``True`` if gather/scatter is needed for this tile.
         """
+        # Dimension mismatch: tile has fewer dims than the map
+        # (e.g. after axis reduction).  The direct ct.load/ct.store
+        # path builds an index from ALL map params, which would
+        # produce a rank mismatch.  Route through gather/scatter.
+        if len(tile_shape) < len(entry.map.range):
+            return True
         for d, (start, _, step) in enumerate(entry.map.range):
             start_val = sp.sympify(start)
             step_val = sp.sympify(step)

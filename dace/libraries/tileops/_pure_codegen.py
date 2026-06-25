@@ -8,7 +8,58 @@ pure expansion plugs in its own per-lane body via :func:`nested_loops`
 and uses :func:`tile_offset` to flatten the tile transient's index
 (register tiles are always row-major-contiguous).
 """
+import re as _re
 from typing import Sequence
+
+_CPP_PATTERN = _re.compile(
+    r"std::|"        # C++ namespace qualifier
+    r"->|"           # pointer dereference
+    r";\s*$|"        # trailing semicolons
+    r"\bsizeof\b"    # sizeof operator
+)
+
+
+def validate_cutile_expr(expr: str) -> None:
+    """Raise if *expr* contains obviously-C++ constructs.
+
+    The cuTile expansion emits *expr* verbatim as Python.  A C++-flavored
+    expression would silently produce invalid code.  This check catches the
+    most common cases; it is not exhaustive.
+
+    :param expr: The expression string to validate.
+    :raises ValueError: If a C++ pattern is detected.
+    """
+    m = _CPP_PATTERN.search(expr)
+    if m:
+        raise ValueError(
+            f"cuTile expansion received a C++-flavored expression "
+            f"(matched {m.group()!r}): {expr!r}.  The cuTile expansion "
+            f"emits expressions as Python; use Python-compatible syntax."
+        )
+
+
+_INT32_MAX = 2**31 - 1
+
+
+def needs_int64(desc, coeffs: Sequence[int]) -> bool:
+    """Return True if linearized indices for *desc* could overflow int32.
+
+    Used by the cuTile gather/scatter expansions to pick the index-tile
+    dtype.  Conservatively returns True for symbolic (non-constant) sizes.
+
+    :param desc: An array descriptor (has ``.shape``).
+    :param coeffs: Per-dim stride coefficients.
+    :returns: True if int64 indices are needed for safety.
+    """
+    for d, s in enumerate(desc.shape):
+        try:
+            dim_max = int(s)
+        except (TypeError, ValueError):
+            return True  # symbolic size -> conservatively use int64
+        c = int(coeffs[d]) if d < len(coeffs) else 1
+        if dim_max * max(c, 1) > _INT32_MAX:
+            return True
+    return False
 
 
 def nested_loops(widths: Sequence[int], body: str, indent: str = "    ") -> str:

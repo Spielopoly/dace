@@ -23,7 +23,32 @@ from dace import library, properties
 from dace.sdfg import nodes
 from dace.transformation.transformation import ExpandTransformation
 
-from .._pure_codegen import nested_loops, tile_offset
+from .._cutile_dtypes import dace_dtype_to_cutile_str
+from .._pure_codegen import nested_loops, tile_offset, validate_cutile_expr
+
+
+def _resolve_dst_cutile_dtype(node, parent_state, parent_sdfg):
+    """Resolve the cuTile dtype string for the ``_dst`` output tile.
+
+    Falls back to ``"ct.int32"`` when no descriptor is wired (bare-expansion
+    tests that call ``expansion()`` without a live SDFG).
+
+    :param node: The TileIota library node being expanded.
+    :param parent_state: The SDFGState containing *node*.
+    :param parent_sdfg: The SDFG owning *parent_state*.
+    :returns: A string like ``"ct.int32"`` or ``"ct.float64"``.
+    """
+    if parent_state is None or parent_sdfg is None:
+        return "ct.int32"
+    for edge in parent_state.out_edges(node):
+        if edge.src_conn == "_dst" and edge.data.data:
+            desc = parent_sdfg.arrays.get(edge.data.data)
+            if desc is not None:
+                try:
+                    return dace_dtype_to_cutile_str(desc.dtype)
+                except ValueError:
+                    return "ct.int32"
+    return "ct.int32"
 
 
 @library.expansion
@@ -109,6 +134,12 @@ class ExpandTileIotaCutile(ExpandTransformation):
         K = len(widths)
         inputs = {c: None for c in node.extra_inputs}
 
+        # Validate: reject C++ constructs that would produce invalid Python.
+        validate_cutile_expr(node.expr)
+
+        # Resolve the output tile dtype for ct.arange calls.
+        ct_dtype = _resolve_dst_cutile_dtype(node, parent_state, parent_sdfg)
+
         # Degenerate single-lane case: all widths are 1.
         if all(w == 1 for w in widths):
             expr = node.expr
@@ -131,7 +162,7 @@ class ExpandTileIotaCutile(ExpandTransformation):
 
         # Per-dim lane-index arrays, broadcast to full tile shape for K>=2.
         if K == 1:
-            lines.append(f"__l0 = ct.arange({widths[0]}, dtype=ct.int32)")
+            lines.append(f"__l0 = ct.arange({widths[0]}, dtype={ct_dtype})")
         else:
             for k in range(K):
                 slc = ["None"] * K
@@ -139,7 +170,7 @@ class ExpandTileIotaCutile(ExpandTransformation):
                 slc_str = "[" + ", ".join(slc) + "]"
                 lines.append(
                     f"__l{k} = ct.broadcast_to("
-                    f"ct.arange({widths[k]}, dtype=ct.int32){slc_str}, "
+                    f"ct.arange({widths[k]}, dtype={ct_dtype}){slc_str}, "
                     f"({shape_tuple}))")
 
         # The expression uses __l0..__l{K-1} which are now cuTile arrays.

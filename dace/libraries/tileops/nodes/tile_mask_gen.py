@@ -15,7 +15,13 @@ from dace.sdfg import nodes
 from dace.transformation.transformation import ExpandTransformation
 
 from .. import _isa_codegen
-from .._pure_codegen import cutile_grid_dim_offset, nested_loops, tile_offset
+from .._pure_codegen import (
+    _enclosing_cutile_map,
+    cutile_grid_dim_offset,
+    nested_loops,
+    tile_offset,
+    validate_cutile_expr,
+)
 
 
 @library.expansion
@@ -50,14 +56,61 @@ class ExpandTileMaskGenPure(ExpandTransformation):
         )
 
 
+_INT32_MAX = 2**31 - 1
+
+
+def _mask_needs_int64(global_ubs: list[str]) -> bool:
+    """Return True if any upper-bound expression could exceed int32 range.
+
+    For mask generation, the offset computation is
+    ``ct.arange(W) + ct.bid(axis) * W``, compared against ``ub``.
+    If *ub* is symbolic (not a pure integer literal) or exceeds 2^31-1,
+    we conservatively use int64 to avoid overflow.
+
+    :param global_ubs: Per-dim exclusive upper-bound expression strings.
+    :returns: True if int64 indices are needed.
+    """
+    for ub in global_ubs:
+        try:
+            val = int(ub)
+            if val > _INT32_MAX:
+                return True
+        except (TypeError, ValueError):
+            # Symbolic or complex expression -- conservatively use int64
+            return True
+    return False
+
+
 @library.expansion
 class ExpandTileMaskGenCutile(ExpandTransformation):
     """``cuda.tile``-Python expansion of :class:`TileMaskGen`.
 
     Emits the per-dim ``ct.arange + __pid * W < ub`` shape used by the
-    reference cuTile kernels (see ``manual_cutile_masked.py``). For
+    reference cuTile kernels (see ``manual_cutile_masked.py``).  For
     K=1 the body is a single 1D mask; for K>=2 each per-dim mask is
     broadcast to the full tile shape and combined with ``&``.
+
+    **Supported predicate form:** only the exclusive-upper-bound OOB-tail
+    form ``offset + base < ub`` is supported.  This is by design: the
+    vectorizer always tiles starting at 0 with step W, so the only
+    remainder case is the upper tail.  Lower-bound and arbitrary-predicate
+    masks are out of scope for this node.
+
+    **iter_vars not used in the cuTile path:** the cuTile execution model
+    resolves tile bases via ``ct.bid(axis) * W`` (block-index times tile
+    width), which is the cuTile equivalent of the host-side iteration
+    variable.  The ``iter_vars`` property is used only by the pure/CPP
+    expansion.
+
+    **Guards:**
+
+    - C++-expression validation: ``global_ubs`` are validated against
+      ``validate_cutile_expr`` to reject C++ constructs (``std::``,
+      ``->``, trailing ``;``, ``sizeof``).
+    - Trailing-K grid-axis binding: verifies that the K tiled dims are
+      the trailing params of the enclosing CuTile map.
+    - int64 overflow: uses ``ct.int64`` for offset indices when any
+      upper bound is symbolic or exceeds ``2^31 - 1``.
     """
 
     environments = []
@@ -75,6 +128,30 @@ class ExpandTileMaskGenCutile(ExpandTransformation):
         widths = list(node.widths)
         global_ubs = list(node.global_ubs)
         K = len(widths)
+
+        # --- Guard: reject C++-flavored upper-bound expressions ----------
+        for ub in global_ubs:
+            validate_cutile_expr(ub)
+
+        # --- Guard: verify trailing-K grid-axis binding -------------------
+        # The mask spans ALL K tiled dims, which must be the TRAILING K
+        # params of the enclosing CuTile map.  If they aren't (hand-built
+        # SDFG), the ct.bid() bindings would be wrong.
+        _cutile_map = _enclosing_cutile_map(node, parent_state, parent_sdfg)
+        if _cutile_map is not None:
+            map_params = list(_cutile_map.map.params)
+            trailing_k = map_params[-K:]
+            if list(node.iter_vars) != trailing_k:
+                raise ValueError(
+                    f"TileMaskGen cuTile expansion requires the K={K} "
+                    f"tiled dims to be the trailing grid axes of the "
+                    f"enclosing CuTile map.  Expected trailing params "
+                    f"{trailing_k}, but node.iter_vars={list(node.iter_vars)}."
+                )
+
+        # --- Determine index dtype ----------------------------------------
+        _idx_dtype = "ct.int64" if _mask_needs_int64(global_ubs) else "ct.int32"
+
         shape_tuple = ", ".join(str(w) for w in widths)
         # The iteration mask always spans ALL K tiled dims, which are the
         # innermost K loops (the ``widths`` innermost-last tiling contract), so
@@ -83,9 +160,12 @@ class ExpandTileMaskGenCutile(ExpandTransformation):
         # (The sub-K gather index tiles in TileLoad/TileStore, which may walk a
         # non-innermost loop, instead resolve each axis via cutile_tile_dim_bids.)
         _goff = cutile_grid_dim_offset(node, parent_state, parent_sdfg, K)
+        # iter_vars are NOT used in the cuTile path.  The cuTile model
+        # resolves tile bases via ct.bid(axis) * W, which is equivalent
+        # to the host-side iteration variable binding.
         lines = [f"__pid{k} = ct.bid({_goff + k})" for k in range(K)]
         for k, (ub, w) in enumerate(zip(global_ubs, widths)):
-            lines.append(f"__offsets{k} = ct.arange({w}, dtype=ct.int32)")
+            lines.append(f"__offsets{k} = ct.arange({w}, dtype={_idx_dtype})")
             lines.append(f"__mask{k} = __offsets{k} + __pid{k} * {w} < ({ub})")
         if K == 1:
             lines.append("_o = __mask0")

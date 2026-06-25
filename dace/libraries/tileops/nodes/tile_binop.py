@@ -20,6 +20,7 @@ from dace.sdfg import nodes
 from dace.transformation.transformation import ExpandTransformation
 
 from .._pure_codegen import nested_loops, tile_offset
+from .._cutile_dtypes import dace_dtype_to_cutile_str
 from .. import _isa_codegen
 
 
@@ -283,11 +284,15 @@ _CUTE_OP_EXPR = {
     "+": "({lhs} + {rhs})",
     "-": "({lhs} - {rhs})",
     "*": "({lhs} * {rhs})",
-    # TODO: handle integer division and other differences between Python and C++ semantics (e.g. negative numbers)
+    # Division: Python `/` is true-division (returns float). For integer
+    # operands the DaCe frontend promotes to float64 before creating the
+    # tasklet, so TileBinop(op="/") with integer inputs should not arise
+    # from @dace.program. Defensive float-cast added in expansion() for
+    # hand-built SDFGs.
     "/": "({lhs} / {rhs})",
-    # TODO: address Python's different modulo semantics for negative numbers (math.fmod for floating point) (integers: r = a - (a / b) * b (with C++ division))
-    # (maybe https://stackoverflow.com/questions/34291760/how-to-easily-implement-c-like-modulo-remainder-operation-in-python-2-7 but this is 2.7-specific) (https://en.wikipedia.org/wiki/Modulo#In_programming_languages) (https://www.youtube.com/watch?v=xVNYurap-lk)
-    # actually we decided to just emit python modulo lol
+    # Modulo: Python `%` uses floor-modulo semantics (result sign matches
+    # divisor). The pure C++ path uses dace::math::py_mod() which matches.
+    # Both backends agree — no cross-backend parity issue.
     "%": "({lhs} % {rhs})",
     "<": "({lhs} < {rhs})",
     "<=": "({lhs} <= {rhs})",
@@ -328,30 +333,89 @@ class ExpandTileBinopCutile(ExpandTransformation):
         :param parent_sdfg: SDFG that owns ``parent_state``.
         :returns: A Python-language tasklet with the element-wise body.
         """
+        node.validate(parent_sdfg, parent_state)
 
+        # -- resolve operand and output dtypes for casting logic ----------
+        in_e = {e.dst_conn: e for e in parent_state.in_edges(node) if e.dst_conn is not None}
+        out_edge = next(e for e in parent_state.out_edges(node) if e.src_conn == "_c")
+        out_desc = parent_sdfg.arrays[out_edge.data.data]
+        out_dtype = out_desc.dtype
+
+        def _resolve_operand_dtype() -> dace.dtypes.typeclass:
+            """Find the common operand dtype for casting symbols.
+
+            Mirrors the pure path: prefer a Tile/Scalar operand's
+            descriptor dtype; fall back to the output dtype when both
+            operands are symbols.
+            """
+            for k, c in ((node.kind_a, "_a"), (node.kind_b, "_b")):
+                if k in (_TILE, _SCALAR) and c in in_e:
+                    return parent_sdfg.arrays[in_e[c].data.data].dtype
+            return out_dtype
+
+        operand_dtype = _resolve_operand_dtype()
+
+        def _operand_is_integer(kind: str, conn: str) -> bool:
+            """True if the operand's element dtype is an integer type."""
+            if kind in (_TILE, _SCALAR) and conn in in_e:
+                dt = parent_sdfg.arrays[in_e[conn].data.data].dtype
+                return bool(np.issubdtype(dt.type, np.integer))
+            if kind == _SYMBOL:
+                # Symbol operand: use the resolved operand dtype
+                return bool(np.issubdtype(operand_dtype.type, np.integer))
+            return False
+
+        # -- cuTile operand reference with symbol dtype-casting (A4) ------
         def _cutile_operand(kind, conn, expr):
-            """cuTile operand reference: inline expr for Symbol, the
+            """cuTile operand reference: inline expr for Symbol (with
+            explicit ``ct.astype`` cast to the operand dtype), the
             connector for Tile or Scalar (broadcasts NumPy-style)."""
             if kind == _SYMBOL:
                 from dace.symbolic import symstr
-                return symstr(expr)
+                sym_str = symstr(expr)
+                # Logical ops already cast both sides to ct.bool_ in the
+                # expression template — skip the operand-dtype cast to avoid
+                # redundant double-wrapping.
+                if node.op in ("&&", "||"):
+                    return sym_str
+                ct_dtype = dace_dtype_to_cutile_str(operand_dtype)
+                return f"ct.astype({sym_str}, {ct_dtype})"
             return conn
 
         lhs = _cutile_operand(node.kind_a, "_a", node.expr_a)
         rhs = _cutile_operand(node.kind_b, "_b", node.expr_b)
+
+        # -- A2 / A5: float-cast integer operands for ** and / -----------
+        lhs_int = _operand_is_integer(node.kind_a, "_a")
+        rhs_int = _operand_is_integer(node.kind_b, "_b")
+        needs_float_cast = node.op in ("**", "/") and (lhs_int or rhs_int)
+        if needs_float_cast:
+            # Wrap integer operands in ct.astype(..., ct.float64)
+            if lhs_int:
+                lhs = f"ct.astype({lhs}, ct.float64)"
+            if rhs_int:
+                rhs = f"ct.astype({rhs}, ct.float64)"
+
         rhs_expr = _CUTE_OP_EXPR[node.op].format(lhs=lhs, rhs=rhs)
+
+        # If we float-cast for ** or / and the output is integer, cast back
+        if needs_float_cast and np.issubdtype(out_dtype.type, np.integer):
+            ct_out = dace_dtype_to_cutile_str(out_dtype)
+            rhs_expr = f"ct.astype({rhs_expr}, {ct_out})"
+
+        # -- build input connector set ------------------------------------
         inputs = set()
-        if node.kind_a == _TILE:
+        if node.kind_a in (_TILE, _SCALAR):
             inputs.add("_a")
-        elif node.kind_a == _SCALAR:
-            inputs.add("_a")
-        if node.kind_b == _TILE:
+        if node.kind_b in (_TILE, _SCALAR):
             inputs.add("_b")
-        elif node.kind_b == _SCALAR:
-            inputs.add("_b")
+
+        # -- A3: dtype-aware masked fill value ----------------------------
         if node.has_mask:
             inputs.add("_mask")
-            rhs_expr = f"ct.where(_mask, {rhs_expr}, False)"
+            fill = "False" if out_dtype == dace.bool_ else "0"
+            rhs_expr = f"ct.where(_mask, {rhs_expr}, {fill})"
+
         body = f"_c = {rhs_expr}"
         return nodes.Tasklet(
             label=f"{node.label}_cutile",

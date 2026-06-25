@@ -16,7 +16,11 @@ from dace import library, properties
 from dace.sdfg import nodes
 from dace.transformation.transformation import ExpandTransformation
 
+from .._cutile_dtypes import dace_dtype_to_cutile_str
 from .._pure_codegen import nested_loops
+
+# Backward-compatible alias (tests and other nodes may import the old name).
+_dace_dtype_to_cutile_str = dace_dtype_to_cutile_str
 
 
 def _identity_literal(op: str, ctype: str) -> str:
@@ -57,9 +61,6 @@ def _combine_expr(op: str, acc: str, val: str) -> str:
 
 
 _VALID_OPS = ("+", "*", "min", "max")
-
-
-
 
 @library.expansion
 class ExpandTileReducePure(ExpandTransformation):
@@ -153,91 +154,54 @@ class ExpandTileReducePure(ExpandTransformation):
         )
 
 
-def _is_cutile_float_type(dtype: str) -> bool:
-    """Return True if ``dtype`` is a floating-point type."""
-    return "float" in dtype
+def _identity_literal_cutile(op: str, dtype: "dace.dtypes.typeclass") -> str:
+    """Return a cuTile expression for ``op``'s identity at type ``dtype``.
 
-def _is_cutile_bool_type(dtype: str) -> bool:
-    """Return True if ``dtype`` is a boolean type."""
-    return "bool" in dtype
-
-def _is_cutile_unsigned_int_type(dtype: str) -> bool:
-    """Return True if ``dtype`` is an unsigned integer type."""
-    return "uint" in dtype
-
-def _is_cutile_signed_int_type(dtype: str) -> bool:
-    """Return True if ``dtype`` is a signed integer type."""
-    return "int" in dtype and not _is_cutile_unsigned_int_type(dtype)
-
-def _cutile_integer_bitwidth(dtype: str) -> int:
-    """Return the bitwidth of a cuTile integer type."""
-    def _get_number(s: str) -> int:
-        return int(''.join(filter(str.isdigit, s)))
-    
-    if _is_cutile_unsigned_int_type(dtype):
-        return _get_number(dtype)
-    if _is_cutile_signed_int_type(dtype):
-        return _get_number(dtype)
-    if _is_cutile_bool_type(dtype):
-        return 1
-    raise ValueError(f"not an integer type: {dtype!r}")
-
-
-def _identity_literal_cutile(op: str, dtype: str) -> str:
-    """Return a cuTile expression for the identity of ``op`` at type ``dtype``.
+    The returned string is a Python expression valid inside a ``ct.kernel``
+    (e.g. ``ct.astype(0, ct.float64)``).  ``ct.astype`` takes positional-only
+    arguments so the value and dtype are passed without keyword names.
 
     :param op: One of ``+``, ``*``, ``min``, ``max``.
-    :param dtype: cuTile scalar type name (e.g. ``float32``).
-    :returns: A cuTile expression suitable as the inactive-lane value.
+    :param dtype: A :class:`dace.dtypes.typeclass` (e.g. ``dace.float64``).
+    :returns: A Python expression suitable as the inactive-lane fill value.
     """
+    import numpy as np
+
+    ct_dtype = dace_dtype_to_cutile_str(dtype)
+    nptype = dtype.type  # numpy scalar type, e.g. numpy.float64
+
     if op == "+":
-        return f"ct.astype(0, dtype={dtype})"
-    elif op == "*":
-        return f"ct.astype(1, dtype={dtype})"
-    elif op == "min":
-        if _is_cutile_float_type(dtype):
-            return f"ct.astype(float('inf'), dtype={dtype})"
-        elif _is_cutile_bool_type(dtype):
+        return f"ct.astype(0, {ct_dtype})"
+    if op == "*":
+        return f"ct.astype(1, {ct_dtype})"
+    if op == "min":
+        if np.issubdtype(nptype, np.floating):
+            return f"ct.astype(float('inf'), {ct_dtype})"
+        if np.issubdtype(nptype, np.integer):
+            return f"ct.astype({np.iinfo(nptype).max}, {ct_dtype})"
+        if np.issubdtype(nptype, np.bool_):
             return "True"
-        elif _is_cutile_unsigned_int_type(dtype):
-            bitwidth = _cutile_integer_bitwidth(dtype)
-            return f"ct.astype({2**bitwidth - 1}, dtype={dtype})"
-        elif _is_cutile_signed_int_type(dtype):
-            bitwidth = _cutile_integer_bitwidth(dtype)
-            return f"ct.astype({2**(bitwidth - 1) - 1}, dtype={dtype})"
-        else:
-            raise ValueError(f"unsupported type for min identity: {dtype!r}")
-    elif op == "max":
-        if _is_cutile_float_type(dtype):
-            return f"ct.astype(float('-inf'), dtype={dtype})"
-        elif _is_cutile_bool_type(dtype):
+        raise ValueError(f"unsupported dtype for min identity: {dtype!r}")
+    if op == "max":
+        if np.issubdtype(nptype, np.floating):
+            return f"ct.astype(float('-inf'), {ct_dtype})"
+        if np.issubdtype(nptype, np.integer):
+            return f"ct.astype({np.iinfo(nptype).min}, {ct_dtype})"
+        if np.issubdtype(nptype, np.bool_):
             return "False"
-        elif _is_cutile_unsigned_int_type(dtype):
-            return f"ct.astype(0, dtype={dtype})"
-        elif _is_cutile_signed_int_type(dtype):
-            bitwidth = _cutile_integer_bitwidth(dtype)
-            return f"ct.astype({-2**(bitwidth - 1)}, dtype={dtype})"
-        else:
-            raise ValueError(f"unsupported type for max identity: {dtype!r}")
-    else:
-        raise NotImplementedError(f"unsupported op: {op!r}")
+        raise ValueError(f"unsupported dtype for max identity: {dtype!r}")
+    raise NotImplementedError(f"unsupported op: {op!r}")
 
 @library.expansion
 class ExpandTileReduceCutile(ExpandTransformation):
-    """``cuda.tile``-Python expansion of :class:`TileReduce`.
+    """Expand :class:`TileReduce` to a cuTile Python tasklet.
 
-    Unmasked (``has_mask=False``): ``_dst = ct.sum(_src, axis=...)``
-    (or ``ct.prod`` / ``ct.min`` / ``ct.max``).
+    Masked (``has_mask=True``): cuTile reductions take no ``mask=``
+    argument, so inactive lanes are pre-filled with the op identity
+    (``+`` -> 0, ``*`` -> 1, ``min`` -> ``+inf``, ``max`` -> ``-inf``)
+    via ``ct.where(_mask, _src, IDENTITY)`` before reducing.
 
-    Masked (``has_mask=True``): cuTile reductions take no ``mask=`` /
-    valid-region argument (L-reduce-nomask), so the inactive lanes must
-    be pre-set to the op's identity (``+`` → 0, ``*`` → 1, ``min`` →
-    ``+inf``, ``max`` → ``-inf``) before reducing. Primary form uses
-    ``ct.where(_mask, _src, IDENT)``; the ``_mask`` input is genuinely
-    consumed (fixing the prior dead-connector bug). When ``ct.where`` is
-    known absent, ``+`` / ``*`` fall back to an arithmetic blend, while
-    masked ``min`` / ``max`` raise ``NotImplementedError`` (the
-    ``inf * 0 = NaN`` hazard makes the blend unsafe).
+    Unmasked: the reduction is applied directly to ``_src``.
     """
 
     environments = []
@@ -251,7 +215,6 @@ class ExpandTileReduceCutile(ExpandTransformation):
         :param parent_sdfg: SDFG that owns ``parent_state``.
         :returns: A Python-language tasklet.
         """
-        
         widths = tuple(node.widths)
         op = node.op
 
@@ -261,18 +224,18 @@ class ExpandTileReduceCutile(ExpandTransformation):
             rhs = f"ct.where(_mask, _src, {identity})"
         else:
             rhs = "_src"
-        
+
         if op == "+":
             reduce_expr = f"ct.sum({rhs}, axis={node.axis})"
         elif op == "*":
             reduce_expr = f"ct.prod({rhs}, axis={node.axis})"
-        elif op == "min":   
+        elif op == "min":
             reduce_expr = f"ct.min({rhs}, axis={node.axis})"
         elif op == "max":
             reduce_expr = f"ct.max({rhs}, axis={node.axis})"
         else:
             raise NotImplementedError(f"unsupported op: {op!r}")
-        
+
         body = f"_dst = {reduce_expr}"
 
         inputs = {"_src"} | ({"_mask"} if node.has_mask else set())

@@ -320,22 +320,31 @@ def test_tile_store_cutile_symbol_to_global_broadcasts_then_stores():
 def test_tile_binop_cutile_emits_bare_elementwise_op():
     """TileBinop cutile body emits the operator inline; no ``ct.where`` wrap
     (mask is applied at the scatter store, not at the binop)."""
-    body, _ = _expand_cutile(TileBinop(name="B", widths=(8, ), op="+"))
+    node = TileBinop(name="B", widths=(8,), op="+")
+    ins = {"_a": ("a", (8,), dace.float32), "_b": ("b", (8,), dace.float32)}
+    outs = {"_c": ("c", (8,), dace.float32)}
+    body, _ = _expand_cutile_with_edges(node, in_arrays=ins, out_arrays=outs)
     _assert_parses_as_python(body)
-    assert "_a + _b" in body
+    assert "_a + _b" in body or "(_a + _b)" in body
     assert "ct.where" not in body
 
 
 def test_tile_binop_cutile_symbol_operand_inlines_expr():
     """Symbol-kind RHS embeds the expression literally."""
-    body, _ = _expand_cutile(TileBinop(name="B", widths=(8, ), op="+", kind_b="Symbol", expr_b="alpha"))
+    node = TileBinop(name="B", widths=(8,), op="+", kind_b="Symbol", expr_b="alpha")
+    ins = {"_a": ("a", (8,), dace.float32)}
+    outs = {"_c": ("c", (8,), dace.float32)}
+    body, _ = _expand_cutile_with_edges(node, in_arrays=ins, out_arrays=outs)
     _assert_parses_as_python(body)
     assert "alpha" in body
 
 
 def test_tile_binop_cutile_uses_ct_minimum_for_min():
     """``min`` op routes to ``ct.minimum``."""
-    body, _ = _expand_cutile(TileBinop(name="B", widths=(4, 8), op="min"))
+    node = TileBinop(name="B", widths=(4, 8), op="min")
+    ins = {"_a": ("a", (4, 8), dace.float32), "_b": ("b", (4, 8), dace.float32)}
+    outs = {"_c": ("c", (4, 8), dace.float32)}
+    body, _ = _expand_cutile_with_edges(node, in_arrays=ins, out_arrays=outs)
     _assert_parses_as_python(body)
     assert "ct.minimum(_a, _b)" in body
 
@@ -346,7 +355,8 @@ def test_tile_mask_gen_cutile_1d_uses_arange_and_bid():
     body, _ = _expand_cutile(TileMaskGen(name="M", widths=(8, ), iter_vars=("i", ), global_ubs=("N_ub", )))
     _assert_parses_as_python(body)
     assert "__pid0 = ct.bid(0)" in body
-    assert "ct.arange(8, dtype=ct.int32)" in body
+    # Symbolic UBs ("N_ub") conservatively use int64 to avoid overflow
+    assert "ct.arange(8, dtype=ct.int64)" in body
     assert "__pid0 * 8" in body
     assert "N_ub" in body
     assert "_o = __mask0" in body
@@ -588,13 +598,206 @@ def test_tile_reduce_cutile_inputs_include_mask_when_masked():
 
 
 # ============================================================
+# _dace_dtype_to_cutile_str and _identity_literal_cutile helpers
+# ============================================================
+
+
+def test_dace_dtype_to_cutile_str_float_types():
+    """Float dtypes map to ct.float{16,32,64}."""
+    assert _tile_reduce_mod._dace_dtype_to_cutile_str(dace.float16) == "ct.float16"
+    assert _tile_reduce_mod._dace_dtype_to_cutile_str(dace.float32) == "ct.float32"
+    assert _tile_reduce_mod._dace_dtype_to_cutile_str(dace.float64) == "ct.float64"
+
+
+def test_dace_dtype_to_cutile_str_int_types():
+    """Signed and unsigned int dtypes map correctly."""
+    assert _tile_reduce_mod._dace_dtype_to_cutile_str(dace.int8) == "ct.int8"
+    assert _tile_reduce_mod._dace_dtype_to_cutile_str(dace.int16) == "ct.int16"
+    assert _tile_reduce_mod._dace_dtype_to_cutile_str(dace.int32) == "ct.int32"
+    assert _tile_reduce_mod._dace_dtype_to_cutile_str(dace.int64) == "ct.int64"
+    assert _tile_reduce_mod._dace_dtype_to_cutile_str(dace.uint8) == "ct.uint8"
+    assert _tile_reduce_mod._dace_dtype_to_cutile_str(dace.uint16) == "ct.uint16"
+    assert _tile_reduce_mod._dace_dtype_to_cutile_str(dace.uint32) == "ct.uint32"
+    assert _tile_reduce_mod._dace_dtype_to_cutile_str(dace.uint64) == "ct.uint64"
+
+
+def test_dace_dtype_to_cutile_str_bool():
+    """Bool dtype maps to ct.bool_."""
+    assert _tile_reduce_mod._dace_dtype_to_cutile_str(dace.bool_) == "ct.bool_"
+
+
+def test_dace_dtype_to_cutile_str_unsupported_raises():
+    """Unsupported dtype raises ValueError."""
+    with pytest.raises(ValueError, match="No cuTile dtype mapping"):
+        _tile_reduce_mod._dace_dtype_to_cutile_str(dace.complex64)
+
+
+def test_identity_literal_cutile_sum_float64():
+    """op='+' float64: positional ct.astype(0, ct.float64)."""
+    result = _tile_reduce_mod._identity_literal_cutile("+", dace.float64)
+    assert result == "ct.astype(0, ct.float64)"
+    assert "dtype=" not in result  # no keyword argument
+
+
+def test_identity_literal_cutile_sum_int32():
+    """op='+' int32: positional ct.astype(0, ct.int32)."""
+    result = _tile_reduce_mod._identity_literal_cutile("+", dace.int32)
+    assert result == "ct.astype(0, ct.int32)"
+    assert "dtype=" not in result
+
+
+def test_identity_literal_cutile_prod_float32():
+    """op='*' float32: positional ct.astype(1, ct.float32)."""
+    result = _tile_reduce_mod._identity_literal_cutile("*", dace.float32)
+    assert result == "ct.astype(1, ct.float32)"
+    assert "dtype=" not in result
+
+
+def test_identity_literal_cutile_min_float64():
+    """op='min' float64: ct.astype(float('inf'), ct.float64)."""
+    result = _tile_reduce_mod._identity_literal_cutile("min", dace.float64)
+    assert result == "ct.astype(float('inf'), ct.float64)"
+    assert "dtype=" not in result
+
+
+def test_identity_literal_cutile_min_int32():
+    """op='min' int32: uses numpy.iinfo max value."""
+    import numpy as np
+    result = _tile_reduce_mod._identity_literal_cutile("min", dace.int32)
+    assert result == f"ct.astype({np.iinfo(np.int32).max}, ct.int32)"
+    assert "dtype=" not in result
+
+
+def test_identity_literal_cutile_min_uint8():
+    """op='min' uint8: uses numpy.iinfo max value (255)."""
+    result = _tile_reduce_mod._identity_literal_cutile("min", dace.uint8)
+    assert result == "ct.astype(255, ct.uint8)"
+
+
+def test_identity_literal_cutile_min_bool():
+    """op='min' bool: returns True (identity for AND)."""
+    result = _tile_reduce_mod._identity_literal_cutile("min", dace.bool_)
+    assert result == "True"
+
+
+def test_identity_literal_cutile_max_float64():
+    """op='max' float64: ct.astype(float('-inf'), ct.float64)."""
+    result = _tile_reduce_mod._identity_literal_cutile("max", dace.float64)
+    assert result == "ct.astype(float('-inf'), ct.float64)"
+    assert "dtype=" not in result
+
+
+def test_identity_literal_cutile_max_int32():
+    """op='max' int32: uses numpy.iinfo min value."""
+    import numpy as np
+    result = _tile_reduce_mod._identity_literal_cutile("max", dace.int32)
+    assert result == f"ct.astype({np.iinfo(np.int32).min}, ct.int32)"
+    assert "dtype=" not in result
+
+
+def test_identity_literal_cutile_max_uint8():
+    """op='max' uint8: uses numpy.iinfo min (0)."""
+    result = _tile_reduce_mod._identity_literal_cutile("max", dace.uint8)
+    assert result == "ct.astype(0, ct.uint8)"
+
+
+def test_identity_literal_cutile_max_bool():
+    """op='max' bool: returns False (identity for OR)."""
+    result = _tile_reduce_mod._identity_literal_cutile("max", dace.bool_)
+    assert result == "False"
+
+
+def test_identity_literal_cutile_unsupported_op_raises():
+    """Unsupported op raises NotImplementedError."""
+    with pytest.raises(NotImplementedError, match="unsupported op"):
+        _tile_reduce_mod._identity_literal_cutile("^", dace.float64)
+
+
+def test_identity_literal_cutile_all_results_are_valid_python():
+    """Every identity literal for common dtypes parses as valid Python."""
+    dtypes = [dace.float16, dace.float32, dace.float64,
+              dace.int8, dace.int16, dace.int32, dace.int64,
+              dace.uint8, dace.uint16, dace.uint32, dace.uint64]
+    for op in ("+", "*", "min", "max"):
+        for dt in dtypes:
+            result = _tile_reduce_mod._identity_literal_cutile(op, dt)
+            ast.parse(result, mode="eval")  # must be valid Python expression
+
+
+def test_identity_literal_cutile_no_keyword_dtype_arg():
+    """No identity literal should use 'dtype=' keyword syntax with ct.astype."""
+    dtypes = [dace.float32, dace.float64, dace.int32, dace.int64, dace.uint8]
+    for op in ("+", "*", "min", "max"):
+        for dt in dtypes:
+            result = _tile_reduce_mod._identity_literal_cutile(op, dt)
+            assert "dtype=" not in result, (
+                f"op={op!r}, dtype={dt!r} produced keyword arg: {result!r}"
+            )
+
+
+def test_tile_reduce_cutile_masked_generates_ct_dtype():
+    """Masked reduce body should contain ct.<dtype>, not raw C++ type names."""
+    body, _ = _expand_cutile_with_edges(
+        TileReduce(name="R", widths=(8,), op="+", has_mask=True),
+        in_arrays={
+            "_src": ("src", (8,), dace.float64),
+            "_mask": ("mask", (8,), dace.bool_),
+        },
+        out_arrays={"_dst": ("dst", (1,), dace.float64)},
+    )
+    _assert_parses_as_python(body)
+    # Must use ct.float64, not "double" or "float64" bare
+    assert "ct.float64" in body
+    assert "dtype=" not in body
+
+
+def test_tile_reduce_cutile_masked_min_float32():
+    """Masked min reduce with float32 produces ct.astype(float('inf'), ct.float32)."""
+    body, _ = _expand_cutile_with_edges(
+        TileReduce(name="R", widths=(8,), op="min", has_mask=True),
+        in_arrays={
+            "_src": ("src", (8,), dace.float32),
+            "_mask": ("mask", (8,), dace.bool_),
+        },
+        out_arrays={"_dst": ("dst", (1,), dace.float32)},
+    )
+    _assert_parses_as_python(body)
+    assert "ct.float32" in body
+    assert "float('inf')" in body
+    assert "ct.min" in body
+
+
+def test_tile_reduce_cutile_masked_max_int64():
+    """Masked max reduce with int64 produces ct.astype(<min_int64>, ct.int64)."""
+    import numpy as np
+    body, _ = _expand_cutile_with_edges(
+        TileReduce(name="R", widths=(8,), op="max", has_mask=True),
+        in_arrays={
+            "_src": ("src", (8,), dace.int64),
+            "_mask": ("mask", (8,), dace.bool_),
+        },
+        out_arrays={"_dst": ("dst", (1,), dace.int64)},
+    )
+    _assert_parses_as_python(body)
+    assert "ct.int64" in body
+    # The AST round-trip may rewrite -9223372036854775808 as
+    # (- 9223372036854775808), so check for the absolute value.
+    min_val_abs = str(abs(np.iinfo(np.int64).min))
+    assert min_val_abs in body
+    assert "ct.max" in body
+
+
+# ============================================================
 # TileBinop ** operator
 # ============================================================
 
 
 def test_tile_binop_cutile_power_operator():
     """op='**' emits Python power expression."""
-    body, lang = _expand_cutile(TileBinop(name="P", widths=(8,), op="**"))
+    node = TileBinop(name="P", widths=(8,), op="**")
+    ins = {"_a": ("a", (8,), dace.float32), "_b": ("b", (8,), dace.float32)}
+    outs = {"_c": ("c", (8,), dace.float32)}
+    body, lang = _expand_cutile_with_edges(node, in_arrays=ins, out_arrays=outs)
     _assert_parses_as_python(body)
     assert "**" in body
     assert lang == dace.dtypes.Language.Python
@@ -961,10 +1164,24 @@ def test_tile_store_cutile_gather_idx_connectors():
 # ============================================================
 
 
-def test_tile_store_cutile_wcr_raises():
-    """WCR set on TileStore: cuTile expansion raises NotImplementedError."""
+def test_tile_store_cutile_wcr_sum_supported():
+    """WCR Sum on TileStore: cuTile expansion emits ``ct.atomic_add``."""
     node = TileStore(name="S", widths=(8,), gather_dims=(0,), dim_strides=(0,),
                      wcr="lambda a, b: a + b")
+    ins = {
+        "_src": ("src", (8,), dace.float32),
+        "_idx_0": ("idx0", (8,), dace.int32),
+    }
+    outs = {"_dst": ("dst", (64,), dace.float32)}
+    body, _ = _expand_cutile_with_edges(node, in_arrays=ins, out_arrays=outs)
+    _assert_parses_as_python(body)
+    assert "ct.atomic_add" in body
+
+
+def test_tile_store_cutile_wcr_unsupported_raises():
+    """WCR with unsupported reduction type raises NotImplementedError."""
+    node = TileStore(name="S", widths=(8,), gather_dims=(0,), dim_strides=(0,),
+                     wcr="lambda a, b: a * b")
     ins = {
         "_src": ("src", (8,), dace.float32),
         "_idx_0": ("idx0", (8,), dace.int32),

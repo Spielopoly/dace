@@ -11,8 +11,8 @@ from dace import library, properties
 from dace.sdfg import nodes
 from dace.transformation.transformation import ExpandTransformation
 
-from .._pure_codegen import (cutile_tile_dim_bids, gather_lane_offset, nested_loops, offset_via_strides,
-                             resolve_gather_deps, tile_offset)
+from .._pure_codegen import (cutile_tile_dim_bids, gather_lane_offset, needs_int64, nested_loops,
+                             offset_via_strides, resolve_gather_deps, tile_offset)
 from .. import _isa_codegen
 
 
@@ -131,8 +131,9 @@ class ExpandTileStoreCutile(ExpandTransformation):
       ``ct.arange`` indices, optionally masked and/or scaled by
       ``dim_strides``.
 
-    WCR (atomic scatter) raises ``NotImplementedError`` --- not yet
-    supported by the cuTile backend.
+    WCR (atomic scatter) is supported for ``Sum`` (``ct.atomic_add``),
+    ``Min`` (``ct.atomic_min``), and ``Max`` (``ct.atomic_max``)
+    reduction types.  Other reductions raise ``NotImplementedError``.
     """
 
     environments = []
@@ -149,11 +150,23 @@ class ExpandTileStoreCutile(ExpandTransformation):
         """
         from dace.symbolic import symstr
 
+        # --- WCR (atomic scatter) resolution ---
+        wcr_atomic_fn = None
         if node.wcr is not None:
-            raise NotImplementedError(
-                f"{node.label}: TileStore cuTile expansion does not support WCR "
-                f"(write-conflict resolution); atomic scatter is not yet implemented. "
-                f"Use the pure (CPP) expansion for WCR stores.")
+            from dace.frontend.operations import detect_reduction_type
+            from dace.dtypes import ReductionType
+            red_type = detect_reduction_type(node.wcr)
+            _WCR_ATOMIC_MAP = {
+                ReductionType.Sum: "ct.atomic_add",
+                ReductionType.Min: "ct.atomic_min",
+                ReductionType.Max: "ct.atomic_max",
+            }
+            wcr_atomic_fn = _WCR_ATOMIC_MAP.get(red_type)
+            if wcr_atomic_fn is None:
+                raise NotImplementedError(
+                    f"{node.label}: TileStore cuTile expansion does not support WCR "
+                    f"reduction type {red_type} ({node.wcr!r}). "
+                    f"Supported: Sum (atomic_add), Min (atomic_min), Max (atomic_max).")
 
         widths = tuple(node.widths)
         K = len(widths)
@@ -201,7 +214,9 @@ class ExpandTileStoreCutile(ExpandTransformation):
         # A widths-shaped transient destination is a tile-register fill
         # (e.g. the Symbol const-fill idiom), not a global-memory write:
         # tiles are SSA values in cuTile, so the fill is a plain assignment.
-        is_tile_fill = bool(dst_arr.transient) and tuple(dst_arr.shape) == widths
+        # WCR on a transient tile-register makes no sense (no global memory
+        # race), so WCR stores always fall through to the scatter path.
+        is_tile_fill = bool(dst_arr.transient) and tuple(dst_arr.shape) == widths and wcr_atomic_fn is None
         if is_tile_fill:
             if node.has_mask:
                 tile_expr = f"ct.where(_mask, {tile_expr}, 0)"
@@ -225,6 +240,11 @@ class ExpandTileStoreCutile(ExpandTransformation):
             used_dimensions = tuple(node.dst_dims) if node.dst_dims else tuple(range(ndim - K, ndim))
             coeffs = tuple(node.dim_strides) if node.dim_strides else tuple(1 for _ in range(K))
 
+            # Determine index dtype: use int64 when dest dims or stride
+            # coefficients could produce indices exceeding int32 range.
+            _coeffs_full = list(coeffs) + [1] * (len(dst_arr.shape) - len(coeffs))
+            _idx_dtype = "ct.int64" if needs_int64(dst_arr, _coeffs_full) else "ct.int32"
+
             _bids = cutile_tile_dim_bids(node, parent_state, parent_sdfg, used_dimensions,
                                          _dst_begins if _dst_begins is not None else [], K)
             lines = [f"__pid{k} = ct.bid({_bids[k]})" for k in range(K)]
@@ -240,7 +260,7 @@ class ExpandTileStoreCutile(ExpandTransformation):
                     idx_entries.append(_unused_dim_index(d))
                 elif d in used_dimensions:
                     k = used_dimensions.index(d)
-                    base = f"ct.arange({widths[k]}, dtype=ct.int32) + __pid{k} * {widths[k]}"
+                    base = f"ct.arange({widths[k]}, dtype={_idx_dtype}) + __pid{k} * {widths[k]}"
                     if coeffs[k] != 1:
                         base = f"({base}) * {coeffs[k]}"
                     if K == 1:
@@ -256,8 +276,28 @@ class ExpandTileStoreCutile(ExpandTransformation):
                 lines.append(f"__tile = {tile_expr}")
                 tile_expr = "__tile"
 
-            mask_kw = ", mask=_mask" if node.has_mask else ""
-            lines.append(f"ct.scatter(_dst, ({', '.join(idx_entries)},), {tile_expr}{mask_kw})")
+            # When ndim > K, the incoming tile may be ndim-rank (from ct.load).
+            # Squeeze to K-rank to match K-rank scatter indices.
+            if ndim > K:
+                lines.append(f"__tile_sq = ct.reshape({tile_expr}, {widths})")
+                tile_expr = "__tile_sq"
+
+            if wcr_atomic_fn is not None:
+                # Atomic scatter: use OOB index trick for masking
+                if node.has_mask:
+                    # Replace first tile-dim index with OOB (-1) for masked lanes
+                    first_tile_idx = None
+                    for i, entry in enumerate(idx_entries):
+                        if entry.startswith("__idx") or entry.startswith("_idx_"):
+                            first_tile_idx = i
+                            break
+                    if first_tile_idx is not None:
+                        orig = idx_entries[first_tile_idx]
+                        idx_entries[first_tile_idx] = f"ct.where(_mask, {orig}, -1)"
+                lines.append(f"{wcr_atomic_fn}(_dst, ({', '.join(idx_entries)},), {tile_expr})")
+            else:
+                mask_kw = ", mask=_mask" if node.has_mask else ""
+                lines.append(f"ct.scatter(_dst, ({', '.join(idx_entries)},), {tile_expr}{mask_kw})")
 
             inputs |= {f"_idx_{d}" for d in node.gather_dims}
 
@@ -286,11 +326,16 @@ class ExpandTileStoreCutile(ExpandTransformation):
             coeffs = tuple(1 for _ in range(K))
             is_default_coeffs = True
 
+        # Determine index dtype: use int64 when dest dims or stride
+        # coefficients could produce indices exceeding int32 range.
+        _coeffs_full = list(coeffs) + [1] * (len(dst_arr.shape) - len(coeffs))
+        _idx_dtype = "ct.int64" if needs_int64(dst_arr, _coeffs_full) else "ct.int32"
+
         _bids = cutile_tile_dim_bids(node, parent_state, parent_sdfg, used_dimensions,
                                      _dst_begins if _dst_begins is not None else [], K)
         lines = [f"__pid{k} = ct.bid({_bids[k]})" for k in range(K)]
 
-        if is_default_coeffs and not node.has_mask:
+        if is_default_coeffs and not node.has_mask and wcr_atomic_fn is None:
             # Aligned block store. The stored tile must be in array-dim
             # order with singleton extents on unused dims: insert the
             # singleton axes first (tile axes then follow ``all_dimensions``
@@ -313,11 +358,12 @@ class ExpandTileStoreCutile(ExpandTransformation):
             lines.append(f"ct.store(_dst, index=({', '.join(index_entries)},), tile={tile_expr})")
         else:
             # General case: a lane mask and/or a non-unit per-tile-dim
-            # coefficient ⇒ no aligned block tile, so build explicit
-            # per-destination-dim index tiles and ct.scatter (the only
-            # lane-masked write cuTile offers — L-store-nomask). Index
-            # entries are built per tile axis, so the stored tile stays in
-            # tile-dim order (no ct.permute on this path; mirrors ct.gather).
+            # coefficient and/or WCR => no aligned block tile, so build
+            # explicit per-destination-dim index tiles and ct.scatter (the
+            # only lane-masked write cuTile offers -- L-store-nomask).
+            # Index entries are built per tile axis, so the stored tile
+            # stays in tile-dim order (no ct.permute on this path; mirrors
+            # ct.gather).
             idx_entries = []
             for d in range(ndim):
                 if d in used_dimensions and coeffs[used_dimensions.index(d)] == 0:
@@ -329,7 +375,7 @@ class ExpandTileStoreCutile(ExpandTransformation):
                     k = used_dimensions.index(d)
                     # global element index along this axis:
                     # (tile_start + lane) * coeff.
-                    base = f"ct.arange({widths[k]}, dtype=ct.int32) + __pid{k} * {widths[k]}"
+                    base = f"ct.arange({widths[k]}, dtype={_idx_dtype}) + __pid{k} * {widths[k]}"
                     if coeffs[k] != 1:
                         base = f"({base}) * {coeffs[k]}"
                     if K == 1:
@@ -344,8 +390,29 @@ class ExpandTileStoreCutile(ExpandTransformation):
             if tile_expr != "_src":
                 lines.append(f"__tile = {tile_expr}")
                 tile_expr = "__tile"
-            mask_kw = ", mask=_mask" if node.has_mask else ""
-            lines.append(f"ct.scatter(_dst, ({', '.join(idx_entries)},), {tile_expr}{mask_kw})")
+
+            # When ndim > K, the incoming tile may be ndim-rank (from ct.load).
+            # Squeeze to K-rank to match K-rank scatter indices.
+            if ndim > K:
+                lines.append(f"__tile_sq = ct.reshape({tile_expr}, {widths})")
+                tile_expr = "__tile_sq"
+
+            if wcr_atomic_fn is not None:
+                # Atomic scatter: use OOB index trick for masking
+                if node.has_mask:
+                    # Replace first tile-dim index with OOB (-1) for masked lanes
+                    first_tile_idx = None
+                    for i, entry in enumerate(idx_entries):
+                        if entry.startswith("__idx"):
+                            first_tile_idx = i
+                            break
+                    if first_tile_idx is not None:
+                        orig = idx_entries[first_tile_idx]
+                        idx_entries[first_tile_idx] = f"ct.where(_mask, {orig}, -1)"
+                lines.append(f"{wcr_atomic_fn}(_dst, ({', '.join(idx_entries)},), {tile_expr})")
+            else:
+                mask_kw = ", mask=_mask" if node.has_mask else ""
+                lines.append(f"ct.scatter(_dst, ({', '.join(idx_entries)},), {tile_expr}{mask_kw})")
 
         return nodes.Tasklet(
             label=f"{node.label}_cutile",
