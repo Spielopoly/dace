@@ -34,9 +34,6 @@ _SCOPE_IN_PREFIX: str = "IN_"
 #: Prefix for inner (output) scope connectors on a MapEntry / MapExit.
 _SCOPE_OUT_PREFIX: str = "OUT_"
 
-# ---------------------------------------------------------------------------
-# Connector helpers
-# ---------------------------------------------------------------------------
 
 
 def _matching_inner_connector(outer_conn: str) -> str:
@@ -61,11 +58,6 @@ def _matching_outer_connector(inner_conn: str) -> str:
     if not inner_conn.startswith(_SCOPE_OUT_PREFIX):
         raise ValueError(f"Expected connector starting with {_SCOPE_OUT_PREFIX!r}, got {inner_conn!r}")
     return _SCOPE_IN_PREFIX + inner_conn[len(_SCOPE_OUT_PREFIX):]
-
-
-# ---------------------------------------------------------------------------
-# Existing helper functions (kept with type hint updates)
-# ---------------------------------------------------------------------------
 
 
 def _array_runtime_name(sdfg: "SDFG", name: str) -> str:
@@ -235,8 +227,6 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
         # storage types that can appear in SDFG edges touching tile transients.
         _tile_peer_storages = [
             dtypes.StorageType.GPU_Global,
-            dtypes.StorageType.CPU_Heap,
-            dtypes.StorageType.CPU_Pinned,
             dtypes.StorageType.Register,
         ]
         _copy_schedules = [dtypes.ScheduleType.CuTile, None]
@@ -478,11 +468,11 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
 
         For CPU_Heap -> GPU_Global (copy-in), emits::
 
-            dst[:].set(src)
+            dst.set(src)
 
         For GPU_Global -> CPU_Heap (copy-out), emits::
 
-            src.get(out=dst[:])
+            src.get(out=dst)
 
         When the memlet carries subsets, the subset is applied to both
         source and destination expressions.  For full-array copies
@@ -512,9 +502,9 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
             if dst_subset_str:
                 dst_lhs = f"{dst_node.data}[{dst_subset_str}]"
             else:
-                dst_lhs = f"{dst_node.data}[:]"
+                dst_lhs = f"{dst_node.data}"
         else:
-            dst_lhs = f"{dst_node.data}[:]"
+            dst_lhs = f"{dst_node.data}"
 
         if cpu_to_gpu:
             callsite_stream.write(f"{dst_lhs}.set({src_expr})", cfg, state_id)
