@@ -1,6 +1,6 @@
 # Copyright 2019-2026 ETH Zurich and the DaCe authors. All rights reserved.
 """``MemsetLibraryNode`` representing 0-memsets."""
-from typing import List, Tuple
+from typing import List, Tuple, Union
 
 import dace
 from dace import library, nodes
@@ -9,7 +9,8 @@ from dace.sdfg.scope import is_devicelevel_gpu
 from dace.transformation.transformation import ExpandTransformation
 from .. import environments
 
-from dace.libraries.standard.helper import CURRENT_STREAM_NAME, auto_dispatch, collapse_shape_and_strides
+from dace.libraries.standard.helper import (CURRENT_STREAM_NAME, auto_dispatch, collapse_shape_and_strides,
+                                              is_python_backend)
 
 
 def _make_memset_skeleton(node: "MemsetLibraryNode",
@@ -81,6 +82,11 @@ def select_memset_implementation(node: "MemsetLibraryNode", parent_state: dace.S
     :returns: One of ``'pure'``, ``'CUDA'``, or ``'CPU'``.
     """
     _out_name, out, out_subset = node.validate(parent_state.sdfg, parent_state)
+
+    if is_python_backend(parent_state):
+        if out_subset.num_elements_exact() == 1:
+            return 'tasklet'
+        return 'Python'
 
     if is_devicelevel_gpu(parent_state.sdfg, parent_state, node):
         if out_subset.num_elements_exact() == 1:
@@ -185,6 +191,64 @@ class ExpandTasklet(ExpandTransformation):
                              language=dace.Language.Python)
 
 
+@library.expansion
+class ExpandPython(ExpandTransformation):
+    """Expand a memset as a Sequential mapped-tasklet ``_out = 0`` inside a
+    wrapper SDFG.  Safe for the Python backend (no ``GPU_Device`` schedule,
+    no C++ intrinsics).  For GPU-resident arrays, returns a bare Tasklet
+    instead -- the Python backend emits ``arr[...] = 0`` via slice
+    assignment, which CuPy handles through broadcasting.
+    """
+
+    environments = []
+
+    @staticmethod
+    def expansion(
+        node: 'MemsetLibraryNode',
+        parent_state: 'dace.sdfg.SDFGState',
+        parent_sdfg: 'dace.SDFG',
+    ) -> Union[nodes.Tasklet, dace.SDFG]:
+        sdfg, state, out_name, out, map_lengths = _make_memset_skeleton(
+            node, parent_state)
+        inner_out_desc = sdfg.arrays[out_name]
+
+        # Bare Tasklet for single-element, or GPU-resident arrays where a
+        # host-side Sequential map cannot access device memory.  The Python
+        # backend emits ``arr[...] = 0`` via slice assignment which numpy /
+        # CuPy handle through broadcasting.
+        if not map_lengths or inner_out_desc.storage in (
+                dace.StorageType.GPU_Global, dace.StorageType.GPU_Shared):
+            return nodes.Tasklet(
+                '_memset_',
+                {},
+                {MemsetLibraryNode.OUTPUT_CONNECTOR_NAME: inner_out_desc.dtype},
+                f'{MemsetLibraryNode.OUTPUT_CONNECTOR_NAME} = 0',
+                language=dace.Language.Python,
+            )
+
+        # CPU multi-element: Sequential mapped tasklet.
+        map_params = [f'__i{i}' for i in range(len(map_lengths))]
+        map_rng = {p: f'0:{s}' for p, s in zip(map_params, map_lengths)}
+        inner_out = '_out'
+        outputs = {
+            inner_out:
+            dace.Memlet(
+                data=out_name,
+                subset=','.join(map_params),
+            )
+        }
+        state.add_mapped_tasklet(
+            name='memset',
+            map_ranges=map_rng,
+            inputs={},
+            code=f'{inner_out} = 0',
+            outputs=outputs,
+            schedule=dace.ScheduleType.Sequential,
+            external_edges=True,
+        )
+        return sdfg
+
+
 @library.node
 class MemsetLibraryNode(nodes.LibraryNode):
     """Library node representing a 0-memset over a contiguous output subset.
@@ -200,7 +264,8 @@ class MemsetLibraryNode(nodes.LibraryNode):
         "pure": ExpandPure,
         "CUDA": ExpandCUDA,
         "CPU": ExpandCPU,
-        "tasklet": ExpandTasklet
+        "tasklet": ExpandTasklet,
+        "Python": ExpandPython,
     }
     default_implementation = 'Auto'
 

@@ -35,6 +35,19 @@ def collapse_shape_and_strides(
     return collapsed_shape, collapsed_strides
 
 
+def is_python_backend(parent_state: 'dace.sdfg.SDFGState') -> bool:
+    """Check whether the root SDFG targets the Python backend.
+
+    :param parent_state: The state containing the library node being expanded.
+    :returns: True if the root SDFG's backend is Python.
+    """
+    try:
+        from dace import dtypes
+        return parent_state.sdfg.root_sdfg.backend == dtypes.BackendLanguage.Python
+    except (AttributeError, IndexError, RuntimeError):
+        return False
+
+
 def auto_dispatch(node: nodes.LibraryNode, parent_state: dace.SDFGState,
                   select_fn: Callable[[nodes.LibraryNode, dace.SDFGState], str], library_cls: type):
     """Dispatch a library node's ``'Auto'`` implementation to the one picked by ``select_fn``.
