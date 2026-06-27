@@ -121,12 +121,7 @@ def _ordered_unique(items: Iterable[str]) -> List[str]:
     :param items: Iterable of strings.
     :returns: Sorted list of unique strings.
     """
-    seen: Dict[str, None] = {}
-    for x in items:
-        if x not in seen:
-            seen[x] = None
-    return sorted(list(seen.keys()))
-
+    return sorted(set(items))
 
 def _collect_free_symbols(entry: nodes.MapEntry, dfg_scope: object, sdfg: "SDFG") -> List[str]:
     """Collect free symbols used in a map scope.

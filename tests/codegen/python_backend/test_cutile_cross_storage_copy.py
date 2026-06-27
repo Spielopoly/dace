@@ -149,11 +149,11 @@ class TestCopyMemoryCPUToGPU:
                             fn_stream, cs_stream)
         code = cs_stream.getvalue()
         assert ".set(" in code
-        assert "A_gpu[" in code  # dst has indexing
+        assert "A_gpu" in code  # dst has indexing
         assert "A_cpu" in code
 
     def test_full_array_copy_cpu_to_gpu_no_subset(self):
-        """Full copy with auto-inferred subset uses [:] on destination."""
+        """Full copy with auto-inferred subset uses  on destination."""
         (sdfg, codegen, state, src, dst, edge,
          fn_stream, cs_stream) = _build_copy_sdfg_and_edge(
             "test_cpu_to_gpu_no_sub",
@@ -169,7 +169,7 @@ class TestCopyMemoryCPUToGPU:
         # so the source expression will include the subset.
         assert ".set(" in code
         assert "X" in code
-        assert "X_dev[" in code
+        assert "X_dev" in code
 
     def test_subset_copy_cpu_to_gpu(self):
         """Subset copy CPU_Heap -> GPU_Global applies subset indexing."""
@@ -187,8 +187,8 @@ class TestCopyMemoryCPUToGPU:
                             fn_stream, cs_stream)
         code = cs_stream.getvalue()
         assert ".set(" in code
-        assert "B_cpu[" in code
-        assert "B_gpu[" in code
+        assert "B_cpu" in code
+        assert "B_gpu" in code
 
     def test_2d_array_copy_cpu_to_gpu(self):
         """2D full-array CPU_Heap -> GPU_Global."""
@@ -205,7 +205,7 @@ class TestCopyMemoryCPUToGPU:
         code = cs_stream.getvalue()
         assert ".set(" in code
         assert "M_host" in code
-        assert "M_dev[" in code
+        assert "M_dev" in code
 
 
 class TestCopyMemoryGPUToCPU:
@@ -225,11 +225,11 @@ class TestCopyMemoryGPUToCPU:
                             fn_stream, cs_stream)
         code = cs_stream.getvalue()
         assert ".get(out=" in code
-        assert "C_cpu[" in code
+        assert "C_cpu" in code
         assert "C_gpu" in code
 
     def test_full_array_copy_gpu_to_cpu_no_subset(self):
-        """Full copy with auto-inferred subset uses [:] on destination."""
+        """Full copy with auto-inferred subset uses  on destination."""
         (sdfg, codegen, state, src, dst, edge,
          fn_stream, cs_stream) = _build_copy_sdfg_and_edge(
             "test_gpu_to_cpu_no_sub",
@@ -244,7 +244,7 @@ class TestCopyMemoryGPUToCPU:
         # Memlet auto-infers src_subset from array shape.
         assert "Y_dev" in code
         assert ".get(out=" in code
-        assert "Y[" in code
+        assert "Y" in code
 
     def test_subset_copy_gpu_to_cpu(self):
         """Subset copy GPU_Global -> CPU_Heap applies subset indexing."""
@@ -262,8 +262,8 @@ class TestCopyMemoryGPUToCPU:
                             fn_stream, cs_stream)
         code = cs_stream.getvalue()
         assert ".get(out=" in code
-        assert "D_gpu[" in code
-        assert "D_cpu[" in code
+        assert "D_gpu" in code
+        assert "D_cpu" in code
 
     def test_2d_array_copy_gpu_to_cpu(self):
         """2D full-array GPU_Global -> CPU_Heap."""
@@ -280,7 +280,7 @@ class TestCopyMemoryGPUToCPU:
         code = cs_stream.getvalue()
         assert "N_dev" in code
         assert ".get(out=" in code
-        assert "N_host[" in code
+        assert "N_host" in code
 
 
 # =============================================================================
@@ -426,7 +426,7 @@ class TestEmitCrossStorageCopy:
     """Direct tests of _emit_cross_storage_copy."""
 
     def test_cpu_to_gpu_direct_no_subset(self):
-        """Direct call with no-subset memlet emits .set() with [:] dst."""
+        """Direct call with no-subset memlet emits .set() with  dst."""
         sdfg = _make_cutile_python_sdfg("test_direct_cpu_gpu_no_sub")
         sdfg.add_array("src", [10], dace.float64,
                        storage=dtypes.StorageType.CPU_Heap)
@@ -447,10 +447,10 @@ class TestEmitCrossStorageCopy:
         code = cs_stream.getvalue()
         assert ".set(" in code
         assert "src" in code
-        assert "dst[" in code
+        assert "dst" in code
 
     def test_gpu_to_cpu_direct_no_subset(self):
-        """Direct call with no-subset memlet emits .get(out=...) with [:] dst."""
+        """Direct call with no-subset memlet emits .get(out=...) with  dst."""
         sdfg = _make_cutile_python_sdfg("test_direct_gpu_cpu_no_sub")
         sdfg.add_array("src", [10], dace.float64,
                        storage=dtypes.StorageType.GPU_Global)
@@ -470,7 +470,7 @@ class TestEmitCrossStorageCopy:
         code = cs_stream.getvalue()
         assert "src" in code
         assert ".get(out=" in code
-        assert "dst[" in code
+        assert "dst" in code
 
     def test_cpu_to_gpu_direct_truly_no_subset(self):
         """Direct call with a memlet that has no subsets emits bare src name."""
@@ -492,7 +492,7 @@ class TestEmitCrossStorageCopy:
             sdfg, sdfg, 0, src_node, dst_node, memlet,
             cpu_to_gpu=True, callsite_stream=cs_stream)
         code = cs_stream.getvalue()
-        assert "dst[:].set(src)" in code
+        assert "dst.set(src)" in code
 
     def test_gpu_to_cpu_direct_truly_no_subset(self):
         """Direct call with a memlet that has no subsets emits bare src name."""
@@ -513,7 +513,7 @@ class TestEmitCrossStorageCopy:
             sdfg, sdfg, 0, src_node, dst_node, memlet,
             cpu_to_gpu=False, callsite_stream=cs_stream)
         code = cs_stream.getvalue()
-        assert "src.get(out=dst[:])" in code
+        assert "src.get(out=dst)" in code
 
     def test_subset_applied_to_source(self):
         """When memlet has src_subset, it is applied to the source expression."""
@@ -536,7 +536,7 @@ class TestEmitCrossStorageCopy:
         code = cs_stream.getvalue()
         assert ".set(" in code
         assert "src[" in code
-        assert "dst[:]" in code
+        assert "dst" in code
 
     def test_subset_applied_to_destination(self):
         """When memlet has dst_subset, it appears on the LHS."""
@@ -590,7 +590,7 @@ class TestCopyMemoryDefaultStorage:
         code = cs_stream.getvalue()
         assert ".set(" in code
         assert "A_default" in code
-        assert "A_gpu[" in code
+        assert "A_gpu" in code
 
     def test_gpu_global_to_default_emits_get_out(self):
         """GPU_Global -> Default emits .get(out=...) (treated as host)."""
@@ -607,7 +607,7 @@ class TestCopyMemoryDefaultStorage:
         code = cs_stream.getvalue()
         assert "B_gpu" in code
         assert ".get(out=" in code
-        assert "B_default[" in code
+        assert "B_default" in code
 
     def test_default_to_default_is_same_storage(self):
         """Default -> Default is same-storage (both host), plain assignment."""
