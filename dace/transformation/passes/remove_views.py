@@ -46,6 +46,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from dace import SDFG, SDFGState, config, data as dt, dtypes, properties, subsets, symbolic
 from dace.frontend.python import astutils
+from dace.properties import CodeBlock
 from dace.sdfg import nodes as nd, utils as sdutil, graph as gr
 from dace.transformation import pass_pipeline as ppl, transformation
 
