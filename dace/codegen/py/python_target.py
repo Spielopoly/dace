@@ -186,8 +186,16 @@ class PythonCodeGen(PythonTargetCodeGenerator):
             ]}
 
     def preprocess(self, sdfg: SDFG) -> None:
-        # TODO: Maybe apply copy-node transformations
-        pass
+        """Strip remaining View access nodes before Python backend codegen.
+
+        The Python backend does not support View access nodes and raises
+        ``NotImplementedError`` when one is encountered during code generation.
+        Therefore we hopefully remove them here
+        """
+        from dace.transformation.passes.remove_views import RemoveViews
+        remove_views = RemoveViews()
+        for nsdfg in sdfg.all_sdfgs_recursive():
+            remove_views.apply_pass(nsdfg, {})
 
     @property
     def has_initializer(self):
