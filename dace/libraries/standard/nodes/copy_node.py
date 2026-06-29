@@ -6,7 +6,8 @@ from typing import List, Optional
 import dace
 from dace import data, library, nodes, dtypes, symbolic
 from dace.codegen.common import sym2cpp, get_gpu_backend
-from dace.libraries.standard.helper import CURRENT_STREAM_NAME, auto_dispatch, collapse_shape_and_strides
+from dace.libraries.standard.helper import (CURRENT_STREAM_NAME, auto_dispatch, collapse_shape_and_strides,
+                                              is_python_backend)
 from dace.sdfg.scope import is_devicelevel_gpu, is_in_scope
 from dace.transformation.transformation import ExpandTransformation
 from .. import environments
@@ -91,6 +92,11 @@ def select_copy_implementation(node: "CopyLibraryNode", parent_state: dace.SDFGS
     # (its 0-D map crashes in memlet propagation). Steps 1 and 2 handle
     # the single-element case explicitly.
     single_elt = (in_subset.num_elements_exact() == 1 and out_subset.num_elements_exact() == 1)
+
+    if is_python_backend(parent_state):
+        if single_elt and not _is_cross_cpu_gpu(inp.storage, out.storage, node, parent_state):
+            return 'Tasklet'
+        return 'Python'
 
     # 1. GPU_Shared involvement. Block-cooperative ``SharedMemoryCollective``
     # (``dace::CopyND<>`` + ``__syncthreads()``) unless the copy is
@@ -785,6 +791,39 @@ class ExpandSharedMemoryCollective(ExpandTransformation):
                              language=dace.Language.CPP)
 
 
+@library.expansion
+class ExpandPython(ExpandTransformation):
+    """Expand a copy as a bare AccessNode-to-AccessNode edge inside a wrapper
+    SDFG.  The Python / cuTile backend dispatches this edge through its
+    existing ``copy_memory`` handler (``.set()`` / ``.get(out=...)`` for
+    cross-storage, plain assignment for same-storage).
+    """
+
+    environments = []
+
+    @staticmethod
+    def expansion(
+        node: 'CopyLibraryNode',
+        parent_state: 'dace.sdfg.SDFGState',
+        parent_sdfg: 'dace.SDFG',
+    ) -> dace.SDFG:
+        ctx = _make_expansion_sdfg(node, parent_state, allow_cross_storage=True)
+        inner_inp_desc = ctx.sdfg.arrays[ctx.inp_name]
+        inner_out_desc = ctx.sdfg.arrays[ctx.out_name]
+        src_node = ctx.state.add_access(ctx.inp_name)
+        dst_node = ctx.state.add_access(ctx.out_name)
+        ctx.state.add_edge(
+            src_node,
+            None,
+            dst_node,
+            None,
+            dace.Memlet(data=ctx.inp_name,
+                        subset=dace.subsets.Range.from_array(inner_inp_desc),
+                        other_subset=dace.subsets.Range.from_array(inner_out_desc)),
+        )
+        return ctx.sdfg
+
+
 @library.node
 class CopyLibraryNode(nodes.LibraryNode):
     """Library node representing a data copy between two access nodes.
@@ -813,6 +852,7 @@ class CopyLibraryNode(nodes.LibraryNode):
         "MemcpyCUDA2D": ExpandMemcpyCUDA2D,
         "MemcpyCUDANDStrided": ExpandMemcpyCUDANDStrided,
         "SharedMemoryCollective": ExpandSharedMemoryCollective,
+        "Python": ExpandPython,
     }
     default_implementation = 'Auto'
 
