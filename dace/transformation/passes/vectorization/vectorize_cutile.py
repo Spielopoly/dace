@@ -15,6 +15,7 @@ from typing import Any, Dict, Literal, Optional, Set, Tuple, Type
 
 from dace import SDFG, dtypes, properties, transformation
 from dace.transformation import pass_pipeline as ppl
+from dace.transformation.passes.insert_explicit_copies import InsertExplicitCopies
 from dace.transformation.passes.vectorization.cutile_lowering import (
     CuTileSetImplementations,
     CuTileSetTileStorage,
@@ -47,6 +48,17 @@ class VectorizeCuTile(ppl.Pass):
        CuTile scopes become ``CuTile_Tile``.
     6. :class:`CuTileSetImplementations` — lib nodes ->
        ``target_isa="CUTILE"``, ``implementation="cutile"``.
+    6b. :class:`InsertExplicitCopies` (when ``insert_explicit_copies``, the
+        default) — lift the implicit host<->device ``AccessNode -> AccessNode``
+        copy edges that ``apply_gpu_transformations()`` created into explicit
+        ``CopyLibraryNode`` instances, giving a uniform IR where every copy is an
+        explicit node.  The copy nodes expand to bare Tasklets:
+        ``_cpy_out = _cpy_in`` for same-storage (``ExpandPython``),
+        ``dst.set(src)`` for H2D (``ExpandPythonH2D``),
+        ``src.get(out=dst)`` for D2H (``ExpandPythonD2H``).  The
+        tileops-anchored tile loads/stores (``CuTile_Tile`` storage) are excluded
+        from :class:`InsertExplicitCopies` and are unaffected. Set
+        ``insert_explicit_copies=False`` to keep the raw copy edges instead.
     7. ``sdfg.backend = dtypes.BackendLanguage.Python``
 
     **Canonicalization is NOT run** (parity with ``VectorizeCPUMultiDim``):
@@ -69,6 +81,15 @@ class VectorizeCuTile(ppl.Pass):
                                  desc="When True, lowering-pass precondition violations raise "
                                  "ValueError instead of emitting a UserWarning.")
 
+    insert_explicit_copies = properties.Property(
+        dtype=bool,
+        default=True,
+        desc="When True (the default), run InsertExplicitCopies after "
+        "implementation stamping to lift the implicit host<->device copy edges "
+        "created by apply_gpu_transformations() into explicit CopyLibraryNode "
+        "instances (uniform explicit-copy IR; runtime unchanged). Set False to "
+        "keep the raw copy edges, which the cuTile/Python backend lowers natively.")
+
     def __init__(self,
                  widths: Tuple[int, ...],
                  *,
@@ -77,6 +98,7 @@ class VectorizeCuTile(ppl.Pass):
                  loop_to_map_permissive: bool = False,
                  nest_map_bodies: bool = False,
                  strict: bool = False,
+                 insert_explicit_copies: bool = True,
                  debug_save: bool = False):
         """Build the orchestrator (validates the configuration eagerly).
 
@@ -93,6 +115,16 @@ class VectorizeCuTile(ppl.Pass):
         :param strict: When ``True``, lowering-pass precondition violations
             (e.g. a partially-vectorized SDFG) raise ``ValueError`` instead of
             emitting a ``UserWarning``.
+        :param insert_explicit_copies: When ``True`` (the default), run
+            :class:`~dace.transformation.passes.insert_explicit_copies.InsertExplicitCopies`
+            after implementation stamping, lifting the implicit host<->device
+            ``AccessNode -> AccessNode`` copies created by
+            ``apply_gpu_transformations()`` into explicit ``CopyLibraryNode``
+            instances.  The copy nodes expand to bare Tasklets:
+            ``_cpy_out = _cpy_in`` for same-storage (``ExpandPython``),
+            ``dst.set(src)`` for H2D (``ExpandPythonH2D``),
+            ``src.get(out=dst)`` for D2H (``ExpandPythonD2H``).
+            Set ``False`` to keep the raw copy edges instead.
         :param debug_save: When ``True``, save intermediate SDFG files
             after each pipeline stage for debugging.
         :raises NotImplementedError: On any configuration
@@ -101,6 +133,7 @@ class VectorizeCuTile(ppl.Pass):
         """
         super().__init__()
         self.strict = strict
+        self.insert_explicit_copies = insert_explicit_copies
         self._debug_save = debug_save
         # Eager construction: VectorizeCPUMultiDim.__init__ validates the
         # whole knob row (widths count/powers of 2, remainder/branch combos),
@@ -175,6 +208,18 @@ class VectorizeCuTile(ppl.Pass):
 
         # Step 6: Stamp cuTile implementations on library nodes
         CuTileSetImplementations(strict=self.strict).apply_pass(sdfg, {})
+        debug_save_sdfg()
+
+        # Step 6b (default on): lift implicit host<->device copies into explicit
+        # CopyLibraryNode instances. tileops tile loads/stores use CuTile_Tile
+        # storage, which InsertExplicitCopies excludes, so only the
+        # apply_gpu_transformations()-created CPU_Heap<->GPU_Global copies are
+        # lifted. Their expansions emit: _cpy_out = _cpy_in for same-storage
+        # (ExpandPython, bare Tasklet), dst.set(src) for H2D (ExpandPythonH2D,
+        # NestedSDFG), src.get(out=dst) for D2H (ExpandPythonD2H, NestedSDFG).
+        if self.insert_explicit_copies:
+            InsertExplicitCopies().apply_pass(sdfg, {})
+            debug_save_sdfg()
 
         # Step 7: Python backend stamp
         sdfg.backend = dtypes.BackendLanguage.Python

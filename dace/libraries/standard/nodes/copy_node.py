@@ -1,16 +1,59 @@
 # Copyright 2019-2026 ETH Zurich and the DaCe authors. All rights reserved.
 """ ``CopyLibraryNode`` representing copies explicitly. """
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Set
 
 import dace
 from dace import data, library, nodes, dtypes, symbolic
 from dace.codegen.common import sym2cpp, get_gpu_backend
 from dace.libraries.standard.helper import (CURRENT_STREAM_NAME, auto_dispatch, collapse_shape_and_strides,
-                                              is_python_backend)
+                                            is_python_backend)
 from dace.sdfg.scope import is_devicelevel_gpu, is_in_scope
 from dace.transformation.transformation import ExpandTransformation
 from .. import environments
+
+
+def _collect_array_shape_symbols(sdfg: dace.SDFG) -> Set[str]:
+    """Collect free symbols from non-transient array shapes in the SDFG.
+
+    :param sdfg: the SDFG whose arrays to inspect.
+    :returns: a set of symbol name strings.
+    """
+    result: Set[str] = set()
+    for desc in sdfg.arrays.values():
+        if desc.transient:
+            continue
+        for s in desc.shape:
+            if hasattr(s, 'free_symbols'):
+                result |= {str(fs) for fs in s.free_symbols}
+    return result
+
+
+def _add_symbol_guard_state(sdfg: dace.SDFG, main_state: dace.SDFGState) -> None:
+    """Add an interstate edge guard that forces symbol discovery for the Python backend.
+
+    The Python backend's NestedSDFG codegen discovers symbols to pass as function
+    arguments via ``used_symbols(all_symbols=False)``.  That method does not report
+    symbols from non-transient array shapes (by design for the C++ backend).  For
+    NestedSDFGs that use symbolic array shapes, this means the inner function
+    doesn't receive the symbols and fails with ``NameError`` at runtime.
+
+    This helper adds a guard state before the main state, connected by an
+    interstate edge whose condition references all free symbols from array shapes
+    (e.g., ``N >= 0``).  Interstate-edge conditions are always discovered by
+    ``used_symbols``, so the symbols are passed to the inner function.  The
+    condition is trivially true for array-dimension symbols (which are positive).
+
+    :param sdfg: the inner expansion SDFG.
+    :param main_state: the state that performs the copy.
+    """
+    shape_syms = _collect_array_shape_symbols(sdfg)
+    if not shape_syms:
+        return
+
+    guard = sdfg.add_state('_sym_guard', is_start_block=True)
+    condition = ' and '.join(f'({s} >= 0)' for s in sorted(shape_syms))
+    sdfg.add_edge(guard, main_state, dace.InterstateEdge(condition=condition))
 
 
 @dataclass
@@ -96,6 +139,12 @@ def select_copy_implementation(node: "CopyLibraryNode", parent_state: dace.SDFGS
     if is_python_backend(parent_state):
         if single_elt and not _is_cross_cpu_gpu(inp.storage, out.storage, node, parent_state):
             return 'Tasklet'
+        # D2H: GPU-resident source -> non-GPU destination requires .get()
+        if (inp.storage in dtypes.GPU_RESIDENT_STORAGES and out.storage not in dtypes.GPU_RESIDENT_STORAGES):
+            return 'PythonD2H'
+        # H2D: non-GPU source -> GPU-resident destination requires .set()
+        if (inp.storage not in dtypes.GPU_RESIDENT_STORAGES and out.storage in dtypes.GPU_RESIDENT_STORAGES):
+            return 'PythonH2D'
         return 'Python'
 
     # 1. GPU_Shared involvement. Block-cooperative ``SharedMemoryCollective``
@@ -793,34 +842,144 @@ class ExpandSharedMemoryCollective(ExpandTransformation):
 
 @library.expansion
 class ExpandPython(ExpandTransformation):
-    """Expand a copy as a bare AccessNode-to-AccessNode edge inside a wrapper
-    SDFG.  The Python / cuTile backend dispatches this edge through its
-    existing ``copy_memory`` handler (``.set()`` / ``.get(out=...)`` for
-    cross-storage, plain assignment for same-storage).
-    """
+    """Multi-element Python-backend same-storage copy as a NestedSDFG.
 
+    Builds a NestedSDFG (via :func:`_make_expansion_sdfg`) with an
+    ``AccessNode -> Tasklet -> AccessNode`` graph inside.  The inner
+    Tasklet performs ``_out = _in`` (a same-storage slice assignment:
+    numpy-to-numpy or cupy-to-cupy).
+
+    For H2D (CPU -> GPU) use :class:`ExpandPythonH2D`, which calls
+    ``dst.set(src)`` inside a NestedSDFG.
+    For D2H (GPU -> CPU) use :class:`ExpandPythonD2H`, which calls
+    ``src.get(out=dst)`` inside a NestedSDFG.
+    """
     environments = []
 
     @staticmethod
-    def expansion(
-        node: 'CopyLibraryNode',
-        parent_state: 'dace.sdfg.SDFGState',
-        parent_sdfg: 'dace.SDFG',
-    ) -> dace.SDFG:
-        ctx = _make_expansion_sdfg(node, parent_state, allow_cross_storage=True)
-        inner_inp_desc = ctx.sdfg.arrays[ctx.inp_name]
-        inner_out_desc = ctx.sdfg.arrays[ctx.out_name]
+    def expansion(node, parent_state, parent_sdfg):
+        ctx = _make_expansion_sdfg(node, parent_state, allow_cross_storage=False)
+        inner_inp = ctx.sdfg.arrays[ctx.inp_name]
+        inner_out = ctx.sdfg.arrays[ctx.out_name]
+
         src_node = ctx.state.add_access(ctx.inp_name)
         dst_node = ctx.state.add_access(ctx.out_name)
-        ctx.state.add_edge(
-            src_node,
-            None,
-            dst_node,
-            None,
-            dace.Memlet(data=ctx.inp_name,
-                        subset=dace.subsets.Range.from_array(inner_inp_desc),
-                        other_subset=dace.subsets.Range.from_array(inner_out_desc)),
+
+        tasklet = nodes.Tasklet(
+            node.name,
+            inputs={"_in": None},
+            outputs={"_out": None},
+            code="_out = _in",
+            language=dace.Language.Python,
         )
+        ctx.state.add_node(tasklet)
+
+        ctx.state.add_edge(src_node, None, tasklet, "_in", dace.Memlet.from_array(ctx.inp_name, inner_inp))
+        ctx.state.add_edge(tasklet, "_out", dst_node, None, dace.Memlet.from_array(ctx.out_name, inner_out))
+
+        _add_symbol_guard_state(ctx.sdfg, ctx.state)
+
+        return ctx.sdfg
+
+
+@library.expansion
+class ExpandPythonD2H(ExpandTransformation):
+    """D2H (GPU -> CPU) copy for the Python backend using ``src.get(out=dst)``.
+
+    Uses CuPy's ``.get(out=...)`` to copy GPU data directly into the
+    pre-allocated host destination array, matching the approach in
+    ``cutile_target._emit_cross_storage_copy()``.
+
+    The expansion builds a NestedSDFG (via :func:`_make_expansion_sdfg`)
+    with a two-input Tasklet that reads both the source (GPU) and
+    destination (CPU) arrays, then calls ``_src.get(out=_dst)``.  Two
+    :class:`~dace.sdfg.nodes.AccessNode` instances for the output array
+    appear inside the NestedSDFG: one feeds the Tasklet's ``_dst`` input
+    (so it can pass the reference to ``.get(out=...)``) and one receives
+    the Tasklet's ``_out`` output (establishing the write dependency in
+    the dataflow DAG).  The output write is a same-device self-copy
+    (CPU memmove), which is negligible overhead.
+    """
+    environments = []
+
+    @staticmethod
+    def expansion(node, parent_state, parent_sdfg):
+        ctx = _make_expansion_sdfg(node, parent_state, allow_cross_storage=True)
+        inner_inp = ctx.sdfg.arrays[ctx.inp_name]
+        inner_out = ctx.sdfg.arrays[ctx.out_name]
+
+        src_node = ctx.state.add_access(ctx.inp_name)
+        dst_read = ctx.state.add_access(ctx.out_name)
+        dst_write = ctx.state.add_access(ctx.out_name)
+
+        tasklet = nodes.Tasklet(
+            node.name,
+            inputs={
+                "_src": None,
+                "_dst": None
+            },
+            outputs={"_out": None},
+            code="_src.get(out=_dst)\n_out = _dst",
+            language=dace.Language.Python,
+        )
+        ctx.state.add_node(tasklet)
+
+        ctx.state.add_edge(src_node, None, tasklet, "_src", dace.Memlet.from_array(ctx.inp_name, inner_inp))
+        ctx.state.add_edge(dst_read, None, tasklet, "_dst", dace.Memlet.from_array(ctx.out_name, inner_out))
+        ctx.state.add_edge(tasklet, "_out", dst_write, None, dace.Memlet.from_array(ctx.out_name, inner_out))
+
+        _add_symbol_guard_state(ctx.sdfg, ctx.state)
+        return ctx.sdfg
+
+
+@library.expansion
+class ExpandPythonH2D(ExpandTransformation):
+    """H2D (CPU -> GPU) copy for the Python backend using ``dst.set(src)``.
+
+    Uses CuPy's ``.set()`` to copy a host numpy array directly into the
+    pre-allocated GPU destination array, matching the approach in
+    ``cutile_target._emit_cross_storage_copy()``.  This avoids the
+    redundant GPU allocation + copy that ``cupy.asarray()`` would incur.
+
+    The expansion builds a NestedSDFG (via :func:`_make_expansion_sdfg`)
+    with a two-input Tasklet that reads both the source (CPU) and
+    destination (GPU) arrays, then calls ``_dst.set(_src)``.  Two
+    :class:`~dace.sdfg.nodes.AccessNode` instances for the output array
+    appear inside the NestedSDFG: one feeds the Tasklet's ``_dst`` input
+    (so it can pass the reference to ``.set()``) and one receives the
+    Tasklet's ``_out`` output (establishing the write dependency in the
+    dataflow DAG).  The output write is a same-device self-copy
+    (GPU memcpy), which is negligible overhead (~0.01ms for 8MB).
+    """
+    environments = []
+
+    @staticmethod
+    def expansion(node, parent_state, parent_sdfg):
+        ctx = _make_expansion_sdfg(node, parent_state, allow_cross_storage=True)
+        inner_inp = ctx.sdfg.arrays[ctx.inp_name]
+        inner_out = ctx.sdfg.arrays[ctx.out_name]
+
+        src_node = ctx.state.add_access(ctx.inp_name)
+        dst_read = ctx.state.add_access(ctx.out_name)
+        dst_write = ctx.state.add_access(ctx.out_name)
+
+        tasklet = nodes.Tasklet(
+            node.name,
+            inputs={
+                "_src": None,
+                "_dst": None
+            },
+            outputs={"_out": None},
+            code="_dst.set(_src)\n_out = _dst",
+            language=dace.Language.Python,
+        )
+        ctx.state.add_node(tasklet)
+
+        ctx.state.add_edge(src_node, None, tasklet, "_src", dace.Memlet.from_array(ctx.inp_name, inner_inp))
+        ctx.state.add_edge(dst_read, None, tasklet, "_dst", dace.Memlet.from_array(ctx.out_name, inner_out))
+        ctx.state.add_edge(tasklet, "_out", dst_write, None, dace.Memlet.from_array(ctx.out_name, inner_out))
+
+        _add_symbol_guard_state(ctx.sdfg, ctx.state)
         return ctx.sdfg
 
 
@@ -828,14 +987,18 @@ class ExpandPython(ExpandTransformation):
 class CopyLibraryNode(nodes.LibraryNode):
     """Library node representing a data copy between two access nodes.
 
-    Each implementation name describes the C++ it emits: ``MappedTasklet``
+    Each implementation name describes the code it emits: ``MappedTasklet``
     (element-wise tasklet, schedule from storages; also handles rank-mismatch
     reshapes via a 1-D walker when both endpoints are packed-same-layout with
     contiguous subsets), ``Tasklet`` (bare assignment, no map), ``MemcpyCPU``
     (``std::memcpy``), ``MemcpyCUDA1D``/``2D`` (one ``cudaMemcpyAsync`` /
     ``cudaMemcpy2DAsync``), ``MemcpyCUDANDStrided`` (Sequential map of
     ``cudaMemcpyAsync``), ``SharedMemoryCollective`` (``dace::CopyND`` +
-    ``__syncthreads()``; the only remaining ``dace::CopyND`` user).
+    ``__syncthreads()``; the only remaining ``dace::CopyND`` user),
+    ``Python`` (same-storage copies via bare Tasklet:
+    ``_cpy_out = _cpy_in``), ``PythonH2D`` (H2D copies via NestedSDFG:
+    ``dst.set(src)``), ``PythonD2H`` (D2H copies via NestedSDFG:
+    ``src.get(out=dst)``).
 
     Design rationale: the libnode does NOT accept dynamic (Scalar) input
     connectors -- subset expressions must use symbols already in scope at
@@ -853,6 +1016,8 @@ class CopyLibraryNode(nodes.LibraryNode):
         "MemcpyCUDANDStrided": ExpandMemcpyCUDANDStrided,
         "SharedMemoryCollective": ExpandSharedMemoryCollective,
         "Python": ExpandPython,
+        "PythonH2D": ExpandPythonH2D,
+        "PythonD2H": ExpandPythonD2H,
     }
     default_implementation = 'Auto'
 

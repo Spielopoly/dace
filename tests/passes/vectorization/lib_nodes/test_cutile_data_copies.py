@@ -1,14 +1,20 @@
 # Copyright 2019-2026 ETH Zurich and the DaCe authors. All rights reserved.
 """Tests for the cuTile data-copy pipeline via ``apply_gpu_transformations()``.
 
-Two layers:
+Three layers:
 
 * **Structure / codegen tests (no GPU):** after applying the full cuTile
   lowering pipeline (which now uses ``sdfg.apply_gpu_transformations()``
   instead of ``CuTileInsertDataCopies``), the SDFG has the expected copy-in /
   copy-out states, GPU_Global transient clones, CPU_Heap originals, and correct
-  AccessNode/Memlet references.  Codegen tests verify ``.set()`` /
-  ``.get(out=...)`` appear in the generated Python code.
+  AccessNode/Memlet references.  Codegen tests verify the new
+  expansion-based code: H2D copies use ``.set()`` (``ExpandPythonH2D``),
+  D2H copies use ``.get(out=...)`` (``ExpandPythonD2H``).
+
+* **Routing / expansion tests (no GPU):** verify that
+  ``select_copy_implementation`` dispatches H2D to ``'PythonH2D'`` and D2H to
+  ``'PythonD2H'``, and that expanded copy nodes become ``Tasklet`` s (not
+  ``NestedSDFG`` s).
 
 * **Runtime tests (``@pytest.mark.gpu``):** compile and run on GPU with
   **NumPy** (host) arrays directly -- the whole point of data copies -- and
@@ -16,13 +22,17 @@ Two layers:
 """
 
 import ast
-from typing import List, Set, Tuple
+from typing import Set, Tuple
 
 import numpy as np
 import pytest
 
 import dace
 from dace import data, dtypes
+from dace.libraries.standard.nodes.copy_node import (
+    CopyLibraryNode,
+    select_copy_implementation,
+)
 from dace.sdfg import SDFG, nodes
 from dace.transformation.passes.vectorization import VectorizeCuTile
 from dace.transformation.passes.vectorization.cutile_lowering import (
@@ -32,8 +42,16 @@ from dace.transformation.passes.vectorization.cutile_lowering import (
     GPUDeviceToCuTile,
 )
 from dace.transformation.passes.vectorization.vectorize_cpu_multi_dim import (
-    VectorizeCPUMultiDim,
-)
+    VectorizeCPUMultiDim, )
+
+
+def _count_copy_nodes(sdfg: SDFG) -> int:
+    """Count ``CopyLibraryNode`` instances anywhere in ``sdfg`` (recursively).
+
+    :param sdfg: The SDFG to inspect.
+    :returns: The number of copy library nodes.
+    """
+    return sum(1 for node, _ in sdfg.all_nodes_recursive() if isinstance(node, CopyLibraryNode))
 
 
 # ============================================================
@@ -50,14 +68,17 @@ def _build_vadd_sdfg(name: str, dtype: dace.typeclass = dace.float64) -> SDFG:
     """
     N = dace.symbol("N")
     sdfg = dace.SDFG(name)
-    sdfg.add_array("A", (N,), dtype)
-    sdfg.add_array("B", (N,), dtype)
-    sdfg.add_array("C", (N,), dtype)
+    sdfg.add_array("A", (N, ), dtype)
+    sdfg.add_array("B", (N, ), dtype)
+    sdfg.add_array("C", (N, ), dtype)
     state = sdfg.add_state("main")
     state.add_mapped_tasklet(
         "add",
         {"i": "0:N"},
-        {"_a": dace.Memlet("A[i]"), "_b": dace.Memlet("B[i]")},
+        {
+            "_a": dace.Memlet("A[i]"),
+            "_b": dace.Memlet("B[i]")
+        },
         "_c = _a + _b",
         {"_c": dace.Memlet("C[i]")},
         external_edges=True,
@@ -81,8 +102,14 @@ def _build_vadd2d_sdfg(name: str, dtype: dace.typeclass = dace.float64) -> SDFG:
     state = sdfg.add_state("main")
     state.add_mapped_tasklet(
         "add2d",
-        {"i": "0:M", "j": "0:N"},
-        {"_a": dace.Memlet("A[i, j]"), "_b": dace.Memlet("B[i, j]")},
+        {
+            "i": "0:M",
+            "j": "0:N"
+        },
+        {
+            "_a": dace.Memlet("A[i, j]"),
+            "_b": dace.Memlet("B[i, j]")
+        },
         "_c = _a + _b",
         {"_c": dace.Memlet("C[i, j]")},
         external_edges=True,
@@ -98,9 +125,9 @@ def _build_vadd_with_scalar_sdfg(name: str) -> SDFG:
     """
     N = dace.symbol("N")
     sdfg = dace.SDFG(name)
-    sdfg.add_array("A", (N,), dace.float64)
-    sdfg.add_array("B", (N,), dace.float64)
-    sdfg.add_array("C", (N,), dace.float64)
+    sdfg.add_array("A", (N, ), dace.float64)
+    sdfg.add_array("B", (N, ), dace.float64)
+    sdfg.add_array("C", (N, ), dace.float64)
     sdfg.add_scalar("alpha", dace.float64)
     state = sdfg.add_state("main")
     state.add_mapped_tasklet(
@@ -123,7 +150,7 @@ def _build_vadd_with_scalar_sdfg(name: str) -> SDFG:
 # ============================================================
 
 
-def _lower_full_pipeline(sdfg: SDFG, widths: Tuple[int, ...] = (8,)) -> None:
+def _lower_full_pipeline(sdfg: SDFG, widths: Tuple[int, ...] = (8, )) -> None:
     """Run the full cuTile pipeline (vectorize + gpu transform + adapters).
 
     :param sdfg: The SDFG to lower.
@@ -207,8 +234,8 @@ def _has_copyout_state(sdfg: SDFG) -> bool:
             if (isinstance(edge.src, nodes.AccessNode) and isinstance(edge.dst, nodes.AccessNode)):
                 src_desc = sdfg.arrays.get(edge.src.data)
                 dst_desc = sdfg.arrays.get(edge.dst.data)
-                if (src_desc is not None and dst_desc is not None
-                        and src_desc.storage == dtypes.StorageType.GPU_Global and src_desc.transient
+                if (src_desc is not None and dst_desc is not None and src_desc.storage == dtypes.StorageType.GPU_Global
+                        and src_desc.transient
                         and dst_desc.storage in (dtypes.StorageType.CPU_Heap, dtypes.StorageType.Default)):
                     return True
     return False
@@ -220,11 +247,7 @@ def _state_access_node_names(state: "dace.sdfg.state.SDFGState") -> Set[str]:
     :param state: The state to inspect.
     :returns: Set of data names referenced by AccessNodes in the state.
     """
-    return {
-        node.data
-        for node in state.nodes()
-        if isinstance(node, nodes.AccessNode)
-    }
+    return {node.data for node in state.nodes() if isinstance(node, nodes.AccessNode)}
 
 
 def _gpu_clone_names(sdfg: SDFG) -> Set[str]:
@@ -234,8 +257,8 @@ def _gpu_clone_names(sdfg: SDFG) -> Set[str]:
     :returns: Set of GPU_Global transient array names.
     """
     return {
-        name for name, desc in sdfg.arrays.items()
-        if desc.storage == dtypes.StorageType.GPU_Global and desc.transient
+        name
+        for name, desc in sdfg.arrays.items() if desc.storage == dtypes.StorageType.GPU_Global and desc.transient
     }
 
 
@@ -273,9 +296,7 @@ class TestCuTileDataCopiesStructure:
         host_storages = {dtypes.StorageType.Default, dtypes.StorageType.CPU_Heap}
         for name in ("A", "B", "C"):
             desc = sdfg.arrays[name]
-            assert desc.storage in host_storages, (
-                f"'{name}' storage is {desc.storage}, expected Default or CPU_Heap"
-            )
+            assert desc.storage in host_storages, (f"'{name}' storage is {desc.storage}, expected Default or CPU_Heap")
 
     def test_gpu_clones_are_gpu_global_transients(self) -> None:
         """GPU-side cloned arrays exist, are transient, and have
@@ -289,8 +310,7 @@ class TestCuTileDataCopiesStructure:
             desc = sdfg.arrays[gpu_name]
             assert desc.transient, f"'{gpu_name}' is not transient"
             assert desc.storage == dtypes.StorageType.GPU_Global, (
-                f"'{gpu_name}' storage is {desc.storage}, expected GPU_Global"
-            )
+                f"'{gpu_name}' storage is {desc.storage}, expected GPU_Global")
 
     def test_scalars_not_cloned(self) -> None:
         """Scalar parameters are NOT cloned by the pipeline."""
@@ -303,9 +323,8 @@ class TestCuTileDataCopiesStructure:
         # No GPU clone of a scalar should exist
         for name, desc in sdfg.arrays.items():
             if desc.transient and desc.storage == dtypes.StorageType.GPU_Global:
-                assert not isinstance(desc, data.Scalar), (
-                    f"Scalar '{name}' was cloned to GPU, but scalars should not be cloned"
-                )
+                assert not isinstance(
+                    desc, data.Scalar), (f"Scalar '{name}' was cloned to GPU, but scalars should not be cloned")
 
     def test_2d_vadd_structure(self) -> None:
         """2D vadd with widths=(8, 4) -- verify clones and copy states for
@@ -335,45 +354,51 @@ class TestCuTileDataCopiesStructure:
 class TestCuTileDataCopiesCodegen:
     """Generated Python-backend code with data copies."""
 
-    def test_codegen_contains_set(self) -> None:
-        """After full pipeline, generated code contains ``.set()``."""
-        sdfg = _build_vadd_sdfg("dc_codegen_set")
-        VectorizeCuTile(widths=(8,)).apply_pass(sdfg, {})
+    def test_codegen_h2d_uses_set(self) -> None:
+        """After full pipeline, H2D copies use ``.set()`` --
+        the ``ExpandPythonH2D`` expansion emits ``_dst.set(_src)``
+        inside a NestedSDFG."""
+        sdfg = _build_vadd_sdfg("dc_codegen_h2d")
+        VectorizeCuTile(widths=(8, )).apply_pass(sdfg, {})
         code = _generate_code(sdfg)
-        assert ".set(" in code, (
-            "Generated code does not contain '.set('"
-        )
+        assert ".set(" in code, ("Generated code does not contain '.set(' -- "
+                                 "expected ExpandPythonH2D expansion")
+        assert "cupy.asarray(" not in code, ("Generated code still contains 'cupy.asarray(' -- "
+                                             "expected .set() from ExpandPythonH2D")
 
-    def test_codegen_contains_get_out(self) -> None:
-        """After full pipeline, generated code contains ``.get(out=...)``."""
-        sdfg = _build_vadd_sdfg("dc_codegen_get_out")
-        VectorizeCuTile(widths=(8,)).apply_pass(sdfg, {})
+    def test_codegen_d2h_contains_get_out(self) -> None:
+        """After full pipeline, D2H copies use ``.get(out=...)``.
+        The ``ExpandPythonD2H`` expansion emits ``_src.get(out=_dst)``
+        inside a NestedSDFG."""
+        sdfg = _build_vadd_sdfg("dc_codegen_get")
+        VectorizeCuTile(widths=(8, )).apply_pass(sdfg, {})
         code = _generate_code(sdfg)
-        assert ".get(out=" in code, (
-            "Generated code does not contain '.get(out='"
-        )
+        assert ".get(out=" in code, ("Generated code does not contain '.get(out=' -- "
+                                     "expected ExpandPythonD2H expansion")
 
     def test_codegen_valid_python(self) -> None:
         """Generated code parses with ``ast.parse``."""
         sdfg = _build_vadd_sdfg("dc_codegen_valid")
-        VectorizeCuTile(widths=(8,)).apply_pass(sdfg, {})
+        VectorizeCuTile(widths=(8, )).apply_pass(sdfg, {})
         code = _generate_code(sdfg)
         ast.parse(code)
 
     def test_codegen_2d_valid_python(self) -> None:
-        """2D vadd with data copies generates valid Python code."""
+        """2D vadd with data copies generates valid Python code using the
+        expansion-based H2D / D2H paths (``.set()``, ``.get(out=...)``)."""
         sdfg = _build_vadd2d_sdfg("dc_codegen_2d_valid")
         VectorizeCuTile(widths=(8, 4)).apply_pass(sdfg, {})
         code = _generate_code(sdfg)
         ast.parse(code)
         assert ".set(" in code
+        assert "cupy.asarray(" not in code
         assert ".get(out=" in code
 
     def test_codegen_with_scalar_valid_python(self) -> None:
         """SDFG with a scalar parameter generates valid Python code with
         data copies (scalar is not cloned)."""
         sdfg = _build_vadd_with_scalar_sdfg("dc_codegen_scalar")
-        VectorizeCuTile(widths=(8,)).apply_pass(sdfg, {})
+        VectorizeCuTile(widths=(8, )).apply_pass(sdfg, {})
         code = _generate_code(sdfg)
         ast.parse(code)
 
@@ -394,7 +419,7 @@ class TestCuTileDataCopiesRuntime:
         This is the KEY test: after data copies, callers pass host arrays.
         """
         sdfg = _build_vadd_sdfg("dc_rt_vadd_numpy")
-        VectorizeCuTile(widths=(8,)).apply_pass(sdfg, {})
+        VectorizeCuTile(widths=(8, )).apply_pass(sdfg, {})
 
         n = 64
         rng = np.random.default_rng(42)
@@ -410,7 +435,7 @@ class TestCuTileDataCopiesRuntime:
     def test_vadd_non_divisible_numpy(self) -> None:
         """N=17 (non-divisible by 8) with NumPy arrays directly."""
         sdfg = _build_vadd_sdfg("dc_rt_vadd_nondiv")
-        VectorizeCuTile(widths=(8,)).apply_pass(sdfg, {})
+        VectorizeCuTile(widths=(8, )).apply_pass(sdfg, {})
 
         n = 17
         rng = np.random.default_rng(43)
@@ -439,16 +464,14 @@ class TestCuTileDataCopiesRuntime:
 
         np.testing.assert_allclose(C, A + B, rtol=1e-14)
 
-    @pytest.mark.skip(
-        reason="apply_gpu_transformations() stages scalars as constants "
-        "(alpha_const) which the cuTile runtime cannot resolve. Known "
-        "limitation of the GPU-transform-based pipeline with scalars."
-    )
+    @pytest.mark.skip(reason="apply_gpu_transformations() stages scalars as constants "
+                      "(alpha_const) which the cuTile runtime cannot resolve. Known "
+                      "limitation of the GPU-transform-based pipeline with scalars.")
     def test_vadd_with_scalar_param_numpy(self) -> None:
         """An SDFG with a scalar parameter. Verify scalar is passed through
         correctly with numpy arrays."""
         sdfg = _build_vadd_with_scalar_sdfg("dc_rt_vadd_scalar")
-        VectorizeCuTile(widths=(8,)).apply_pass(sdfg, {})
+        VectorizeCuTile(widths=(8, )).apply_pass(sdfg, {})
 
         n = 32
         rng = np.random.default_rng(45)
@@ -465,7 +488,7 @@ class TestCuTileDataCopiesRuntime:
     def test_vadd_large_numpy(self) -> None:
         """Larger problem size (N=1000) to exercise multiple tile iterations."""
         sdfg = _build_vadd_sdfg("dc_rt_vadd_large")
-        VectorizeCuTile(widths=(8,)).apply_pass(sdfg, {})
+        VectorizeCuTile(widths=(8, )).apply_pass(sdfg, {})
 
         n = 1000
         rng = np.random.default_rng(47)
@@ -481,7 +504,7 @@ class TestCuTileDataCopiesRuntime:
     def test_vadd_float32_numpy(self) -> None:
         """float32 dtype with numpy arrays directly."""
         sdfg = _build_vadd_sdfg("dc_rt_vadd_f32", dtype=dace.float32)
-        VectorizeCuTile(widths=(8,)).apply_pass(sdfg, {})
+        VectorizeCuTile(widths=(8, )).apply_pass(sdfg, {})
 
         n = 100
         rng = np.random.default_rng(48)
@@ -497,7 +520,7 @@ class TestCuTileDataCopiesRuntime:
     def test_symbolic_n_two_sizes_numpy(self) -> None:
         """One compiled SDFG, two runtime values of the symbol N, numpy arrays."""
         sdfg = _build_vadd_sdfg("dc_rt_vadd_symbolic")
-        VectorizeCuTile(widths=(8,)).apply_pass(sdfg, {})
+        VectorizeCuTile(widths=(8, )).apply_pass(sdfg, {})
         csdfg = sdfg.compile()
 
         rng = np.random.default_rng(49)
@@ -507,6 +530,327 @@ class TestCuTileDataCopiesRuntime:
             C = np.zeros(n)
             csdfg(A=A, B=B, C=C, N=n)
             np.testing.assert_allclose(C, A + B, rtol=1e-14)
+
+
+# ============================================================
+# InsertExplicitCopies adoption (VectorizeCuTile knob)
+# ============================================================
+
+
+class TestCuTileExplicitCopiesStructure:
+    """``VectorizeCuTile`` lifts the implicit host<->device copies into
+    ``CopyLibraryNode`` instances by default; ``insert_explicit_copies=False``
+    keeps the raw copy edges.  The expansion-based path uses
+    ``cupy.asarray()`` for H2D and ``.get()`` for D2H."""
+
+    def test_default_inserts_copy_nodes(self) -> None:
+        """By default the implicit copy-in (A, B, C) and copy-out (C) edges are
+        lifted into explicit ``CopyLibraryNode`` instances (3 host->device +
+        1 device->host = 4)."""
+        sdfg = _build_vadd_sdfg("ec_default_copies")
+        VectorizeCuTile(widths=(8, )).apply_pass(sdfg, {})
+        assert _count_copy_nodes(sdfg) == 4
+
+    def test_disabled_has_no_copy_nodes(self) -> None:
+        """With ``insert_explicit_copies=False`` no ``CopyLibraryNode`` is
+        inserted (the backend lowers the raw copy edges natively)."""
+        sdfg = _build_vadd_sdfg("ec_disabled_nocopy")
+        VectorizeCuTile(widths=(8, ), insert_explicit_copies=False).apply_pass(sdfg, {})
+        assert _count_copy_nodes(sdfg) == 0
+
+    def test_knob_copies_are_not_cutile_stamped(self) -> None:
+        """Inserted copy nodes are left at the default ``'Auto'`` routing
+        (``implementation`` is ``None`` / ``'Auto'``, never the tileops-only
+        ``'cutile'`` stamp); ``'Auto'`` routes to ``'Python'`` at codegen since
+        the backend is Python by then."""
+        sdfg = _build_vadd_sdfg("ec_knob_auto")
+        VectorizeCuTile(widths=(8, ), insert_explicit_copies=True).apply_pass(sdfg, {})
+        copy_nodes = [node for node, _ in sdfg.all_nodes_recursive() if isinstance(node, CopyLibraryNode)]
+        assert copy_nodes
+        for node in copy_nodes:
+            assert node.implementation in (None, "Auto")
+            assert CopyLibraryNode.default_implementation == "Auto"
+
+    def test_knob_codegen_valid_single_launch(self) -> None:
+        """Generated code still parses, keeps a single (``full_mask``) kernel
+        launch, uses expansion-based copies (``.set()`` for H2D,
+        ``.get(out=...)`` for D2H)."""
+        sdfg = _build_vadd_sdfg("ec_knob_codegen")
+        VectorizeCuTile(widths=(8, ), insert_explicit_copies=True).apply_pass(sdfg, {})
+        code = _generate_code(sdfg)
+        ast.parse(code)
+        assert code.count("ct.launch") == 1
+        assert ".set(" in code
+        assert "cupy.asarray(" not in code
+        assert ".get(out=" in code
+
+    def test_knob_2d_codegen_valid(self) -> None:
+        """2D vadd with the knob generates valid single-launch Python code."""
+        sdfg = _build_vadd2d_sdfg("ec_knob_2d")
+        VectorizeCuTile(widths=(8, 4), insert_explicit_copies=True).apply_pass(sdfg, {})
+        code = _generate_code(sdfg)
+        ast.parse(code)
+        assert code.count("ct.launch") == 1
+        assert _count_copy_nodes(sdfg) == 4
+
+
+# ============================================================
+# Copy expansion routing and structure (no GPU)
+# ============================================================
+
+
+class TestCopyExpansionDirect:
+    """Verify ``select_copy_implementation`` routing and the post-expansion
+    SDFG structure for the Python-backend copy expansions.
+
+    All tests in this class are CPU-only (no GPU required): they inspect the
+    routing decision and the expanded SDFG structure, not runtime behavior.
+    """
+
+    # ----------------------------------------------------------
+    # Routing tests
+    # ----------------------------------------------------------
+
+    def test_select_h2d_routes_to_python_h2d(self) -> None:
+        """H2D copies (CPU_Heap -> GPU_Global) route to ``'PythonH2D'``."""
+        sdfg = _build_vadd_sdfg("cpy_route_h2d")
+        VectorizeCuTile(widths=(8, )).apply_pass(sdfg, {})
+
+        for state in sdfg.states():
+            for node in state.nodes():
+                if isinstance(node, CopyLibraryNode):
+                    src_st = node.src_storage(state)
+                    dst_st = node.dst_storage(state)
+                    if (src_st in (dtypes.StorageType.CPU_Heap, dtypes.StorageType.Default)
+                            and dst_st == dtypes.StorageType.GPU_Global):
+                        impl = select_copy_implementation(node, state)
+                        assert impl == "PythonH2D", (f"H2D copy routed to '{impl}', expected 'PythonH2D'")
+
+    def test_select_d2h_routes_to_python_d2h(self) -> None:
+        """D2H copies (GPU_Global -> CPU_Heap) route to ``'PythonD2H'``."""
+        sdfg = _build_vadd_sdfg("cpy_route_d2h")
+        VectorizeCuTile(widths=(8, )).apply_pass(sdfg, {})
+
+        found_d2h = False
+        for state in sdfg.states():
+            for node in state.nodes():
+                if isinstance(node, CopyLibraryNode):
+                    src_st = node.src_storage(state)
+                    dst_st = node.dst_storage(state)
+                    if (src_st == dtypes.StorageType.GPU_Global
+                            and dst_st in (dtypes.StorageType.CPU_Heap, dtypes.StorageType.Default)):
+                        impl = select_copy_implementation(node, state)
+                        assert impl == "PythonD2H", (f"D2H copy routed to '{impl}', expected 'PythonD2H'")
+                        found_d2h = True
+        assert found_d2h, "No D2H CopyLibraryNode found in the SDFG"
+
+    def test_select_2d_h2d_routes_to_python_h2d(self) -> None:
+        """2D H2D copies also route to ``'PythonH2D'``."""
+        sdfg = _build_vadd2d_sdfg("cpy_route_2d_h2d")
+        VectorizeCuTile(widths=(8, 4)).apply_pass(sdfg, {})
+
+        found_h2d = False
+        for state in sdfg.states():
+            for node in state.nodes():
+                if isinstance(node, CopyLibraryNode):
+                    src_st = node.src_storage(state)
+                    dst_st = node.dst_storage(state)
+                    if (src_st in (dtypes.StorageType.CPU_Heap, dtypes.StorageType.Default)
+                            and dst_st == dtypes.StorageType.GPU_Global):
+                        impl = select_copy_implementation(node, state)
+                        assert impl == "PythonH2D", (f"2D H2D copy routed to '{impl}', expected 'PythonH2D'")
+                        found_h2d = True
+        assert found_h2d, "No H2D CopyLibraryNode found in 2D SDFG"
+
+    def test_select_2d_d2h_routes_to_python_d2h(self) -> None:
+        """2D D2H copies also route to ``'PythonD2H'``."""
+        sdfg = _build_vadd2d_sdfg("cpy_route_2d_d2h")
+        VectorizeCuTile(widths=(8, 4)).apply_pass(sdfg, {})
+
+        found_d2h = False
+        for state in sdfg.states():
+            for node in state.nodes():
+                if isinstance(node, CopyLibraryNode):
+                    src_st = node.src_storage(state)
+                    dst_st = node.dst_storage(state)
+                    if (src_st == dtypes.StorageType.GPU_Global
+                            and dst_st in (dtypes.StorageType.CPU_Heap, dtypes.StorageType.Default)):
+                        impl = select_copy_implementation(node, state)
+                        assert impl == "PythonD2H", (f"2D D2H copy routed to '{impl}', expected 'PythonD2H'")
+                        found_d2h = True
+        assert found_d2h, "No D2H CopyLibraryNode found in 2D SDFG"
+
+    # ----------------------------------------------------------
+    # Structure tests (post-expansion)
+    # ----------------------------------------------------------
+
+    def test_expansion_replaces_all_copy_nodes(self) -> None:
+        """After expansion, no CopyLibraryNode instances remain."""
+        sdfg = _build_vadd_sdfg("cpy_struct_tasklet")
+        VectorizeCuTile(widths=(8, )).apply_pass(sdfg, {})
+
+        # Before expansion: should have CopyLibraryNodes
+        assert _count_copy_nodes(sdfg) > 0
+
+        # Expand and check
+        sdfg.expand_library_nodes()
+
+        assert _count_copy_nodes(sdfg) == 0, ("CopyLibraryNodes remain after expand_library_nodes()")
+
+    def test_d2h_tasklet_contains_get_out(self) -> None:
+        """D2H expansion Tasklet code contains ``.get(out=...)``."""
+        sdfg = _build_vadd_sdfg("cpy_struct_d2h_get")
+        VectorizeCuTile(widths=(8, )).apply_pass(sdfg, {})
+        code = _generate_code(sdfg)
+        assert ".get(out=" in code, ("Generated code missing '.get(out=' for D2H expansion")
+
+    def test_h2d_code_uses_set(self) -> None:
+        """H2D expansion uses ``.set()`` (not ``cupy.asarray()``)."""
+        sdfg = _build_vadd_sdfg("cpy_struct_h2d_set")
+        VectorizeCuTile(widths=(8, )).apply_pass(sdfg, {})
+        code = _generate_code(sdfg)
+        assert ".set(" in code, ("Generated code does not contain '.set(' -- "
+                                 "expected ExpandPythonH2D expansion")
+        assert "cupy.asarray(" not in code, ("Generated code still contains 'cupy.asarray(' -- "
+                                             "expected .set() from ExpandPythonH2D")
+
+    def test_h2d_codegen_valid_python(self) -> None:
+        """H2D expansion generates valid Python code."""
+        sdfg = _build_vadd_sdfg("cpy_struct_h2d_valid")
+        VectorizeCuTile(widths=(8, )).apply_pass(sdfg, {})
+        code = _generate_code(sdfg)
+        ast.parse(code)
+
+    def test_d2h_codegen_valid_python(self) -> None:
+        """D2H expansion generates valid Python code."""
+        sdfg = _build_vadd_sdfg("cpy_struct_d2h_valid")
+        VectorizeCuTile(widths=(8, )).apply_pass(sdfg, {})
+        code = _generate_code(sdfg)
+        ast.parse(code)
+
+    def test_2d_expansion_produces_tasklets(self) -> None:
+        """2D copy expansion also produces Tasklets."""
+        sdfg = _build_vadd2d_sdfg("cpy_struct_2d_tasklet")
+        VectorizeCuTile(widths=(8, 4)).apply_pass(sdfg, {})
+
+        assert _count_copy_nodes(sdfg) > 0
+        sdfg.expand_library_nodes()
+        assert _count_copy_nodes(sdfg) == 0
+
+
+@pytest.mark.gpu
+class TestCuTileExplicitCopiesRuntime:
+    """Runtime parity: ``insert_explicit_copies=True`` matches NumPy and the
+    native-copy default, with host (NumPy) arrays passed directly."""
+
+    def test_vadd_numpy_arrays_directly(self) -> None:
+        """1D vadd, divisible size, NumPy arrays, explicit copies."""
+        sdfg = _build_vadd_sdfg("ec_rt_vadd")
+        VectorizeCuTile(widths=(8, ), insert_explicit_copies=True).apply_pass(sdfg, {})
+
+        n = 64
+        rng = np.random.default_rng(50)
+        A = rng.random(n)
+        B = rng.random(n)
+        C = np.zeros(n)
+
+        csdfg = sdfg.compile()
+        csdfg(A=A, B=B, C=C, N=n)
+        np.testing.assert_allclose(C, A + B, rtol=1e-14)
+
+    def test_vadd_non_divisible_numpy(self) -> None:
+        """N=17 (non-divisible by 8) with explicit copies."""
+        sdfg = _build_vadd_sdfg("ec_rt_vadd_nondiv")
+        VectorizeCuTile(widths=(8, ), insert_explicit_copies=True).apply_pass(sdfg, {})
+
+        n = 17
+        rng = np.random.default_rng(51)
+        A = rng.random(n)
+        B = rng.random(n)
+        C = np.zeros(n)
+
+        csdfg = sdfg.compile()
+        csdfg(A=A, B=B, C=C, N=n)
+        np.testing.assert_allclose(C, A + B, rtol=1e-14)
+
+    def test_vadd_2d_numpy(self) -> None:
+        """2D vadd with widths=(8, 4) and explicit copies."""
+        sdfg = _build_vadd2d_sdfg("ec_rt_vadd_2d")
+        VectorizeCuTile(widths=(8, 4), insert_explicit_copies=True).apply_pass(sdfg, {})
+
+        m, n = 10, 17
+        rng = np.random.default_rng(52)
+        A = rng.random((m, n))
+        B = rng.random((m, n))
+        C = np.zeros((m, n))
+
+        csdfg = sdfg.compile()
+        csdfg(A=A, B=B, C=C, M=m, N=n)
+        np.testing.assert_allclose(C, A + B, rtol=1e-14)
+
+    def test_vadd_large_numpy(self) -> None:
+        """N=1000 (multiple tiles) with explicit copies."""
+        sdfg = _build_vadd_sdfg("ec_rt_vadd_large")
+        VectorizeCuTile(widths=(8, ), insert_explicit_copies=True).apply_pass(sdfg, {})
+
+        n = 1000
+        rng = np.random.default_rng(53)
+        A = rng.random(n)
+        B = rng.random(n)
+        C = np.zeros(n)
+
+        csdfg = sdfg.compile()
+        csdfg(A=A, B=B, C=C, N=n)
+        np.testing.assert_allclose(C, A + B, rtol=1e-14)
+
+    def test_vadd_float32_numpy(self) -> None:
+        """float32 dtype with explicit copies."""
+        sdfg = _build_vadd_sdfg("ec_rt_vadd_f32", dtype=dace.float32)
+        VectorizeCuTile(widths=(8, ), insert_explicit_copies=True).apply_pass(sdfg, {})
+
+        n = 100
+        rng = np.random.default_rng(54)
+        A = rng.random(n).astype(np.float32)
+        B = rng.random(n).astype(np.float32)
+        C = np.zeros(n, dtype=np.float32)
+
+        csdfg = sdfg.compile()
+        csdfg(A=A, B=B, C=C, N=n)
+        np.testing.assert_allclose(C, A + B, rtol=1e-6)
+
+    def test_symbolic_n_two_sizes_numpy(self) -> None:
+        """One compiled SDFG, two runtime sizes of N, with explicit copies."""
+        sdfg = _build_vadd_sdfg("ec_rt_vadd_symbolic")
+        VectorizeCuTile(widths=(8, ), insert_explicit_copies=True).apply_pass(sdfg, {})
+        csdfg = sdfg.compile()
+
+        rng = np.random.default_rng(55)
+        for n in (64, 17):
+            A = rng.random(n)
+            B = rng.random(n)
+            C = np.zeros(n)
+            csdfg(A=A, B=B, C=C, N=n)
+            np.testing.assert_allclose(C, A + B, rtol=1e-14)
+
+    def test_explicit_matches_native_copy(self) -> None:
+        """Explicit-copy default result equals the native-copy
+        (``insert_explicit_copies=False``) result, bit for bit."""
+        rng = np.random.default_rng(56)
+        n = 96
+        A = rng.random(n)
+        B = rng.random(n)
+
+        sdfg_native = _build_vadd_sdfg("ec_rt_native")
+        VectorizeCuTile(widths=(8, ), insert_explicit_copies=False).apply_pass(sdfg_native, {})
+        C_native = np.zeros(n)
+        sdfg_native.compile()(A=A, B=B, C=C_native, N=n)
+
+        sdfg_explicit = _build_vadd_sdfg("ec_rt_explicit")
+        VectorizeCuTile(widths=(8, )).apply_pass(sdfg_explicit, {})  # default: copies on
+        C_explicit = np.zeros(n)
+        sdfg_explicit.compile()(A=A, B=B, C=C_explicit, N=n)
+
+        np.testing.assert_array_equal(C_native, C_explicit)
 
 
 if __name__ == "__main__":
