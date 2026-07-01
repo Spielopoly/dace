@@ -30,10 +30,10 @@ from dace.transformation.passes.vectorization.vectorize_cpu_multi_dim import Vec
 class VectorizeCuTile(ppl.Pass):
     """Vectorize an SDFG into cuTile kernels for the Python backend.
 
-    Imperative stages, run once, in order (:class:`CanonicalizationPipeline`
-    style — this is a :class:`~dace.transformation.pass_pipeline.Pass`, not a
-    ``Pipeline``, because the lowering passes must run between the vectorizer
-    and library-node expansion and the vectorizer is itself a Pipeline):
+    Imperative stages, run once, in order (this is a
+    :class:`~dace.transformation.pass_pipeline.Pass`, not a ``Pipeline``,
+    because the lowering passes must run between the vectorizer and
+    library-node expansion and the vectorizer is itself a Pipeline):
 
     1. ``VectorizeCPUMultiDim(widths=..., target_isa="CUTILE",
        expand_tile_nodes=False, ...)`` — emit ``tileops`` library nodes.
@@ -46,13 +46,13 @@ class VectorizeCuTile(ppl.Pass):
        outermost maps from ``GPU_Device`` to ``CuTile``.
     5. :class:`CuTileSetTileStorage` — ``Register`` tile transients inside
        CuTile scopes become ``CuTile_Tile``.
-    6. :class:`CuTileSetImplementations` — lib nodes ->
+    6. :class:`CuTileSetLibraryImplementations` — select and expand
+       *non*-tileops library nodes (e.g. BLAS ``MatMul``) that the cuTile
+       codegen cannot handle.
+    7. :class:`CuTileSetImplementations` — lib nodes ->
        ``target_isa="CUTILE"``, ``implementation="cutile"``.
-    7. ``sdfg.backend = dtypes.BackendLanguage.Python``
+    8. ``sdfg.backend = dtypes.BackendLanguage.Python``
 
-    **Canonicalization is NOT run** (parity with ``VectorizeCPUMultiDim``):
-    callers wanting the full front-door flow run
-    ``dace.transformation.passes.canonicalize.canonicalize(sdfg)`` first.
 
     The cuTile configuration is pinned: ``target_isa`` is always ``"CUTILE"``
     and ``expand_tile_nodes`` is always ``False`` internally (expansion happens
