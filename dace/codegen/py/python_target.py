@@ -377,7 +377,12 @@ class PythonCodeGen(PythonTargetCodeGenerator):
 
     def _nsdfg_runtime_symbol_names(self, node: nodes.NestedSDFG) -> list[str]:
         runtime_defined_names = _collect_runtime_defined_names(node.sdfg)
-        free_symbols = set(map(str, node.sdfg.used_symbols(all_symbols=False, keep_defined_in_mapping=True)))
+        # ``free_symbols`` (not ``used_symbols(all_symbols=False)``) is the set of
+        # symbols the nested SDFG needs from outside: the latter drops symbols
+        # that appear only in data shapes / memlet subsets (e.g. an outer matmul
+        # dimension ``M`` used as ``_a[0:M, 0:K]``), which the Python backend
+        # still emits literally and must therefore receive as parameters.
+        free_symbols = set(map(str, node.sdfg.free_symbols))
         return [symname for symname in sorted(node.symbol_mapping.keys())
                 if symname in free_symbols and symname not in node.sdfg.constants and symname not in runtime_defined_names]
 
@@ -531,13 +536,16 @@ class PythonCodeGen(PythonTargetCodeGenerator):
             raise NotImplementedError('External memory management is not supported in the Python backend.')
 
         desc = update_persistent_desc(nodedesc, sdfg) if is_global else nodedesc
-        # When the SDFG uses cuTile kernels, top-level transients that are
-        # passed between kernel launches must live in GPU memory (cupy) rather
-        # than host memory (numpy). Register-storage transients are still
-        # emitted as numpy because they are never passed to a kernel directly.
+        # A transient must live in GPU memory (cupy) rather than host memory
+        # (numpy) when either it is explicitly GPU_Global (e.g. a matmul operand
+        # or an apply_gpu_transformations copy target -- true even in a
+        # matmul-only kernel with no cuTile map), or the SDFG uses cuTile
+        # kernels and the transient is passed between kernel launches.
+        # Register-storage transients stay numpy: they are never passed to a
+        # kernel directly.
         on_gpu = (isinstance(desc, data.Array)
                   and desc.storage != dtypes.StorageType.Register
-                  and _sdfg_uses_cutile(sdfg))
+                  and (desc.storage == dtypes.StorageType.GPU_Global or _sdfg_uses_cutile(sdfg)))
         init_expr = self._default_expression(desc, on_gpu=on_gpu, setzero=node.setzero)
 
         if is_global:
@@ -855,8 +863,14 @@ class PythonCodeGen(PythonTargetCodeGenerator):
             nested_runtime_defined_names = _collect_nested_runtime_defined_names(node.sdfg)
             nested_only_runtime_names = {name for name in nested_runtime_defined_names if name not in node.sdfg.symbols}
             runtime_symbol_names = {name for name in _collect_runtime_used_names(node.sdfg) if name in node.sdfg.symbols}
-            nested_free_symbols = ((self._frame.free_symbols(node.sdfg) | runtime_symbol_names) - runtime_defined_names
-                                   - nested_only_runtime_names)
+            # Include the nested SDFG's ``free_symbols`` (shape/subset symbols
+            # such as an outer matmul dimension ``M``) in addition to
+            # ``used_symbols(all_symbols=False)``: the Python backend emits data
+            # subsets literally, so those symbols must appear in the nested
+            # function's arglist to match ``_nsdfg_runtime_symbol_names``.
+            nested_free_symbols = ((self._frame.free_symbols(node.sdfg) | runtime_symbol_names
+                                    | set(map(str, node.sdfg.free_symbols))) - runtime_defined_names -
+                                   nested_only_runtime_names)
             nested_arglist = node.sdfg.arglist(scalars_only=False, free_symbols=nested_free_symbols)
             ordered_arglist = {name: nested_arglist[name] for _, name, _ in memlet_references}
             for symname in self._nsdfg_runtime_symbol_names(node):

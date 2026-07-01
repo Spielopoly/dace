@@ -11,11 +11,12 @@ tileops-specific concerns that the generic GPU transform does not cover.
 
 Required order::
 
-    CuTileValidateTiles        # tile-op anchors exist; widths are powers of 2
+    CuTileValidateTiles           # tile-op anchors exist; widths are powers of 2
     sdfg.apply_gpu_transformations(...)  # GPU scheduling, storage, data copies
-    GPUDeviceToCuTile          # re-stamp tileops-anchored maps GPU_Device -> CuTile
-    CuTileSetTileStorage       # Register tile transients -> CuTile_Tile
-    CuTileSetImplementations   # lib nodes -> target_isa="CUTILE", implementation="cutile"
+    GPUDeviceToCuTile             # re-stamp tileops-anchored maps GPU_Device -> CuTile
+    CuTileSetTileStorage          # Register tile transients -> CuTile_Tile
+    CuTileSetLibraryImplementations  # non-tileops lib nodes (BLAS MatMul) -> CuPy, expand
+    CuTileSetImplementations      # tileops lib nodes -> target_isa="CUTILE", implementation="cutile"
 
 followed by ``sdfg.expand_library_nodes()`` and
 ``sdfg.backend = dtypes.BackendLanguage.Python`` (single core-API calls,
@@ -72,6 +73,23 @@ def _collect_tile_nodes(sdfg: SDFG) -> List[Tuple[nodes.LibraryNode, SDFGState]]
     """
     tile_types = _tile_node_types()
     return [(node, graph) for node, graph in sdfg.all_nodes_recursive() if isinstance(node, tile_types)]
+
+
+def _collect_non_tile_library_nodes(sdfg: SDFG) -> List[Tuple[nodes.LibraryNode, SDFGState]]:
+    """Collect every non-tileops library node in ``sdfg``, recursively.
+
+    These are library nodes that the tileops-anchored lowering passes leave
+    untouched -- most importantly BLAS ``MatMul`` (and its specialized
+    ``Gemm`` / ``Gemv`` / ``Dot`` / ``BatchedMatMul`` forms) produced by
+    ``@`` / ``np.matmul`` in the source program.
+
+    :param sdfg: SDFG to search (NestedSDFGs are included).
+    :returns: List of ``(lib_node, state)`` pairs, where ``state`` is the
+        SDFGState that owns the node.
+    """
+    tile_types = _tile_node_types()
+    return [(node, graph) for node, graph in sdfg.all_nodes_recursive()
+            if isinstance(node, nodes.LibraryNode) and not isinstance(node, tile_types)]
 
 
 def _enclosing_map_chain(node: nodes.Node,
@@ -422,3 +440,81 @@ class CuTileSetImplementations(_CuTileLoweringPass):
             node.target_isa = "CUTILE"
             node.implementation = "cutile"
         return len(anchors)
+
+
+@properties.make_properties
+@transformation.explicit_cf_compatible
+class CuTileSetLibraryImplementations(_CuTileLoweringPass):
+    """Select and expand implementations for non-tileops library nodes.
+
+    The cuTile front door lowers elementwise / stencil maps into tileops
+    library nodes, but any *other* library node in the program is left
+    untouched by the tileops-anchored passes. The important case is BLAS
+    ``MatMul`` (from ``@`` / ``np.matmul``) and its specialized ``Gemm`` /
+    ``Gemv`` / ``Dot`` / ``BatchedMatMul`` forms: left alone they keep the
+    ``GPU_Device`` schedule stamped by ``apply_gpu_transformations()`` and are
+    never expanded, so the Python/cuTile backend raises
+    ``KeyError: ScheduleType.GPU_Device`` at code generation.
+
+    This pass gives every non-tileops library node a Python-backend-compatible
+    implementation and drives its expansion, so no such node survives to
+    codegen. Implementations are tried in :attr:`PREFERRED_IMPLEMENTATIONS`
+    order -- ``'CuPy'`` first (it emits a ``cupy`` call, which the Python
+    backend runs directly on the ``GPU_Global`` operands), then ``'pure'``.
+    Nodes that expose neither (notably ``MatMul``, which only offers the
+    ``'specialize'`` meta-expansion) are first expanded via ``'specialize'``;
+    the concrete node it produces is picked up on the next iteration.
+
+    Must run *after* ``GPUDeviceToCuTile`` (so the tileops kernels are already
+    re-stamped to :class:`~dace.dtypes.ScheduleType.CuTile`) and *before* the
+    Python-backend stamp. Tileops nodes are deliberately skipped -- they are
+    handled by :class:`CuTileSetImplementations`.
+    """
+
+    #: Implementations to try, in priority order, for a non-tileops node.
+    PREFERRED_IMPLEMENTATIONS: Tuple[str, ...] = ("CuPy", "pure")
+
+    def _select_implementation(self, node: nodes.LibraryNode) -> Optional[str]:
+        """Return the highest-priority available implementation, or ``None``.
+
+        :param node: The library node to inspect.
+        :returns: The first entry of :attr:`PREFERRED_IMPLEMENTATIONS` that the
+            node exposes, or ``None`` if it exposes none of them.
+        """
+        for impl in self.PREFERRED_IMPLEMENTATIONS:
+            if impl in node.implementations:
+                return impl
+        return None
+
+    def apply_pass(self, sdfg: SDFG, pipeline_results: Dict[str, Any]) -> Optional[int]:
+        """Select and expand implementations for every non-tileops library node.
+
+        :param sdfg: The SDFG whose library nodes are expanded in place.
+        :param pipeline_results: Unused pipeline results.
+        :returns: The number of library nodes expanded, or ``None`` if there
+            were none.
+        :raises ValueError: When ``strict`` and a non-tileops library node
+            exposes neither a preferred implementation nor ``'specialize'``.
+        """
+        expanded = 0
+        # Fixed-point loop: expanding a meta-node (``specialize``) reveals a new
+        # concrete node that must itself be selected on the next iteration.
+        progressed = True
+        while progressed:
+            progressed = False
+            for node, state in _collect_non_tile_library_nodes(sdfg):
+                impl = self._select_implementation(node)
+                if impl is None and "specialize" in node.implementations:
+                    impl = "specialize"
+                if impl is None:
+                    _warn_or_raise(
+                        f"CuTileSetLibraryImplementations: {type(node).__name__} '{node.label}' "
+                        f"exposes none of {self.PREFERRED_IMPLEMENTATIONS} nor 'specialize'; the "
+                        "Python/cuTile backend cannot code-generate it", self.strict)
+                    continue
+                node.implementation = impl
+                node.expand(state, impl)
+                expanded += 1
+                progressed = True
+
+        return expanded or None

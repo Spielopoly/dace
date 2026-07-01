@@ -17,6 +17,7 @@ from dace import SDFG, dtypes, properties, transformation
 from dace.transformation import pass_pipeline as ppl
 from dace.transformation.passes.vectorization.cutile_lowering import (
     CuTileSetImplementations,
+    CuTileSetLibraryImplementations,
     CuTileSetTileStorage,
     CuTileValidateTiles,
     GPUDeviceToCuTile,
@@ -173,10 +174,15 @@ class VectorizeCuTile(ppl.Pass):
         CuTileSetTileStorage(strict=self.strict).apply_pass(sdfg, {})
         debug_save_sdfg()
 
-        # Step 6: Stamp cuTile implementations on library nodes
+        # Step 6: Select + expand non-tileops library nodes (e.g. BLAS MatMul ->
+        # CuPy) so no GPU_Device-scheduled library node survives to codegen.
+        CuTileSetLibraryImplementations(strict=self.strict).apply_pass(sdfg, {})
+        debug_save_sdfg()
+
+        # Step 7: Stamp cuTile implementations on tileops library nodes
         CuTileSetImplementations(strict=self.strict).apply_pass(sdfg, {})
 
-        # Step 7: Python backend stamp
+        # Step 8: Python backend stamp
         sdfg.backend = dtypes.BackendLanguage.Python
         debug_save_sdfg()
 
