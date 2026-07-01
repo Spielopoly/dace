@@ -160,20 +160,34 @@ def _rewrite_memlets_with_offset(inner_sdfg: SDFG, inner_name: str, offset_dims:
             for d, (offset, collapsed) in enumerate(zip(offset_dims, collapsed_dims)):
                 if inner_is_full_rank:
                     (lo, hi, stp) = inner_subset[d]
-                    # Add the window base to a full-rank inner dim ONLY when the
-                    # inner begin is expressed RELATIVE to the window (an
-                    # intra-window stencil offset ``0`` / ``1`` / ``2``, or the
-                    # NSDFG-boundary connector binding ``[0:1]``). When the inner
-                    # begin ALREADY references the offset's iteration symbol(s) it
-                    # is in absolute outer coordinates -- an in-place RMW body
-                    # keeps ``A[i, j]`` verbatim (the inner SDFG receives ``i``,
-                    # ``j`` as symbols) -- and re-adding the base double-counts
-                    # (``i + i = 2*i``), reading/writing only every other element.
-                    # Detect the absolute case via free-symbol overlap with the
-                    # offset and leave such dims untouched.
-                    off_syms = sympy.sympify(offset).free_symbols
-                    lo_syms = sympy.sympify(lo).free_symbols
-                    if off_syms and (off_syms & lo_syms):
+                    # Add the window base to a full-rank inner dim UNLESS the
+                    # inner begin is ALREADY in absolute outer coordinates. The
+                    # absolute case is an in-place RMW body that keeps ``A[i, j]``
+                    # verbatim (the inner SDFG receives ``i``, ``j`` as symbols)
+                    # -- there the boundary subset is the single element
+                    # ``[i:i, j:j]`` so the per-dim ``offset`` EQUALS the inner
+                    # begin; re-adding it would double-count (``i + i = 2*i``),
+                    # reading/writing only every other element.
+                    #
+                    # The test is EXACT equality ``lo == offset``, NOT mere
+                    # free-symbol overlap. When the boundary connector bundles
+                    # two differently-shaped accesses to the SAME array (e.g. an
+                    # ``np.add.outer`` reads both ``M[i, k]`` and ``M[k, j]``),
+                    # ``NestInnermostMapBodyIntoNSDFG`` propagates a bounding-box
+                    # boundary whose per-dim origin is a ``Min(k, i)`` expression
+                    # and REBASES each inner begin to it -- e.g. ``M[i, k]`` dim1
+                    # becomes ``k - Min(k, j)``. That rebased begin SHARES symbols
+                    # with the offset ``Min(k, j)`` yet is NOT absolute: the
+                    # correct action is to add the offset back so the ``Min``
+                    # cancels (``(k - Min(k, j)) + Min(k, j) == k``), restoring the
+                    # constant column ``M[i, k]``. The old free-symbol-overlap test
+                    # mis-classified this as absolute and silently collapsed the
+                    # outer-product operands into a full 2-D tile of ``M``.
+                    try:
+                        is_absolute = bool(symbolic.simplify(lo - offset) == 0)
+                    except Exception:  # noqa: BLE001
+                        is_absolute = (lo == offset)
+                    if is_absolute:
                         new_range_list.append((lo, hi, stp))
                     else:
                         new_range_list.append((lo + offset, hi + offset, stp))
@@ -187,11 +201,24 @@ def _rewrite_memlets_with_offset(inner_sdfg: SDFG, inner_name: str, offset_dims:
             if memlet.other_subset is not None:
                 src = edge.src
                 dst = edge.dst
-                if (isinstance(src, nodes.AccessNode) and isinstance(dst, nodes.AccessNode)
-                        and (memlet.other_subset == subsets.Range([(0, 0, 1)]) and memlet.data == src.data)):
+                # ``other_subset`` addresses the OPPOSITE endpoint of an
+                # AccessNode->AccessNode copy (``memlet.data`` / ``subset`` names
+                # one side; ``other_subset`` names the other). This widening only
+                # reshapes ``inner_name`` (== ``memlet.data`` here), so as long as
+                # the opposite endpoint is a DIFFERENT array it is untouched and
+                # its ``other_subset`` carries through verbatim -- both for a
+                # scalar ``[0]`` (e.g. a reduction-buffer write) and for a full
+                # range (e.g. trmm's triangular slice ``A[i+1:, i]`` reshaped into
+                # a contiguous 1-D dot buffer ``A_0[0:M-i-1]``: ``subset`` into
+                # ``A`` gets offset, ``other_subset`` into ``A_0`` does not).
+                if isinstance(src, nodes.AccessNode) and isinstance(dst, nodes.AccessNode):
+                    opposite_name = dst.data if memlet.data == src.data else src.data
+                else:
+                    opposite_name = None
+                if opposite_name is not None and opposite_name != inner_name:
                     new_memlet = Memlet(data=memlet.data,
                                         subset=subsets.Range(new_range_list),
-                                        other_subset=subsets.Range([(0, 0, 1)]))
+                                        other_subset=copy.deepcopy(memlet.other_subset))
                     edge.data = new_memlet
                 else:
                     raise NotImplementedError("Unsupported other subset case for memlet with data == outer array")

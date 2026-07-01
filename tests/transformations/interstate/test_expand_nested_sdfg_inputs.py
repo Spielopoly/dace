@@ -390,3 +390,122 @@ def test_scalar_source_not_subscripted_in_interstate_assignment():
     expr = next((a for a in found_assigns if "c1" in a and "c2" in a), None)
     assert expr is not None, f"expected an assignment referencing c1 and c2; got {found_assigns}"
     assert "[0]" not in expr, f"Scalar reference should not be subscripted; got {expr!r}"
+
+
+def _build_reshape_copy_sdfg():
+    """Build the shape that trmm's triangular column slice produces: a body
+    NSDFG whose inner AccessNode->AccessNode copy reshapes a strided 2-D slice
+    ``Ac[0:N-1, 0]`` into a contiguous 1-D buffer ``tmp[0:N-1]``. The copy
+    memlet's ``data`` is the widened connector (``Ac``) and it carries a RANGED
+    ``other_subset`` (``0:N-1``) into the separate transient ``tmp``.
+
+    This is the exact memlet shape that tripped ``_rewrite_memlets_with_offset``
+    (bug 12): its ``other_subset`` handling only accepted the scalar ``[0]``
+    case and raised ``NotImplementedError: Unsupported other subset case`` on a
+    ranged ``other_subset``. The offset from the narrowed boundary read
+    ``A[1:N, 0]`` (row offset ``+1``, collapsed column) must be threaded onto
+    the copy's primary subset while the ``other_subset`` into ``tmp`` (a
+    separate array this widening does not touch) is carried through verbatim.
+    """
+    from dace import subsets
+
+    N_sym = dace.symbol('N', dtype=dace.int64)
+
+    inner = dace.SDFG('reshape_copy_inner')
+    inner.add_symbol('N', dace.int64)
+    inner.add_array('Ac', (N_sym, N_sym), dace.float64)  # widen target mirrors outer A
+    inner.add_array('Rc', (N_sym, ), dace.float64)       # full 1-D output connector
+    inner.add_transient('tmp', (N_sym - 1, ), dace.float64)
+
+    st = inner.add_state('body')
+    ac = st.add_access('Ac')
+    tmp = st.add_access('tmp')
+    rc = st.add_access('Rc')
+    # AN->AN reshape copy Ac[0:N-1, 0] -> tmp[0:N-1] (ranged other_subset).
+    st.add_edge(
+        ac, None, tmp, None,
+        dace.Memlet(data='Ac',
+                    subset=subsets.Range([(0, N_sym - 2, 1), (0, 0, 1)]),
+                    other_subset=subsets.Range([(0, N_sym - 2, 1)])))
+    me, mx = st.add_map('dbl', dict(k='0:N-1'))
+    t = st.add_tasklet('d', {'i'}, {'o'}, 'o = 2.0 * i')
+    st.add_memlet_path(tmp, me, t, dst_conn='i', memlet=dace.Memlet('tmp[k]'))
+    st.add_memlet_path(t, mx, rc, src_conn='o', memlet=dace.Memlet('Rc[k+1]'))
+
+    outer = dace.SDFG('reshape_copy_outer')
+    outer.add_symbol('N', dace.int64)
+    outer.add_array('A', (N_sym, N_sym), dace.float64)
+    outer.add_array('R', (N_sym, ), dace.float64)
+    s0 = outer.add_state('s0')
+    a_an = s0.add_access('A')
+    r_an = s0.add_access('R')
+    nsdfg = s0.add_nested_sdfg(inner, {'Ac'}, {'Rc'}, symbol_mapping={'N': N_sym})
+    # Narrowed in-edge A[1:N, 0] (row offset +1, collapsed column) triggers Expand.
+    s0.add_edge(a_an, None, nsdfg, 'Ac',
+                dace.Memlet(data='A', subset=subsets.Range([(1, N_sym - 1, 1), (0, 0, 1)])))
+    s0.add_edge(nsdfg, 'Rc', r_an,
+                None, dace.Memlet(data='R', subset=subsets.Range([(0, N_sym - 1, 1)])))
+    outer.validate()
+    return outer
+
+
+def test_reshape_copy_ranged_other_subset_widens_and_validates():
+    """Regression (bug 12): a widened connector's AN->AN copy with a RANGED
+    ``other_subset`` (the trmm triangular-slice-into-dot-buffer shape) must be
+    accepted by ``ExpandNestedSDFGInputs`` instead of raising
+    ``NotImplementedError: Unsupported other subset case``."""
+    sdfg = _build_reshape_copy_sdfg()
+    PatternMatchAndApplyRepeated([ExpandNestedSDFGInputs()]).apply_pass(sdfg, {})
+    sdfg.validate()
+
+
+def test_reshape_copy_ranged_other_subset_numerics_via_expand_then_inline():
+    """End-to-end (bug 12): expand + inline the reshape-copy SDFG, compile and
+    run, and check the result matches the reference ``R[1:] = 2*A[1:, 0]``.
+
+    The narrowed boundary offset (+1 on the row axis) must be threaded onto the
+    copy's primary subset while the ranged ``other_subset`` into ``tmp`` is
+    preserved verbatim; getting either wrong corrupts the numerics."""
+    sdfg = _build_reshape_copy_sdfg()
+    PatternMatchAndApplyRepeated([ExpandNestedSDFGInputs()]).apply_pass(sdfg, {})
+    PatternMatchAndApplyRepeated([InlineMultistateSDFG()]).apply_pass(sdfg, {})
+    sdfg.validate()
+
+    n = 9
+    rng = np.random.default_rng(7)
+    a = rng.standard_normal((n, n))
+    r = np.zeros(n)
+    sdfg(A=a.copy(), R=r, N=n)
+    ref = np.zeros(n)
+    ref[1:n] = 2.0 * a[1:n, 0]
+    assert np.allclose(r, ref), f'max diff: {np.abs(r - ref).max():.3e}'
+
+
+def test_trmm_pipeline_no_unsupported_other_subset():
+    """Integration (bug 12): the trmm kernel driven through the cuTile
+    vectorizer must NOT raise ``Unsupported other subset case`` in
+    ``ExpandNestedSDFGInputs``. The kernel's ``B[i,j] += dot(A[i+1:, i],
+    B[i+1:, j])`` reshapes the triangular column slice ``A[i+1:, i]`` into a
+    contiguous 1-D dot buffer -- an AN->AN copy with a ranged ``other_subset``.
+
+    Full cuTile lowering of trmm hits an unrelated K=2/1-D-reduction limitation
+    downstream (``MarkTileDims``), so we only assert that whatever error the
+    pipeline raises is NOT the bug-12 expand error.
+    """
+    M_sym = dace.symbol('M', dtype=dace.int64)
+    N_sym = dace.symbol('N', dtype=dace.int64)
+
+    @dace.program
+    def trmm(alpha: dace.float64, A: dace.float64[M_sym, M_sym], B: dace.float64[M_sym, N_sym]):
+        for i in range(M_sym):
+            for j in range(N_sym):
+                B[i, j] += np.dot(A[i + 1:, i], B[i + 1:, j])
+        B *= alpha
+
+    from dace.transformation.passes.vectorization import VectorizeCuTile
+    sdfg = copy.deepcopy(trmm.to_sdfg(simplify=False))
+    try:
+        VectorizeCuTile(widths=(8, 8)).apply_pass(sdfg, {})
+    except Exception as e:  # noqa: BLE001 - any downstream failure is acceptable
+        assert 'Unsupported other subset case' not in str(e), \
+            f'bug 12 regressed: {e}'

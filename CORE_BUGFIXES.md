@@ -336,6 +336,42 @@ with core APIs (SDFG/state construction, `LoopToMap`, `MapToForLoop`,
   succeeds (without the fix the assertion errors with `AttributeError`).
 - **Status:** fixed, regression-verified; commit pending.
 
+### 13. `InlineMultistateSDFG` non-identity symbol_mapping collided with an outer data descriptor
+- **Scope: branch-only (`vectorized-tile-ir`) — NOT on `main`, excluded from
+  the consolidated PR.** `origin/main`'s `InlineMultistateSDFG` still does the
+  legacy full inline substitution
+  (`symbolic.safe_replace(nsdfg_node.symbol_mapping, nsdfg.replace_dict)`),
+  which handles this case, so `main` is not affected.
+- **File:** `dace/transformation/interstate/multistate_inline.py`
+- **Introduced by:** commit `66e0a84af`
+  (`feat(nsdfg-inline): data-name-ordering isolate + ...`), which split the
+  symbol mapping into IDENTITY / NON-IDENTITY and lowered non-identity entries
+  to interstate-edge assignments plus new outer-symbol declarations
+  (`sdfg.add_symbol(inner_name, ...)`).
+- **Bug:** when an inner symbol's name is ALSO the name of an outer *data
+  descriptor* (frontend shape: a global `dc.symbol('nit')` used inside a
+  nested `@dc.program`, while the outer program takes a same-named parameter
+  `nit`; the frontend renames the outer symbol to `__sym_nit` and keeps `nit`
+  as the scalar data descriptor), the non-identity path tried
+  `sdfg.add_symbol('nit', ...)` and raised
+  `FileExistsError: Cannot create symbol "nit", the name is used by a data
+  descriptor.` Triggered by `sdfg.simplify()` on npbench `cavity_flow` /
+  `channel_flow` (and hence by `VectorizeCuTile`, which calls `simplify()`).
+- **Fix:** partition a third bucket — non-identity entries whose inner name is
+  already taken by an outer data descriptor or constant
+  (`str(k) in sdfg.arrays or str(k) in sdfg.constants_prop`) are substituted
+  *inline* (`inner_K -> outer_expr`, the legacy behavior) instead of being
+  planted as an iedge assignment + new outer symbol. Non-colliding
+  non-identity entries keep the new iedge-assignment behavior.
+- **Reproducer tests:**
+  `tests/transformations/interstate/test_inline_multistate_sdfg.py`
+  — `test_inline_inner_symbol_collides_with_outer_data_descriptor`
+  (structural: inline must not raise; `nit` stays a data descriptor, no iedge
+  assignment planted) and `test_inline_inner_symbol_collides_end_to_end`
+  (`@dace.program` with a global symbol shadowed by a same-named parameter,
+  `to_sdfg(simplify=True)` → compile → run, matches NumPy).
+- **Status:** fixed, regression-tested.
+
 ### 8. (BACKLOG, not a bug) MoveIfIntoMap underpowered for the top-level guard-over-map shape
 - **Observation:** `MoveIfIntoMap.can_be_applied` only matches a guard
   already inside a NestedSDFG that sits in an outer map; it is a no-op on
@@ -514,3 +550,47 @@ bugs.
 - **Use:** several TSVC benchmarks need front/back peeling before the steady-
   state middle vectorizes. Try small ``X``, ``Y`` and keep the peeling only if
   the middle becomes a clean parallel map. (User-requested 2026-05-21.)
+
+## Bug 15 — CPU-vectorizer `np.add.outer` miscompile (added 2026-07-01)
+
+Reproducer test: `tests/passes/vectorization/orchestrator/test_add_outer_e2e.py`
+(numeric, compile→run→compare vs NumPy; `pure` K≥2 + K=1 `SCALAR`/`AUTO`
+intrinsic; divisible + masked-tail sizes). See
+`TileIR/pipeline_bugs/15-add-outer-miscompiled-cpu-vectorizer.md` for the full
+write-up.
+
+### 15a. `SDFG.append_global_code(cpp_code=...)` — wrong kwarg name
+- **File:** `dace/transformation/passes/vectorization/vectorize.py:2317`.
+- **Bug:** called with `cpp_code=`; the method parameter is `code`
+  (`append_global_code(code, location, language)`). `TypeError` on every
+  CPU-ISA-intrinsics K=1 lowering (`SCALAR`/`AVX2`/`AVX512`). Confirmed on
+  pristine `origin` tree (identical bad call).
+- **Fix:** `cpp_code=` → `code=`.
+
+### 15b. `tile_load` broadcast overload hijacks `__restrict__` strided loads
+- **File:** `dace/runtime/include/dace/tile_ops/scalar.h` (VLEN>1 by-value
+  broadcast `tile_load`, SFINAE guard).
+- **Bug:** `std::is_pointer_v<T* __restrict__>` is `false` under GCC/Clang, so
+  the `!is_pointer` SFINAE guard did not exclude the restrict-qualified strided
+  source pointer; the by-value broadcast overload won and splatted `src[0]`
+  across all lanes (K=1 strided loads returned a constant). Silent numeric
+  miscompile of any K=1 `SCALAR` strided load with a restrict source.
+- **Fix:** `_strip_restrict` trait removes `__restrict__` before the pointer
+  test (`_is_pointer_like<Src>`) so restrict pointers route to the strided-load
+  overload; genuine by-value scalars still broadcast.
+
+### 15c. `ExpandNestedSDFGInputs` collapses outer-product operands
+- **File:** `dace/transformation/interstate/expand_nested_sdfg_inputs.py`,
+  `_rewrite_memlets_with_offset` (full-rank offset re-add heuristic).
+- **Bug:** when one NSDFG boundary connector bundles two differently-shaped
+  accesses to the same array (`M[i,k]` + `M[k,j]`), the inner memlets are
+  rebased against a `Min(k, i)` bounding-box origin. The "already absolute"
+  test used *free-symbol overlap*, which the rebased begin `k - Min(k, j)`
+  satisfies, so the offset was not re-added and both operands collapsed into a
+  full 2-D tile of `M` (computing `2·M[i,j]`).
+- **Fix:** tighten the test to exact equality `simplify(lo - offset) == 0`
+  (the true keep-verbatim in-place-RMW case), so the rebased begin gets the
+  offset re-added and the `Min` cancels back to the constant slice. Preserves
+  the in-place RMW read (`lo == offset`) and write (`lo == 0`) paths; verified
+  against `expand_nested_sdfg_inputs`/`inline_multistate` suites (19P) and the
+  jacobi stencil.
