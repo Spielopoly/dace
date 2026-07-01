@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Optional
 import warnings
 
 from dace import Config, data, dtypes, memlet as mmlt, registry, subsets, symbolic
+from dace.utils import prod
 import dace.codegen.dispatcher as dispatcher_mod
 from dace.codegen.common import update_persistent_desc
 from dace.codegen.py import utils as pyutils
@@ -337,6 +338,46 @@ class PythonCodeGen(PythonTargetCodeGenerator):
             return f'{runtime_name}[{components}]'
         raise NotImplementedError(
             f'Unsupported subset type for nested SDFG connector: {type(actual_subset).__name__}')
+
+    def _reconcile_nested_arg_shape(self, arg_expr: str, memlet: mmlt.Memlet, desc: data.Array,
+                                    is_input: bool) -> str:
+        """Reshape a nested-SDFG array argument to its connector's declared shape.
+
+        The outer memlet subset and the nested connector array must denote the
+        same element count, but their axis order can differ -- e.g. a reshape
+        :class:`~dace.data.View` that :class:`~dace.transformation.passes.remove_views.RemoveViews`
+        rewrote into a differently-ordered slice of the underlying array (a
+        ``(NQ, 1, NP)`` view becomes a ``(1, NQ, NP)`` slice). Since the flat
+        element order is preserved, a ``.reshape`` to the connector's shape
+        yields the layout the nested function's inner memlets index against.
+
+        Only applied to input connectors: for a contiguous slice ``reshape``
+        returns a view, but a non-contiguous slice would copy, which would drop
+        writes to an output connector. Output connectors are expected to already
+        match their outer subset in this backend.
+
+        :param arg_expr: The Python expression selecting the outer subset.
+        :param memlet: The connector's memlet (its subset gives the outer shape).
+        :param desc: The nested connector's array descriptor.
+        :param is_input: Whether this is an input connector.
+        :returns: ``arg_expr`` wrapped in a ``.reshape`` when reconciliation is
+            needed, otherwise unchanged.
+        """
+        if not is_input:
+            return arg_expr
+        subset_size = list(memlet.subset.size())
+        conn_shape = list(desc.shape)
+        # Identical ordered shapes (including singleton positions) need nothing.
+        if len(subset_size) == len(conn_shape) and all(
+                symbolic.equal_valued(a, b) for a, b in zip(subset_size, conn_shape)):
+            return arg_expr
+
+        # Reshape only when the two denote the same number of elements; a flat
+        # reshape then relayouts the outer slice into the connector's shape.
+        # ``prod`` handles symbolic dims (unlike ``math.prod``).
+        if not symbolic.equal_valued(prod(subset_size), prod(conn_shape)):
+            return arg_expr
+        return f'({arg_expr}).reshape({self._shape_expression(conn_shape)})'
 
     def _nested_scalar_bridge_name(self, cfg: ControlFlowRegion, state, node: nodes.NestedSDFG,
                                    connector_name: str) -> str:
@@ -786,6 +827,7 @@ class PythonCodeGen(PythonTargetCodeGenerator):
                 arg_expr = _bind_bridge(connector_name, memlet, desc, is_input)
             elif isinstance(desc, data.Array):
                 arg_expr = self._nested_view_expr(sdfg, memlet.data, memlet.subset)
+                arg_expr = self._reconcile_nested_arg_shape(arg_expr, memlet, desc, is_input)
             else:
                 arg_expr = self._runtime_data_name(sdfg, memlet.data)
 

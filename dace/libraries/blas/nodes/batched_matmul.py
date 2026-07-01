@@ -6,7 +6,8 @@ import dace.library
 from dace.frontend.common import op_repository as oprepo
 import dace.sdfg.nodes
 from dace.transformation.transformation import ExpandTransformation
-from dace.libraries.blas.blas_helpers import to_blastype, check_access, dtype_to_cudadatatype, to_cublas_computetype
+from dace.libraries.blas.blas_helpers import (to_blastype, check_access, dtype_to_cudadatatype, to_cublas_computetype,
+                                              cupy_in_wrap, cupy_out_wrap)
 from dace.libraries.blas.nodes.matmul import _get_matmul_operands, _get_batchmm_opts, _get_codegen_gemm_opts
 from .. import environments
 import warnings
@@ -466,20 +467,24 @@ class ExpandBatchedMatMulCuPy(ExpandTransformation):
         nsdfg.add_array('_c', shape_c, dtype_c,
                         strides=cdesc.strides, storage=cdesc.storage)
 
-        # Build tasklet code.
+        # Build tasklet code. Operands already on GPU storage (the cuTile
+        # pipeline places everything on GPU_Global) are kept device-resident:
+        # no host ``cupy.asarray`` / ``cupy.asnumpy`` round-trip -- otherwise a
+        # NumPy result cannot be assigned into the cupy output.
         code_lines = ['import cupy']
+
+        a_in = cupy_in_wrap('__a', adesc.storage)
+        b_in = cupy_in_wrap('__b', bdesc.storage)
 
         # Transpose handling — only last two dims for batched matmul.
         if node.transA:
-            code_lines.append(
-                '__a_t = cupy.swapaxes(cupy.asarray(__a), -1, -2)')
+            code_lines.append(f'__a_t = cupy.swapaxes({a_in}, -1, -2)')
         else:
-            code_lines.append('__a_t = cupy.asarray(__a)')
+            code_lines.append(f'__a_t = {a_in}')
         if node.transB:
-            code_lines.append(
-                '__b_t = cupy.swapaxes(cupy.asarray(__b), -1, -2)')
+            code_lines.append(f'__b_t = cupy.swapaxes({b_in}, -1, -2)')
         else:
-            code_lines.append('__b_t = cupy.asarray(__b)')
+            code_lines.append(f'__b_t = {b_in}')
 
         # Alpha scaling.
         alpha = node.alpha
@@ -487,13 +492,13 @@ class ExpandBatchedMatMulCuPy(ExpandTransformation):
             code_lines.append('__result = cupy.matmul(__a_t, __b_t)')
         elif equal_valued(0, alpha):
             code_lines.append(
-                '__result = cupy.zeros_like(cupy.asarray(__c))')
+                f'__result = cupy.zeros_like({cupy_in_wrap("__c", cdesc.storage)})')
         else:
             alpha_str = symstr(alpha)
             code_lines.append(
                 f'__result = {alpha_str} * cupy.matmul(__a_t, __b_t)')
 
-        code_lines.append('__c_out = cupy.asnumpy(__result)')
+        code_lines.append(f'__c_out = {cupy_out_wrap("__result", cdesc.storage)}')
 
         code = '\n'.join(code_lines)
 

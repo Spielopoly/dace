@@ -4,6 +4,50 @@ from dace import dtypes, data
 from typing import Any, Dict, Tuple
 
 
+def is_device_resident(storage: dtypes.StorageType) -> bool:
+    """Return whether an array on ``storage`` is already a device (cupy) array.
+
+    Used by the CuPy BLAS expansions to decide whether operands need a host
+    ``cupy.asarray`` / ``cupy.asnumpy`` round-trip. In the cuTile pipeline
+    ``apply_gpu_transformations()`` places every array on
+    :attr:`~dace.dtypes.StorageType.GPU_Global`, so the operands passed to the
+    generated Python tasklet are already ``cupy`` arrays; converting the result
+    back to NumPy then fails to assign into the ``cupy`` output. Treating such
+    operands as device-resident keeps the whole matmul on the device.
+
+    :param storage: The storage type of the operand array.
+    :returns: ``True`` when the storage is GPU-resident (no host conversion
+        needed), ``False`` otherwise.
+    """
+    return storage in dtypes.GPU_RESIDENT_STORAGES
+
+
+def cupy_in_wrap(name: str, storage: dtypes.StorageType) -> str:
+    """Return an expression that yields a ``cupy`` view of a tasklet input.
+
+    Device-resident operands are passed through unchanged; host operands are
+    wrapped in ``cupy.asarray`` (a host-to-device copy).
+
+    :param name: The tasklet input connector name (e.g. ``'__a'``).
+    :param storage: The storage type of the backing array.
+    :returns: A Python expression string producing a ``cupy`` array.
+    """
+    return name if is_device_resident(storage) else f'cupy.asarray({name})'
+
+
+def cupy_out_wrap(expr: str, storage: dtypes.StorageType) -> str:
+    """Return an expression converting a ``cupy`` result to the output storage.
+
+    Device-resident outputs keep the ``cupy`` array (no round-trip); host
+    outputs are converted back with ``cupy.asnumpy``.
+
+    :param expr: The Python expression producing a ``cupy`` result.
+    :param storage: The storage type of the output array.
+    :returns: A Python expression string matching the output storage kind.
+    """
+    return expr if is_device_resident(storage) else f'cupy.asnumpy({expr})'
+
+
 def to_blastype(dtype):
     """ Returns a BLAS character that corresponds to the input type.
         Used in MKL/CUBLAS calls. """

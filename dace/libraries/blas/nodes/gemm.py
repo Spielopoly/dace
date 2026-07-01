@@ -7,11 +7,13 @@ from dace import SDFG, SDFGState
 from dace.frontend.common import op_repository as oprepo
 import dace.sdfg.nodes
 from dace.transformation.transformation import ExpandTransformation
-from dace.libraries.blas.blas_helpers import to_blastype, check_access, dtype_to_cudadatatype, to_cublas_computetype
+from dace.libraries.blas.blas_helpers import (to_blastype, check_access, dtype_to_cudadatatype, to_cublas_computetype,
+                                              cupy_in_wrap, cupy_out_wrap)
 from dace.libraries.blas.nodes.matmul import (_get_matmul_operands, _get_codegen_gemm_opts)
 from .. import environments
 import numpy as np
 import warnings
+from typing import Any, Sequence
 
 
 def _is_complex(dtype):
@@ -511,32 +513,52 @@ class ExpandGemmCuPy(ExpandTransformation):
     @staticmethod
     def expansion(node: 'Gemm', state: SDFGState,
                   sdfg: SDFG) -> SDFG:
-        node.validate(sdfg, state)
-
-        # Get operands using the existing helper.
-        ((edge_a, outer_array_a, shape_a, strides_a, _, _),
-         (edge_b, outer_array_b, shape_b, strides_b, _, _),
+        # Get operands using the existing helper. ``squeezed_*`` are the operand
+        # sizes with redundant unit dimensions removed -- a ``MatMul`` that was
+        # specialized to ``Gemm`` may still carry singleton dims from an
+        # ``np.reshape`` (e.g. doitgen's ``(NQ, 1, NP) @ (NP, NP)``); the matmul
+        # is genuinely 2-D once those are squeezed away.
+        ((edge_a, outer_array_a, shape_a, strides_a, squeezed_a, _),
+         (edge_b, outer_array_b, shape_b, strides_b, squeezed_b, _),
          cdata) = _get_matmul_operands(node, state, sdfg)
+        shape_c = cdata[2]
+        strides_c = cdata[3]
+        squeezed_c = cdata[4]
+
+        # Whether any operand carries redundant (unit) dimensions that the
+        # strict 2-D ``Gemm`` validation would reject; the squeezed operands
+        # must themselves be 2-D matrices for this to be a plain GEMM.
+        needs_squeeze = (len(shape_a) != 2 or len(shape_b) != 2 or len(shape_c) != 2)
+        if not needs_squeeze:
+            node.validate(sdfg, state)
+        elif len(squeezed_a) != 2 or len(squeezed_b) != 2 or len(squeezed_c) != 2:
+            raise ValueError(
+                "ExpandGemmCuPy: operands do not reduce to 2-D matrices after "
+                f"squeezing unit dimensions (got {squeezed_a} @ {squeezed_b} -> "
+                f"{squeezed_c}); this is not a plain matrix-matrix product")
 
         dtype_a = outer_array_a.dtype.type
         dtype_b = outer_array_b.dtype.type
         dtype_c = dace.dtype_to_typeclass(
             np.result_type(dtype_a, dtype_b).type)
 
-        # Compute shapes after transposition.
-        if node.transA:
-            trans_shape_a = list(reversed(shape_a))
-        else:
-            trans_shape_a = shape_a
-        if node.transB:
-            trans_shape_b = list(reversed(shape_b))
-        else:
-            trans_shape_b = shape_b
+        # Compute 2-D matmul shapes after transposition. Only operands that
+        # carry redundant unit dims are squeezed; a genuinely 2-D operand (even
+        # one with a size-1 matrix dim like ``(1, K)``) keeps its full shape.
+        base_a = list(squeezed_a) if len(shape_a) != 2 else list(shape_a)
+        base_b = list(squeezed_b) if len(shape_b) != 2 else list(shape_b)
+        trans_shape_a = list(reversed(base_a)) if node.transA else base_a
+        trans_shape_b = list(reversed(base_b)) if node.transB else base_b
 
         M, K, N = trans_shape_a[0], trans_shape_a[1], trans_shape_b[1]
-        shape_c = (M, N)
 
-        # Create the nested SDFG.
+        def _tuple_str(shape: Sequence[Any]) -> str:
+            """Format a shape sequence as a Python tuple-literal string (via ``symstr``)."""
+            return '(' + ', '.join(symstr(d) for d in shape) + ',)'
+
+        # Create the nested SDFG. ``_c`` keeps the full (possibly singleton-bearing)
+        # output shape so the outer memlet matches; the tasklet reshapes the 2-D
+        # matmul result to it.
         nsdfg = dace.SDFG(node.label + '_cupy')
         nstate = nsdfg.add_state()
 
@@ -544,20 +566,34 @@ class ExpandGemmCuPy(ExpandTransformation):
                         storage=outer_array_a.storage)
         nsdfg.add_array('_b', shape_b, dtype_b, strides=strides_b,
                         storage=outer_array_b.storage)
-        nsdfg.add_array('_c', shape_c, dtype_c, strides=cdata[-3],
+        nsdfg.add_array('_c', shape_c, dtype_c, strides=strides_c,
                         storage=cdata[1].storage)
 
-        # Build tasklet code.
+        # Build tasklet code. Operands already on GPU storage (the cuTile
+        # pipeline places everything on GPU_Global) are kept device-resident:
+        # no host ``cupy.asarray`` / ``cupy.asnumpy`` round-trip -- otherwise a
+        # NumPy result cannot be assigned into the cupy output.
+        storage_a = outer_array_a.storage
+        storage_b = outer_array_b.storage
+        storage_c = cdata[1].storage
         code_lines = ['import cupy']
 
+        # Reduce operands to 2-D matrices (dropping redundant unit dims) so the
+        # matmul and any beta*C term stay 2-D; the result is reshaped back at the end.
+        a_in = cupy_in_wrap('__a', storage_a)
+        b_in = cupy_in_wrap('__b', storage_b)
+        if len(shape_a) != 2:
+            a_in = f'({a_in}).reshape({_tuple_str(squeezed_a)})'
+        if len(shape_b) != 2:
+            b_in = f'({b_in}).reshape({_tuple_str(squeezed_b)})'
         if node.transA:
-            code_lines.append('__a_t = cupy.asarray(__a).T')
+            code_lines.append(f'__a_t = ({a_in}).T')
         else:
-            code_lines.append('__a_t = cupy.asarray(__a)')
+            code_lines.append(f'__a_t = {a_in}')
         if node.transB:
-            code_lines.append('__b_t = cupy.asarray(__b).T')
+            code_lines.append(f'__b_t = ({b_in}).T')
         else:
-            code_lines.append('__b_t = cupy.asarray(__b)')
+            code_lines.append(f'__b_t = {b_in}')
 
         alpha = node.alpha
         if equal_valued(0, alpha):
@@ -576,16 +612,21 @@ class ExpandGemmCuPy(ExpandTransformation):
         has_cin = not equal_valued(0, beta) and node.cin
 
         if has_cin:
+            cin_in = cupy_in_wrap('__cin', storage_c)
+            if len(shape_c) != 2:
+                cin_in = f'({cin_in}).reshape({_tuple_str(squeezed_c)})'
             if equal_valued(1, beta):
                 code_lines.append(
-                    '__result = __result + cupy.asarray(__cin)')
+                    f'__result = __result + {cin_in}')
             else:
                 beta_str = symstr(beta)
                 code_lines.append(
                     f'__result = __result + {beta_str}'
-                    f' * cupy.asarray(__cin)')
+                    f' * {cin_in}')
 
-        code_lines.append('__c_out = cupy.asnumpy(__result)')
+        # The 2-D result is stored through ``_c``'s inner memlet, which squeezes
+        # the redundant unit dimensions itself, so no output reshape is needed.
+        code_lines.append(f'__c_out = {cupy_out_wrap("__result", storage_c)}')
 
         code = '\n'.join(code_lines)
 

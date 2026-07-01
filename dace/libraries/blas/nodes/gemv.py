@@ -414,43 +414,49 @@ class ExpandGemvCuPy(ExpandTransformation):
         nsdfg.add_array('_y', shape_y, dtype_y, strides=strides_y,
                         storage=ydesc.storage)
 
-        # Build tasklet code.
+        # Build tasklet code. Operands already on GPU storage (the cuTile
+        # pipeline places everything on GPU_Global) are kept device-resident:
+        # no host ``cupy.asarray`` / ``cupy.asnumpy`` round-trip -- otherwise a
+        # NumPy result cannot be assigned into the cupy output.
         code_lines = ['import cupy']
 
+        a_in = blas_helpers.cupy_in_wrap('__A', adesc.storage)
+        x_in = blas_helpers.cupy_in_wrap('__x', xdesc.storage)
         if node.transA:
-            code_lines.append('__A_t = cupy.asarray(__A).T')
+            code_lines.append(f'__A_t = ({a_in}).T')
         else:
-            code_lines.append('__A_t = cupy.asarray(__A)')
+            code_lines.append(f'__A_t = {a_in}')
 
         alpha = node.alpha
         if symbolic.equal_valued(1, alpha):
-            code_lines.append('__result = cupy.matmul(__A_t, cupy.asarray(__x))')
+            code_lines.append(f'__result = cupy.matmul(__A_t, {x_in})')
         elif symbolic.equal_valued(0, alpha):
             if node.transA:
                 code_lines.append(
-                    '__result = cupy.zeros(cupy.asarray(__A).shape[1], '
-                    'dtype=cupy.asarray(__A).dtype)')
+                    f'__result = cupy.zeros(({a_in}).shape[1], '
+                    f'dtype=({a_in}).dtype)')
             else:
                 code_lines.append(
-                    '__result = cupy.zeros(cupy.asarray(__A).shape[0], '
-                    'dtype=cupy.asarray(__A).dtype)')
+                    f'__result = cupy.zeros(({a_in}).shape[0], '
+                    f'dtype=({a_in}).dtype)')
         else:
             alpha_str = symbolic.symstr(alpha)
             code_lines.append(
-                f'__result = {alpha_str} * cupy.matmul(__A_t, cupy.asarray(__x))')
+                f'__result = {alpha_str} * cupy.matmul(__A_t, {x_in})')
 
         beta = node.beta
         has_yin = not symbolic.equal_valued(0, beta)
 
         if has_yin:
+            yin_in = blas_helpers.cupy_in_wrap('__yin', ydesc.storage)
             if symbolic.equal_valued(1, beta):
-                code_lines.append('__result = __result + cupy.asarray(__yin)')
+                code_lines.append(f'__result = __result + {yin_in}')
             else:
                 beta_str = symbolic.symstr(beta)
                 code_lines.append(
-                    f'__result = __result + {beta_str} * cupy.asarray(__yin)')
+                    f'__result = __result + {beta_str} * {yin_in}')
 
-        code_lines.append('__y_out = cupy.asnumpy(__result)')
+        code_lines.append(f'__y_out = {blas_helpers.cupy_out_wrap("__result", ydesc.storage)}')
 
         code = '\n'.join(code_lines)
 

@@ -352,24 +352,31 @@ class CuTileSetTileStorage(_CuTileLoweringPass):
 @properties.make_properties
 @transformation.explicit_cf_compatible
 class GPUDeviceToCuTile(_CuTileLoweringPass):
-    """Convert GPU_Device-scheduled maps containing tileops anchors to CuTile.
+    """Convert GPU_Device-scheduled maps to CuTile (tileops) or Sequential.
 
     This adapter pass runs AFTER ``sdfg.apply_gpu_transformations()``, which
     stamps top-level maps as ``ScheduleType.GPU_Device`` and inner maps as
-    ``ScheduleType.Sequential``.  This pass re-stamps only those outermost
-    maps that enclose tileops library nodes from ``GPU_Device`` to ``CuTile``,
-    leaving non-tileops maps (e.g. free-tasklet wrappers added by
-    :class:`~dace.transformation.interstate.gpu_transform_sdfg.GPUTransformSDFG`)
-    at their original schedule.
+    ``ScheduleType.Sequential``.  It performs two re-stamping steps:
 
-    The pass is tileops-anchored: for each tileops library node the chain
-    of enclosing maps (walked across NestedSDFG boundaries via
-    :func:`_enclosing_map_chain`) is inspected; if the outermost map has
-    ``ScheduleType.GPU_Device`` it is re-stamped ``ScheduleType.CuTile``.
+    1. **Tileops-anchored -> CuTile.**  For each tileops library node the chain
+       of enclosing maps (walked across NestedSDFG boundaries via
+       :func:`_enclosing_map_chain`) is inspected; if the outermost map has
+       ``ScheduleType.GPU_Device`` it is re-stamped ``ScheduleType.CuTile`` --
+       these become the cuTile kernels.
+    2. **Everything else -> Sequential.**  Any remaining ``GPU_Device`` map is
+       a non-tileops map (e.g. the scalar / small-elementwise control steps of
+       a sequential solver such as ``cholesky`` / ``trisolv`` / ``durbin``,
+       which ``apply_gpu_transformations()`` blindly stamps ``GPU_Device``).
+       The Python/cuTile backend has **no** ``GPU_Device`` scope dispatcher --
+       only ``Sequential`` / CPU / ``CuTile`` -- so such a map would raise
+       ``KeyError: ScheduleType.GPU_Device`` at code generation.  It is
+       re-stamped ``ScheduleType.Sequential`` and emitted as a host ("driver")
+       Python loop that operates directly on the ``GPU_Global`` (``cupy``)
+       arrays, which are host-addressable in this backend.
     """
 
     def apply_pass(self, sdfg: SDFG, pipeline_results: Dict[str, Any]) -> Optional[int]:
-        """Re-stamp GPU_Device maps containing tile-ops to CuTile.
+        """Re-stamp GPU_Device maps to CuTile (tileops) or Sequential (rest).
 
         :param sdfg: The SDFG to transform in place.
         :param pipeline_results: Unused pipeline results.
@@ -377,12 +384,16 @@ class GPUDeviceToCuTile(_CuTileLoweringPass):
             if there were no tileops anchors.
         :raises ValueError: When ``strict`` and no tileops anchors exist.
         """
+        # Step 1: re-stamp tileops-anchored outermost maps to CuTile.  Absence
+        # of anchors is not fatal here -- an SDFG whose only reductions became
+        # BLAS library nodes (e.g. ``cholesky`` / ``trisolv`` with ``np.dot``)
+        # has zero cuTile kernels but still carries GPU_Device host-control maps
+        # that step 2 must demote -- so we warn but continue.
         anchors = _collect_tile_nodes(sdfg)
         if not anchors:
             _warn_or_raise(
                 "GPUDeviceToCuTile: no tileops library nodes found; run "
                 "VectorizeCPUMultiDim(target_isa='CUTILE', expand_tile_nodes=False) first", self.strict)
-            return None
 
         scope_cache: _ScopeCache = {}
         cutile_entries: Set[nodes.MapEntry] = set()
@@ -398,6 +409,15 @@ class GPUDeviceToCuTile(_CuTileLoweringPass):
             if outermost_entry.map.schedule == dtypes.ScheduleType.GPU_Device:
                 outermost_entry.map.schedule = dtypes.ScheduleType.CuTile
                 cutile_entries.add(outermost_entry)
+
+        # Step 2: demote every remaining GPU_Device map (non-tileops host
+        # control) to Sequential so the Python/cuTile backend can code-generate
+        # it as a host driver loop over the GPU_Global (cupy) operands.  Runs
+        # unconditionally -- these maps exist even when there are no anchors.
+        for map_node, _ in sdfg.all_nodes_recursive():
+            if (isinstance(map_node, nodes.MapEntry)
+                    and map_node.map.schedule == dtypes.ScheduleType.GPU_Device):
+                map_node.map.schedule = dtypes.ScheduleType.Sequential
 
         return len(cutile_entries) if cutile_entries else None
 

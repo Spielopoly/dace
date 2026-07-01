@@ -187,11 +187,18 @@ class ExpandDotCuPy(ExpandTransformation):
         # Build tasklet code.  The dot product is a scalar; the Python
         # backend memlet write does ``_result[0] = __result_out`` so we
         # must produce a plain Python float (or int), not a cupy scalar
-        # or numpy array.
+        # or numpy array.  ``cupy_in_wrap`` avoids a host round-trip for
+        # device-resident (``GPU_Global``) operands -- the cuTile pipeline
+        # places every array there.  The operands may arrive as a length-1
+        # leading-dim slice (e.g. ``A[i, :j]`` lowers to a ``(1, j)`` view),
+        # so ``.ravel()`` collapses them to the 1-D vectors ``cupy.dot``
+        # expects before it can return a scalar.
+        x_in = blas_helpers.cupy_in_wrap('__x', desc_x.storage)
+        y_in = blas_helpers.cupy_in_wrap('__y', desc_y.storage)
         code = '\n'.join([
             'import cupy',
-            ('__result_out = float(cupy.dot('
-             'cupy.asarray(__x), cupy.asarray(__y)))'),
+            (f'__result_out = float(cupy.dot(({x_in}).ravel(), '
+             f'({y_in}).ravel()))'),
         ])
 
         tasklet = dace.sdfg.nodes.Tasklet(

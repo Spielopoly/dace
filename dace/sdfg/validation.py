@@ -355,12 +355,40 @@ def validate_sdfg(sdfg: 'dace.sdfg.SDFG', references: Set[int] = None, **context
         raise
 
 
+def _root_backend_is_python(sdfg: 'dace.sdfg.SDFG') -> bool:
+    """Whether the root SDFG of ``sdfg`` targets the Python backend.
+
+    Walks the ``parent_sdfg`` chain to the top-level SDFG (the backend is a
+    property of the root only; nested SDFGs inherit it implicitly) and reports
+    whether its :attr:`~dace.sdfg.SDFG.backend` is
+    :attr:`~dace.dtypes.BackendLanguage.Python`.
+
+    :param sdfg: Any SDFG in the tree (possibly nested).
+    :returns: ``True`` iff the root SDFG's backend is ``Python``.
+    """
+    root = sdfg
+    while root.parent_sdfg is not None:
+        root = root.parent_sdfg
+    return root.backend == dtypes.BackendLanguage.Python
+
+
 def _accessible(sdfg: 'dace.sdfg.SDFG', container: str, context: Dict[str, bool]):
     """
     Helper function that returns False if a data container cannot be accessed in the current SDFG context.
     """
     storage = sdfg.arrays[container].storage
     if storage == dtypes.StorageType.GPU_Global or storage in dtypes.GPU_STORAGES:
+        # The Python/cuTile backend represents ``GPU_Global`` data as ``cupy``
+        # arrays, which are addressable from host ("driver") Python code -- a
+        # host tasklet may index them, pass them to ``cupy.dot``, or launch a
+        # ``cuda.tile`` kernel over them.  The "GPU storage cannot be accessed
+        # on host" restriction is a C++/CUDA-backend invariant that does not
+        # hold there, so it is lifted for Python-backend SDFGs.  The bypass is
+        # restricted to ``GPU_Global`` only: ``GPU_Shared``/``GPU_Register`` are
+        # not host-addressable even under the Python backend, so they keep the
+        # original ``in_gpu`` check.
+        if storage == dtypes.StorageType.GPU_Global and _root_backend_is_python(sdfg):
+            return True
         return context.get('in_gpu', False)
 
     return True

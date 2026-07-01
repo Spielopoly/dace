@@ -10,7 +10,7 @@ import pytest
 
 import dace
 from dace import dtypes
-from dace.codegen.py.compiled_sdfg import PythonCompiledSDFG
+from dace.codegen.py.compiled_sdfg import PythonCompiledSDFG, _is_return_array_name
 
 N = dace.symbol('N')
 
@@ -699,6 +699,108 @@ class TestGpuReturn:
         assert isinstance(arr, cupy.ndarray)
         assert arr.shape == (8,)
         assert arr.dtype == np.float64
+
+
+# ---------------------------------------------------------------------------
+# Regression: __return coexisting with __return_tile* transients (Bug 13)
+# ---------------------------------------------------------------------------
+
+class TestReturnTilePrefixTransients:
+    """Regression tests for Bug 13.
+
+    The cuTile vectorizer introduces transients that share the ``__return``
+    prefix (e.g. ``__return_tile_out``) when a program's return value is
+    written through a tile kernel.  These are NOT genuine return values and
+    must not (a) trip the single-vs-tuple return assertion in
+    ``PythonCompiledSDFG.__init__`` nor (b) be marshaled as return values.
+    """
+
+    def test_is_return_array_name_classification(self):
+        """Only ``__return`` / ``__return_<int>`` count as return arrays."""
+        assert _is_return_array_name('__return')
+        assert _is_return_array_name('__return_0')
+        assert _is_return_array_name('__return_12')
+        # Tile transients sharing the prefix are excluded.
+        assert not _is_return_array_name('__return_tile')
+        assert not _is_return_array_name('__return_tile_out')
+        assert not _is_return_array_name('__return_tile_0')
+        # Unrelated names.
+        assert not _is_return_array_name('A')
+        assert not _is_return_array_name('return')
+
+    def test_return_plus_tile_transient_no_assertion(self):
+        """``__return`` next to a ``__return_tile_out`` transient must compile.
+
+        Before Bug 13 was fixed the ``startswith('__return_')`` check treated
+        the tile transient as a conflicting tuple-return element and tripped an
+        ``AssertionError`` during ``PythonCompiledSDFG.__init__``.
+        """
+        sdfg = dace.SDFG('ret_tile_test')
+        sdfg.backend = dtypes.BackendLanguage.Python
+        sdfg.add_array('__return', [8], dace.float64)
+        sdfg.add_transient('__return_tile_out', [8], dace.float64)
+        sdfg.add_state('s')
+        code = "def ret_tile_test(**kwargs): pass\n"
+
+        # Must not raise AssertionError.
+        csdfg = PythonCompiledSDFG(sdfg, code)
+
+        # The tile transient is not a return value: single-return semantics
+        # hold and only __return is marshaled.
+        assert csdfg._is_single_value_ret is True
+        assert csdfg._has_returns is True
+        assert csdfg._get_return_names() == ['__return']
+
+    def test_return_tile_transient_only_is_not_a_return(self):
+        """A lone ``__return_tile*`` transient does not count as a return."""
+        sdfg = dace.SDFG('tile_only_test')
+        sdfg.backend = dtypes.BackendLanguage.Python
+        sdfg.add_transient('__return_tile_out', [8], dace.float64)
+        sdfg.add_state('s')
+        code = "def tile_only_test(**kwargs): pass\n"
+        csdfg = PythonCompiledSDFG(sdfg, code)
+        assert csdfg._has_returns is False
+        assert csdfg._get_return_names() == []
+
+
+class TestCuTileReturnIntegration:
+    """End-to-end cuTile pipeline: a returned value written through a tile
+    kernel must marshal correctly despite the ``__return_tile_out`` transient.
+    """
+
+    @pytest.mark.gpu
+    def test_cutile_single_return_2d(self):
+        """`compute`-style kernel lowered to cuTile returns the right array."""
+        from dace.transformation.passes.vectorization import VectorizeCuTile
+
+        M = dace.symbol('M')
+        Nn = dace.symbol('N')
+
+        @dace.program
+        def compute_kernel(array_1: dace.int64[M, Nn], array_2: dace.int64[M, Nn],
+                           a: dace.int64, b: dace.int64, c: dace.int64):
+            return np.minimum(np.maximum(array_1, 2), 10) * a + array_2 * b + c
+
+        sdfg = compute_kernel.to_sdfg(simplify=False)
+        VectorizeCuTile(widths=(8, 8)).apply_pass(sdfg, {})
+
+        # The offending dual naming must be present to exercise the regression.
+        return_prefixed = [n for n in sdfg.arrays if n.startswith('__return')]
+        assert '__return' in return_prefixed
+        assert any(n.startswith('__return_tile') for n in return_prefixed)
+
+        csdfg = sdfg.compile()
+
+        rng = np.random.default_rng(0)
+        mm, nn = 16, 16
+        a1 = rng.integers(0, 20, (mm, nn)).astype(np.int64)
+        a2 = rng.integers(0, 20, (mm, nn)).astype(np.int64)
+        a, b, c = 3, 4, 5
+        res = csdfg(array_1=a1.copy(), array_2=a2.copy(), a=a, b=b, c=c, M=mm, N=nn)
+        r = np.asarray(res.get() if hasattr(res, 'get') else res)
+        exp = np.minimum(np.maximum(a1, 2), 10) * a + a2 * b + c
+        np.testing.assert_array_equal(r, exp)
+        assert r.shape == (mm, nn)
 
 
 if __name__ == '__main__':

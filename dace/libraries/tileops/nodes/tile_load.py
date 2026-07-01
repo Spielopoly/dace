@@ -12,8 +12,9 @@ from dace import library, properties
 from dace.sdfg import nodes
 from dace.transformation.transformation import ExpandTransformation
 
-from .._pure_codegen import (cutile_grid_dim_offset, cutile_tile_dim_bids, gather_lane_offset, nested_loops,
-                             offset_via_strides, resolve_gather_deps, tile_offset)
+from .._pure_codegen import (cutile_bid_lines, cutile_grid_dim_offset, cutile_offset_is_nonzero, cutile_tile_dim_bids,
+                             cutile_tile_dim_offsets, gather_lane_offset, nested_loops, offset_via_strides,
+                             resolve_gather_deps, tile_offset)
 from .. import _isa_codegen
 
 #: Map the :attr:`TileLoad.pad_mode` property values to the cuTile
@@ -266,6 +267,14 @@ class ExpandTileLoadCutile(ExpandTransformation):
             # block id (the positional trailing-K offset is wrong there).
             _tile_bids = cutile_tile_dim_bids(node, parent_state, parent_sdfg, used_dimensions,
                                               _src_begins if _src_begins is not None else [], K)
+            # Constant per-tile-dim element offset carried by the memlet begin
+            # (e.g. ``A[1:-1]`` -> begin ``__i0 + 1`` -> offset ``1``). The
+            # block-aligned ``ct.load`` index only reconstructs ``__pid*W`` and
+            # drops this offset, so a non-zero offset must go through the
+            # per-element ``ct.gather`` path with the offset added to each index.
+            _tile_offsets = cutile_tile_dim_offsets(node, parent_state, parent_sdfg, used_dimensions,
+                                                    _src_begins if _src_begins is not None else [], K)
+            has_offset = any(cutile_offset_is_nonzero(c) for c in _tile_offsets)
             # cutile currently does not offer a way to reduce the number of indexing dimensions so we need to specify
             # all dimensions
             unused_dimensions = tuple(sorted(set(range(ndim)) - set(used_dimensions)))
@@ -311,6 +320,8 @@ class ExpandTileLoadCutile(ExpandTransformation):
                         base = f"({arange} + __pid{d} * {widths[d]})"
                         if coeffs[d] != 1:
                             base = f"({base}) * {coeffs[d]}"
+                        if cutile_offset_is_nonzero(_tile_offsets[d]):
+                            base = f"({base}) + {_tile_offsets[d]}"
                         if K > 1:
                             slicer = ", ".join(":" if a == d else "None" for a in range(K))
                             idx_entries.append(f"ct.broadcast_to(({base})[{slicer}], {widths})")
@@ -321,7 +332,7 @@ class ExpandTileLoadCutile(ExpandTransformation):
                 idx_tuple = ", ".join(idx_entries)
                 mask_kw = f", mask=_mask" if node.has_mask else ""
                 src_code = f"ct.gather(_src, ({idx_tuple},), padding_value={pad_value}{mask_kw})"
-            elif is_default_coeffs and not has_replicate:
+            elif is_default_coeffs and not has_replicate and not has_offset:
                 # Simple case: direct load with no striding and no replication
                 index_expr = "("
                 width_expr = "("
@@ -361,13 +372,25 @@ class ExpandTileLoadCutile(ExpandTransformation):
                         if replicate[dim_idx] != 1:
                             arange = f"({arange} // {replicate[dim_idx]})"
                         base = f"({arange} + __pid{dim_idx} * {widths[dim_idx]}) * {coeffs[dim_idx]}"
-                        # place the W arange on tile axis dim_idx (singleton elsewhere)
-                        slicer = ", ".join(":" if a == dim_idx else "None" for a in range(K))
-                        idx_entries.append(f"ct.broadcast_to(({base})[{slicer}], {widths})")
+                        # Add the constant slice offset carried by the memlet
+                        # begin (e.g. ``A[1:-1]`` -> ``+ 1``) so the per-lane
+                        # element index is absolute, not block-relative.
+                        if cutile_offset_is_nonzero(_tile_offsets[dim_idx]):
+                            base = f"({base}) + {_tile_offsets[dim_idx]}"
+                        if K == 1:
+                            # 1-D gather: the index tile is already ``widths``-shaped;
+                            # indexing/broadcasting it (``[:]``) is both unnecessary
+                            # and rejected by cuTile (tiles are not subscriptable).
+                            idx_entries.append(base)
+                        else:
+                            # place the W arange on tile axis dim_idx (singleton elsewhere)
+                            slicer = ", ".join(":" if a == dim_idx else "None" for a in range(K))
+                            idx_entries.append(f"ct.broadcast_to(({base})[{slicer}], {widths})")
                     else:
                         idx_entries.append(_unused_dim_index(d))  # base index along unused source dims
                 idx_tuple = ", ".join(idx_entries)
-                src_code = f"ct.gather(_src, ({idx_tuple},), padding_value={pad_value})"
+                mask_kw = ", mask=_mask" if node.has_mask else ""
+                src_code = f"ct.gather(_src, ({idx_tuple},), padding_value={pad_value}{mask_kw})"
 
             if all_dimensions != tuple(sorted(all_dimensions)):
                 # We need to permute the loaded tile to match the expected layout
@@ -411,7 +434,7 @@ class ExpandTileLoadCutile(ExpandTransformation):
         _bids = _tile_bids if node.src_kind == "Tile" else [
             cutile_grid_dim_offset(node, parent_state, parent_sdfg, K) + d for d in range(K)
         ]
-        code = ''.join(f"__pid{d} = ct.bid({_bids[d]})\n" for d in range(K))
+        code = ''.join(line + "\n" for line in cutile_bid_lines(node, parent_state, parent_sdfg, _bids))
         code += f"_dst = {src_code}"
         inputs = (set() if node.src_kind == "Symbol" else {"_src"}) | ({"_mask"} if node.has_mask else set())
         inputs |= {f"_idx_{d}" for d in node.gather_dims}

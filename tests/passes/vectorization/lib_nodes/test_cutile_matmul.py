@@ -59,16 +59,39 @@ def test_matmul_lowering_leaves_no_blas_libnode_or_gpu_device():
     assert not leftover_gpu_device, f"leftover GPU_Device nodes: {leftover_gpu_device}"
 
 
+def test_matmul_reshaped_contraction_lowers():
+    """A reshape-based tensor contraction (doitgen) lowers without error.
+
+    doitgen's ``np.reshape(A[r], (NQ, 1, NP)) @ C4`` specializes ``MatMul`` to
+    ``Gemm`` over operands that carry a redundant singleton dimension from the
+    reshape. The strict 2-D ``Gemm`` validation used to raise
+    ``ValueError: matrix-matrix product only supported on matrices``; the CuPy
+    expansion now squeezes the unit dims and lowers cleanly. Pure structural
+    check -- no GPU required.
+    """
+    NR, NQ, NP = (dace.symbol(s, dtype=dace.int64) for s in ("NR", "NQ", "NP"))
+
+    @dace.program
+    def doitgen(A: dace.float64[NR, NQ, NP], C4: dace.float64[NP, NP]):
+        for r in range(NR):
+            A[r, :, :] = np.reshape(np.reshape(A[r], (NQ, 1, NP)) @ C4, (NQ, NP))
+
+    sdfg = doitgen.to_sdfg(simplify=False)
+    VectorizeCuTile(widths=(8, 8, 8)).apply_pass(sdfg, {})
+
+    assert not _collect_non_tile_library_nodes(sdfg)
+    assert not _gpu_device_scheduled_nodes(sdfg)
+
+
 @pytest.mark.gpu
 def test_matmul_cutile_runtime_validates():
     """Compile+run a matmul kernel on GPU and validate against NumPy.
 
-    The ``CuTileSetLibraryImplementations`` pass resolves Bug A (the
-    previously-fatal ``KeyError: GPU_Device`` is gone and the kernel compiles --
-    see the structural test above). This test currently FAILS at execution on a
-    separate, unfixed storage-model mismatch: the BLAS 'CuPy' expansion
-    round-trips the result through host (``cupy.asnumpy(...)``), which cannot be
-    assigned into the GPU_Global (cupy) output.
+    Regression for Bug 02: the BLAS 'CuPy' expansion used to round-trip its
+    result through host (``cupy.asnumpy(...)``), which cannot be assigned into
+    the ``GPU_Global`` (cupy) output the cuTile pipeline places arrays on. The
+    expansion is now device-resident when operands live on GPU storage, so the
+    matmul stays on the device and the kernel produces correct numerics.
     """
     M, N = (dace.symbol(s, dtype=dace.int64) for s in ("M", "N"))
 
@@ -90,6 +113,70 @@ def test_matmul_cutile_runtime_validates():
     assert np.allclose(np.asarray(result), expected, atol=1e-10)
 
 
+@pytest.mark.gpu
+def test_matmul_cutile_runtime_non_divisible():
+    """atax with array sizes that are not multiples of the tile width.
+
+    Exercises remainder handling of the device-resident matmul (Bug 02) on a
+    non-divisible boundary (``30 x 20`` with width 8).
+    """
+    M, N = (dace.symbol(s, dtype=dace.int64) for s in ("M", "N"))
+
+    @dace.program
+    def atax(A: dace.float64[M, N], x: dace.float64[N]):
+        return (A @ x) @ A
+
+    sdfg = atax.to_sdfg(simplify=False)
+    VectorizeCuTile(widths=(8, 8)).apply_pass(sdfg, {})
+    csdfg = sdfg.compile()
+
+    m, n = 30, 20
+    rng = np.random.default_rng(7)
+    A = rng.random((m, n))
+    x = rng.random(n)
+    result = csdfg(A=A, x=x, M=m, N=n)
+
+    assert np.allclose(np.asarray(result), (A @ x) @ A, atol=1e-9)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("nr,nq,np_", [(6, 8, 8), (5, 10, 8)])
+def test_matmul_reshaped_contraction_runtime(nr: int, nq: int, np_: int):
+    """Compile+run doitgen's reshape contraction on GPU and validate numerics.
+
+    Regression for Bug 08: the singleton-bearing ``(NQ, 1, NP) @ (NP, NP)``
+    product must expand and execute (device-resident) rather than raise at
+    ``Gemm`` validation. Covers a divisible and a non-divisible ``NQ``.
+    """
+    NR, NQ, NP = (dace.symbol(s, dtype=dace.int64) for s in ("NR", "NQ", "NP"))
+
+    @dace.program
+    def doitgen(A: dace.float64[NR, NQ, NP], C4: dace.float64[NP, NP]):
+        for r in range(NR):
+            A[r, :, :] = np.reshape(np.reshape(A[r], (NQ, 1, NP)) @ C4, (NQ, NP))
+
+    sdfg = doitgen.to_sdfg(simplify=False)
+    VectorizeCuTile(widths=(8, 8, 8)).apply_pass(sdfg, {})
+    csdfg = sdfg.compile()
+
+    rng = np.random.default_rng(11)
+    A = rng.random((nr, nq, np_))
+    C4 = rng.random((np_, np_))
+
+    expected = A.copy()
+    for r in range(nr):
+        expected[r] = np.reshape(np.reshape(expected[r], (nq, 1, np_)) @ C4, (nq, np_))
+
+    result = A.copy()
+    csdfg(A=result, C4=C4, NR=nr, NQ=nq, NP=np_)
+
+    assert np.allclose(result, expected, atol=1e-9)
+
+
 if __name__ == "__main__":
     test_matmul_lowering_leaves_no_blas_libnode_or_gpu_device()
+    test_matmul_reshaped_contraction_lowers()
     test_matmul_cutile_runtime_validates()
+    test_matmul_cutile_runtime_non_divisible()
+    test_matmul_reshaped_contraction_runtime(6, 8, 8)
+    test_matmul_reshaped_contraction_runtime(5, 10, 8)

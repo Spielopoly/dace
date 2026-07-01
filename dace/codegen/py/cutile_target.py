@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Tuple
 
 import sympy as sp
 
-from dace import dtypes, registry, subsets
+from dace import data, dtypes, registry, subsets
 import dace.codegen.dispatcher as dispatcher_mod
 from dace.codegen.py import control_flow as py_cflow
 from dace.codegen.py.framecode import codeblock_to_python
@@ -84,12 +84,60 @@ def _array_runtime_name(sdfg: "SDFG", name: str) -> str:
 
 
 def _grid_exprs_from_map_entry(entry: nodes.MapEntry) -> List[str]:
-    """Return per-dimension grid size expressions from a map entry.
+    """Return per-dimension grid size (number of tiles) expressions from a map entry.
+
+    Each grid dimension is the number of tiles ``ceil(extent / step)`` where
+    ``extent = end - start + 1`` (the map range end is inclusive). This is
+    emitted as a structural integer ceil-division ``int_ceil(extent, step)``
+    rather than ``symstr(range.size())``.
+
+    The latter is unsound for the Python/cuTile backend: ``symstr`` rewrites a
+    symbolic ceiling using C integer-division semantics (e.g.
+    ``ceiling((N-2)/8)`` becomes ``int_ceil(int_floor(N, 8) - 1/4, 1)``). Under
+    Python's true division the residual rational ``1/4`` is the float ``0.25``,
+    which both yields a non-integer grid dimension (rejected by ``ct.launch``)
+    and is off-by-one for non-divisible extents. Building ``int_ceil`` directly
+    from ``(start, end, step)`` keeps both operands integral.
 
     :param entry: The map entry node.
-    :returns: List of symbolic expressions for the grid dimensions.
+    :returns: List of grid-dimension expression strings (one per map dimension).
     """
-    return [symstr(s) for s in entry.map.range.size()]
+    # Delegate to the single shared implementation so the map-entry grid and the
+    # tile-op ``cutile`` expansions cannot drift apart (divergent grid strings
+    # would silently desynchronize the folded launch-grid PIDs).
+    from dace.libraries.tileops._pure_codegen import cutile_grid_size_exprs
+    return cutile_grid_size_exprs(entry)
+
+
+def _fold_grid_to_launch(grid_exprs: List[str]) -> Tuple[List[str], List[str]]:
+    """Fold a ``K``-dimensional tile grid onto the cuTile launch grid (rank <= 3).
+
+    The ``cuda.tile`` runtime caps the launch grid at three axes (``Dim3`` in
+    ``ct.launch``; ``ct.bid(axis)`` only accepts ``axis in {0, 1, 2}``). When a
+    tiled map nest has more than three dimensions (e.g. 4-D ``softmax``, 5-D
+    ``conv2d``), the extra dimensions are linearized onto the available axes and
+    recovered inside the kernel via integer div/mod.
+
+    The fold layout is the single canonical contract defined in
+    :mod:`dace.libraries.tileops._pure_codegen` (``cutile_launch_grid_dims`` /
+    ``cutile_bid_expr``), shared with every tile-op ``cutile`` expansion so the
+    map-entry block IDs and the tile-op block IDs agree: the two innermost map
+    dimensions map to grid axes 1 and 2, and the leading ``K-2`` dimensions are
+    folded row-major onto grid axis 0. For ``K <= 3`` the identity mapping is
+    used (``__pid{d} = ct.bid(d)``), unchanged from the pre-folding behavior.
+
+    :param grid_exprs: Per-dimension grid-size (tile-count) expression strings,
+        in map order (dimension 0 is outermost). Length is ``K``.
+    :returns: A tuple ``(launch_dims, pid_stmts)`` where ``launch_dims`` is the
+        list of at most three launch-grid dimension expressions passed to
+        ``ct.launch``, and ``pid_stmts`` is the list of Python statement strings
+        that bind ``__pid{d}`` for every map dimension ``d`` inside the kernel.
+    """
+    from dace.libraries.tileops._pure_codegen import cutile_bid_expr, cutile_launch_grid_dims
+    num_dims = len(grid_exprs)
+    launch_dims = cutile_launch_grid_dims(grid_exprs)
+    pid_stmts = [f"__pid{d} = {cutile_bid_expr(d, num_dims, grid_exprs)}" for d in range(num_dims)]
+    return launch_dims, pid_stmts
 
 
 def _map_index_exprs(entry: nodes.MapEntry) -> List[str]:
@@ -685,6 +733,88 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
                 return outer_edge.data.data if outer_edge.data else outer_edge.dst.data
         return None
 
+    @staticmethod
+    def _load_source_begins(state: "SDFGState", entry: nodes.MapEntry, in_edge: object) -> Optional[List[str]]:
+        """Per-dim begin expressions of the outer memlet feeding a tile load.
+
+        :param state: The SDFG state.
+        :param entry: The MapEntry node.
+        :param in_edge: The edge from MapEntry to the tile AccessNode.
+        :returns: Per-dim begin expression strings of the outer (global-array)
+            memlet, or ``None`` if not resolvable.
+        """
+        src_conn = in_edge.src_conn
+        if src_conn is None or not src_conn.startswith(_SCOPE_OUT_PREFIX):
+            return None
+        outer_conn = _matching_outer_connector(src_conn)
+        for outer_edge in state.in_edges_by_connector(entry, outer_conn):
+            if (isinstance(outer_edge.src, nodes.AccessNode) and outer_edge.data is not None
+                    and outer_edge.data.subset is not None):
+                return [symstr(r[0]) for r in outer_edge.data.subset.ranges]
+        return None
+
+    @staticmethod
+    def _store_target_begins(state: "SDFGState", exit_node: nodes.MapExit, out_edge: object) -> Optional[List[str]]:
+        """Per-dim begin expressions of the outer memlet receiving a tile store.
+
+        :param state: The SDFG state.
+        :param exit_node: The MapExit node.
+        :param out_edge: The edge from the tile AccessNode to the MapExit.
+        :returns: Per-dim begin expression strings of the outer (global-array)
+            memlet, or ``None`` if not resolvable.
+        """
+        dst_conn = out_edge.dst_conn
+        if dst_conn is None or not dst_conn.startswith(_SCOPE_IN_PREFIX):
+            return None
+        outer_conn = _matching_inner_connector(dst_conn)
+        for outer_edge in state.out_edges_by_connector(exit_node, outer_conn):
+            if (isinstance(outer_edge.dst, nodes.AccessNode) and outer_edge.data is not None
+                    and outer_edge.data.subset is not None):
+                return [symstr(r[0]) for r in outer_edge.data.subset.ranges]
+        return None
+
+    @staticmethod
+    def _const_begin_offsets(begins: Optional[List[str]], entry: nodes.MapEntry) -> List[object]:
+        """Constant element offset per dim carried by the outer memlet begin.
+
+        The outer memlet begin has the form ``<iter-var> + c`` (e.g. an offset
+        slice ``B[1:-1]`` yields begin ``tile_i + 1``). Substituting every map
+        iteration variable with ``0`` leaves the constant offset ``c`` that the
+        block-id / map-range index reconstruction drops -- it must be added back
+        to the ``ct.load`` / ``ct.gather`` / ``ct.scatter`` element index.
+
+        :param begins: Per-dim begin expression strings (or ``None``).
+        :param entry: The enclosing MapEntry (for its iteration variables).
+        :returns: Per-dim symbolic offsets (``0`` where the begin is unusable or
+            anchored at the block-aligned start).
+        """
+        if begins is None:
+            return []
+        subs = {sp.Symbol(str(p)): sp.Integer(0) for p in entry.map.params}
+        offsets: List[object] = []
+        for b in begins:
+            try:
+                offsets.append(sp.simplify(sp.sympify(b).subs(subs)))
+            except Exception:  # noqa: BLE001 - non-symbolic begin -> assume anchored
+                offsets.append(sp.Integer(0))
+        return offsets
+
+    @staticmethod
+    def _apply_index_offsets(map_index_exprs: List[str], offsets: List[object]) -> List[str]:
+        """Add the constant per-dim offsets to the per-dim map index expressions.
+
+        :param map_index_exprs: Per-dim element-index expression strings.
+        :param offsets: Per-dim constant offsets from :meth:`_const_begin_offsets`.
+        :returns: Per-dim index expression strings with non-zero offsets folded in.
+        """
+        adjusted: List[str] = []
+        for d, expr in enumerate(map_index_exprs):
+            if d < len(offsets) and offsets[d] != 0:
+                adjusted.append(f"(({expr}) + ({symstr(offsets[d])}))")
+            else:
+                adjusted.append(expr)
+        return adjusted
+
     # ------------------------------------------------------------------
     # Gather / scatter emission helpers
     # ------------------------------------------------------------------
@@ -803,8 +933,14 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
         """
         map_index_exprs = _map_index_exprs(node)
 
-        for d in range(len(node.map.range)):
-            callsite_stream.write(f"__pid{d} = ct.bid({d})", cfg, state_id)
+        # Bind __pid{d} for every map dimension. When the grid rank exceeds the
+        # cuTile launch-grid cap of 3, the extra dimensions are folded onto
+        # axis 0 and recovered here via integer div/mod (see
+        # ``_fold_grid_to_launch``); the launch site must fold identically.
+        grid_exprs = _grid_exprs_from_map_entry(node)
+        _, pid_stmts = _fold_grid_to_launch(grid_exprs)
+        for stmt in pid_stmts:
+            callsite_stream.write(stmt, cfg, state_id)
         for var, expr in zip(node.map.params, map_index_exprs):
             callsite_stream.write(f"{var} = {expr}", cfg, state_id)
 
@@ -829,6 +965,33 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
     # ------------------------------------------------------------------
     # AccessNode: THE CORE of the AccessNode-centric redesign
     # ------------------------------------------------------------------
+
+    def _emit_scalar_bridge_binding(self, sdfg: "SDFG", state: "SDFGState", node: nodes.AccessNode, cfg: object,
+                                    state_id: int, callsite_stream: PythonCodeIOStream) -> None:
+        """Bind a Register-storage scalar bridge to its source kernel parameter.
+
+        A loop-invariant scalar (e.g. ``alpha``) that the vectorizer staged via
+        :func:`~dace.transformation.passes.vectorization.insert_tile_load_store.stage_constant_access`
+        appears inside the cuTile scope as a fresh ``Register`` scalar transient
+        (``alpha_const``) fed by an edge from the MapEntry. The scalar itself is
+        passed into the kernel as a plain parameter (``alpha``), so the bridge is
+        just a rename: emit ``alpha_const = alpha``. Without this the kernel body
+        references the undefined ``alpha_const`` and the ``cuda.tile`` compiler
+        raises ``Undefined variable alpha_const``.
+
+        :param sdfg: The SDFG.
+        :param state: The state holding ``node``.
+        :param node: The Register-storage scalar bridge AccessNode.
+        :param cfg: The control flow graph.
+        :param state_id: The state ID.
+        :param callsite_stream: Stream for call-site (kernel body) code.
+        """
+        for in_edge in state.in_edges(node):
+            if not isinstance(in_edge.src, nodes.MapEntry):
+                continue
+            source = self._trace_load_source(state, in_edge.src, node, in_edge)
+            if source is not None and source != node.data:
+                callsite_stream.write(f"{node.data} = {source}", cfg, state_id)
 
     def _generate_AccessNode(self, sdfg: "SDFG", cfg: object, dfg: object, state_id: int, node: nodes.AccessNode,
                              function_stream: PythonCodeIOStream, callsite_stream: PythonCodeIOStream) -> None:
@@ -863,6 +1026,15 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
         # Non-tile AccessNodes (e.g. global arrays) are outside the scope
         # and connected via MapEntry/MapExit.
         if desc.storage != dtypes.StorageType.CuTile_Tile:
+            # A Register-storage scalar bridge (a loop-invariant scalar such as
+            # ``alpha`` staged by ``stage_constant_access``) enters the cuTile
+            # kernel through the MapEntry, where it is a kernel parameter. Emit
+            # the rename ``<bridge> = <scalar_param>`` so the kernel body can
+            # read it; without this the tasklet references an undefined
+            # ``*_const`` name and the cuda.tile compiler raises
+            # ``Undefined variable <name>``.
+            if desc.storage == dtypes.StorageType.Register and isinstance(desc, data.Scalar):
+                self._emit_scalar_bridge_binding(sdfg, state, node, cfg, state_id, callsite_stream)
             return
 
         entry = _enclosing_cutile_entry(state, node)
@@ -884,8 +1056,16 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
                 map_index_exprs = _map_index_exprs(entry)
                 cutile_index = ", ".join(f"__pid{d}" for d in range(len(entry.map.range)))
 
-                if self._needs_gather_for_tile(entry, tile_shape, sdfg):
-                    self._emit_gather_load(callsite_stream, global_arr, node.data, map_index_exprs, tile_shape, cfg,
+                # Fold the outer memlet's constant begin offset (e.g. ``A[1:-1]``
+                # -> ``+ 1``) into the element index; a non-zero offset is not
+                # block-aligned, so it forces the per-element ``ct.gather`` path.
+                begins = self._load_source_begins(state, src, in_edge)
+                offsets = self._const_begin_offsets(begins, entry)
+                has_offset = any(o != 0 for o in offsets)
+                gather_index_exprs = self._apply_index_offsets(map_index_exprs, offsets)
+
+                if has_offset or self._needs_gather_for_tile(entry, tile_shape, sdfg):
+                    self._emit_gather_load(callsite_stream, global_arr, node.data, gather_index_exprs, tile_shape, cfg,
                                            state_id)
                 else:
                     shape_str = ", ".join(str(s) for s in tile_shape)
@@ -934,10 +1114,18 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
                 map_index_exprs = _map_index_exprs(entry)
                 cutile_index = ", ".join(f"__pid{d}" for d in range(len(entry.map.range)))
 
-                if self._needs_gather_for_tile(entry, tile_shape, sdfg):
+                # Fold the outer memlet's constant begin offset (e.g. ``B[1:-1]``
+                # -> ``+ 1``) into the element index; a non-zero offset is not
+                # block-aligned, so it forces the per-element ``ct.scatter`` path.
+                begins = self._store_target_begins(state, dst, out_edge)
+                offsets = self._const_begin_offsets(begins, entry)
+                has_offset = any(o != 0 for o in offsets)
+                scatter_index_exprs = self._apply_index_offsets(map_index_exprs, offsets)
+
+                if has_offset or self._needs_gather_for_tile(entry, tile_shape, sdfg):
                     # Build index tiles for scatter
                     idx_vars = self._emit_gather_load(callsite_stream, global_arr, f"__ct_scatter_{node.data}",
-                                                      map_index_exprs, tile_shape, cfg, state_id)
+                                                      scatter_index_exprs, tile_shape, cfg, state_id)
                     self._emit_scatter_store(callsite_stream, global_arr, node.data, idx_vars, cfg, state_id)
                 else:
                     callsite_stream.write(f"ct.store({global_arr}, index=({cutile_index},), "
@@ -1366,11 +1554,12 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
         function_stream.write(kernel_stream.getvalue())
         function_stream.write("")
 
-        padded_grid = (grid_exprs + ["1", "1", "1"])[:3]
-        if len(grid_exprs) > 3:
-            # TODO: support >3D grids by flattening extra dimensions into the 3D grid or via multiple kernel launches.
-            raise NotImplementedError("CuTile backend does not support >3D grids yet.")
-        grid_tuple = f"({', '.join(padded_grid)})"
+        # The cuTile launch grid is capped at 3 axes by the runtime. Grids with
+        # more than 3 tiled dimensions are folded onto the 3 available axes (the
+        # kernel recovers per-dim block IDs via div/mod in ``_generate_MapEntry``,
+        # using the same ``_fold_grid_to_launch`` layout).
+        launch_dims, _ = _fold_grid_to_launch(grid_exprs)
+        grid_tuple = f"({', '.join(launch_dims)})"
         deduped_arrays = list(dict.fromkeys(input_arrays + output_arrays))
         launch_args = ([_array_runtime_name(sdfg, n) for n in deduped_arrays] + free_syms)
         args_tuple = (f"({', '.join(launch_args)},)" if len(launch_args) == 1 else f"({', '.join(launch_args)})")

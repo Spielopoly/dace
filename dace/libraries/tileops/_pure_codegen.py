@@ -8,7 +8,7 @@ pure expansion plugs in its own per-lane body via :func:`nested_loops`
 and uses :func:`tile_offset` to flatten the tile transient's index
 (register tiles are always row-major-contiguous).
 """
-from typing import Sequence
+from typing import List, Sequence
 
 
 def nested_loops(widths: Sequence[int], body: str, indent: str = "    ") -> str:
@@ -63,6 +63,122 @@ def _enclosing_cutile_map(node, parent_state, parent_sdfg):
         cur_state = cur_sdfg.parent
         cur_sdfg = cur_state.sdfg
     return None
+
+
+# ---------------------------------------------------------------------------
+# CuTile launch-grid folding (>3-D grid support)
+#
+# The ``cuda.tile`` runtime caps the launch grid at three axes (``ct.launch``
+# takes a ``Dim3`` and ``ct.bid(axis)`` only accepts ``axis in {0, 1, 2}``).
+# When a tiled ``CuTile`` map has more than three dimensions (e.g. 4-D
+# ``softmax``, 5-D ``conv2d``), the extra grid dimensions are FOLDED onto the
+# available axes and recovered inside the kernel via integer div/mod. The
+# single canonical layout, shared by the map-entry codegen
+# (``codegen/py/cutile_target.py``) and every tile-op ``cutile`` expansion, is:
+#
+#   * The two innermost map dimensions (``M-2`` and ``M-1``) map to grid axes
+#     1 and 2 respectively.
+#   * The remaining leading dimensions (``0 .. M-3``) are folded, row-major,
+#     onto grid axis 0 (``x``, which carries the largest hardware grid-size
+#     limit). Their block IDs are recovered from ``ct.bid(0)`` via div/mod.
+#
+# For ``M <= 3`` the identity mapping (``__pid{d} = ct.bid(d)``) is used, which
+# is unchanged from the pre-folding behavior.
+# ---------------------------------------------------------------------------
+
+
+def cutile_grid_size_exprs(cutile_map_entry) -> List[str]:
+    """Per-dimension grid size (tile count) expressions for a CuTile map.
+
+    Each dimension's grid size is the number of tiles
+    ``int_ceil(extent, step)`` where ``extent = end - start + 1`` (inclusive
+    map-range end). Emitted as a structural integer ceil-division to keep both
+    operands integral for the Python/cuTile backend (mirrors
+    ``cutile_target._grid_exprs_from_map_entry``).
+
+    :param cutile_map_entry: The enclosing CuTile ``MapEntry``.
+    :returns: List of grid-size expression strings, one per map dimension.
+    """
+    from dace.symbolic import symstr
+    exprs: List[str] = []
+    for start, end, step in cutile_map_entry.map.range:
+        extent_s = symstr(end - start + 1)
+        step_s = symstr(step)
+        exprs.append(extent_s if step_s == "1" else f"int_ceil({extent_s}, {step_s})")
+    return exprs
+
+
+def cutile_launch_grid_dims(grid_size_exprs: Sequence[str]) -> List[str]:
+    """Fold per-dimension grid sizes onto the <=3-axis cuTile launch grid.
+
+    :param grid_size_exprs: Per-dimension grid-size expressions in map order
+        (dimension 0 outermost), length ``M``.
+    :returns: List of at most three launch-grid dimension expressions passed to
+        ``ct.launch``. For ``M <= 3`` the sizes are padded with ``"1"`` to a
+        3-tuple; for ``M > 3`` the leading ``M-2`` dimensions are multiplied
+        onto axis 0.
+    """
+    num_dims = len(grid_size_exprs)
+    if num_dims <= 3:
+        return (list(grid_size_exprs) + ["1", "1", "1"])[:3]
+    folded = grid_size_exprs[:num_dims - 2]
+    axis0 = " * ".join(f"({g})" for g in folded)
+    return [axis0, grid_size_exprs[num_dims - 2], grid_size_exprs[num_dims - 1]]
+
+
+def cutile_bid_expr(map_axis: int, num_map_dims: int, grid_size_exprs: Sequence[str]) -> str:
+    """Block-ID expression for a single CuTile map grid axis (folding-aware).
+
+    Returns the Python expression that evaluates, inside a cuTile kernel, to
+    the block index of map dimension ``map_axis``. For ``num_map_dims <= 3``
+    this is simply ``ct.bid(map_axis)``. For ``num_map_dims > 3`` the leading
+    ``M-2`` dimensions are recovered from ``ct.bid(0)`` via div/mod and the two
+    innermost dimensions read ``ct.bid(1)`` / ``ct.bid(2)`` (see the module
+    header for the canonical layout).
+
+    :param map_axis: The map dimension index (grid axis) to recover.
+    :param num_map_dims: Total number of CuTile map dimensions (``M``).
+    :param grid_size_exprs: Per-dimension grid-size expressions (length ``M``).
+    :returns: A Python expression string yielding the block ID for ``map_axis``.
+    """
+    if num_map_dims <= 3:
+        return f"ct.bid({map_axis})"
+    if map_axis == num_map_dims - 2:
+        return "ct.bid(1)"
+    if map_axis == num_map_dims - 1:
+        return "ct.bid(2)"
+    # Folded leading dimension (0 <= map_axis <= M-3), recovered from ct.bid(0).
+    g_axis = grid_size_exprs[map_axis]
+    inner = grid_size_exprs[map_axis + 1:num_map_dims - 2]  # dims strictly inside, up to M-3
+    if not inner:  # innermost folded dim (map_axis == M-3)
+        return f"(ct.bid(0) % ({g_axis}))"
+    divisor = " * ".join(f"({g})" for g in inner)
+    if map_axis == 0:  # outermost folded dim: quotient is already < g_axis
+        return f"(ct.bid(0) // ({divisor}))"
+    return f"((ct.bid(0) // ({divisor})) % ({g_axis}))"
+
+
+def cutile_bid_lines(node, parent_state, parent_sdfg, axes: Sequence[int]) -> List[str]:
+    """Emit ``__pid{k} = <block-id>`` bindings for a tile op's grid axes.
+
+    Resolves each tile-op tile dim's block ID against the enclosing CuTile map,
+    applying the >3-D grid fold (see the module header) so the axis indices
+    stay within the runtime's 3-axis cap. When there is no enclosing CuTile map
+    or it has at most three dimensions, the direct ``ct.bid(axis)`` form is used
+    (identical to the pre-folding behavior).
+
+    :param node: The tile-op library node being expanded.
+    :param parent_state: The state that owns ``node``.
+    :param parent_sdfg: The SDFG that owns ``parent_state``.
+    :param axes: Per-tile-dim grid axis (enclosing-map dimension index).
+    :returns: List of ``__pid{k} = ...`` statement strings, one per tile dim.
+    """
+    m = _enclosing_cutile_map(node, parent_state, parent_sdfg)
+    if m is None or len(m.map.range) <= 3:
+        return [f"__pid{k} = ct.bid({axes[k]})" for k in range(len(axes))]
+    num_map_dims = len(m.map.range)
+    grid = cutile_grid_size_exprs(m)
+    return [f"__pid{k} = {cutile_bid_expr(axes[k], num_map_dims, grid)}" for k in range(len(axes))]
 
 
 def cutile_grid_dim_offset(node, parent_state, parent_sdfg, K: int) -> int:
@@ -139,6 +255,66 @@ def cutile_tile_dim_bids(node, parent_state, parent_sdfg, used_dimensions: Seque
                     break
         bids.append(pos if pos is not None else fallback[d])
     return bids
+
+
+def cutile_tile_dim_offsets(node, parent_state, parent_sdfg, used_dimensions: Sequence[int],
+                            begins: Sequence[str], K: int) -> list:
+    """Return the constant per-tile-dim element offset carried by the memlet begin.
+
+    A tiled load/store's per-dim memlet begin has the form ``<iter-var> + c`` --
+    e.g. ``A[1:-1]`` yields begin ``__i0 + 1`` for the tiled dim, where ``__i0``
+    is the block's element start (``__pid_k * W``) and ``c = 1`` is the constant
+    offset of the slice. The block-aligned ``ct.load`` / ``ct.arange + __pid*W``
+    index only reconstructs ``__i0`` and drops ``c``, so an offset slice
+    (``A[1:-1]``, ``A[2:]``) reads/writes one (or more) elements too low. This
+    helper recovers ``c`` for each tile dim by substituting every enclosing
+    CuTile-map iteration variable in the begin with ``0`` -- what remains is the
+    part of the address the block id does NOT advance and must be added back to
+    the per-lane element index.
+
+    :param node: The tile-op library node being expanded.
+    :param parent_state: The state that owns ``node``.
+    :param parent_sdfg: The SDFG that owns ``parent_state``.
+    :param used_dimensions: Per-tile-dim source/dest array dim index.
+    :param begins: Per-source/dest-dim memlet begin expression (as strings).
+    :param K: The tile-op's tile-dim count.
+    :returns: List of ``K`` symbolic offsets (usually integers; ``0`` when the
+        slice is anchored at the block-aligned start or the begin is unusable).
+    """
+    import dace.symbolic as _sym
+    m = _enclosing_cutile_map(node, parent_state, parent_sdfg)
+    subs = {}
+    if m is not None:
+        for p in m.map.params:
+            try:
+                subs[_sym.pystr_to_symbolic(str(p))] = 0
+            except Exception:  # noqa: BLE001 - skip unparseable params
+                continue
+    offsets = []
+    for d in range(K):
+        sd = used_dimensions[d] if d < len(used_dimensions) else None
+        if sd is None or sd >= len(begins):
+            offsets.append(0)
+            continue
+        try:
+            begin = _sym.pystr_to_symbolic(str(begins[sd]))
+            offsets.append(_sym.simplify(begin.subs(subs)))
+        except Exception:  # noqa: BLE001 - non-symbolic begin -> assume anchored
+            offsets.append(0)
+    return offsets
+
+
+def cutile_offset_is_nonzero(offset) -> bool:
+    """Whether a tile-dim element offset is provably non-zero.
+
+    :param offset: A symbolic / numeric offset from :func:`cutile_tile_dim_offsets`.
+    :returns: ``True`` if the offset does not simplify to ``0``.
+    """
+    import dace.symbolic as _sym
+    try:
+        return bool(_sym.simplify(offset) != 0)
+    except Exception:  # noqa: BLE001 - be conservative: treat as offset present
+        return offset != 0
 
 
 def tile_offset(widths: Sequence[int]) -> str:

@@ -11,8 +11,8 @@ from dace import library, properties
 from dace.sdfg import nodes
 from dace.transformation.transformation import ExpandTransformation
 
-from .._pure_codegen import (cutile_tile_dim_bids, gather_lane_offset, nested_loops, offset_via_strides,
-                             resolve_gather_deps, tile_offset)
+from .._pure_codegen import (cutile_bid_lines, cutile_offset_is_nonzero, cutile_tile_dim_bids, cutile_tile_dim_offsets,
+                             gather_lane_offset, nested_loops, offset_via_strides, resolve_gather_deps, tile_offset)
 from .. import _isa_codegen
 
 
@@ -227,7 +227,9 @@ class ExpandTileStoreCutile(ExpandTransformation):
 
             _bids = cutile_tile_dim_bids(node, parent_state, parent_sdfg, used_dimensions,
                                          _dst_begins if _dst_begins is not None else [], K)
-            lines = [f"__pid{k} = ct.bid({_bids[k]})" for k in range(K)]
+            lines = cutile_bid_lines(node, parent_state, parent_sdfg, _bids)
+            _tile_offsets = cutile_tile_dim_offsets(node, parent_state, parent_sdfg, used_dimensions,
+                                                    _dst_begins if _dst_begins is not None else [], K)
 
             idx_entries = []
             for d in range(ndim):
@@ -243,6 +245,9 @@ class ExpandTileStoreCutile(ExpandTransformation):
                     base = f"ct.arange({widths[k]}, dtype=ct.int32) + __pid{k} * {widths[k]}"
                     if coeffs[k] != 1:
                         base = f"({base}) * {coeffs[k]}"
+                    # Add the constant slice offset carried by the dest memlet begin.
+                    if cutile_offset_is_nonzero(_tile_offsets[k]):
+                        base = f"({base}) + {_tile_offsets[k]}"
                     if K == 1:
                         lines.append(f"__idx{k} = {base}")
                     else:
@@ -252,6 +257,8 @@ class ExpandTileStoreCutile(ExpandTransformation):
                 else:
                     idx_entries.append(_unused_dim_index(d))
 
+            if ndim > K:
+                tile_expr = _squeeze_tile_to_widths(tile_expr, ndim, used_dimensions, widths)
             if tile_expr != "_src":
                 lines.append(f"__tile = {tile_expr}")
                 tile_expr = "__tile"
@@ -288,9 +295,19 @@ class ExpandTileStoreCutile(ExpandTransformation):
 
         _bids = cutile_tile_dim_bids(node, parent_state, parent_sdfg, used_dimensions,
                                      _dst_begins if _dst_begins is not None else [], K)
-        lines = [f"__pid{k} = ct.bid({_bids[k]})" for k in range(K)]
+        lines = cutile_bid_lines(node, parent_state, parent_sdfg, _bids)
 
-        if is_default_coeffs and not node.has_mask:
+        # Constant per-tile-dim element offset carried by the dest memlet begin
+        # (e.g. ``B[1:-1]`` -> begin ``__i0 + 1`` -> offset ``1``). The
+        # block-aligned ``ct.store`` index / ``ct.arange + __pid*W`` scatter
+        # index only reconstruct ``__pid*W`` and drop this offset, so a non-zero
+        # offset must go through the per-element ``ct.scatter`` path with the
+        # offset added to each index.
+        _tile_offsets = cutile_tile_dim_offsets(node, parent_state, parent_sdfg, used_dimensions,
+                                                _dst_begins if _dst_begins is not None else [], K)
+        has_offset = any(cutile_offset_is_nonzero(c) for c in _tile_offsets)
+
+        if is_default_coeffs and not node.has_mask and not has_offset:
             # Aligned block store. The stored tile must be in array-dim
             # order with singleton extents on unused dims: insert the
             # singleton axes first (tile axes then follow ``all_dimensions``
@@ -332,6 +349,11 @@ class ExpandTileStoreCutile(ExpandTransformation):
                     base = f"ct.arange({widths[k]}, dtype=ct.int32) + __pid{k} * {widths[k]}"
                     if coeffs[k] != 1:
                         base = f"({base}) * {coeffs[k]}"
+                    # Add the constant slice offset carried by the dest memlet
+                    # begin (e.g. ``B[1:-1]`` -> ``+ 1``) so the per-lane element
+                    # index is absolute, not block-relative.
+                    if cutile_offset_is_nonzero(_tile_offsets[k]):
+                        base = f"({base}) + {_tile_offsets[k]}"
                     if K == 1:
                         lines.append(f"__idx{k} = {base}")
                     else:
@@ -341,6 +363,8 @@ class ExpandTileStoreCutile(ExpandTransformation):
                     idx_entries.append(f"__idx{k}")
                 else:
                     idx_entries.append(_unused_dim_index(d))  # base index along unused destination dims
+            if ndim > K:
+                tile_expr = _squeeze_tile_to_widths(tile_expr, ndim, used_dimensions, widths)
             if tile_expr != "_src":
                 lines.append(f"__tile = {tile_expr}")
                 tile_expr = "__tile"
@@ -355,6 +379,41 @@ class ExpandTileStoreCutile(ExpandTransformation):
             code="\n".join(lines),
             language=dace.dtypes.Language.Python,
         )
+
+
+def _squeeze_tile_to_widths(tile_expr: str, ndim: int, used_dimensions: Tuple[int, ...],
+                            widths: Tuple[int, ...]) -> str:
+    """Collapse a value tile's non-tiled singleton axes to the K-dim tile shape.
+
+    In a masked ``ct.scatter`` store the pointer (per-dim index tiles) and the
+    lane mask are ``K``-dimensional (``widths``-shaped), but the value tile
+    flowing in from the load/compute chain is ``ndim``-dimensional with unit
+    extents on the array dimensions that are NOT tiled (the leading point dims
+    of a >3-D grid, e.g. ``ct.load(..., shape=(1, 8, 8, 8))`` for a 4-D array
+    tiled over its inner 3 dims). ``ct.scatter`` requires the value to be
+    broadcastable to the ``K``-dim pointer shape, so the ``ndim - K`` singleton
+    axes must be removed.
+
+    Only the default trailing-``K`` tile binding (unused dims are the leading
+    ``ndim - K`` dims) is supported; there the value is row-major reshapeable to
+    ``widths``. A permuted binding (explicit non-trailing ``dst_dims``) is
+    rejected, since collapsing would reorder lanes.
+
+    :param tile_expr: The current value-tile expression.
+    :param ndim: The destination array rank.
+    :param used_dimensions: Per-tile-dim destination array dim index.
+    :param widths: Per-tile-dim tile widths (length ``K``).
+    :returns: A ``ct.reshape(...)`` expression yielding the ``K``-dim value tile.
+    :raises NotImplementedError: If the tile binding is not the trailing-``K``
+        default (non-leading singleton axes cannot be safely reshaped away).
+    """
+    K = len(widths)
+    if tuple(used_dimensions) != tuple(range(ndim - K, ndim)):
+        raise NotImplementedError(
+            "TileStore cutile expansion: collapsing non-tiled singleton axes for a masked "
+            f"scatter is only supported for the trailing-K tile binding, got used_dimensions="
+            f"{used_dimensions!r} with ndim={ndim}, K={K}.")
+    return f"ct.reshape({tile_expr}, {tuple(widths)})"
 
 
 def _stride_dim_may_scatter(p: int, dst_dims: Optional[Tuple[int, ...]], gather_dims: Tuple[int, ...]) -> bool:

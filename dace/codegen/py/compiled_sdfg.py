@@ -3,6 +3,7 @@
 
 import builtins
 import linecache
+import re
 import types
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
@@ -10,6 +11,23 @@ import numpy as np
 
 if TYPE_CHECKING:
     from dace.codegen.codeobject import CodeObject
+
+#: A return-value array is named exactly ``__return`` (single value) or
+#: ``__return_<int>`` (tuple element).  Transients that merely share the
+#: ``__return`` prefix -- e.g. the ``__return_tile`` / ``__return_tile_out``
+#: buffers the tile vectorizer creates when the program's return value is
+#: written through a cuTile kernel -- are NOT return values and must be
+#: excluded from return marshaling.
+_RETURN_ARRAY_RE = re.compile(r'^__return(_[0-9]+)?$')
+
+
+def _is_return_array_name(name: str) -> bool:
+    """Whether ``name`` is a genuine SDFG return-value array name.
+
+    :param name: A data-descriptor name from ``sdfg.arrays``.
+    :returns: ``True`` for ``__return`` and ``__return_<int>`` only.
+    """
+    return _RETURN_ARRAY_RE.match(name) is not None
 
 
 def _build_aux_module(co: 'CodeObject') -> types.ModuleType:
@@ -100,14 +118,15 @@ class PythonCompiledSDFG:
         self._is_single_value_ret: bool = False
         if '__return' in self._sdfg.arrays:
             assert not any(
-                aname.startswith('__return_')
+                _is_return_array_name(aname) and aname != '__return'
                 for aname in self._sdfg.arrays.keys()
             )
             self._is_single_value_ret = True
 
-        # Whether the SDFG has any __return* arrays (cached for fast __call__)
+        # Whether the SDFG has any genuine return arrays (cached for fast
+        # __call__); tile transients sharing the __return prefix don't count.
         self._has_returns: bool = any(
-            aname.startswith('__return') for aname in self._sdfg.arrays
+            _is_return_array_name(aname) for aname in self._sdfg.arrays
         )
 
         # Argument name list for positional arg conversion (includes __return*).
@@ -191,7 +210,7 @@ class PythonCompiledSDFG:
         """Sorted names of ``__return*`` arrays in the SDFG."""
         if self._return_names is None:
             self._return_names = sorted(
-                n for n in self._sdfg.arrays if n.startswith('__return')
+                n for n in self._sdfg.arrays if _is_return_array_name(n)
             )
         return self._return_names
 
