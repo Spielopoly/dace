@@ -30,6 +30,7 @@ from dace.sdfg import SDFG
 from dace.sdfg.nodes import AccessNode, MapEntry, MapExit, NestedSDFG
 from dace.sdfg.state import SDFGState
 from dace.transformation import pass_pipeline as ppl, transformation
+from dace.transformation.passes.vectorization.utils.name_schemes import sanitize_transient_name_hint
 
 #: Associative / commutative ops whose partial sums may be folded independently.
 SUPPORTED_REDUCE_OPS = ("+", "*", "min", "max")
@@ -219,7 +220,10 @@ class TileCarriedScalarReduction(ppl.Pass):
         from dace.transformation.passes.vectorization.split_map_for_tile_remainder import SCALAR_TAIL_MARKER
 
         def _make_identity_tile(tag):
-            nm, _ = sdfg.add_array(f"{accname}_{tag}", (W, ), dtype, transient=True, find_new_name=True)
+            nm, _ = sdfg.add_array(sanitize_transient_name_hint(accname, f"_{tag}"), (W, ),
+                                   dtype,
+                                   transient=True,
+                                   find_new_name=True)
             an = state.add_access(nm)
             # Marker suffix keeps MarkTileDims / StrideMapByTileWidths from striding this
             # plain [0:W] init map to step W (which would init only lane 0).
@@ -268,7 +272,10 @@ class TileCarriedScalarReduction(ppl.Pass):
 
         # --- 5. Fold the partial-sum tile -> scalar with TileReduce, combine init. ---
         from dace.libraries.tileops.nodes import TileReduce
-        folded_name, _ = sdfg.add_scalar(f"{accname}_red", dtype, transient=True, find_new_name=True)
+        folded_name, _ = sdfg.add_scalar(sanitize_transient_name_hint(accname, "_red"),
+                                         dtype,
+                                         transient=True,
+                                         find_new_name=True)
         folded = state.add_access(folded_name)
         red_node = TileReduce(name=f"{acc_name}_reduce", widths=(W, ), op=op, has_mask=False)
         state.add_node(red_node)

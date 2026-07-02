@@ -35,7 +35,6 @@ _SCOPE_IN_PREFIX: str = "IN_"
 _SCOPE_OUT_PREFIX: str = "OUT_"
 
 
-
 def _matching_inner_connector(outer_conn: str) -> str:
     """Convert an outer (input) scope connector name to the matching inner (output) name.
 
@@ -170,6 +169,7 @@ def _ordered_unique(items: Iterable[str]) -> List[str]:
     :returns: Sorted list of unique strings.
     """
     return sorted(set(items))
+
 
 def _collect_free_symbols(entry: nodes.MapEntry, dfg_scope: object, sdfg: "SDFG") -> List[str]:
     """Collect free symbols used in a map scope.
@@ -686,6 +686,28 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
     # ------------------------------------------------------------------
 
     @staticmethod
+    def _trace_load_source_edge(state: "SDFGState", entry: nodes.MapEntry, in_edge: object) -> Optional[object]:
+        """Trace through a MapEntry to the outer edge feeding a scope input.
+
+        Given an edge MapEntry -> (inner node), finds the corresponding outer
+        edge AccessNode(global) -> MapEntry (which carries the source memlet,
+        including its subset).
+
+        :param state: The SDFG state.
+        :param entry: The MapEntry node.
+        :param in_edge: The edge from MapEntry to the inner node.
+        :returns: The outer edge, or ``None`` if not found.
+        """
+        src_conn = in_edge.src_conn
+        if src_conn is None or not src_conn.startswith(_SCOPE_OUT_PREFIX):
+            return None
+        outer_conn = _matching_outer_connector(src_conn)
+        for outer_edge in state.in_edges_by_connector(entry, outer_conn):
+            if isinstance(outer_edge.src, nodes.AccessNode):
+                return outer_edge
+        return None
+
+    @staticmethod
     def _trace_load_source(state: "SDFGState", entry: nodes.MapEntry, tile_node: nodes.AccessNode,
                            in_edge: object) -> Optional[str]:
         """Trace through a MapEntry to find the global array feeding a tile.
@@ -700,14 +722,10 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
         :param in_edge: The edge from MapEntry to tile_node.
         :returns: The global array name, or ``None`` if not found.
         """
-        src_conn = in_edge.src_conn
-        if src_conn is None or not src_conn.startswith(_SCOPE_OUT_PREFIX):
+        outer_edge = CuTilePythonCodeGen._trace_load_source_edge(state, entry, in_edge)
+        if outer_edge is None:
             return None
-        outer_conn = _matching_outer_connector(src_conn)
-        for outer_edge in state.in_edges_by_connector(entry, outer_conn):
-            if isinstance(outer_edge.src, nodes.AccessNode):
-                return outer_edge.data.data if outer_edge.data else outer_edge.src.data
-        return None
+        return outer_edge.data.data if outer_edge.data else outer_edge.src.data
 
     @staticmethod
     def _trace_store_target(state: "SDFGState", exit_node: nodes.MapExit, tile_node: nodes.AccessNode,
@@ -979,6 +997,12 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
         references the undefined ``alpha_const`` and the ``cuda.tile`` compiler
         raises ``Undefined variable alpha_const``.
 
+        When the traced source is an *array* rather than a scalar, the bridge
+        stages a single element of it (``stage_constant_access`` with a
+        ``src_subset`` like ``aa[0, j]``); binding the bare name would alias
+        the whole tensor, so the memlet subset is emitted as an index:
+        ``aa_const = aa[0, j]``.
+
         :param sdfg: The SDFG.
         :param state: The state holding ``node``.
         :param node: The Register-storage scalar bridge AccessNode.
@@ -986,12 +1010,36 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
         :param state_id: The state ID.
         :param callsite_stream: Stream for call-site (kernel body) code.
         """
-        for in_edge in state.in_edges(node):
-            if not isinstance(in_edge.src, nodes.MapEntry):
+        from dace.codegen.py.utils import data_access_expression
+
+        in_edges = list(state.in_edges(node))
+        map_entry_edges = [e for e in in_edges if isinstance(e.src, nodes.MapEntry)]
+        if in_edges and not map_entry_edges:
+            # A code-node producer (tasklet / nested SDFG) binds the name in its
+            # own emission; anything else leaves the bridge undefined in the
+            # kernel body -- surface it instead of silently emitting nothing.
+            if not any(isinstance(e.src, nodes.CodeNode) for e in in_edges):
+                srcs = sorted({type(e.src).__name__ for e in in_edges})
+                warnings.warn(f"cuTile codegen: scalar bridge {node.data!r} is fed by {srcs} instead of a "
+                              f"MapEntry; no binding emitted (the kernel may reference an undefined name).")
+            return
+        for in_edge in map_entry_edges:
+            outer_edge = self._trace_load_source_edge(state, in_edge.src, in_edge)
+            if outer_edge is None:
+                warnings.warn(f"cuTile codegen: could not trace the source of scalar bridge {node.data!r} "
+                              f"through MapEntry {in_edge.src.map.label!r}; no binding emitted.")
                 continue
-            source = self._trace_load_source(state, in_edge.src, node, in_edge)
-            if source is not None and source != node.data:
-                callsite_stream.write(f"{node.data} = {source}", cfg, state_id)
+            src_name = outer_edge.data.data if outer_edge.data else outer_edge.src.data
+            src_desc = sdfg.arrays.get(src_name)
+            if src_desc is None:
+                source_expr = src_name
+            else:
+                # Scalar source: bare name. Array source: index by the memlet
+                # subset so exactly the staged element is bound.
+                src_subset = outer_edge.data.subset if outer_edge.data else None
+                source_expr = data_access_expression(src_name, src_desc, src_subset)
+            if source_expr != node.data:
+                callsite_stream.write(f"{node.data} = {source_expr}", cfg, state_id)
 
     def _generate_AccessNode(self, sdfg: "SDFG", cfg: object, dfg: object, state_id: int, node: nodes.AccessNode,
                              function_stream: PythonCodeIOStream, callsite_stream: PythonCodeIOStream) -> None:
@@ -1367,8 +1415,8 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
         # passed exactly once, matching the function's parameter list.
         input_conn_set = set(input_conns)
         call_args: List[str] = [
-            self._resolve_nsdfg_input_var(state, node, c)
-            if c in input_conn_set else self._resolve_nsdfg_output_var(state, node, c) for c in param_conns
+            self._resolve_nsdfg_input_var(state, node, c) if c in input_conn_set else self._resolve_nsdfg_output_var(
+                state, node, c) for c in param_conns
         ]
         for sym_name in symbol_names:
             mapping_expr = node.symbol_mapping.get(sym_name)

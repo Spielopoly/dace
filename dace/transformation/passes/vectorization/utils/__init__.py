@@ -1,7 +1,9 @@
 # Copyright 2019-2026 ETH Zurich and the DaCe authors. All rights reserved.
 """Vectorization helper utilities: layout/query inspectors, AST and memlet
 rewriters, NSDFG reshaping, tasklet and array mutators, and naming schemes."""
-from .name_schemes import LaneIdScheme, PackedNameScheme, VecNameScheme  # noqa: F401
+from .name_schemes import (  # noqa: F401
+    LaneIdScheme, PackedNameScheme, VecNameScheme, sanitize_transient_name_hint,
+)
 from .layout import assert_strides_are_packed_C_or_packed_Fortran  # noqa: F401
 from .queries import (  # noqa: F401
     collect_accesses_to_array_name, collect_all_memlets_to_dataname, collect_non_unit_stride_accesses_in_map,

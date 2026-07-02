@@ -14,10 +14,10 @@ from dace.codegen.py.compiled_sdfg import PythonCompiledSDFG, _is_return_array_n
 
 N = dace.symbol('N')
 
-
 # ---------------------------------------------------------------------------
 # Helper
 # ---------------------------------------------------------------------------
+
 
 def _compile_python(sdfg):
     """Set the backend to Python and compile."""
@@ -29,11 +29,13 @@ def _compile_python(sdfg):
 # Single return value
 # ---------------------------------------------------------------------------
 
+
 class TestSingleReturn:
     """Tests for SDFGs that return a single array."""
 
     def test_single_return_keyword_args(self):
         """Single return via keyword arguments."""
+
         @dace.program
         def add_one(A: dace.float64[8]):
             return A + 1.0
@@ -47,6 +49,7 @@ class TestSingleReturn:
 
     def test_single_return_positional_args(self):
         """Single return via positional arguments."""
+
         @dace.program
         def add_one(A: dace.float64[8]):
             return A + 1.0
@@ -59,6 +62,7 @@ class TestSingleReturn:
 
     def test_single_return_scalar_constant(self):
         """Return a constant scalar value (shape (1,))."""
+
         @dace.program
         def return_42():
             return 42
@@ -67,11 +71,12 @@ class TestSingleReturn:
         csdfg = _compile_python(sdfg)
         result = csdfg()
         assert isinstance(result, np.ndarray)
-        assert result.shape == (1,)
+        assert result.shape == (1, )
         assert result[0] == 42
 
     def test_single_return_symbolic_size(self):
         """Return array with symbolic size."""
+
         @dace.program
         def scale(A: dace.float64[N]):
             return A * 3.0
@@ -85,6 +90,7 @@ class TestSingleReturn:
 
     def test_single_return_does_not_modify_input(self):
         """The input array should not be modified."""
+
         @dace.program
         def add_one(A: dace.float64[8]):
             return A + 1.0
@@ -98,6 +104,7 @@ class TestSingleReturn:
 
     def test_single_return_explicit_return_buffer(self):
         """User passes __return explicitly as a keyword argument."""
+
         @dace.program
         def add_one(A: dace.float64[8]):
             return A + 1.0
@@ -116,11 +123,13 @@ class TestSingleReturn:
 # Multiple return values
 # ---------------------------------------------------------------------------
 
+
 class TestMultipleReturns:
     """Tests for SDFGs that return multiple arrays."""
 
     def test_two_returns(self):
         """Return two arrays as a tuple."""
+
         @dace.program
         def two_ret(A: dace.float64[8]):
             return A + 1.0, A * 2.0
@@ -136,6 +145,7 @@ class TestMultipleReturns:
 
     def test_three_returns(self):
         """Return three arrays as a tuple."""
+
         @dace.program
         def three_ret(A: dace.float64[4]):
             return A + 1.0, A * 2.0, A - 1.0
@@ -152,6 +162,7 @@ class TestMultipleReturns:
 
     def test_multiple_returns_symbolic_size(self):
         """Multiple returns with symbolic sizes."""
+
         @dace.program
         def sym_multi(A: dace.float64[N]):
             return A + 1.0, A * 2.0
@@ -171,11 +182,13 @@ class TestMultipleReturns:
 # No return value
 # ---------------------------------------------------------------------------
 
+
 class TestNoReturn:
     """Tests for SDFGs that have no return values."""
 
     def test_no_return_modifies_output_in_place(self):
         """SDFGs without return values write to output arrays in-place."""
+
         @dace.program
         def no_ret(A: dace.float64[4], B: dace.float64[4]):
             for i in range(4):
@@ -195,11 +208,13 @@ class TestNoReturn:
 # do_not_execute
 # ---------------------------------------------------------------------------
 
+
 class TestDoNotExecute:
     """Tests for do_not_execute flag with return values."""
 
     def test_do_not_execute_returns_allocated_arrays(self):
         """With do_not_execute, return values are allocated but not computed."""
+
         @dace.program
         def add_one(A: dace.float64[4]):
             return A + 1.0
@@ -211,11 +226,12 @@ class TestDoNotExecute:
         result = csdfg(A=A)
         # Return value is still an array (allocated), even though not computed
         assert isinstance(result, np.ndarray)
-        assert result.shape == (4,)
+        assert result.shape == (4, )
         assert result.dtype == np.float64
 
     def test_do_not_execute_no_return(self):
         """With do_not_execute and no return arrays, returns None."""
+
         @dace.program
         def no_ret(A: dace.float64[4], B: dace.float64[4]):
             for i in range(4):
@@ -231,6 +247,7 @@ class TestDoNotExecute:
 
     def test_do_not_execute_multiple_returns(self):
         """With do_not_execute and multiple returns, returns tuple of arrays."""
+
         @dace.program
         def two_ret(A: dace.float64[4]):
             return A + 1.0, A * 2.0
@@ -248,11 +265,13 @@ class TestDoNotExecute:
 # Positional argument mapping
 # ---------------------------------------------------------------------------
 
+
 class TestPositionalArgs:
     """Tests for positional argument conversion with return values."""
 
     def test_positional_single_return(self):
         """Positional arg for input, return auto-allocated."""
+
         @dace.program
         def add_one(A: dace.float64[4]):
             return A + 1.0
@@ -265,6 +284,7 @@ class TestPositionalArgs:
 
     def test_positional_explicit_return(self):
         """Positional arg maps to __return if no other args exist."""
+
         @dace.program
         def return_42():
             return 42
@@ -278,6 +298,7 @@ class TestPositionalArgs:
 
     def test_positional_and_keyword_overlap_error(self):
         """Error when same arg is both positional and keyword."""
+
         @dace.program
         def add_one(A: dace.float64[4]):
             return A + 1.0
@@ -293,11 +314,13 @@ class TestPositionalArgs:
 # _has_returns (cached attribute)
 # ---------------------------------------------------------------------------
 
+
 class TestHasReturns:
     """Tests for the _has_returns cached attribute."""
 
     def test_no_returns(self):
         """SDFG with no __return arrays."""
+
         @dace.program
         def no_ret(A: dace.float64[4], B: dace.float64[4]):
             for i in range(4):
@@ -309,6 +332,7 @@ class TestHasReturns:
 
     def test_single_return(self):
         """SDFG with __return."""
+
         @dace.program
         def single():
             return 42
@@ -319,6 +343,7 @@ class TestHasReturns:
 
     def test_multiple_returns(self):
         """SDFG with __return_0, __return_1."""
+
         @dace.program
         def multi(A: dace.float64[4]):
             return A + 1.0, A * 2.0
@@ -332,11 +357,13 @@ class TestHasReturns:
 # Integration: end-to-end through @dace.program
 # ---------------------------------------------------------------------------
 
+
 class TestIntegration:
     """End-to-end integration tests through @dace.program."""
 
     def test_return_via_sdfg_call(self):
         """SDFG.__call__ returns the computed value (single return)."""
+
         @dace.program
         def add_one(A: dace.float64[8]):
             return A + 1.0
@@ -349,6 +376,7 @@ class TestIntegration:
 
     def test_multi_return_via_sdfg_call(self):
         """SDFG.__call__ returns a tuple for multiple returns."""
+
         @dace.program
         def two_ret(A: dace.float64[4]):
             return A + 1.0, A * 2.0
@@ -364,6 +392,7 @@ class TestIntegration:
 
     def test_return_with_computation(self):
         """Return after non-trivial computation."""
+
         @dace.program
         def compute(A: dace.float64[N], B: dace.float64[N]):
             return A + B
@@ -377,6 +406,7 @@ class TestIntegration:
 
     def test_return_preserves_dtype_int64(self):
         """Return preserves integer dtypes (int64)."""
+
         @dace.program
         def int_op(A: dace.int64[4]):
             return A + np.int64(1)
@@ -390,6 +420,7 @@ class TestIntegration:
 
     def test_repeated_calls_same_compiled_sdfg(self):
         """Multiple calls to the same compiled SDFG produce correct results."""
+
         @dace.program
         def add_one(A: dace.float64[4]):
             return A + 1.0
@@ -398,7 +429,7 @@ class TestIntegration:
         csdfg = _compile_python(sdfg)
 
         for i in range(3):
-            A = np.array([float(i), float(i+1), float(i+2), float(i+3)])
+            A = np.array([float(i), float(i + 1), float(i + 2), float(i + 3)])
             result = csdfg(A=A)
             np.testing.assert_allclose(result, A + 1.0)
 
@@ -407,11 +438,13 @@ class TestIntegration:
 # Edge cases
 # ---------------------------------------------------------------------------
 
+
 class TestEdgeCases:
     """Edge cases for return-value handling."""
 
     def test_size_one_array_return(self):
         """Return a single-element array."""
+
         @dace.program
         def ret_one():
             return 42
@@ -419,7 +452,7 @@ class TestEdgeCases:
         sdfg = ret_one.to_sdfg(simplify=False)
         csdfg = _compile_python(sdfg)
         result = csdfg()
-        assert result.shape == (1,)
+        assert result.shape == (1, )
         assert result[0] == 42
 
     def test_empty_sdfg_no_crash(self):
@@ -434,6 +467,7 @@ class TestEdgeCases:
 
     def test_return_different_symbolic_sizes(self):
         """Return array size changes between calls with different symbols."""
+
         @dace.program
         def scale(A: dace.float64[N]):
             return A * 2.0
@@ -451,12 +485,13 @@ class TestEdgeCases:
         A8 = np.arange(8, dtype=np.float64)
         r8 = csdfg(A=A8, N=8)
         np.testing.assert_allclose(r8, A8 * 2.0)
-        assert r8.shape == (8,)
+        assert r8.shape == (8, )
 
 
 # ---------------------------------------------------------------------------
 # Parity with C++ backend return_value_test.py
 # ---------------------------------------------------------------------------
+
 
 class TestCppBackendParity:
     """Mirror test cases from tests/python_frontend/return_value_test.py
@@ -464,6 +499,7 @@ class TestCppBackendParity:
 
     def test_return_scalar_constant_5(self):
         """C++ parity: return scalar constant 5."""
+
         @dace.program
         def return_scalar():
             return 5
@@ -473,11 +509,12 @@ class TestCppBackendParity:
         res = csdfg()
         assert res == 5
         assert isinstance(res, np.ndarray)
-        assert res.shape == (1,)
+        assert res.shape == (1, )
         assert res.dtype == np.int64
 
     def test_return_tuple_scalars(self):
         """C++ parity: return tuple of scalars (5, 6)."""
+
         @dace.program
         def return_tuple():
             return 5, 6
@@ -492,6 +529,7 @@ class TestCppBackendParity:
 
     def test_return_array_tuple_different_sizes(self):
         """C++ parity: return tuple of arrays with different sizes."""
+
         @dace.program
         def return_array_tuple(A: dace.float64[5], B: dace.float64[6]):
             return A + 1.0, B + 2.0
@@ -505,11 +543,12 @@ class TestCppBackendParity:
         assert len(res) == 2
         np.testing.assert_allclose(res[0], A + 1.0)
         np.testing.assert_allclose(res[1], B + 2.0)
-        assert res[0].shape == (5,)
-        assert res[1].shape == (6,)
+        assert res[0].shape == (5, )
+        assert res[1].shape == (6, )
 
     def test_return_constant_array(self):
         """C++ parity: return array computed from input."""
+
         @dace.program
         def return_array(A: dace.float64[5]):
             return A + 1.0
@@ -522,9 +561,10 @@ class TestCppBackendParity:
 
     def test_return_tuple_1_element(self):
         """C++ parity: return single-element tuple (not scalar)."""
+
         @dace.program
         def return_one_element_tuple(a: dace.float64[20]):
-            return (a + 3.5,)
+            return (a + 3.5, )
 
         sdfg = return_one_element_tuple.to_sdfg()
         csdfg = _compile_python(sdfg)
@@ -537,6 +577,7 @@ class TestCppBackendParity:
 
     def test_return_void_early_return(self):
         """C++ parity: void return with in-place mutation."""
+
         @dace.program
         def return_void(a: dace.float64[20]):
             a[:] += 1
@@ -556,11 +597,13 @@ class TestCppBackendParity:
 # Additional coverage: dtype, caching, multi-arg positional
 # ---------------------------------------------------------------------------
 
+
 class TestAdditionalCoverage:
     """Additional tests for edge cases and coverage gaps."""
 
     def test_return_float32(self):
         """Return preserves float32 dtype."""
+
         @dace.program
         def f32_op(A: dace.float32[4], B: dace.float32[4]):
             return A + B
@@ -575,6 +618,7 @@ class TestAdditionalCoverage:
 
     def test_two_positional_inputs_with_return(self):
         """Two positional input arrays with an auto-allocated return."""
+
         @dace.program
         def add_arrays(A: dace.float64[4], B: dace.float64[4]):
             return A + B
@@ -588,6 +632,7 @@ class TestAdditionalCoverage:
 
     def test_repeated_calls_same_symbols_correct(self):
         """Repeated calls with same symbols produce correct results."""
+
         @dace.program
         def scale(A: dace.float64[N]):
             return A * 2.0
@@ -609,6 +654,7 @@ class TestAdditionalCoverage:
 
     def test_is_single_value_ret_flag(self):
         """_is_single_value_ret is True for single return, False for multi."""
+
         @dace.program
         def single(A: dace.float64[4]):
             return A + 1.0
@@ -625,6 +671,7 @@ class TestAdditionalCoverage:
 
     def test_return_large_array(self):
         """Return a larger array to verify allocation works at scale."""
+
         @dace.program
         def identity(A: dace.float64[N]):
             return A + 0.0
@@ -634,7 +681,7 @@ class TestAdditionalCoverage:
         A = np.random.default_rng(42).random(10000)
         result = csdfg(A=A, N=10000)
         np.testing.assert_allclose(result, A)
-        assert result.shape == (10000,)
+        assert result.shape == (10000, )
 
     def test_return_2d_array(self):
         """Return a 2D array."""
@@ -653,6 +700,7 @@ class TestAdditionalCoverage:
 
     def test_return_result_is_independent_copy(self):
         """Each call returns a new independent array (not aliasing prior results)."""
+
         @dace.program
         def add_one(A: dace.float64[4]):
             return A + 1.0
@@ -676,6 +724,7 @@ class TestAdditionalCoverage:
 # GPU return value tests
 # ---------------------------------------------------------------------------
 
+
 class TestGpuReturn:
     """GPU return value tests (require cupy and GPU hardware)."""
 
@@ -689,21 +738,21 @@ class TestGpuReturn:
 
         sdfg = dace.SDFG('gpu_ret_test')
         sdfg.backend = dtypes.BackendLanguage.Python
-        sdfg.add_array('__return', [8], dace.float64,
-                        storage=dtypes.StorageType.GPU_Global)
+        sdfg.add_array('__return', [8], dace.float64, storage=dtypes.StorageType.GPU_Global)
         sdfg.add_state('s')
         code = "def gpu_ret_test(**kwargs): pass\n"
         csdfg = PythonCompiledSDFG(sdfg, code)
 
         arr = csdfg._allocate_return_array('__return', {})
         assert isinstance(arr, cupy.ndarray)
-        assert arr.shape == (8,)
+        assert arr.shape == (8, )
         assert arr.dtype == np.float64
 
 
 # ---------------------------------------------------------------------------
 # Regression: __return coexisting with __return_tile* transients (Bug 13)
 # ---------------------------------------------------------------------------
+
 
 class TestReturnTilePrefixTransients:
     """Regression tests for Bug 13.
@@ -765,7 +814,10 @@ class TestReturnTilePrefixTransients:
 
 class TestCuTileReturnIntegration:
     """End-to-end cuTile pipeline: a returned value written through a tile
-    kernel must marshal correctly despite the ``__return_tile_out`` transient.
+    kernel must marshal correctly, and the vectorizer must not mint tile
+    transients inside the reserved ``__return*`` namespace (bug 13: the hint
+    ``f"{data}_tile_out"`` from ``data == '__return'`` used to produce
+    ``__return_tile_out``; it is now sanitized to ``tile_return_tile_out``).
     """
 
     @pytest.mark.gpu
@@ -777,17 +829,20 @@ class TestCuTileReturnIntegration:
         Nn = dace.symbol('N')
 
         @dace.program
-        def compute_kernel(array_1: dace.int64[M, Nn], array_2: dace.int64[M, Nn],
-                           a: dace.int64, b: dace.int64, c: dace.int64):
+        def compute_kernel(array_1: dace.int64[M, Nn], array_2: dace.int64[M, Nn], a: dace.int64, b: dace.int64,
+                           c: dace.int64):
             return np.minimum(np.maximum(array_1, 2), 10) * a + array_2 * b + c
 
         sdfg = compute_kernel.to_sdfg(simplify=False)
         VectorizeCuTile(widths=(8, 8)).apply_pass(sdfg, {})
 
-        # The offending dual naming must be present to exercise the regression.
-        return_prefixed = [n for n in sdfg.arrays if n.startswith('__return')]
-        assert '__return' in return_prefixed
-        assert any(n.startswith('__return_tile') for n in return_prefixed)
+        # Fix 13: only the return array itself may carry the reserved prefix;
+        # the tile bridge is minted outside it (``tile_return*``).
+        for nsdfg in sdfg.all_sdfgs_recursive():
+            for n in nsdfg.arrays:
+                if n.startswith('__return'):
+                    assert n == '__return', f"reserved-namespace transient {n!r}"
+        assert '__return' in sdfg.arrays
 
         csdfg = sdfg.compile()
 
