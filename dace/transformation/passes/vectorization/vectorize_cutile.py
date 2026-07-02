@@ -21,6 +21,7 @@ from dace.transformation.passes.vectorization.cutile_lowering import (
     CuTileSetTileStorage,
     CuTileValidateTiles,
     GPUDeviceToCuTile,
+    _collect_tile_nodes,
 )
 from dace.transformation.passes.vectorization.vectorize_cpu_multi_dim import VectorizeCPUMultiDim
 
@@ -154,6 +155,12 @@ class VectorizeCuTile(ppl.Pass):
         self._vectorizer.apply_pass(sdfg, {})
         debug_save_sdfg()
 
+        # Anchor census: zero anchors is either the supported BLAS-only
+        # configuration (all reductions became BLAS library nodes, lowered in
+        # step 6) or a genuinely un-vectorized SDFG; the lowering passes
+        # diagnose which. No anchors can appear after this point.
+        has_anchors = bool(_collect_tile_nodes(sdfg))
+
         # Step 2: Validate — anchors exist, widths are powers of 2
         CuTileValidateTiles(strict=self.strict).apply_pass(sdfg, {})
         debug_save_sdfg()
@@ -179,8 +186,12 @@ class VectorizeCuTile(ppl.Pass):
         CuTileSetLibraryImplementations(strict=self.strict).apply_pass(sdfg, {})
         debug_save_sdfg()
 
-        # Step 7: Stamp cuTile implementations on tileops library nodes
-        CuTileSetImplementations(strict=self.strict).apply_pass(sdfg, {})
+        # Step 7: Stamp cuTile implementations on tileops library nodes.
+        # Skipped when step 1 produced no anchors: the pass would be a no-op,
+        # and its "already expanded?" diagnostic is misleading here (in the
+        # BLAS-only configuration step 6 legitimately expanded everything).
+        if has_anchors:
+            CuTileSetImplementations(strict=self.strict).apply_pass(sdfg, {})
 
         # Step 8: Python backend stamp
         sdfg.backend = dtypes.BackendLanguage.Python
