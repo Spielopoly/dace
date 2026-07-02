@@ -170,15 +170,21 @@ def cutile_bid_lines(node, parent_state, parent_sdfg, axes: Sequence[int]) -> Li
     :param node: The tile-op library node being expanded.
     :param parent_state: The state that owns ``node``.
     :param parent_sdfg: The SDFG that owns ``parent_state``.
-    :param axes: Per-tile-dim grid axis (enclosing-map dimension index).
+    :param axes: Per-tile-dim grid axis (enclosing-map dimension index), or
+        ``None`` for a dim no grid axis drives (its base is fully carried by
+        the recovered offset; see :func:`cutile_tile_dim_bids`) — bound as
+        ``__pid{k} = 0``.
     :returns: List of ``__pid{k} = ...`` statement strings, one per tile dim.
     """
     m = _enclosing_cutile_map(node, parent_state, parent_sdfg)
     if m is None or len(m.map.range) <= 3:
-        return [f"__pid{k} = ct.bid({axes[k]})" for k in range(len(axes))]
+        return [f"__pid{k} = {'0' if axes[k] is None else f'ct.bid({axes[k]})'}" for k in range(len(axes))]
     num_map_dims = len(m.map.range)
     grid = cutile_grid_size_exprs(m)
-    return [f"__pid{k} = {cutile_bid_expr(axes[k], num_map_dims, grid)}" for k in range(len(axes))]
+    return [
+        f"__pid{k} = {'0' if axes[k] is None else cutile_bid_expr(axes[k], num_map_dims, grid)}"
+        for k in range(len(axes))
+    ]
 
 
 def cutile_grid_dim_offset(node, parent_state, parent_sdfg, K: int) -> int:
@@ -231,7 +237,9 @@ def cutile_tile_dim_bids(node, parent_state, parent_sdfg, used_dimensions: Seque
     :param used_dimensions: Per-tile-dim source/dest array dim index.
     :param src_begins: Per-source-dim memlet begin expression (as strings).
     :param K: The tile-op's tile-dim count.
-    :returns: List of ``K`` grid-axis indices, one per tile dim.
+    :returns: List of ``K`` entries: the grid-axis index, or ``None`` for a
+        dim whose begin is driven by a non-grid variable (e.g. a sequential
+        inner tile loop) — no ``__pid*W`` term applies there.
     """
     import dace.symbolic as _sym
     m = _enclosing_cutile_map(node, parent_state, parent_sdfg)
@@ -244,16 +252,30 @@ def cutile_tile_dim_bids(node, parent_state, parent_sdfg, used_dimensions: Seque
     for d in range(K):
         sd = used_dimensions[d] if d < len(used_dimensions) else None
         pos = None
+        has_symbols = False
         if sd is not None and sd < len(src_begins):
             try:
                 syms = {str(s) for s in _sym.pystr_to_symbolic(str(src_begins[sd])).free_symbols}
             except Exception:  # noqa: BLE001 - non-symbolic begin -> use the raw string
                 syms = {str(src_begins[sd])}
+            has_symbols = any(not s.lstrip('-').isdigit() for s in syms)
             for i, p in enumerate(params):
                 if p in syms:
                     pos = i
                     break
-        bids.append(pos if pos is not None else fallback[d])
+        if pos is None and has_symbols:
+            # The begin is driven by a variable that is NOT a grid param
+            # (e.g. a tile-strided SEQUENTIAL inner map inside the kernel,
+            # from a dependent range like ``j = i+1 : N : W``).  No block id
+            # advances this dim -- the full base is carried by the recovered
+            # offset (:func:`cutile_tile_dim_offsets` leaves non-grid
+            # variables in place) -- so the ``__pid*W`` term must vanish:
+            # signal "no grid axis" and let :func:`cutile_bid_lines` bind
+            # ``__pid{d} = 0``.  The positional fallback here would read a
+            # WRONG grid axis (an outer point dim) and silently miscompile.
+            bids.append(None)
+        else:
+            bids.append(pos if pos is not None else fallback[d])
     return bids
 
 

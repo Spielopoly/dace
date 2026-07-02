@@ -67,8 +67,8 @@ def _tile_node_types() -> Tuple[Type[nodes.LibraryNode], ...]:
     :returns: All tile-op ``LibraryNode`` classes exported by
         :mod:`dace.libraries.tileops.nodes` (including :class:`TileIota`).
     """
-    from dace.libraries.tileops.nodes import (TileBinop, TileIota, TileITE, TileLoad, TileMaskGen, TileMMA,
-                                              TileReduce, TileStore, TileUnop)
+    from dace.libraries.tileops.nodes import (TileBinop, TileIota, TileITE, TileLoad, TileMaskGen, TileMMA, TileReduce,
+                                              TileStore, TileUnop)
     return (TileBinop, TileIota, TileITE, TileLoad, TileMaskGen, TileMMA, TileReduce, TileStore, TileUnop)
 
 
@@ -172,6 +172,74 @@ def _warn_or_raise(message: str, strict: bool) -> None:
     if strict:
         raise ValueError(message)
     warnings.warn(message)
+
+
+def mark_tile_op_memlets_allow_oob(sdfg: SDFG) -> int:
+    """Set ``allow_oob=True`` on every memlet adjacent to a tileops node.
+
+    Masked tile ops address a full ``W``-wide window whose tail lanes are
+    inactive (the ``full_mask`` remainder strategy); at a non-divisible or
+    single-point boundary the window's SUBSET exceeds the array bounds even
+    though the masked runtime accesses (``ct.load`` / ``ct.gather`` /
+    ``ct.scatter``) never touch the out-of-bounds lanes.  SDFG validation
+    would reject such memlets ("Memlet subset out-of-bounds"), notably
+    inside ``apply_gpu_transformations()`` whose simplify step re-propagates
+    them outward.  Marking the LEAF memlets suffices for future
+    propagations (``propagate_memlet`` shallow-copies the leaf, inheriting
+    ``allow_oob``); the current memlet trees are marked too.
+
+    :param sdfg: The SDFG whose tileops-adjacent memlets are marked.
+    :returns: The number of memlets marked.
+    """
+    marked = 0
+    for node, state in _collect_tile_nodes(sdfg):
+        for edge in list(state.in_edges(node)) + list(state.out_edges(node)):
+            if edge.data is None or edge.data.data is None:
+                continue
+            for tree_edge in state.memlet_tree(edge):
+                if not tree_edge.data.allow_oob:
+                    tree_edge.data.allow_oob = True
+                    marked += 1
+    return marked
+
+
+def _demote_residual_gpu_device_maps(sdfg: SDFG, strict: bool, pass_name: str) -> int:
+    """Demote every remaining ``GPU_Device`` map to ``Sequential``.
+
+    The Python/cuTile backend has no ``GPU_Device`` scope dispatcher, so any
+    such map surviving to code generation raises ``KeyError: GPU_Device``.
+    Demoted maps become host ("driver") Python loops over the ``GPU_Global``
+    (cupy) operands.  Silent only for provably tiny maps (total volume at
+    most :data:`_TINY_DEMOTION_VOLUME` — the intended scalar-control case);
+    larger or symbolic volumes are diagnosed via :func:`_warn_or_raise`
+    first, since the host loop pays one device round-trip per element.
+
+    :param sdfg: The SDFG to re-stamp in place (NestedSDFGs included).
+    :param strict: Whether the large-volume diagnostic raises.
+    :param pass_name: Name of the calling pass (message prefix).
+    :returns: The number of maps demoted.
+    :raises ValueError: When ``strict`` and a residual map is not provably
+        tiny.
+    """
+    demoted = 0
+    for map_node, graph in sdfg.all_nodes_recursive():
+        if not (isinstance(map_node, nodes.MapEntry) and map_node.map.schedule == dtypes.ScheduleType.GPU_Device):
+            continue
+        volume = map_node.map.range.num_elements()
+        try:
+            provably_tiny = int(volume) <= _TINY_DEMOTION_VOLUME
+        except (TypeError, ValueError):
+            provably_tiny = False  # Symbolic volume: not provably tiny.
+        if not provably_tiny:
+            _warn_or_raise(
+                f"{pass_name}: demoting non-tileops GPU_Device map "
+                f"'{map_node.map.label}' (state '{graph.label}', volume {volume}) to "
+                "Sequential: it compiles to a per-element host loop over GPU data "
+                "(one device round-trip per element), which is pathological for "
+                "anything but tiny scalar-control maps", strict)
+        map_node.map.schedule = dtypes.ScheduleType.Sequential
+        demoted += 1
+    return demoted
 
 
 def _diagnose_no_anchors(pass_name: str, sdfg: SDFG, strict: bool) -> None:
@@ -342,8 +410,7 @@ class CuTileSetTileStorage(_CuTileLoweringPass):
                 if not isinstance(neighbor, nodes.AccessNode):
                     continue
                 desc = owning_arrays.get(neighbor.data)
-                if (isinstance(desc, data.Array) and desc.transient
-                        and desc.storage == dtypes.StorageType.Register):
+                if (isinstance(desc, data.Array) and desc.transient and desc.storage == dtypes.StorageType.Register):
                     _stamp(desc)
 
         # Rule (b): NSDFG boundary propagation (fixpoint).
@@ -362,8 +429,8 @@ class CuTileSetTileStorage(_CuTileLoweringPass):
                         continue
                     outer_arrays = graph.sdfg.arrays
                     inner_arrays = node.sdfg.arrays
-                    boundary = ([(e.dst_conn, e) for e in graph.in_edges(node)] +
-                                [(e.src_conn, e) for e in graph.out_edges(node)])
+                    boundary = ([(e.dst_conn, e) for e in graph.in_edges(node)] + [(e.src_conn, e)
+                                                                                   for e in graph.out_edges(node)])
                     for conn, edge in boundary:
                         if conn is None or edge.data.data is None:
                             continue
@@ -388,8 +455,7 @@ class CuTileSetTileStorage(_CuTileLoweringPass):
             if not isinstance(node, nodes.AccessNode):
                 continue
             desc = graph.sdfg.arrays.get(node.data)
-            if not (isinstance(desc, data.Array) and desc.transient
-                    and desc.storage == dtypes.StorageType.Register):
+            if not (isinstance(desc, data.Array) and desc.transient and desc.storage == dtypes.StorageType.Register):
                 continue
             chain = _enclosing_map_chain(node, graph, scope_cache)
             if any(entry.map.schedule == dtypes.ScheduleType.CuTile for entry, _ in chain):
@@ -472,25 +538,7 @@ class GPUDeviceToCuTile(_CuTileLoweringPass):
         # control) to Sequential so the Python/cuTile backend can code-generate
         # it as a host driver loop over the GPU_Global (cupy) operands.  Runs
         # unconditionally -- these maps exist even when there are no anchors.
-        # Silent only for provably tiny maps (the intended scalar-control
-        # case); large or symbolic volumes warn / strict-raise, since the host
-        # loop pays one device round-trip per element.
-        for map_node, graph in sdfg.all_nodes_recursive():
-            if not (isinstance(map_node, nodes.MapEntry) and map_node.map.schedule == dtypes.ScheduleType.GPU_Device):
-                continue
-            volume = map_node.map.range.num_elements()
-            try:
-                provably_tiny = int(volume) <= _TINY_DEMOTION_VOLUME
-            except (TypeError, ValueError):
-                provably_tiny = False  # Symbolic volume: not provably tiny.
-            if not provably_tiny:
-                _warn_or_raise(
-                    f"GPUDeviceToCuTile: demoting non-tileops GPU_Device map "
-                    f"'{map_node.map.label}' (state '{graph.label}', volume {volume}) to "
-                    "Sequential: it compiles to a per-element host loop over GPU data "
-                    "(one device round-trip per element), which is pathological for "
-                    "anything but tiny scalar-control maps", self.strict)
-            map_node.map.schedule = dtypes.ScheduleType.Sequential
+        _demote_residual_gpu_device_maps(sdfg, self.strict, "GPUDeviceToCuTile")
 
         return len(cutile_entries) if cutile_entries else None
 
@@ -609,5 +657,13 @@ class CuTileSetLibraryImplementations(_CuTileLoweringPass):
                 node.expand(state, impl)
                 expanded += 1
                 progressed = True
+
+        # Expansion can introduce NEW GPU_Device-scheduled maps: the expansion
+        # framework re-stamps a nested expansion's default-scheduled maps with
+        # the library node's schedule (GPU_Device from
+        # apply_gpu_transformations()), and GPUDeviceToCuTile has already run.
+        # Re-run its demotion so no such map survives to codegen.
+        if expanded:
+            _demote_residual_gpu_device_maps(sdfg, self.strict, "CuTileSetLibraryImplementations")
 
         return expanded or None

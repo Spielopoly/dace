@@ -136,6 +136,73 @@ def test_inout_connector_flat_reshape():
     assert np.allclose(Y, ref), f"max diff = {np.max(np.abs(Y - ref))}"
 
 
+def test_rendered_column_slice_needs_no_reshape():
+    """A strided column slice whose RENDERED shape matches the connector
+    (correlation regression).
+
+    The outer memlet ``X[0:5, 2]`` has subset size ``(5, 1)`` but renders to
+    a shape-``(5,)`` view (the size-1 dim collapses to an index), exactly
+    matching the 1-D connector ``_x`` with column stride ``(7,)``.  Before
+    the fix this raised ``NotImplementedError`` (non-contiguous strides
+    rejected the flat reshape that is not actually needed).
+    """
+    sdfg = dace.SDFG('nested_column_slice')
+    state = sdfg.add_state()
+    sdfg.add_array('X', (5, 7), dace.float64)
+    sdfg.add_array('Y', (5, ), dace.float64)
+
+    nsdfg = dace.SDFG('nested_column_slice_inner')
+    nstate = nsdfg.add_state()
+    nsdfg.add_array('_x', (5, ), dace.float64, strides=(7, ))
+    nsdfg.add_array('_y', (5, ), dace.float64)
+    t = nstate.add_tasklet('scale', {'__i'}, {'__o'}, '__o = 2 * __i')
+    nstate.add_edge(nstate.add_read('_x'), None, t, '__i', Memlet.from_array('_x', nsdfg.arrays['_x']))
+    nstate.add_edge(t, '__o', nstate.add_write('_y'), None, Memlet.from_array('_y', nsdfg.arrays['_y']))
+
+    node = state.add_nested_sdfg(nsdfg, {'_x'}, {'_y'})
+    state.add_edge(state.add_read('X'), None, node, '_x', Memlet('X[0:5, 2]'))
+    state.add_edge(node, '_y', state.add_write('Y'), None, Memlet.from_array('Y', sdfg.arrays['Y']))
+    sdfg.backend = dtypes.BackendLanguage.Python
+
+    X = np.random.rand(5, 7)
+    Y = np.zeros(5)
+    sdfg(X=X, Y=Y)
+    assert np.allclose(Y, 2 * X[:, 2])
+
+
+def test_writeback_through_collapsed_dim():
+    """A reshape-bridge writeback into a target with a collapsed size-1 dim
+    (mlp regression).
+
+    The outer memlet ``Y[0:6, 0]`` renders to a shape-``(6,)`` target, so
+    the bridge writeback must reshape to ``(6,)``, not the raw subset size
+    ``(6, 1)`` (which raised a cupy/numpy shape mismatch).
+    """
+    sdfg = dace.SDFG('nested_collapsed_writeback')
+    state = sdfg.add_state()
+    sdfg.add_array('X', (2, 3), dace.float64)
+    sdfg.add_array('Y', (6, 2), dace.float64)
+
+    nsdfg = dace.SDFG('nested_collapsed_writeback_inner')
+    nstate = nsdfg.add_state()
+    nsdfg.add_array('_x', (2, 3), dace.float64, strides=(3, 1))
+    nsdfg.add_array('_y', (2, 3), dace.float64, strides=(3, 1))
+    t = nstate.add_tasklet('scale', {'__i'}, {'__o'}, '__o = 2 * __i')
+    nstate.add_edge(nstate.add_read('_x'), None, t, '__i', Memlet.from_array('_x', nsdfg.arrays['_x']))
+    nstate.add_edge(t, '__o', nstate.add_write('_y'), None, Memlet.from_array('_y', nsdfg.arrays['_y']))
+
+    node = state.add_nested_sdfg(nsdfg, {'_x'}, {'_y'})
+    state.add_edge(state.add_read('X'), None, node, '_x', Memlet.from_array('X', sdfg.arrays['X']))
+    state.add_edge(node, '_y', state.add_write('Y'), None, Memlet('Y[0:6, 0]'))
+    sdfg.backend = dtypes.BackendLanguage.Python
+
+    X = np.random.rand(2, 3)
+    Y = np.zeros((6, 2))
+    sdfg(X=X, Y=Y)
+    assert np.allclose(Y[:, 0], (2 * X).reshape(6))
+    assert np.allclose(Y[:, 1], 0.0)
+
+
 if __name__ == '__main__':
     test_output_side_flat_reshape()
     test_input_permutation_mismatch_raises()
@@ -143,3 +210,5 @@ if __name__ == '__main__':
     test_element_count_mismatch_raises()
     test_matching_shapes_unchanged()
     test_inout_connector_flat_reshape()
+    test_rendered_column_slice_needs_no_reshape()
+    test_writeback_through_collapsed_dim()

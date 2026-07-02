@@ -21,7 +21,6 @@ from dace import data, Memlet, nodes
 from dace.dtypes import BackendLanguage
 from dace.sdfg import SDFG
 
-
 _SDFG_COUNTER = itertools.count()
 
 
@@ -37,8 +36,7 @@ def _count_views(sdfg: SDFG) -> int:
     count = 0
     for state in sdfg.states():
         for n in state.nodes():
-            if isinstance(n, nodes.AccessNode) and isinstance(
-                    sdfg.arrays.get(n.data, None), data.View):
+            if isinstance(n, nodes.AccessNode) and isinstance(sdfg.arrays.get(n.data, None), data.View):
                 count += 1
     return count
 
@@ -80,7 +78,10 @@ def test_reshape_view_python_backend():
 
     state.add_mapped_tasklet(
         'double',
-        {'i': '0:4', 'j': '0:5'},
+        {
+            'i': '0:4',
+            'j': '0:5'
+        },
         {'inp': Memlet('V[i, j]')},
         'out = inp * 2.0',
         {'out': Memlet('B[i, j]')},
@@ -174,7 +175,10 @@ def test_nested_sdfg_with_view_python_backend():
 
     inner_state.add_mapped_tasklet(
         'double',
-        {'i': '0:4', 'j': '0:5'},
+        {
+            'i': '0:4',
+            'j': '0:5'
+        },
         {'inp': Memlet('V[i, j]')},
         'out = inp * 2.0',
         {'out': Memlet('Y[i, j]')},
@@ -306,7 +310,7 @@ def test_cutile_pipeline_with_views():
     canonicalize(sdfg)
 
     # Step 2: Run the cuTile pipeline (widths must be powers of 2)
-    pipeline = VectorizeCuTile(widths=(4,))
+    pipeline = VectorizeCuTile(widths=(4, ))
     pipeline.apply_pass(sdfg, {})
 
     # VectorizeCuTile sets the Python backend automatically
@@ -323,7 +327,108 @@ def test_cutile_pipeline_with_views():
 
 
 # ---------------------------------------------------------------------------
+# Scope-crossing views (mlp regression): the view edge attaches to a
+# MapEntry/MapExit ``views`` connector rather than directly to the viewed
+# AccessNode.  RemoveViews must reconnect to the IMMEDIATE scope-node
+# endpoint; reconnecting to the distant viewed AccessNode bypasses the
+# scope node and orphans it (MapExit with in_degree 0 ->
+# "Leftover nodes in queue" in scope_dict()).
+# ---------------------------------------------------------------------------
 
+
+def _build_write_view_through_mapexit(n: int = 16) -> SDFG:
+    """``B[i] = A[i] + 1`` where the write goes through a View of ``B`` whose
+    view edge attaches to the MapExit's ``views`` connector."""
+    sdfg = _new_sdfg('scope_write_view')
+    sdfg.add_array('A', (n, ), dace.float64)
+    sdfg.add_array('B', (n, ), dace.float64)
+    sdfg.add_view('V', (n, ), dace.float64)
+    state = sdfg.add_state()
+    me, mx = state.add_map('m', {'i': f'0:{n}'})
+    t = state.add_tasklet('body', {'_a'}, {'_b'}, '_b = _a + 1.0')
+    state.add_memlet_path(state.add_read('A'), me, t, dst_conn='_a', memlet=Memlet(f'A[i]'))
+    v = state.add_access('V')
+    v.add_out_connector('views')
+    state.add_edge(t, '_b', v, None, Memlet('V[i]'))
+    mx.add_in_connector('IN_B')
+    mx.add_out_connector('OUT_B')
+    state.add_edge(v, 'views', mx, 'IN_B', Memlet(f'B[0:{n}]'))
+    state.add_edge(mx, 'OUT_B', state.add_write('B'), None, Memlet(f'B[0:{n}]'))
+    return sdfg
+
+
+def test_scope_crossing_write_view_keeps_mapexit_connected():
+    """RemoveViews on a write-side scope-crossing view must keep the MapExit
+    on the dataflow path (in_degree > 0) and leave a valid scope tree."""
+    from dace.transformation.passes.remove_views import RemoveViews
+
+    sdfg = _build_write_view_through_mapexit()
+    state = next(iter(sdfg.states()))
+    RemoveViews().apply_pass(sdfg, {})
+    assert _count_views(sdfg) == 0
+    exits = [n for n in state.nodes() if isinstance(n, nodes.MapExit)]
+    assert exits and all(state.in_degree(x) > 0 for x in exits), \
+        'MapExit was orphaned by the view removal'
+    state.scope_dict()  # raised "Leftover nodes in queue" before the fix
+
+
+def test_scope_crossing_write_view_runs():
+    """End-to-end compile + run of the scope-crossing write view."""
+    n = 16
+    sdfg = _build_write_view_through_mapexit(n)
+    a = np.arange(n, dtype=np.float64)
+    b = np.zeros(n)
+    sdfg.compile()(A=a.copy(), B=b)
+    np.testing.assert_allclose(b, a + 1.0)
+
+
+def _build_read_view_through_mapentry(n: int = 16) -> SDFG:
+    """``B[i] = 2 * A[i]`` where the read comes through a View of ``A`` whose
+    view edge attaches to the MapEntry's ``views`` connector."""
+    sdfg = _new_sdfg('scope_read_view')
+    sdfg.add_array('A', (n, ), dace.float64)
+    sdfg.add_array('B', (n, ), dace.float64)
+    sdfg.add_view('V', (n, ), dace.float64)
+    state = sdfg.add_state()
+    me, mx = state.add_map('m', {'i': f'0:{n}'})
+    me.add_in_connector('IN_A')
+    me.add_out_connector('OUT_A')
+    state.add_edge(state.add_read('A'), None, me, 'IN_A', Memlet(f'A[0:{n}]'))
+    v = state.add_access('V')
+    v.add_in_connector('views')
+    state.add_edge(me, 'OUT_A', v, 'views', Memlet(f'A[0:{n}]'))
+    t = state.add_tasklet('body', {'_a'}, {'_b'}, '_b = 2.0 * _a')
+    state.add_edge(v, None, t, '_a', Memlet('V[i]'))
+    state.add_memlet_path(t, mx, state.add_write('B'), src_conn='_b', memlet=Memlet('B[i]'))
+    return sdfg
+
+
+def test_scope_crossing_read_view_keeps_mapentry_connected():
+    """RemoveViews on a read-side scope-crossing view must keep the MapEntry
+    on the dataflow path (out_degree > 0) and leave a valid scope tree."""
+    from dace.transformation.passes.remove_views import RemoveViews
+
+    sdfg = _build_read_view_through_mapentry()
+    state = next(iter(sdfg.states()))
+    RemoveViews().apply_pass(sdfg, {})
+    assert _count_views(sdfg) == 0
+    entries = [n for n in state.nodes() if isinstance(n, nodes.MapEntry)]
+    assert entries and all(state.out_degree(x) > 0 for x in entries), \
+        'MapEntry was orphaned by the view removal'
+    state.scope_dict()
+
+
+def test_scope_crossing_read_view_runs():
+    """End-to-end compile + run of the scope-crossing read view."""
+    n = 16
+    sdfg = _build_read_view_through_mapentry(n)
+    a = np.arange(n, dtype=np.float64)
+    b = np.zeros(n)
+    sdfg.compile()(A=a.copy(), B=b)
+    np.testing.assert_allclose(b, 2.0 * a)
+
+
+# ---------------------------------------------------------------------------
 
 if __name__ == '__main__':
     test_reshape_view_python_backend()
@@ -331,4 +436,8 @@ if __name__ == '__main__':
     test_nested_sdfg_with_view_python_backend()
     test_dace_program_reshape_python_backend()
     test_dace_program_slice_python_backend()
+    test_scope_crossing_write_view_keeps_mapexit_connected()
+    test_scope_crossing_write_view_runs()
+    test_scope_crossing_read_view_keeps_mapentry_connected()
+    test_scope_crossing_read_view_runs()
     # GPU test skipped in __main__; run via pytest with --gpu

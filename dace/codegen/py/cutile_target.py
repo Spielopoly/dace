@@ -199,6 +199,11 @@ def _collect_free_symbols(entry: nodes.MapEntry, dfg_scope: object, sdfg: "SDFG"
                     syms |= {str(s) for s in expr.free_symbols}
                 else:
                     syms.add(str(expr))
+        elif isinstance(scope_node, nodes.Tasklet):
+            # Symbols referenced only in tasklet code (e.g. a TileBinop
+            # Symbol-operand expansion emitting ``_a / N``) appear in no
+            # memlet; without this they are undefined inside the kernel.
+            syms |= scope_node.free_symbols
     syms = {s for s in syms if s in sdfg.symbols and s not in sdfg.constants}
     return sorted(syms)
 
@@ -1243,17 +1248,17 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
                 if isinstance(edge.src, nodes.AccessNode):
                     rhs = edge.src.data
                 elif isinstance(edge.src, (nodes.MapEntry, nodes.ConsumeEntry)):
-                    # Trace through the scope entry to find the actual array name.
-                    # The inner connector (e.g. "OUT_A") maps to the outer
-                    # connector ("IN_A") which receives from the real AccessNode.
-                    inner_conn = edge.src_conn  # e.g., "OUT_A"
-                    outer_conn = _matching_outer_connector(inner_conn) if inner_conn else None
-                    if outer_conn:
-                        for outer_edge in state.in_edges_by_connector(edge.src, outer_conn):
-                            if isinstance(outer_edge.src, nodes.AccessNode):
-                                rhs = outer_edge.src.data
-                                break
-                    if rhs is None and edge.src_conn is not None:
+                    # Trace through the scope entries to the root AccessNode.
+                    # The memlet path walks ALL enclosing entries (a one-level
+                    # connector hop breaks for doubly-nested scopes, and the
+                    # connector name may be a stale transient name that
+                    # differs from the array actually flowing through).
+                    root = state.memlet_path(edge)[0].src
+                    if isinstance(root, nodes.AccessNode):
+                        rhs = root.data
+                    elif edge.data is not None and edge.data.data is not None:
+                        rhs = edge.data.data
+                    elif edge.src_conn is not None:
                         rhs = edge.src_conn  # fallback
                 elif edge.src_conn is not None:
                     rhs = edge.src_conn
@@ -1284,13 +1289,11 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
                         continue
                     dst_name = edge.dst.data
                 elif isinstance(edge.dst, (nodes.MapExit, nodes.ConsumeExit)):
-                    inner_conn = edge.dst_conn
-                    outer_conn = _matching_inner_connector(inner_conn) if inner_conn else None
-                    if outer_conn:
-                        for outer_edge in state.out_edges_by_connector(edge.dst, outer_conn):
-                            if isinstance(outer_edge.dst, nodes.AccessNode):
-                                dst_name = outer_edge.dst.data
-                                break
+                    # Trace through ALL enclosing scope exits (see input
+                    # binding above for why a one-level hop is insufficient).
+                    leaf = state.memlet_path(edge)[-1].dst
+                    if isinstance(leaf, nodes.AccessNode):
+                        dst_name = leaf.data
                 if dst_name and dst_name != edge.src_conn:
                     callsite_stream.write(f"{edge.src_conn} = {dst_name}", cfg, state_id)
                     self._dispatcher.defined_vars.add(edge.src_conn, dispatcher_mod.DefinedType.Scalar, "object")
@@ -1315,23 +1318,15 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
                     callsite_stream.write(f"{edge.dst.data} = {edge.src_conn}", cfg, state_id)
                     self._dispatcher.defined_vars.add(edge.dst.data, dispatcher_mod.DefinedType.Scalar, "object")
                 elif isinstance(edge.dst, (nodes.MapExit, nodes.ConsumeExit)):
-                    # Trace through the scope exit to find the actual
-                    # destination array.  The inner connector (e.g. "IN_C")
-                    # maps to the outer connector ("OUT_C") which feeds
-                    # the real AccessNode.
-                    inner_conn = edge.dst_conn  # e.g., "IN_C"
-                    outer_conn = _matching_inner_connector(inner_conn) if inner_conn else None
-                    if outer_conn:
-                        for outer_edge in state.out_edges_by_connector(edge.dst, outer_conn):
-                            if isinstance(outer_edge.dst, nodes.AccessNode):
-                                dst_name = outer_edge.dst.data
-                                if dst_name != edge.src_conn:
-                                    if edge.src_conn in _prebind_outputs:
-                                        break
-                                    callsite_stream.write(f"{dst_name} = {edge.src_conn}", cfg, state_id)
-                                    self._dispatcher.defined_vars.add(dst_name, dispatcher_mod.DefinedType.Scalar,
-                                                                      "object")
-                                break
+                    # Trace through ALL enclosing scope exits to the actual
+                    # destination AccessNode (see input binding above for why
+                    # a one-level connector hop is insufficient).
+                    leaf = state.memlet_path(edge)[-1].dst
+                    if isinstance(leaf, nodes.AccessNode):
+                        dst_name = leaf.data
+                        if dst_name != edge.src_conn and edge.src_conn not in _prebind_outputs:
+                            callsite_stream.write(f"{dst_name} = {edge.src_conn}", cfg, state_id)
+                            self._dispatcher.defined_vars.add(dst_name, dispatcher_mod.DefinedType.Scalar, "object")
         finally:
             self._dispatcher.defined_vars.exit_scope(node)
 
