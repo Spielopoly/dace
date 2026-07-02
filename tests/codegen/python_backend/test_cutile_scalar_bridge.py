@@ -4,9 +4,13 @@
 ``_emit_scalar_bridge_binding`` binds a Register scalar bridge (staged by the
 vectorizer's ``stage_constant_access``) to its traced source. The vectorizer
 can stage a single ELEMENT of an array (``src_subset`` like ``aa[0, j]``); the
-binding must then index the source (``aa_const = aa[0, j]``) instead of
-aliasing the whole tensor. Untraceable bridges must warn, not silently emit
-nothing.
+binding must then load exactly that element as a 0-d tile
+(``aa_const = ct.load(aa, (0, j), shape=())``) — cuTile arrays are not
+subscriptable in-kernel and the propagated outer subset is a non-constant
+slice the cuda.tile compiler rejects. Float scalar sources also bind via a
+0-d tile load (the launch site passes them as 1-element device arrays to keep
+f64 precision); integer scalars keep the plain rename. Untraceable bridges
+must warn, not silently emit nothing.
 """
 import warnings as _warnings
 
@@ -63,24 +67,26 @@ def _make_sdfg_with_bridge(name: str, src_memlet: Memlet, add_symbol: str = None
 
 
 class TestArrayElementBridge:
-    """Array-element sources must be bound with the memlet subset as index."""
+    """Array-element sources must be bound with a 0-d ``ct.load`` at the
+    memlet subset (arrays are not subscriptable inside a ct kernel)."""
 
     def test_constant_element_index(self):
-        """``aa[0, 1]`` staged into the bridge -> ``aa_const = aa[0, 1]``."""
+        """``aa[0, 1]`` staged -> ``aa_const = ct.load(aa, (0, 1), shape=())``."""
         sdfg, state, bridge = _make_sdfg_with_bridge("bridge_const_idx", Memlet(data="aa", subset="0, 1"))
-        code = _emit_bridge_binding(sdfg, state, bridge)
-        assert "aa_const = aa[0, 1]" in code
+        code = _emit_bridge_binding(sdfg, state, bridge).replace(" ", "")
+        assert "aa_const=ct.load(aa,(0,1,),shape=())" in code
         # The whole-tensor alias must NOT be emitted.
         assert "aa_const = aa\n" not in code
 
     def test_symbolic_element_index(self):
-        """``aa[0, j]`` with a free symbol -> ``aa_const = aa[0, j]``."""
+        """``aa[0, j]`` -> ``aa_const = ct.load(aa, (0, j), shape=())``."""
         sdfg, state, bridge = _make_sdfg_with_bridge("bridge_sym_idx", Memlet(data="aa", subset="0, j"), add_symbol="j")
-        code = _emit_bridge_binding(sdfg, state, bridge)
-        assert "aa_const = aa[0, j]" in code
+        code = _emit_bridge_binding(sdfg, state, bridge).replace(" ", "")
+        assert "aa_const=ct.load(aa,(0,j,),shape=())" in code
 
-    def test_scalar_source_binds_bare_name(self):
-        """A true scalar source keeps the plain rename (``alpha_const = alpha``)."""
+    def test_float_scalar_source_binds_scalar_tile_load(self):
+        """A float scalar source is a 1-element device array at runtime and
+        binds via a 0-d tile load (f64 precision; by-value floats are f32)."""
         sdfg = SDFG("bridge_scalar_src")
         sdfg.backend = dtypes.BackendLanguage.Python
         sdfg.add_scalar("alpha", dace.float64)
@@ -90,9 +96,23 @@ class TestArrayElementBridge:
         a_node = state.add_read("alpha")
         bridge = state.add_access("alpha_const")
         state.add_memlet_path(a_node, me, bridge, memlet=Memlet(data="alpha", subset="0"))
+        code = _emit_bridge_binding(sdfg, state, bridge).replace(" ", "")
+        assert "alpha_const=ct.load(alpha,(0,),shape=())" in code
+
+    def test_int_scalar_source_binds_bare_name(self):
+        """An integer scalar source keeps the plain rename (passed by value)."""
+        sdfg = SDFG("bridge_int_scalar_src")
+        sdfg.backend = dtypes.BackendLanguage.Python
+        sdfg.add_scalar("kk", dace.int64)
+        sdfg.add_scalar("kk_const", dace.int64, storage=StorageType.Register, transient=True)
+        state = sdfg.add_state("main")
+        me, _mx = state.add_map("cutile_map", {"tile_i": "0:8"}, schedule=ScheduleType.CuTile)
+        a_node = state.add_read("kk")
+        bridge = state.add_access("kk_const")
+        state.add_memlet_path(a_node, me, bridge, memlet=Memlet(data="kk", subset="0"))
         code = _emit_bridge_binding(sdfg, state, bridge)
-        assert "alpha_const = alpha" in code
-        assert "alpha[" not in code
+        assert "kk_const = kk" in code
+        assert "kk[" not in code
 
 
 class TestBridgeWarnings:

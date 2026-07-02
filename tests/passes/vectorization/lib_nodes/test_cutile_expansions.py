@@ -273,8 +273,9 @@ def test_tile_store_cutile_scalar_src_broadcasts_item():
 
 def test_tile_store_cutile_symbol_fill_to_tile_transient_is_assignment():
     """``src_kind='Symbol'`` writing a ``widths``-shaped transient is the
-    const-fill idiom: a plain broadcast assignment (tiles are SSA values
-    in cuTile), NOT a ``ct.store``. No ``_src`` input is declared."""
+    const-fill idiom: a plain dtype-typed ``ct.full`` assignment (tiles are
+    SSA values in cuTile; a bare literal would materialize the wrong dtype),
+    NOT a ``ct.store``. No ``_src`` input is declared."""
     tasklet = _expand_cutile_tasklet_with_edges(
         TileStore(name="S", widths=(8, ), src_kind="Symbol", src_expr="alpha"),
         out_arrays={"_dst": ("tile_c", (8,), dace.float32)},
@@ -285,7 +286,7 @@ def test_tile_store_cutile_symbol_fill_to_tile_transient_is_assignment():
     assert "_src" not in tasklet.in_connectors
     assert "ct.store" not in body
     assert "ct.scatter" not in body
-    assert "ct.broadcast_to(alpha, (8,))" in body
+    assert "ct.full((8,), alpha, ct.float32)" in body
     assert body.startswith("_dst = ")
 
 
@@ -300,7 +301,7 @@ def test_tile_store_cutile_symbol_fill_masked_blends_with_where():
     body = tasklet.code.as_string
     _assert_parses_as_python(body)
     assert "_mask" in tasklet.in_connectors
-    assert "ct.where(_mask, ct.broadcast_to(3.14, (8,)), 0)" in body
+    assert "ct.where(_mask, ct.full((8,), 3.14, ct.float32), 0)" in body
 
 
 def test_tile_store_cutile_symbol_to_global_broadcasts_then_stores():
@@ -313,7 +314,7 @@ def test_tile_store_cutile_symbol_to_global_broadcasts_then_stores():
     body = tasklet.code.as_string
     _assert_parses_as_python(body)
     assert "_src" not in tasklet.in_connectors
-    assert "__tile = ct.broadcast_to(alpha, (8,))" in body
+    assert "__tile = ct.full((8,), alpha, ct.float32)" in body
     assert "ct.store(_dst, index=(__pid0,), tile=__tile)" in body
 
 

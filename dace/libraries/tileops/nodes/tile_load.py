@@ -12,7 +12,7 @@ from dace import library, properties
 from dace.sdfg import nodes
 from dace.transformation.transformation import ExpandTransformation
 
-from .._pure_codegen import (cutile_bid_lines, cutile_grid_dim_offset, cutile_offset_block_shift,
+from .._pure_codegen import (ct_dtype_name, cutile_bid_lines, cutile_grid_dim_offset, cutile_offset_block_shift,
                              cutile_offset_is_nonzero, cutile_tile_dim_bids, cutile_tile_dim_offsets,
                              gather_lane_offset, nested_loops, offset_via_strides, resolve_gather_deps, tile_offset)
 from .. import _isa_codegen
@@ -227,6 +227,13 @@ class ExpandTileLoadCutile(ExpandTransformation):
                              f"must be one of {list(_PAD_MODE_CUTILE.keys())}")
         pad_mode = _PAD_MODE_CUTILE[node.pad_mode]
 
+        def _dst_ct_dtype() -> str:
+            """``ct`` dtype name of the result tile, for dtype-correct constant
+            fills (a bare literal like ``0.0`` would otherwise materialize a
+            float32 tile that cannot be stored into e.g. an int32 array)."""
+            _dst_edge = next(e for e in parent_state.out_edges(node) if e.src_conn == "_dst")
+            return ct_dtype_name(parent_sdfg.arrays[_dst_edge.data.data].dtype)
+
         if node.src_kind == "Scalar":
             # Broadcast a single value
             # If the source comes from a global array, we need to load it first
@@ -236,11 +243,19 @@ class ExpandTileLoadCutile(ExpandTransformation):
                              and all(bool(dace.symbolic.simplify(s == 1)) for s in desc.shape))
             if is_len1_array:
                 ref = f"ct.load(_src, index=({'0,' * len(desc.shape)}), shape=({'1,' * len(desc.shape)})).item()"
+                src_code = f"ct.broadcast_to({ref}, {widths})"
+            elif isinstance(desc, dace.data.Scalar):
+                # Scalar kernel parameters are normalized at the launch site
+                # (cutile_target): floats arrive as 0-d tiles (device path,
+                # keeps f64 precision), ints/bools as plain Python values.
+                if desc.dtype.as_numpy_dtype().kind == "f":
+                    src_code = f"ct.broadcast_to(_src, {widths})"
+                else:
+                    src_code = f"ct.full({widths}, _src, ct.{_dst_ct_dtype()})"
             else:
-                ref = "_src.item()"
-            src_code = f"ct.broadcast_to({ref}, {widths})"
+                src_code = f"ct.broadcast_to(_src.item(), {widths})"
         elif node.src_kind == "Symbol":
-            src_code = f"ct.broadcast_to(({symstr(node.src_expr, cpp_mode=False)}), {widths})"
+            src_code = f"ct.full({widths}, ({symstr(node.src_expr, cpp_mode=False)}), ct.{_dst_ct_dtype()})"
         elif node.src_kind == "Tile":
             src_edge = next(e for e in parent_state.in_edges(node) if e.dst_conn == "_src")
             src_arr = parent_sdfg.arrays[src_edge.data.data]

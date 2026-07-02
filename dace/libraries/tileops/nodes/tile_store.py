@@ -11,7 +11,7 @@ from dace import library, properties
 from dace.sdfg import nodes
 from dace.transformation.transformation import ExpandTransformation
 
-from .._pure_codegen import (cutile_bid_lines, cutile_offset_block_shift, cutile_offset_is_nonzero,
+from .._pure_codegen import (ct_dtype_name, cutile_bid_lines, cutile_offset_block_shift, cutile_offset_is_nonzero,
                              cutile_tile_dim_bids, cutile_tile_dim_offsets, gather_lane_offset, nested_loops,
                              offset_via_strides, resolve_gather_deps, tile_offset)
 from .. import _isa_codegen
@@ -175,6 +175,11 @@ class ExpandTileStoreCutile(ExpandTransformation):
                 return _dst_begins[d]
             return "0"
 
+        # The destination dtype, for dtype-correct constant fills (a bare
+        # literal like ``0.0`` would otherwise materialize a float32 tile that
+        # cannot be stored into e.g. an int32 array).
+        _dst_ct_dtype = ct_dtype_name(dst_arr.dtype)
+
         # Resolve the stored tile expression per src_kind (mirrors TileLoad).
         if node.src_kind == "Scalar":
             # Broadcast a single value. If the source comes from a global
@@ -186,11 +191,19 @@ class ExpandTileStoreCutile(ExpandTransformation):
                              and all(bool(dace.symbolic.simplify(s == 1)) for s in desc.shape))
             if is_len1_array:
                 ref = f"ct.load(_src, index=({'0,' * len(desc.shape)}), shape=({'1,' * len(desc.shape)})).item()"
+                tile_expr = f"ct.broadcast_to({ref}, {widths})"
+            elif isinstance(desc, dace.data.Scalar):
+                # Scalar kernel parameters are normalized at the launch site
+                # (cutile_target): floats arrive as 0-d tiles (device path,
+                # keeps f64 precision), ints/bools as plain Python values.
+                if desc.dtype.as_numpy_dtype().kind == "f":
+                    tile_expr = f"ct.broadcast_to(_src, {widths})"
+                else:
+                    tile_expr = f"ct.full({widths}, _src, ct.{_dst_ct_dtype})"
             else:
-                ref = "_src.item()"
-            tile_expr = f"ct.broadcast_to({ref}, {widths})"
+                tile_expr = f"ct.broadcast_to(_src.item(), {widths})"
         elif node.src_kind == "Symbol":
-            tile_expr = f"ct.broadcast_to(({symstr(node.src_expr, cpp_mode=False)}), {widths})"
+            tile_expr = f"ct.full({widths}, ({symstr(node.src_expr, cpp_mode=False)}), ct.{_dst_ct_dtype})"
         elif node.src_kind == "Tile":
             # Rank invariant (bug 07): the value tile arriving here must be
             # rank-K (``widths``-shaped) — TileLoad normalizes source-rank
