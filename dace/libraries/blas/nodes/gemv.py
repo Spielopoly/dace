@@ -376,28 +376,41 @@ class ExpandGemvCuPy(ExpandTransformation):
     environments = []
 
     @staticmethod
-    def expansion(node: 'Gemv', state: SDFGState,
-                  sdfg: SDFG) -> SDFG:
+    def expansion(node: 'Gemv', state: SDFGState, sdfg: SDFG) -> SDFG:
         node.validate(sdfg, state)
 
-        # Collect array descriptors from edges.
+        def _squeezed_size(subset) -> list:
+            """Subset size with provably-1 dims removed."""
+            squeezed = copy.deepcopy(subset)
+            squeezed.squeeze()
+            return squeezed.size()
+
+        # Collect array descriptors from edges. ``squeezed_*`` drop redundant
+        # unit dimensions -- a ``MatMul`` specialized to ``Gemv`` may carry
+        # singleton dims from an ``np.reshape`` (e.g. ``(NQ, 1, NP) @ (NP,)``);
+        # ``Gemv.validate`` accepts those since it squeezes, so the tasklet
+        # must feed the squeezed 2-D/1-D operands to ``cupy.matmul`` too.
         adesc = xdesc = ydesc = None
         shape_a = shape_x = shape_y = None
         strides_a = strides_x = strides_y = None
+        squeezed_a = squeezed_x = squeezed_y = None
         for e in state.in_edges(node):
             if e.dst_conn == '_A':
                 adesc = sdfg.arrays[e.data.data]
                 shape_a = e.data.subset.size()
                 strides_a = adesc.strides
+                squeezed_a = _squeezed_size(e.data.subset)
             elif e.dst_conn == '_x':
                 xdesc = sdfg.arrays[e.data.data]
                 shape_x = e.data.subset.size()
                 strides_x = xdesc.strides
+                squeezed_x = _squeezed_size(e.data.subset)
         for e in state.out_edges(node):
             if e.src_conn == '_y':
                 ydesc = sdfg.arrays[e.data.data]
                 shape_y = e.data.subset.size()
                 strides_y = ydesc.strides
+                squeezed_y = _squeezed_size(e.data.subset)
 
         dtype_a = adesc.dtype.type
         dtype_x = xdesc.dtype.type
@@ -407,12 +420,9 @@ class ExpandGemvCuPy(ExpandTransformation):
         nsdfg = dace.SDFG(node.label + '_cupy')
         nstate = nsdfg.add_state()
 
-        nsdfg.add_array('_A', shape_a, dtype_a, strides=strides_a,
-                        storage=adesc.storage)
-        nsdfg.add_array('_x', shape_x, dtype_x, strides=strides_x,
-                        storage=xdesc.storage)
-        nsdfg.add_array('_y', shape_y, dtype_y, strides=strides_y,
-                        storage=ydesc.storage)
+        nsdfg.add_array('_A', shape_a, dtype_a, strides=strides_a, storage=adesc.storage)
+        nsdfg.add_array('_x', shape_x, dtype_x, strides=strides_x, storage=xdesc.storage)
+        nsdfg.add_array('_y', shape_y, dtype_y, strides=strides_y, storage=ydesc.storage)
 
         # Build tasklet code. Operands already on GPU storage (the cuTile
         # pipeline places everything on GPU_Global) are kept device-resident:
@@ -420,8 +430,18 @@ class ExpandGemvCuPy(ExpandTransformation):
         # NumPy result cannot be assigned into the cupy output.
         code_lines = ['import cupy']
 
+        def _tuple_str(shape) -> str:
+            """Format a shape sequence as a Python tuple-literal string."""
+            return '(' + ', '.join(symbolic.symstr(d) for d in shape) + ',)'
+
+        # Reduce operands to their squeezed 2-D matrix / 1-D vector form
+        # (dropping redundant unit dims); the result is reshaped back at the end.
         a_in = blas_helpers.cupy_in_wrap('__A', adesc.storage)
         x_in = blas_helpers.cupy_in_wrap('__x', xdesc.storage)
+        if len(shape_a) != 2:
+            a_in = f'({a_in}).reshape({_tuple_str(squeezed_a)})'
+        if len(shape_x) != 1:
+            x_in = f'({x_in}).reshape({_tuple_str(squeezed_x)})'
         if node.transA:
             code_lines.append(f'__A_t = ({a_in}).T')
         else:
@@ -431,31 +451,26 @@ class ExpandGemvCuPy(ExpandTransformation):
         if symbolic.equal_valued(1, alpha):
             code_lines.append(f'__result = cupy.matmul(__A_t, {x_in})')
         elif symbolic.equal_valued(0, alpha):
-            if node.transA:
-                code_lines.append(
-                    f'__result = cupy.zeros(({a_in}).shape[1], '
-                    f'dtype=({a_in}).dtype)')
-            else:
-                code_lines.append(
-                    f'__result = cupy.zeros(({a_in}).shape[0], '
-                    f'dtype=({a_in}).dtype)')
+            code_lines.append('__result = cupy.zeros(__A_t.shape[0], dtype=__A_t.dtype)')
         else:
             alpha_str = symbolic.symstr(alpha)
-            code_lines.append(
-                f'__result = {alpha_str} * cupy.matmul(__A_t, {x_in})')
+            code_lines.append(f'__result = {alpha_str} * cupy.matmul(__A_t, {x_in})')
 
         beta = node.beta
         has_yin = not symbolic.equal_valued(0, beta)
 
         if has_yin:
             yin_in = blas_helpers.cupy_in_wrap('__yin', ydesc.storage)
+            if len(shape_y) != 1:
+                yin_in = f'({yin_in}).reshape({_tuple_str(squeezed_y)})'
             if symbolic.equal_valued(1, beta):
                 code_lines.append(f'__result = __result + {yin_in}')
             else:
                 beta_str = symbolic.symstr(beta)
-                code_lines.append(
-                    f'__result = __result + {beta_str} * {yin_in}')
+                code_lines.append(f'__result = __result + {beta_str} * {yin_in}')
 
+        # The squeezed 1-D result is stored through ``_y``'s inner memlet, which
+        # squeezes the redundant unit dimensions itself; no output reshape needed.
         code_lines.append(f'__y_out = {blas_helpers.cupy_out_wrap("__result", ydesc.storage)}')
 
         code = '\n'.join(code_lines)
@@ -480,18 +495,13 @@ class ExpandGemvCuPy(ExpandTransformation):
         x_read = nstate.add_read('_x')
         y_write = nstate.add_write('_y')
 
-        nstate.add_edge(a_read, None, tasklet, '__A',
-                        dace.Memlet.from_array('_A', nsdfg.arrays['_A']))
-        nstate.add_edge(x_read, None, tasklet, '__x',
-                        dace.Memlet.from_array('_x', nsdfg.arrays['_x']))
-        nstate.add_edge(tasklet, '__y_out', y_write, None,
-                        dace.Memlet.from_array('_y', nsdfg.arrays['_y']))
+        nstate.add_edge(a_read, None, tasklet, '__A', dace.Memlet.from_array('_A', nsdfg.arrays['_A']))
+        nstate.add_edge(x_read, None, tasklet, '__x', dace.Memlet.from_array('_x', nsdfg.arrays['_x']))
+        nstate.add_edge(tasklet, '__y_out', y_write, None, dace.Memlet.from_array('_y', nsdfg.arrays['_y']))
 
         if has_yin:
             y_read = nstate.add_read('_y')
-            nstate.add_edge(
-                y_read, None, tasklet, '__yin',
-                dace.Memlet.from_array('_y', nsdfg.arrays['_y']))
+            nstate.add_edge(y_read, None, tasklet, '__yin', dace.Memlet.from_array('_y', nsdfg.arrays['_y']))
 
         return nsdfg
 
