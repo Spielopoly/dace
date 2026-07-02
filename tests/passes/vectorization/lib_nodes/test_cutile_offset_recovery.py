@@ -7,11 +7,12 @@ FOREIGN map parameters in coupled begins (``A[__i0 + __i1]`` — exactly the
 silent-wrong bug class 16 was about), silently dropped a nonzero map start,
 and swallowed parse failures via a bare ``except: offsets.append(0)``.
 
-The hardened helper removes only the matched dim's OWN parameter and raises
-``NotImplementedError`` loudly for coupled begins, nonzero map-range starts,
-and unparseable begins. Offsets free of map parameters (including symbolic
-SDFG-symbol offsets) are returned for the caller's divisibility/gather
-decision.
+The hardened helper substitutes only the matched dim's OWN parameter — with
+its range START, so a nonzero-start map (the vectorizer's remainder map)
+folds the start into the offset — and raises ``NotImplementedError`` loudly
+for coupled begins and unparseable begins. Offsets free of map parameters
+(including symbolic SDFG-symbol offsets) are returned for the caller's
+divisibility/gather decision.
 
 No GPU required: these operate on the symbolic helper directly.
 """
@@ -76,12 +77,22 @@ def test_coupled_params_raise():
         cutile_tile_dim_offsets(node, state, sdfg, (0, ), ["__i0 + __i1"], 1)
 
 
-def test_nonzero_map_start_raises():
-    """A map whose own parameter starts at 4 breaks the ``__pid * W``
-    reconstruction; must raise instead of silently dropping the start."""
+def test_nonzero_map_start_folded_into_offset():
+    """A map whose own parameter starts at 4 folds the start into the offset
+    (``__pid * W`` counts blocks relative to the range start): begin
+    ``__i0 + 3`` with range ``4:64:8`` recovers offset ``4 + 3 = 7``."""
     node, state, sdfg = _node_in_cutile_map({"__i0": "4:64:8"})
-    with pytest.raises(NotImplementedError, match="range start"):
-        cutile_tile_dim_offsets(node, state, sdfg, (0, ), ["__i0 + 3"], 1)
+    offs = cutile_tile_dim_offsets(node, state, sdfg, (0, ), ["__i0 + 3"], 1)
+    assert len(offs) == 1 and int(offs[0]) == 7
+
+
+def test_remainder_map_symbolic_start_folded():
+    """The vectorizer's remainder map (start ``8*int_floor(N, 8)``) folds its
+    symbolic start into the offset instead of raising — the shape that arises
+    for non-divisible symbolic sizes on the CPU/remainder track."""
+    node, state, sdfg = _node_in_cutile_map({"__i0": "8*int_floor(N, 8):N:8"})
+    offs = cutile_tile_dim_offsets(node, state, sdfg, (0, ), ["__i0"], 1)
+    assert len(offs) == 1 and str(offs[0]) == "8*int_floor(N, 8)"
 
 
 def test_nonzero_map_start_other_param_ok():
@@ -115,7 +126,8 @@ if __name__ == "__main__":
     test_zero_offset_recovered()
     test_symbolic_offset_recovered()
     test_coupled_params_raise()
-    test_nonzero_map_start_raises()
+    test_nonzero_map_start_folded_into_offset()
+    test_remainder_map_symbolic_start_folded()
     test_nonzero_map_start_other_param_ok()
     test_single_iteration_param_substituted_exactly()
     test_scaled_own_param_offset_recovered()

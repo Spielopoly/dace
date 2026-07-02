@@ -268,9 +268,13 @@ def cutile_tile_dim_offsets(node, parent_state, parent_sdfg, used_dimensions: Se
     index only reconstructs ``__i0`` and drops ``c``, so an offset slice
     (``A[1:-1]``, ``A[2:]``) reads/writes one (or more) elements too low. This
     helper recovers ``c`` for each tile dim by substituting every enclosing
-    CuTile-map iteration variable in the begin with ``0`` -- what remains is the
-    part of the address the block id does NOT advance and must be added back to
-    the per-lane element index.
+    CuTile-map iteration variable in the begin with its range START -- what
+    remains is the part of the address the block id does NOT advance and must
+    be added back to the per-lane element index. For canonical 0-start maps the
+    start substitution degenerates to the plain constant slice offset; for a
+    nonzero-start map (e.g. the vectorizer's remainder map over
+    ``4*int_floor(N,4):N``) the start itself becomes part of the offset, since
+    ``__pid * W`` counts blocks relative to the range start.
 
     Map parameters whose range provably has a single iteration (e.g. a
     single-tile inner loop ``0:4:4``) are substituted with their constant
@@ -278,10 +282,9 @@ def cutile_tile_dim_offsets(node, parent_state, parent_sdfg, used_dimensions: Se
     affine in AT MOST ONE enclosing-map parameter (the dim's own iteration
     variable, the same one :func:`cutile_tile_dim_bids` resolves the block id
     from). A begin coupling several multi-iteration map parameters (e.g.
-    ``A[__i0 + __i1]``) cannot be reconstructed from a single block id, and a
-    map whose own parameter does not start at 0 breaks the ``__pid * W``
-    block-start reconstruction — both raise ``NotImplementedError`` instead of
-    silently producing a wrong offset.
+    ``A[__i0 + __i1]``) cannot be reconstructed from a single block id and
+    raises ``NotImplementedError`` instead of silently producing a wrong
+    offset.
 
     :param node: The tile-op library node being expanded.
     :param parent_state: The state that owns ``node``.
@@ -291,9 +294,8 @@ def cutile_tile_dim_offsets(node, parent_state, parent_sdfg, used_dimensions: Se
     :param K: The tile-op's tile-dim count.
     :returns: List of ``K`` symbolic offsets (usually integers; ``0`` when the
         slice is anchored at the block-aligned start).
-    :raises NotImplementedError: If a begin cannot be parsed, couples more than
-        one enclosing-map parameter, or its map parameter has a nonzero range
-        start.
+    :raises NotImplementedError: If a begin cannot be parsed or couples more
+        than one enclosing-map parameter.
     """
     import dace.symbolic as _sym
     m = _enclosing_cutile_map(node, parent_state, parent_sdfg)
@@ -341,12 +343,11 @@ def cutile_tile_dim_offsets(node, parent_state, parent_sdfg, used_dimensions: Se
                 f"should have been routed to the gather/scatter path by the detection passes.")
         if own:
             own_p = own[0]
+            # ``__pid * W`` counts blocks relative to the range start, so the
+            # begin evaluated AT the start is exactly the part the block id
+            # does not advance (0-start maps degenerate to the slice constant).
             start = starts[params.index(own_p)]
-            if not bool(_sym.simplify(start) == 0):
-                raise NotImplementedError(f"{node.label}: enclosing CuTile-map parameter '{own_p}' has range start "
-                                          f"{start} != 0; the ``__pid * W`` block-start reconstruction assumes 0-start "
-                                          f"(canonical) map ranges.")
-            begin = begin.subs(own_p, 0)
+            begin = begin.subs(own_p, start)
         remaining = _sym.simplify(begin)
         foreign = param_set & set(remaining.free_symbols)
         if foreign:
