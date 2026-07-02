@@ -1435,24 +1435,27 @@ class ExpandReduceCuPy(pm.ExpandTransformation):
         # The Python backend maps connector names to local variables:
         #   input  connectors are read from the incoming memlet,
         #   output connectors are written to the outgoing memlet AFTER the
-        #   tasklet body.  We therefore assign the CuPy result (converted
-        #   back to NumPy) directly to the output connector variable so
-        #   the backend can copy it into the output array.
+        #   tasklet body.  We therefore assign the CuPy result directly to
+        #   the output connector variable so the backend can copy it into
+        #   the output array. The result must live in the output's memory
+        #   space: cupy rejects assigning a non-scalar NumPy array into a
+        #   device array (``non-scalar numpy.ndarray cannot be used for
+        #   fill``), so only convert to NumPy for host-resident outputs.
+        if output_data.storage == dtypes.StorageType.GPU_Global:
+            result_expr = cupy_call
+        else:
+            result_expr = f'cupy.asnumpy({cupy_call})'
         tasklet_code = ('import cupy\n'
                         '__inp_cp = cupy.asarray(__in)\n'
-                        f'__out = cupy.asnumpy({cupy_call})')
+                        f'__out = {result_expr}')
 
-        tasklet = nstate.add_tasklet('cupy_reduce', {'__in'}, {'__out'},
-                                     tasklet_code,
-                                     language=dace.Language.Python)
+        tasklet = nstate.add_tasklet('cupy_reduce', {'__in'}, {'__out'}, tasklet_code, language=dace.Language.Python)
 
         # Wire edges
         r = nstate.add_read('_in')
         w = nstate.add_write('_out')
-        nstate.add_edge(r, None, tasklet, '__in',
-                        dace.Memlet.from_array('_in', nsdfg.arrays['_in']))
-        nstate.add_edge(tasklet, '__out', w, None,
-                        dace.Memlet.from_array('_out', nsdfg.arrays['_out']))
+        nstate.add_edge(r, None, tasklet, '__in', dace.Memlet.from_array('_in', nsdfg.arrays['_in']))
+        nstate.add_edge(tasklet, '__out', w, None, dace.Memlet.from_array('_out', nsdfg.arrays['_out']))
 
         return nsdfg
 

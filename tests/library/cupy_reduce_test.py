@@ -68,12 +68,53 @@ def _make_reduce_sdfg(in_shape, axes, wcr, dtype=dace.float64, identity=None):
     return g, r
 
 
+def _make_reduce_sdfg_gpu(in_shape, axes, wcr, dtype=dace.float64, identity=None):
+    """Like :func:`_make_reduce_sdfg` but with GPU_Global (cupy) arrays.
+
+    :param in_shape: shape of the input array (list of ints).
+    :param axes:     axes to reduce over (list of ints or None for all).
+    :param wcr:      WCR lambda string.
+    :param dtype:    DaCe data type.
+    :param identity: optional identity value for initialisation.
+    :returns:        (sdfg, reduce_node)
+    """
+    sdfg, rnode = _make_reduce_sdfg(in_shape, axes, wcr, dtype=dtype, identity=identity)
+    for arr in sdfg.arrays.values():
+        arr.storage = dtypes.StorageType.GPU_Global
+    return sdfg, rnode
+
+
 # ---------------------------------------------------------------------------
 # Structural tests (no GPU required)
 # ---------------------------------------------------------------------------
 
 class TestCuPyReduceStructure:
     """Structural / unit tests that do NOT need a GPU."""
+
+    @staticmethod
+    def _tasklet_code(nsdfg):
+        tasklets = [n for n in nsdfg.start_block.nodes() if isinstance(n, dace.sdfg.nodes.Tasklet)]
+        assert len(tasklets) == 1
+        return tasklets[0].code.as_string
+
+    def test_gpu_output_stays_on_device(self):
+        """A GPU_Global output must NOT go through ``cupy.asnumpy``.
+
+        Assigning a non-scalar numpy array into a device array fails at
+        runtime with ``non-scalar numpy.ndarray cannot be used for fill``
+        (softmax regression).
+        """
+        sdfg, rnode = _make_reduce_sdfg_gpu([8, 4], [1], 'lambda a, b: max(a, b)')
+        rnode.implementation = 'CuPy'
+        nsdfg = ExpandReduceCuPy.expansion(rnode, sdfg.start_block, sdfg)
+        assert 'asnumpy' not in self._tasklet_code(nsdfg)
+
+    def test_host_output_converts_to_numpy(self):
+        """A host-resident output keeps the ``cupy.asnumpy`` conversion."""
+        sdfg, rnode = _make_reduce_sdfg([8, 4], [1], 'lambda a, b: max(a, b)')
+        rnode.implementation = 'CuPy'
+        nsdfg = ExpandReduceCuPy.expansion(rnode, sdfg.start_block, sdfg)
+        assert 'asnumpy' in self._tasklet_code(nsdfg)
 
     def test_registered(self):
         """CuPy must appear in the Reduce implementations dict."""
@@ -675,6 +716,43 @@ class TestCuPyReduceGPU:
         np.testing.assert_allclose(
             b.reshape(expected.shape), expected, rtol=1e-10
         )
+
+    # -------------------------------------------- GPU_Global (device) output
+    def test_max_gpu_global_output(self):
+        """Max reduction with GPU_Global in/out arrays (softmax regression).
+
+        The result must stay on device: previously the expansion converted
+        it to numpy, and cupy rejected the write-back into the device array.
+        """
+        import cupy
+        sdfg, rnode = _make_reduce_sdfg_gpu([16, 32], [1], 'lambda a, b: max(a, b)', dtype=dace.float32)
+        rnode.implementation = 'CuPy'
+
+        a = np.random.rand(16, 32).astype(np.float32)
+        a_gpu = cupy.asarray(a)
+        b_gpu = cupy.zeros(16, dtype=cupy.float32)
+
+        csdfg = sdfg.compile()
+        csdfg(A=a_gpu, B=b_gpu)
+        del csdfg
+
+        np.testing.assert_allclose(cupy.asnumpy(b_gpu), np.max(a, axis=1))
+
+    def test_sum_gpu_global_output(self):
+        """Sum reduction with GPU_Global in/out arrays stays on device."""
+        import cupy
+        sdfg, rnode = _make_reduce_sdfg_gpu([8, 4, 16], [0, 2], 'lambda a, b: a + b', dtype=dace.float64, identity=0)
+        rnode.implementation = 'CuPy'
+
+        a = np.random.rand(8, 4, 16)
+        a_gpu = cupy.asarray(a)
+        b_gpu = cupy.zeros(4, dtype=cupy.float64)
+
+        csdfg = sdfg.compile()
+        csdfg(A=a_gpu, B=b_gpu)
+        del csdfg
+
+        np.testing.assert_allclose(cupy.asnumpy(b_gpu), np.sum(a, axis=(0, 2)), rtol=1e-12)
 
     # --------------------------------------------- single-axis 2D variants
     def test_sum_axis0(self):

@@ -375,6 +375,106 @@ class PythonCodeGen(PythonTargetCodeGenerator):
             expected = expected * dim
         return True
 
+    def _nested_shapes_match(self, memlet: mmlt.Memlet, desc: data.Array) -> bool:
+        """Whether the outer memlet subset and the nested connector have
+        provably identical ordered shapes (including singleton positions).
+
+        :param memlet: The connector's memlet.
+        :param desc: The nested connector's array descriptor.
+        :returns: True when no reconciliation is needed.
+        """
+        subset_size = list(memlet.subset.size())
+        conn_shape = list(desc.shape)
+        return len(subset_size) == len(conn_shape) and all(
+            self._provably_equal(a, b) for a, b in zip(subset_size, conn_shape))
+
+    def _outer_view_dims(self, outer_desc: data.Array, subset) -> Optional[list]:
+        """Per-dimension (size, stride, start, end, step) of the view the outer
+        memlet subset selects from ``outer_desc``; strides in elements of the
+        underlying array (subset step folded in).
+
+        :param outer_desc: The outer array descriptor.
+        :param subset: The (normalized) memlet subset, or None for the whole array.
+        :returns: A list of (size, stride, start, end, step) tuples, or None
+            when the subset type is unsupported.
+        """
+        if subset is None:
+            return [(size, stride, 0, size - 1, 1) for size, stride in zip(outer_desc.shape, outer_desc.strides)]
+        if isinstance(subset, subsets.Indices):
+            return [(1, stride, index, index, 1) for index, stride in zip(subset.indices, outer_desc.strides)]
+        if isinstance(subset, subsets.Range):
+            return [(size, stride * step, start, end, step)
+                    for (start, end, step), size, stride in zip(subset.ranges, subset.size(), outer_desc.strides)]
+        return None
+
+    def _nested_strided_view_expr(self, sdfg: SDFG, memlet: mmlt.Memlet, desc: data.Array) -> Optional[str]:
+        """Expression for a genuine strided view of the outer array matching
+        the nested connector's declared shape/strides, or None when no such
+        view provably exists.
+
+        The connector's non-singleton dims must map one-to-one (possibly
+        permuted) onto the non-singleton dims of the outer subset view, with
+        provably equal sizes and element strides. The view is then a slice
+        (integer-indexing away singleton subset dims), an optional
+        ``.transpose``, and optional ``None``-indexing to insert singleton
+        connector dims -- all pure view operations for numpy and cupy alike,
+        hence safe for inputs AND outputs (writes land in the outer array).
+
+        :param sdfg: The parent SDFG.
+        :param memlet: The connector's memlet.
+        :param desc: The nested connector's array descriptor.
+        :returns: A Python view expression, or None.
+        """
+        outer_desc = sdfg.arrays[memlet.data]
+        if not isinstance(outer_desc, data.Array) or outer_desc.dtype != desc.dtype:
+            return None
+        outer_dims = self._outer_view_dims(outer_desc, self._normalize_subset(memlet.subset))
+        if outer_dims is None:
+            return None
+
+        # Subscript: integer index drops singleton dims, slice keeps the rest.
+        components = []
+        kept = []  # (size, stride) of kept outer dims
+        for size, stride, start, end, step in outer_dims:
+            if symbolic.equal_valued(1, size):
+                components.append(_python_expr(start))
+            else:
+                components.append(_python_view_component(start, end, step))
+                kept.append((size, stride))
+
+        conn_nonsingleton = [(size, stride) for size, stride in zip(desc.shape, desc.strides)
+                             if not symbolic.equal_valued(1, size)]
+        if len(kept) == 0 or len(conn_nonsingleton) != len(kept):
+            return None
+
+        # Match connector dims to kept outer dims: identity order first, then
+        # a permutation (on provably equal size AND stride).
+        if all(
+                self._provably_equal(cs, os) and self._provably_equal(ct, ot)
+                for (cs, ct), (os, ot) in zip(conn_nonsingleton, kept)):
+            perm = list(range(len(kept)))
+        else:
+            perm = []
+            unmatched = list(range(len(kept)))
+            for conn_size, conn_stride in conn_nonsingleton:
+                match = next(
+                    (k for k in unmatched
+                     if self._provably_equal(conn_size, kept[k][0]) and self._provably_equal(conn_stride, kept[k][1])),
+                    None)
+                if match is None:
+                    return None
+                unmatched.remove(match)
+                perm.append(match)
+
+        expr = f'{self._runtime_data_name(sdfg, memlet.data)}[{", ".join(components)}]'
+        if perm != list(range(len(kept))):
+            expr = f'{expr}.transpose({tuple(perm)})'
+        if len(conn_nonsingleton) != len(desc.shape):
+            # Insert singleton connector dims via None-indexing (a pure view).
+            inserts = ', '.join('None' if symbolic.equal_valued(1, size) else ':' for size in desc.shape)
+            expr = f'{expr}[{inserts}]'
+        return expr
+
     def _nested_arg_needs_flat_reshape(self, connector_name: str, memlet: mmlt.Memlet, desc: data.Array) -> bool:
         """Whether a nested-SDFG array connector needs (and safely admits) a
         flat C-order ``.reshape`` from the outer memlet subset to its shape.
@@ -403,15 +503,15 @@ class PythonCodeGen(PythonTargetCodeGenerator):
         subset_size = list(memlet.subset.size())
         conn_shape = list(desc.shape)
         # Identical ordered shapes (including singleton positions) need nothing.
-        if len(subset_size) == len(conn_shape) and all(
-                self._provably_equal(a, b) for a, b in zip(subset_size, conn_shape)):
+        if self._nested_shapes_match(memlet, desc):
             return False
         if (not self._provably_equal(prod(subset_size), prod(conn_shape))
                 or not self._is_c_contiguous_layout(desc.shape, desc.strides)):
             raise NotImplementedError(
                 f'Cannot reconcile nested SDFG connector {connector_name!r} (shape {conn_shape}, '
                 f'strides {list(desc.strides)}) with the outer subset of array {memlet.data!r} '
-                f'(shape {subset_size}): the mismatch is not a provably flat-order-preserving reshape.')
+                f'(shape {subset_size}): the mismatch is neither a representable strided view of the '
+                f'outer subset nor a provably flat-order-preserving reshape.')
         return True
 
     def _nested_scalar_bridge_name(self, cfg: ControlFlowRegion, state, node: nodes.NestedSDFG,
@@ -708,6 +808,14 @@ class PythonCodeGen(PythonTargetCodeGenerator):
             stream.write(f'{edge.dst_conn} = {src_expr}', cfg, state_id)
             return
 
+        # Device -> scalar copies need value semantics: Python-backend Scalars
+        # are host Python values regardless of their stamped storage, and
+        # without ``.item()`` the scalar would be bound to a cupy 0-d array,
+        # which cupy later rejects when mixed with numpy operands on the host.
+        if (isinstance(src_desc, data.Array) and src_desc.storage == dtypes.StorageType.GPU_Global
+                and isinstance(dst_desc, data.Scalar)):
+            src_expr = f'({src_expr}).item()'
+
         self._emit_memlet_write(sdfg,
                                 memlet,
                                 src_expr,
@@ -930,14 +1038,21 @@ class PythonCodeGen(PythonTargetCodeGenerator):
                 arg_expr = _bind_bridge(connector_name, memlet, desc, is_input)
             elif isinstance(desc, data.Array):
                 arg_expr = self._nested_view_expr(sdfg, memlet.data, memlet.subset)
-                if self._nested_arg_needs_flat_reshape(connector_name, memlet, desc):
-                    if connector_name in output_connector_names:
-                        # Writes must land in the outer array: go through a
-                        # contiguous bridge with an explicit copy-back.
-                        arg_expr = _bind_reshape_bridge(connector_name, memlet, desc, arg_expr, is_input)
-                    else:
-                        # Read-only: a flat reshape view (or copy) suffices.
-                        arg_expr = f'({arg_expr}).reshape({self._shape_expression(desc.shape)})'
+                if not self._nested_shapes_match(memlet, desc):
+                    # Prefer a genuine strided view (exact layout, valid for
+                    # reads and writes); otherwise fall back to a flat reshape,
+                    # which raises when not provably order-preserving.
+                    strided_expr = self._nested_strided_view_expr(sdfg, memlet, desc)
+                    if strided_expr is not None:
+                        arg_expr = strided_expr
+                    elif self._nested_arg_needs_flat_reshape(connector_name, memlet, desc):
+                        if connector_name in output_connector_names:
+                            # Writes must land in the outer array: go through a
+                            # contiguous bridge with an explicit copy-back.
+                            arg_expr = _bind_reshape_bridge(connector_name, memlet, desc, arg_expr, is_input)
+                        else:
+                            # Read-only: a flat reshape view (or copy) suffices.
+                            arg_expr = f'({arg_expr}).reshape({self._shape_expression(desc.shape)})'
             else:
                 arg_expr = self._runtime_data_name(sdfg, memlet.data)
 

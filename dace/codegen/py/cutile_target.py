@@ -199,7 +199,21 @@ def _collect_free_symbols(entry: nodes.MapEntry, dfg_scope: object, sdfg: "SDFG"
                     syms |= {str(s) for s in expr.free_symbols}
                 else:
                     syms.add(str(expr))
-    syms = {s for s in syms if s in sdfg.symbols and s not in sdfg.constants}
+    # Loop induction variables and interstate-assigned names are module-level
+    # Python locals in the generated code but not necessarily in
+    # ``sdfg.symbols``; they must still become kernel parameters.
+    runtime_defined = set()
+    for region in sdfg.all_control_flow_regions():
+        loop_var = getattr(region, 'loop_variable', None)
+        if loop_var:
+            runtime_defined.add(str(loop_var))
+    for isedge in sdfg.all_interstate_edges():
+        runtime_defined |= set(isedge.data.assignments.keys())
+    syms = {
+        s
+        for s in syms
+        if (s in sdfg.symbols or s in runtime_defined) and s not in sdfg.constants and s not in sdfg.arrays
+    }
     return sorted(syms)
 
 
@@ -465,7 +479,9 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
         dst_storage = sdfg.arrays[dst_node.data].storage
 
         # --- Cross-storage CPU <-> GPU transfers ---
-        _HOST_STORAGES = (dtypes.StorageType.CPU_Heap, dtypes.StorageType.Default)
+        # Register counts as host-side: Register transients (e.g. staged
+        # scalars) live in host memory in the Python backend.
+        _HOST_STORAGES = (dtypes.StorageType.CPU_Heap, dtypes.StorageType.Default, dtypes.StorageType.Register)
         src_on_host = src_storage in _HOST_STORAGES
         dst_on_host = dst_storage in _HOST_STORAGES
         src_on_gpu = src_storage == dtypes.StorageType.GPU_Global
@@ -538,6 +554,27 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
             src_subset_str = self._subset_to_python(memlet.src_subset)
             if src_subset_str:
                 src_expr = f"{src_node.data}[{src_subset_str}]"
+
+        # Host-side SCALAR endpoints need value semantics: ``.set``/``.get``
+        # (and plain assignment) require arrays, and assigning a cupy 0-d into
+        # a host scalar (or a numpy value into a device slice) fails at runtime.
+        src_desc = sdfg.arrays[src_node.data]
+        dst_desc = sdfg.arrays[dst_node.data]
+        if not cpu_to_gpu and isinstance(dst_desc, data.Scalar):
+            value_expr = f"{src_expr}.item()"
+            if dst_desc.transient:
+                # Plain Python local: rebinding is the correct write.
+                callsite_stream.write(f"{dst_node.data} = {value_expr}", cfg, state_id)
+            else:
+                # Non-transient scalars are 0-d numpy buffers (caller-aliased).
+                callsite_stream.write(f"{dst_node.data}[...] = {value_expr}", cfg, state_id)
+            return
+        if cpu_to_gpu and isinstance(src_desc, data.Scalar):
+            value_expr = src_node.data if src_desc.transient else f"{src_node.data}.item()"
+            dst_subset_str = self._subset_to_python(memlet.dst_subset) if memlet.dst_subset is not None else ""
+            dst_expr = f"{dst_node.data}[{dst_subset_str or '...'}]"
+            callsite_stream.write(f"{dst_expr} = {value_expr}", cfg, state_id)
+            return
 
         # Build destination LHS (with optional subset, or [:] for full copy).
         if memlet.dst_subset is not None:
@@ -1033,13 +1070,44 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
             src_desc = sdfg.arrays.get(src_name)
             if src_desc is None:
                 source_expr = src_name
-            else:
-                # Scalar source: bare name. Array source: index by the memlet
-                # subset so exactly the staged element is bound.
+            elif isinstance(src_desc, data.Scalar):
                 src_subset = outer_edge.data.subset if outer_edge.data else None
                 source_expr = data_access_expression(src_name, src_desc, src_subset)
+            else:
+                # Array-element source: cuda.tile arrays are not subscriptable
+                # inside kernels ("Use load() or gather()"), and the element may
+                # vary per block, so index by the INNER (per-iteration) memlet
+                # subset -- the outer subset spans the whole map range.
+                inner_subset = in_edge.data.subset if in_edge.data is not None else None
+                source_expr = self._scalar_bridge_load_expr(src_name, inner_subset)
+                if source_expr is None:
+                    warnings.warn(f"cuTile codegen: scalar bridge {node.data!r} stages a non-single-element "
+                                  f"subset of array {src_name!r}; no binding emitted.")
+                    continue
             if source_expr != node.data:
                 callsite_stream.write(f"{node.data} = {source_expr}", cfg, state_id)
+
+    @staticmethod
+    def _scalar_bridge_load_expr(src_name: str, subset) -> Optional[str]:
+        """``ct.load`` expression for a single staged array element, as a
+        ``(1,)`` tile (broadcastable against any tile operand), or None when
+        ``subset`` does not select exactly one element per dimension.
+
+        :param src_name: The (kernel-parameter) array name.
+        :param subset: The inner-memlet subset selecting the element.
+        :returns: The load expression, or None.
+        """
+        if isinstance(subset, subsets.Indices):
+            indices = [symstr(index) for index in subset.indices]
+        elif isinstance(subset, subsets.Range):
+            if any(sp.simplify(size) != 1 for size in subset.size()):
+                return None
+            indices = [symstr(start) for start, _end, _step in subset.ranges]
+        else:
+            return None
+        index_str = ', '.join(f'({index})' for index in indices)
+        shape_str = ', '.join('1' for _ in indices)
+        return f'ct.reshape(ct.load({src_name}, index=({index_str},), shape=({shape_str},)), (1,))'
 
     def _generate_AccessNode(self, sdfg: "SDFG", cfg: object, dfg: object, state_id: int, node: nodes.AccessNode,
                              function_stream: PythonCodeIOStream, callsite_stream: PythonCodeIOStream) -> None:
@@ -1619,8 +1687,11 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
                 if instr is not None:
                     instr.on_scope_entry(sdfg, cfg, state, entry, callsite_stream, callsite_stream, function_stream)
 
+        # Zero-trip maps (e.g. a loop-dependent range ``0:i`` at ``i == 0``)
+        # yield a grid dimension of 0, which the cuTile runtime rejects
+        # ("invalid argument"); the launch is a no-op then, so skip it.
         callsite_stream.write(
-            f"ct.launch(cupy.cuda.get_current_stream(), {grid_tuple}, "
+            f"if 0 not in {grid_tuple}: ct.launch(cupy.cuda.get_current_stream(), {grid_tuple}, "
             f"{kernel_name}, {args_tuple})",
             cfg,
             state_id,

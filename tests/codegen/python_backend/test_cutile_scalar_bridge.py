@@ -63,21 +63,54 @@ def _make_sdfg_with_bridge(name: str, src_memlet: Memlet, add_symbol: str = None
 
 
 class TestArrayElementBridge:
-    """Array-element sources must be bound with the memlet subset as index."""
+    """Array-element sources must be bound with a ``ct.load`` at the staged
+    element: cuda.tile arrays are not subscriptable inside kernels, so a raw
+    ``aa[0, 1]`` subscript would raise at kernel compile time."""
 
     def test_constant_element_index(self):
-        """``aa[0, 1]`` staged into the bridge -> ``aa_const = aa[0, 1]``."""
+        """``aa[0, 1]`` staged into the bridge -> a (1, 1)-shaped ``ct.load``."""
         sdfg, state, bridge = _make_sdfg_with_bridge("bridge_const_idx", Memlet(data="aa", subset="0, 1"))
         code = _emit_bridge_binding(sdfg, state, bridge)
-        assert "aa_const = aa[0, 1]" in code
-        # The whole-tensor alias must NOT be emitted.
+        assert "aa_const = ct.reshape(ct.load(aa, index=((0), (1),), shape=(1, 1,)), (1,))" in code
+        # Neither the whole-tensor alias nor a raw subscript may be emitted.
         assert "aa_const = aa\n" not in code
+        assert "aa_const = aa[" not in code
 
     def test_symbolic_element_index(self):
-        """``aa[0, j]`` with a free symbol -> ``aa_const = aa[0, j]``."""
+        """``aa[0, j]`` with a free symbol loads at the symbolic index."""
         sdfg, state, bridge = _make_sdfg_with_bridge("bridge_sym_idx", Memlet(data="aa", subset="0, j"), add_symbol="j")
         code = _emit_bridge_binding(sdfg, state, bridge)
-        assert "aa_const = aa[0, j]" in code
+        assert "aa_const = ct.reshape(ct.load(aa, index=((0), (j),), shape=(1, 1,)), (1,))" in code
+
+    def test_per_iteration_element_uses_inner_subset(self):
+        """The binding must index by the INNER (per-iteration) memlet subset.
+
+        The outer edge spans the whole map range (``aa[0:4, 0:8]``); the staged
+        element varies per iteration (``aa[tile_i, 3]``). Using the outer
+        subset would emit a non-constant slice of the wrong elements
+        (softmax/conv2d_bias regression).
+        """
+        sdfg = SDFG("bridge_per_iter")
+        sdfg.backend = dtypes.BackendLanguage.Python
+        sdfg.add_array("aa", [4, 8], dace.float64, storage=StorageType.GPU_Global)
+        sdfg.add_scalar("aa_const", dace.float64, storage=StorageType.Register, transient=True)
+        state = sdfg.add_state("main")
+        me, _mx = state.add_map("cutile_map", {"tile_i": "0:4"}, schedule=ScheduleType.CuTile)
+        aa_node = state.add_read("aa")
+        bridge = state.add_access("aa_const")
+        me.add_in_connector("IN_aa")
+        me.add_out_connector("OUT_aa")
+        state.add_edge(aa_node, None, me, "IN_aa", Memlet(data="aa", subset="0:4, 3"))
+        state.add_edge(me, "OUT_aa", bridge, None, Memlet(data="aa", subset="tile_i, 3"))
+        code = _emit_bridge_binding(sdfg, state, bridge)
+        assert "aa_const = ct.reshape(ct.load(aa, index=((tile_i), (3),), shape=(1, 1,)), (1,))" in code
+
+    def test_non_single_element_subset_warns(self):
+        """A multi-element staged subset cannot be a scalar bridge: warn."""
+        sdfg, state, bridge = _make_sdfg_with_bridge("bridge_multi_elem", Memlet(data="aa", subset="0:2, 1"))
+        with pytest.warns(UserWarning, match="non-single-element"):
+            code = _emit_bridge_binding(sdfg, state, bridge)
+        assert "aa_const =" not in code
 
     def test_scalar_source_binds_bare_name(self):
         """A true scalar source keeps the plain rename (``alpha_const = alpha``)."""
