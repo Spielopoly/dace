@@ -209,8 +209,8 @@ def cutile_grid_dim_offset(node, parent_state, parent_sdfg, K: int) -> int:
     return max(0, len(m.map.range) - K) if m is not None else 0
 
 
-def cutile_tile_dim_bids(node, parent_state, parent_sdfg, used_dimensions: Sequence[int],
-                         src_begins: Sequence[str], K: int) -> list:
+def cutile_tile_dim_bids(node, parent_state, parent_sdfg, used_dimensions: Sequence[int], src_begins: Sequence[str],
+                         K: int) -> list:
     """Resolve the ``ct.bid`` grid axis for each of a load/store's K tile dims.
 
     The grid axis for tile dim ``d`` is the position, in the enclosing CuTile
@@ -257,8 +257,8 @@ def cutile_tile_dim_bids(node, parent_state, parent_sdfg, used_dimensions: Seque
     return bids
 
 
-def cutile_tile_dim_offsets(node, parent_state, parent_sdfg, used_dimensions: Sequence[int],
-                            begins: Sequence[str], K: int) -> list:
+def cutile_tile_dim_offsets(node, parent_state, parent_sdfg, used_dimensions: Sequence[int], begins: Sequence[str],
+                            K: int) -> list:
     """Return the constant per-tile-dim element offset carried by the memlet begin.
 
     A tiled load/store's per-dim memlet begin has the form ``<iter-var> + c`` --
@@ -272,6 +272,17 @@ def cutile_tile_dim_offsets(node, parent_state, parent_sdfg, used_dimensions: Se
     part of the address the block id does NOT advance and must be added back to
     the per-lane element index.
 
+    Map parameters whose range provably has a single iteration (e.g. a
+    single-tile inner loop ``0:4:4``) are substituted with their constant
+    value first — that is exact, not a guess. After that the begin must be
+    affine in AT MOST ONE enclosing-map parameter (the dim's own iteration
+    variable, the same one :func:`cutile_tile_dim_bids` resolves the block id
+    from). A begin coupling several multi-iteration map parameters (e.g.
+    ``A[__i0 + __i1]``) cannot be reconstructed from a single block id, and a
+    map whose own parameter does not start at 0 breaks the ``__pid * W``
+    block-start reconstruction — both raise ``NotImplementedError`` instead of
+    silently producing a wrong offset.
+
     :param node: The tile-op library node being expanded.
     :param parent_state: The state that owns ``node``.
     :param parent_sdfg: The SDFG that owns ``parent_state``.
@@ -279,17 +290,35 @@ def cutile_tile_dim_offsets(node, parent_state, parent_sdfg, used_dimensions: Se
     :param begins: Per-source/dest-dim memlet begin expression (as strings).
     :param K: The tile-op's tile-dim count.
     :returns: List of ``K`` symbolic offsets (usually integers; ``0`` when the
-        slice is anchored at the block-aligned start or the begin is unusable).
+        slice is anchored at the block-aligned start).
+    :raises NotImplementedError: If a begin cannot be parsed, couples more than
+        one enclosing-map parameter, or its map parameter has a nonzero range
+        start.
     """
     import dace.symbolic as _sym
     m = _enclosing_cutile_map(node, parent_state, parent_sdfg)
-    subs = {}
+    params = []
+    starts = []
+    single_iter_subs = {}
     if m is not None:
-        for p in m.map.params:
+        for p, rng in zip(m.map.params, m.map.range):
             try:
-                subs[_sym.pystr_to_symbolic(str(p))] = 0
+                p_sym = _sym.pystr_to_symbolic(str(p))
             except Exception:  # noqa: BLE001 - skip unparseable params
+                params.append(None)
+                starts.append(rng[0])
                 continue
+            params.append(p_sym)
+            start, end, step = rng[0], rng[1], rng[2]
+            starts.append(start)
+            # A range with provably one iteration (extent <= step) pins the
+            # parameter to its start value; substituting it is exact.
+            try:
+                if bool(_sym.simplify(end - start + 1 - step) <= 0):
+                    single_iter_subs[p_sym] = start
+            except (TypeError, ValueError):
+                pass  # symbolic, not provably single-iteration
+    param_set = {p for p in params if p is not None}
     offsets = []
     for d in range(K):
         sd = used_dimensions[d] if d < len(used_dimensions) else None
@@ -298,9 +327,34 @@ def cutile_tile_dim_offsets(node, parent_state, parent_sdfg, used_dimensions: Se
             continue
         try:
             begin = _sym.pystr_to_symbolic(str(begins[sd]))
-            offsets.append(_sym.simplify(begin.subs(subs)))
-        except Exception:  # noqa: BLE001 - non-symbolic begin -> assume anchored
-            offsets.append(0)
+        except Exception as ex:  # noqa: BLE001 - unusable begin must fail loudly
+            raise NotImplementedError(f"{node.label}: cannot parse memlet begin {begins[sd]!r} for tile dim {d} "
+                                      f"(array dim {sd}); refusing to guess the element offset.") from ex
+        if single_iter_subs:
+            begin = begin.subs(single_iter_subs)
+        own = sorted((p for p in param_set if p in begin.free_symbols), key=str)
+        if len(own) > 1:
+            raise NotImplementedError(
+                f"{node.label}: memlet begin {begins[sd]!r} for tile dim {d} (array dim {sd}) couples "
+                f"multiple enclosing CuTile-map parameters {[str(p) for p in own]}; the block-aligned "
+                f"index reconstruction supports at most one iteration variable per dim. Such accesses "
+                f"should have been routed to the gather/scatter path by the detection passes.")
+        if own:
+            own_p = own[0]
+            start = starts[params.index(own_p)]
+            if not bool(_sym.simplify(start) == 0):
+                raise NotImplementedError(f"{node.label}: enclosing CuTile-map parameter '{own_p}' has range start "
+                                          f"{start} != 0; the ``__pid * W`` block-start reconstruction assumes 0-start "
+                                          f"(canonical) map ranges.")
+            begin = begin.subs(own_p, 0)
+        remaining = _sym.simplify(begin)
+        foreign = param_set & set(remaining.free_symbols)
+        if foreign:
+            raise NotImplementedError(
+                f"{node.label}: element offset {remaining} for tile dim {d} (array dim {sd}) still "
+                f"contains enclosing CuTile-map parameter(s) {[str(p) for p in sorted(foreign, key=str)]} "
+                f"after removing the dim's own iteration variable; refusing to silently zero them.")
+        offsets.append(remaining)
     return offsets
 
 
@@ -315,6 +369,31 @@ def cutile_offset_is_nonzero(offset) -> bool:
         return bool(_sym.simplify(offset) != 0)
     except Exception:  # noqa: BLE001 - be conservative: treat as offset present
         return offset != 0
+
+
+def cutile_offset_block_shift(offset, width: int):
+    """Block-index shift for a tile-dim element offset, if provably block-aligned.
+
+    When the element offset is a provably nonnegative multiple of the tile
+    width, an aligned ``ct.load`` / ``ct.store`` stays valid with the block
+    index shifted by ``offset // width`` (fast path instead of per-element
+    gather/scatter). Nonnegativity guards the undefined-behavior case of a
+    tile lying entirely before the array start.
+
+    :param offset: A symbolic / numeric offset from :func:`cutile_tile_dim_offsets`.
+    :param width: The tile width of that dim.
+    :returns: The symbolic block shift ``offset // width``, or ``None`` when
+        divisibility / nonnegativity is not provable (caller must take the
+        gather/scatter path).
+    """
+    import dace.symbolic as _sym
+    try:
+        q = _sym.simplify(_sym.pystr_to_symbolic(str(offset)) / int(width))
+    except Exception:  # noqa: BLE001 - unprovable -> no fast path
+        return None
+    if getattr(q, "is_integer", None) and getattr(q, "is_nonnegative", None):
+        return q
+    return None
 
 
 def tile_offset(widths: Sequence[int]) -> str:
