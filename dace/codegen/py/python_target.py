@@ -505,6 +505,18 @@ class PythonCodeGen(PythonTargetCodeGenerator):
         # Identical ordered shapes (including singleton positions) need nothing.
         if self._nested_shapes_match(memlet, desc):
             return False
+        # A pure squeeze/unsqueeze mismatch -- only size-1 dims differ (e.g. a
+        # strided column slice ``A[0:N, i]`` of subset size ``(N, 1)`` feeding
+        # a 1-D ``(N,)`` connector) -- preserves flat element order regardless
+        # of the connector strides: dropping/inserting size-1 axes never
+        # reorders elements (NumPy realizes such a reshape as a view).  It
+        # therefore needs the reshape but must BYPASS the C-contiguity guard
+        # below, which would wrongly reject the non-contiguous column strides.
+        sub_nontrivial = [s for s in subset_size if not self._provably_equal(s, 1)]
+        conn_nontrivial = [s for s in conn_shape if not self._provably_equal(s, 1)]
+        if len(sub_nontrivial) == len(conn_nontrivial) and all(
+                self._provably_equal(a, b) for a, b in zip(sub_nontrivial, conn_nontrivial)):
+            return True
         if (not self._provably_equal(prod(subset_size), prod(conn_shape))
                 or not self._is_c_contiguous_layout(desc.shape, desc.strides)):
             raise NotImplementedError(
@@ -521,6 +533,27 @@ class PythonCodeGen(PythonTargetCodeGenerator):
     def _nested_reshape_bridge_name(self, cfg: ControlFlowRegion, state, node: nodes.NestedSDFG,
                                     connector_name: str) -> str:
         return f'__dace_nested_reshape_{cfg.cfg_id}_{state.block_id}_{state.node_id(node)}_{connector_name}'
+
+    def _writeback_shape(self, subset) -> list:
+        """Shape of the target expression a subset renders to.
+
+        The subset renderer (:func:`pyutils._python_slice_component`) emits a
+        step-1 ``start == end`` range as a plain index, which DROPS that
+        dimension from the indexed target (``A[0:N, 0]`` has shape ``(N,)``,
+        not ``(N, 1)``). A writeback value must be reshaped to the kept
+        dimensions only, or the assignment raises a shape mismatch.
+
+        :param subset: The target memlet subset.
+        :returns: List of sizes of the dimensions the rendered target keeps.
+        """
+        if isinstance(subset, subsets.Indices):
+            return []  # Plain indices collapse every dimension.
+        if not isinstance(subset, subsets.Range):
+            return list(subset.size())
+        return [
+            size for (start, end, step), size in zip(subset.ranges, subset.size())
+            if ':' in pyutils._python_slice_component(start, end, step)
+        ]
 
     def _nested_scalar_direct_expr(self, sdfg: SDFG, data_name: str, subset) -> Optional[str]:
         outer_desc = sdfg.arrays[data_name]
@@ -1013,7 +1046,7 @@ class PythonCodeGen(PythonTargetCodeGenerator):
                 initialized_reshape_bridges.add(bridge_name)
             if not is_input and bridge_name not in registered_reshape_writebacks:
                 target_desc = sdfg.arrays[memlet.data]
-                outer_shape = list(memlet.subset.size())
+                outer_shape = self._writeback_shape(memlet.subset)
                 post_call_actions.append({
                     'memlet': memlet,
                     'target_name': memlet.data,

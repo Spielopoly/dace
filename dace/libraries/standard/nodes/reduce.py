@@ -1435,19 +1435,15 @@ class ExpandReduceCuPy(pm.ExpandTransformation):
         # The Python backend maps connector names to local variables:
         #   input  connectors are read from the incoming memlet,
         #   output connectors are written to the outgoing memlet AFTER the
-        #   tasklet body.  We therefore assign the CuPy result directly to
-        #   the output connector variable so the backend can copy it into
-        #   the output array. The result must live in the output's memory
-        #   space: cupy rejects assigning a non-scalar NumPy array into a
-        #   device array (``non-scalar numpy.ndarray cannot be used for
-        #   fill``), so only convert to NumPy for host-resident outputs.
-        if output_data.storage == dtypes.StorageType.GPU_Global:
-            result_expr = cupy_call
-        else:
-            result_expr = f'cupy.asnumpy({cupy_call})'
+        #   tasklet body.  Device-resident (GPU_Global) operands stay on the
+        #   device (no cupy.asarray/asnumpy round-trip): assigning a NumPy
+        #   array into a cupy output view fails with "non-scalar
+        #   numpy.ndarray cannot be used for fill".  Host operands keep the
+        #   asarray/asnumpy conversions.
+        from dace.libraries.blas.blas_helpers import cupy_in_wrap, cupy_out_wrap
         tasklet_code = ('import cupy\n'
-                        '__inp_cp = cupy.asarray(__in)\n'
-                        f'__out = {result_expr}')
+                        f"__inp_cp = {cupy_in_wrap('__in', input_data.storage)}\n"
+                        f"__out = {cupy_out_wrap(cupy_call, output_data.storage)}")
 
         tasklet = nstate.add_tasklet('cupy_reduce', {'__in'}, {'__out'}, tasklet_code, language=dace.Language.Python)
 

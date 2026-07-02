@@ -46,7 +46,6 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from dace import SDFG, SDFGState, config, data as dt, dtypes, properties, subsets, symbolic
 from dace.frontend.python import astutils
-from dace.properties import CodeBlock
 from dace.sdfg import nodes as nd, utils as sdutil, graph as gr
 from dace.transformation import pass_pipeline as ppl, transformation
 
@@ -738,7 +737,15 @@ class RemoveViews(ppl.Pass):
                               f' -> other_subset={m.other_subset}')
 
     def _reconnect_edges(self, state, view_node, viewed_node, view_edge, is_viewed_src):
+        # Reconnect to the IMMEDIATE endpoint of the view edge. This is the
+        # viewed AccessNode in the common case, but when the view edge crosses
+        # a map scope boundary (MapEntry/MapExit ``views`` connector), the
+        # scope node must stay on the path -- reconnecting to the distant
+        # viewed AccessNode would bypass the scope node, orphaning it
+        # (MapExit with in_degree 0 -> "Leftover nodes in queue" in
+        # scope_dict()).
         if is_viewed_src:
+            neighbor, neighbor_conn = view_edge.src, view_edge.src_conn
             for e in list(state.out_edges(view_node)):
                 if e is view_edge:
                     continue
@@ -746,11 +753,12 @@ class RemoveViews(ppl.Pass):
                     print(f'[{_PASS}]       reconnect:'
                           f' {view_node.data}:{e.src_conn}'
                           f' -> {e.dst}:{e.dst_conn}'
-                          f'  =>  {viewed_node.data}:{view_edge.src_conn}'
+                          f'  =>  {neighbor}:{neighbor_conn}'
                           f' -> {e.dst}:{e.dst_conn}')
                 state.remove_edge(e)
-                state.add_edge(viewed_node, view_edge.src_conn, e.dst, e.dst_conn, e.data)
+                state.add_edge(neighbor, neighbor_conn, e.dst, e.dst_conn, e.data)
         else:
+            neighbor, neighbor_conn = view_edge.dst, view_edge.dst_conn
             for e in list(state.in_edges(view_node)):
                 if e is view_edge:
                     continue
@@ -759,9 +767,9 @@ class RemoveViews(ppl.Pass):
                           f' {e.src}:{e.src_conn}'
                           f' -> {view_node.data}:{e.dst_conn}'
                           f'  =>  {e.src}:{e.src_conn}'
-                          f' -> {viewed_node.data}:{view_edge.dst_conn}')
+                          f' -> {neighbor}:{neighbor_conn}')
                 state.remove_edge(e)
-                state.add_edge(e.src, e.src_conn, viewed_node, view_edge.dst_conn, e.data)
+                state.add_edge(e.src, e.src_conn, neighbor, neighbor_conn, e.data)
         if view_edge in state.edges():
             state.remove_edge(view_edge)
 

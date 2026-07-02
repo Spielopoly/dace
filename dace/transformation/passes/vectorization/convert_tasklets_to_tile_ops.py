@@ -225,34 +225,18 @@ class ConvertTaskletsToTileOps(ppl.Pass):
             storage=_dtypes.StorageType.Register,
             find_new_name=True,
         )
-        # Compute the row-major flat offset string.
-        parts = []
-        for i in range(K):
-            inner = 1
-            for q in range(i + 1, K):
-                inner *= widths[q]
-            parts.append(f"__l{i}" if inner == 1 else f"(__l{i} * {inner})")
-        flat = " + ".join(parts) if parts else "0"
-        code_lines = []
-        for d in range(K):
-            # constexpr lane-loop bound + full-unroll hint: every tile dim has a
-            # compile-time-constant width, so the lane loop lowers to SIMD.
-            code_lines.append(f"{'    ' * d}constexpr std::size_t __W{d} = {widths[d]};")
-            code_lines.append(f"{'    ' * d}DACE_UNROLL")
-            code_lines.append(f"{'    ' * d}for (std::size_t __l{d} = 0; __l{d} < __W{d}; ++__l{d}) {{")
-        code_lines.append(f"{'    ' * K}_out[{flat}] = (int64_t)({body_expr});")
-        for d in reversed(range(K)):
-            code_lines.append(f"{'    ' * d}}}")
-        tasklet = inner_state.add_tasklet(
-            name=f"lane_id_mat_{arr_name}",
-            inputs=set(),
-            outputs={"_out"},
-            code="\n".join(code_lines),
-            language=_dtypes.Language.CPP,
-        )
+        # Materialize via a TileIota lib node (NOT a raw CPP tasklet): the
+        # expression in the lane placeholders ``__l<k>`` is exactly TileIota's
+        # contract, the pure expansion reproduces the previous unrolled CPP
+        # lane loop, and the cutile expansion keeps the kernel Python-only
+        # (a raw CPP tasklet fails the cuTile backend with "CuTile backend
+        # only supports Python tasklets").
+        from dace.libraries.tileops.nodes import TileIota
+        iota = TileIota(name=f"lane_id_mat_{arr_name}", widths=widths, expr=body_expr)
+        inner_state.add_node(iota)
         out_an = inner_state.add_access(arr_name)
         out_subset = ", ".join(f"0:{w}" for w in widths)
-        inner_state.add_edge(tasklet, "_out", out_an, None, _Memlet(f"{arr_name}[{out_subset}]"))
+        inner_state.add_edge(iota, "_dst", out_an, None, _Memlet(f"{arr_name}[{out_subset}]"))
         return arr_name
 
     def _find_mask_an(self, inner_state: SDFGState):

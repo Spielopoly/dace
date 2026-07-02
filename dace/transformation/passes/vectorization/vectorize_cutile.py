@@ -22,6 +22,7 @@ from dace.transformation.passes.vectorization.cutile_lowering import (
     CuTileValidateTiles,
     GPUDeviceToCuTile,
     _collect_tile_nodes,
+    mark_tile_op_memlets_allow_oob,
 )
 from dace.transformation.passes.vectorization.vectorize_cpu_multi_dim import VectorizeCPUMultiDim
 
@@ -164,6 +165,13 @@ class VectorizeCuTile(ppl.Pass):
         # Step 2: Validate — anchors exist, widths are powers of 2
         CuTileValidateTiles(strict=self.strict).apply_pass(sdfg, {})
         debug_save_sdfg()
+
+        # Step 2b: Masked tile ops address a full W-wide window whose tail
+        # lanes are inactive; at non-divisible boundaries the memlet SUBSET
+        # exceeds the array bounds even though the masked runtime accesses do
+        # not.  Mark those memlets allow_oob so the re-propagation inside
+        # apply_gpu_transformations() (and any later validation) accepts them.
+        mark_tile_op_memlets_allow_oob(sdfg)
 
         # Step 3: GPU transform — scheduling, storage, data copies
         sdfg.apply_gpu_transformations(

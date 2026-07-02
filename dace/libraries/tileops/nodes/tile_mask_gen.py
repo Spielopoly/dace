@@ -15,7 +15,7 @@ from dace.sdfg import nodes
 from dace.transformation.transformation import ExpandTransformation
 
 from .. import _isa_codegen
-from .._pure_codegen import cutile_bid_lines, cutile_grid_dim_offset, nested_loops, tile_offset
+from .._pure_codegen import cutile_bid_lines, cutile_tile_dim_bids, nested_loops, tile_offset
 
 
 @library.expansion
@@ -73,20 +73,24 @@ class ExpandTileMaskGenCutile(ExpandTransformation):
             ``cuda.tile``-broadcasted boolean tile.
         """
         widths = list(node.widths)
+        iter_vars = list(node.iter_vars)
         global_ubs = list(node.global_ubs)
         K = len(widths)
         shape_tuple = ", ".join(str(w) for w in widths)
-        # The iteration mask always spans ALL K tiled dims, which are the
-        # innermost K loops (the ``widths`` innermost-last tiling contract), so
-        # they are the TRAILING K grid axes and any outer/point dims lead. The
-        # positional ``offset = len(map.range) - K`` is therefore exact here.
-        # (The sub-K gather index tiles in TileLoad/TileStore, which may walk a
-        # non-innermost loop, instead resolve each axis via cutile_tile_dim_bids.)
-        _goff = cutile_grid_dim_offset(node, parent_state, parent_sdfg, K)
-        lines = cutile_bid_lines(node, parent_state, parent_sdfg, [_goff + k for k in range(K)])
-        for k, (ub, w) in enumerate(zip(global_ubs, widths)):
+        # The iteration mask spans ALL K tiled dims, which are the innermost K
+        # loops (the ``widths`` innermost-last tiling contract).  A dim whose
+        # iter var IS a grid param gets the reconstructed ``__pid*W`` base; a
+        # dim driven by a SEQUENTIAL tile loop inside the kernel (dependent
+        # range, e.g. ``j = i+1 : N : W``) has no grid axis
+        # (``cutile_tile_dim_bids`` returns None) and uses the loop variable
+        # itself, which is in scope in the kernel body — exactly like the
+        # pure expansion.
+        _axes = cutile_tile_dim_bids(node, parent_state, parent_sdfg, list(range(K)), [str(v) for v in iter_vars], K)
+        lines = cutile_bid_lines(node, parent_state, parent_sdfg, _axes)
+        for k, (iv, ub, w) in enumerate(zip(iter_vars, global_ubs, widths)):
+            base = f"__pid{k} * {w}" if _axes[k] is not None else f"({iv})"
             lines.append(f"__offsets{k} = ct.arange({w}, dtype=ct.int32)")
-            lines.append(f"__mask{k} = __offsets{k} + __pid{k} * {w} < ({ub})")
+            lines.append(f"__mask{k} = __offsets{k} + {base} < ({ub})")
         if K == 1:
             lines.append("_o = __mask0")
         else:
