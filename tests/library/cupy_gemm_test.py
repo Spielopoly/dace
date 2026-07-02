@@ -13,18 +13,17 @@ from dace.libraries.blas.nodes.batched_matmul import BatchedMatMul
 from dace.libraries.blas.nodes.einsum import Einsum
 from dace.memlet import Memlet
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _sanitize_name(name):
     """Replace characters invalid in SDFG names with underscores."""
     return name.replace('.', '_').replace('-', '_').replace('+', '_')
 
 
-def _make_gemm_sdfg(dtype, A_shape, B_shape, Y_shape, transA, transB,
-                     alpha, beta, sdfg_name):
+def _make_gemm_sdfg(dtype, A_shape, B_shape, Y_shape, transA, transB, alpha, beta, sdfg_name):
     """Build a minimal SDFG with a single Gemm node using CuPy and the
     Python backend."""
     sdfg = dace.SDFG(sdfg_name)
@@ -38,8 +37,7 @@ def _make_gemm_sdfg(dtype, A_shape, B_shape, Y_shape, transA, transB,
     wC = state.add_write("C")
 
     cin = not (beta == 0 or beta == 0.0)
-    libnode = Gemm('_Gemm_', transA=transA, transB=transB,
-                   alpha=alpha, beta=beta, cin=cin)
+    libnode = Gemm('_Gemm_', transA=transA, transB=transB, alpha=alpha, beta=beta, cin=cin)
     libnode.implementation = 'CuPy'
     state.add_node(libnode)
 
@@ -48,8 +46,7 @@ def _make_gemm_sdfg(dtype, A_shape, B_shape, Y_shape, transA, transB,
     state.add_edge(libnode, '_c', wC, None, Memlet.from_array(C, C_arr))
     if cin:
         rC = state.add_read('C')
-        state.add_edge(rC, None, libnode, '_c',
-                       Memlet.from_array(C, C_arr))
+        state.add_edge(rC, None, libnode, '_c', Memlet.from_array(C, C_arr))
 
     sdfg.backend = dtypes.BackendLanguage.Python
     return sdfg
@@ -65,9 +62,7 @@ def _numpy_gemm(A, B, C, transA, transB, alpha, beta):
     return result
 
 
-def _make_batched_matmul_sdfg(shape_a, shape_b, shape_c, dtype,
-                               sdfg_name, transA=False, transB=False,
-                               alpha=1):
+def _make_batched_matmul_sdfg(shape_a, shape_b, shape_c, dtype, sdfg_name, transA=False, transB=False, alpha=1):
     """Build an SDFG with a single BatchedMatMul node using CuPy."""
     sdfg = dace.SDFG(sdfg_name)
     state = sdfg.add_state()
@@ -94,8 +89,7 @@ def _make_batched_matmul_sdfg(shape_a, shape_b, shape_c, dtype,
     return sdfg
 
 
-def _make_einsum_sdfg(einsum_str, input_shapes, output_shape,
-                       dtype, sdfg_name, alpha=1, beta=0):
+def _make_einsum_sdfg(einsum_str, input_shapes, output_shape, dtype, sdfg_name, alpha=1, beta=0):
     """Build an SDFG with a single Einsum node using CuPy.
 
     :param einsum_str: Einstein notation string, e.g. ``'ij,jk->ik'``.
@@ -139,18 +133,15 @@ def _make_einsum_sdfg(einsum_str, input_shapes, output_shape,
 
     for name in input_names:
         r = state.add_read(name)
-        state.add_edge(r, None, ein, name,
-                       Memlet.from_array(name, sdfg.arrays[name]))
+        state.add_edge(r, None, ein, name, Memlet.from_array(name, sdfg.arrays[name]))
 
     w = state.add_write(out_name)
-    state.add_edge(ein, out_name, w, None,
-                   Memlet.from_array(out_name, sdfg.arrays[out_name]))
+    state.add_edge(ein, out_name, w, None, Memlet.from_array(out_name, sdfg.arrays[out_name]))
 
     if beta != 0 and beta != 0.0:
         ein.add_in_connector(out_name)
         r_out = state.add_read(out_name)
-        state.add_edge(r_out, None, ein, out_name,
-                       Memlet.from_array(out_name, sdfg.arrays[out_name]))
+        state.add_edge(r_out, None, ein, out_name, Memlet.from_array(out_name, sdfg.arrays[out_name]))
 
     sdfg.backend = dtypes.BackendLanguage.Python
     return sdfg
@@ -159,6 +150,7 @@ def _make_einsum_sdfg(einsum_str, input_shapes, output_shape,
 # ---------------------------------------------------------------------------
 # Structural tests (no GPU required)
 # ---------------------------------------------------------------------------
+
 
 class TestCuPyGemmStructural:
     """Structural / unit tests that do NOT need a GPU."""
@@ -177,59 +169,123 @@ class TestCuPyGemmStructural:
 
     def test_gemm_expansion_produces_sdfg(self):
         """Expanding Gemm with CuPy should produce a nested SDFG."""
-        sdfg = _make_gemm_sdfg(
-            dace.float64, [10, 15], [15, 8], [10, 8],
-            False, False, 1.0, 0.0, 'gemm_cupy_expansion_test')
+        sdfg = _make_gemm_sdfg(dace.float64, [10, 15], [15, 8], [10, 8], False, False, 1.0, 0.0,
+                               'gemm_cupy_expansion_test')
         sdfg.expand_library_nodes()
         state = sdfg.states()[0]
-        lib_nodes = [n for n in state.nodes()
-                     if isinstance(n, dace.sdfg.nodes.LibraryNode)]
+        lib_nodes = [n for n in state.nodes() if isinstance(n, dace.sdfg.nodes.LibraryNode)]
         assert len(lib_nodes) == 0, "Library nodes should be expanded"
 
     def test_gemm_expansion_with_beta(self):
         """Expanding Gemm with CuPy and beta!=0 should produce a nested SDFG."""
-        sdfg = _make_gemm_sdfg(
-            dace.float64, [10, 15], [15, 8], [10, 8],
-            False, False, 1.0, 1.0, 'gemm_cupy_beta_expansion_test')
+        sdfg = _make_gemm_sdfg(dace.float64, [10, 15], [15, 8], [10, 8], False, False, 1.0, 1.0,
+                               'gemm_cupy_beta_expansion_test')
         sdfg.expand_library_nodes()
         state = sdfg.states()[0]
-        lib_nodes = [n for n in state.nodes()
-                     if isinstance(n, dace.sdfg.nodes.LibraryNode)]
+        lib_nodes = [n for n in state.nodes() if isinstance(n, dace.sdfg.nodes.LibraryNode)]
         assert len(lib_nodes) == 0
 
     def test_batched_matmul_expansion_produces_sdfg(self):
         """Expanding BatchedMatMul with CuPy should produce a nested SDFG."""
-        sdfg = _make_batched_matmul_sdfg(
-            [4, 10, 15], [4, 15, 8], [4, 10, 8],
-            dace.float64, 'bmm_cupy_expansion_test')
+        sdfg = _make_batched_matmul_sdfg([4, 10, 15], [4, 15, 8], [4, 10, 8], dace.float64, 'bmm_cupy_expansion_test')
         sdfg.expand_library_nodes()
         state = sdfg.states()[0]
-        lib_nodes = [n for n in state.nodes()
-                     if isinstance(n, dace.sdfg.nodes.LibraryNode)]
+        lib_nodes = [n for n in state.nodes() if isinstance(n, dace.sdfg.nodes.LibraryNode)]
         assert len(lib_nodes) == 0
 
     def test_einsum_expansion_produces_sdfg(self):
         """Expanding Einsum with CuPy should produce a nested SDFG."""
-        sdfg = _make_einsum_sdfg(
-            'ij,jk->ik', [[10, 15], [15, 8]], [10, 8],
-            dace.float64, 'einsum_cupy_expansion_test')
+        sdfg = _make_einsum_sdfg('ij,jk->ik', [[10, 15], [15, 8]], [10, 8], dace.float64, 'einsum_cupy_expansion_test')
         sdfg.expand_library_nodes()
         state = sdfg.states()[0]
-        lib_nodes = [n for n in state.nodes()
-                     if isinstance(n, dace.sdfg.nodes.LibraryNode)]
+        lib_nodes = [n for n in state.nodes() if isinstance(n, dace.sdfg.nodes.LibraryNode)]
         assert len(lib_nodes) == 0
+
+    def test_gemm_cupy_unit_dim_expansion(self):
+        """A unit-dim operand (raw rank != 2) passes validation and expands."""
+        sdfg = _make_gemm_sdfg(dace.float64, [10, 1, 15], [15, 8], [10, 8], False, False, 1.0, 0.0,
+                               'gemm_cupy_unit_dim_expansion_test')
+        sdfg.expand_library_nodes()
+        state = sdfg.states()[0]
+        lib_nodes = [n for n in state.nodes() if isinstance(n, dace.sdfg.nodes.LibraryNode)]
+        assert len(lib_nodes) == 0
+
+    def test_gemm_cupy_unit_dim_k_mismatch_raises(self):
+        """A K-mismatched unit-dim product fails loudly at expansion time.
+
+        Bug-08a root cause guard: ``ExpandGemmCuPy`` used to skip
+        ``node.validate`` for singleton-bearing operands, so a K mismatch
+        (15 vs 16) only surfaced inside the cupy kernel at runtime.
+        """
+        sdfg = _make_gemm_sdfg(dace.float64, [10, 1, 15], [16, 8], [10, 8], False, False, 1.0, 0.0,
+                               'gemm_cupy_unit_dim_k_mismatch_test')
+        with pytest.raises(ValueError, match='k-dimension'):
+            sdfg.expand_library_nodes()
+
+    def test_gemm_pure_unit_dim_k_mismatch_raises(self):
+        """The pure expansion rejects the same K-mismatched unit-dim node."""
+        sdfg = _make_gemm_sdfg(dace.float64, [10, 1, 15], [16, 8], [10, 8], False, False, 1.0, 0.0,
+                               'gemm_pure_unit_dim_k_mismatch_test')
+        state = sdfg.states()[0]
+        for n in state.nodes():
+            if isinstance(n, dace.sdfg.nodes.LibraryNode):
+                n.implementation = 'pure'
+        with pytest.raises(ValueError, match='k-dimension'):
+            sdfg.expand_library_nodes()
+
+    def test_gemm_pure_unit_dim_runs(self):
+        """The pure (C++ CPU) expansion handles unit-dim operands end-to-end.
+
+        Before ``Gemm.validate`` squeezed, ``ExpandGemmPure`` raised on the
+        identical node the CuPy expansion accepted; both now consume the same
+        squeezed sizes.
+        """
+        sdfg = _make_gemm_sdfg(dace.float64, [10, 1, 15], [15, 8], [10, 8], False, False, 1.0, 0.0,
+                               'gemm_pure_unit_dim_runs_test')
+        sdfg.backend = dtypes.BackendLanguage.CPP
+        state = sdfg.states()[0]
+        for n in state.nodes():
+            if isinstance(n, dace.sdfg.nodes.LibraryNode):
+                n.implementation = 'pure'
+        sdfg.expand_library_nodes()
+        sdfg.validate()
+
+        A = np.random.rand(10, 1, 15)
+        B = np.random.rand(15, 8)
+        C = np.zeros((10, 8))
+        sdfg(A=A, B=B, C=C)
+        ref = A.reshape(10, 15) @ B
+        assert np.allclose(C, ref), f"max diff = {np.max(np.abs(C - ref))}"
+
+    def test_gemm_outer_product_still_validates(self):
+        """A raw-rank-2 outer product ``(M, 1) @ (1, N)`` is NOT squeezed away."""
+        sdfg = _make_gemm_sdfg(dace.float64, [10, 1], [1, 8], [10, 8], False, False, 1.0, 0.0,
+                               'gemm_outer_product_validate_test')
+        sdfg.backend = dtypes.BackendLanguage.CPP
+        state = sdfg.states()[0]
+        for n in state.nodes():
+            if isinstance(n, dace.sdfg.nodes.LibraryNode):
+                n.implementation = 'pure'
+        sdfg.expand_library_nodes()
+        sdfg.validate()
+
+        A = np.random.rand(10, 1)
+        B = np.random.rand(1, 8)
+        C = np.zeros((10, 8))
+        sdfg(A=A, B=B, C=C)
+        assert np.allclose(C, A @ B)
 
 
 # ---------------------------------------------------------------------------
 # GEMM GPU integration tests
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.gpu
 class TestCuPyGemm:
     """End-to-end GPU tests for Gemm CuPy expansion."""
 
-    def _run(self, M, N, K, transA, transB, alpha, beta,
-             np_dtype=np.float32):
+    def _run(self, M, N, K, transA, transB, alpha, beta, np_dtype=np.float32):
         """Helper: build SDFG, compile, run, and compare."""
         A_shape = [K, M] if transA else [M, K]
         B_shape = [N, K] if transB else [K, N]
@@ -248,12 +304,9 @@ class TestCuPyGemm:
 
         ref = _numpy_gemm(A, B, C_init, transA, transB, alpha, beta)
 
-        name = _sanitize_name(
-            f'cupy_gemm_{M}_{N}_{K}_{transA}_{transB}_{alpha}_{beta}'
-            f'_{np_dtype.__name__}')
-        sdfg = _make_gemm_sdfg(
-            dace_dtype, A_shape, B_shape, Y_shape,
-            transA, transB, alpha, beta, name)
+        name = _sanitize_name(f'cupy_gemm_{M}_{N}_{K}_{transA}_{transB}_{alpha}_{beta}'
+                              f'_{np_dtype.__name__}')
+        sdfg = _make_gemm_sdfg(dace_dtype, A_shape, B_shape, Y_shape, transA, transB, alpha, beta, name)
 
         Y = np.zeros(Y_shape, dtype=np_dtype)
         if C_init is not None:
@@ -314,16 +367,12 @@ class TestCuPyGemm:
         A_shape, B_shape, Y_shape = [M, K], [K, N], [M, N]
         np_dtype = np.complex64
 
-        A = (np.random.rand(*A_shape) +
-             1j * np.random.rand(*A_shape)).astype(np_dtype)
-        B = (np.random.rand(*B_shape) +
-             1j * np.random.rand(*B_shape)).astype(np_dtype)
+        A = (np.random.rand(*A_shape) + 1j * np.random.rand(*A_shape)).astype(np_dtype)
+        B = (np.random.rand(*B_shape) + 1j * np.random.rand(*B_shape)).astype(np_dtype)
         ref = A @ B
         Y = np.zeros(Y_shape, dtype=np_dtype)
 
-        sdfg = _make_gemm_sdfg(
-            dace.complex64, A_shape, B_shape, Y_shape,
-            False, False, 1.0, 0.0, 'cupy_gemm_complex64')
+        sdfg = _make_gemm_sdfg(dace.complex64, A_shape, B_shape, Y_shape, False, False, 1.0, 0.0, 'cupy_gemm_complex64')
         sdfg(A=A, B=B, C=Y)
 
         assert np.allclose(Y, ref, rtol=1e-4), \
@@ -345,10 +394,23 @@ class TestCuPyGemm:
         """Tiny 2×2 GEMM — smallest non-degenerate case."""
         self._run(2, 2, 2, False, False, 1.0, 0.0)
 
+    def test_unit_dim_operand_runtime(self):
+        """(10, 1, 15) @ (15, 8): unit-dim operand runs and matches NumPy."""
+        sdfg = _make_gemm_sdfg(dace.float64, [10, 1, 15], [15, 8], [10, 8], False, False, 1.0, 0.0,
+                               'cupy_gemm_unit_dim_runtime')
+        A = np.random.rand(10, 1, 15)
+        B = np.random.rand(15, 8)
+        C = np.zeros((10, 8))
+        sdfg(A=A, B=B, C=C)
+        ref = A.reshape(10, 15) @ B
+        assert np.allclose(C, ref, atol=1e-12), \
+            f"max diff = {np.max(np.abs(C - ref))}"
+
 
 # ---------------------------------------------------------------------------
 # BatchedMatMul GPU integration tests
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.gpu
 class TestCuPyBatchedMatMul:
@@ -357,9 +419,7 @@ class TestCuPyBatchedMatMul:
     def test_basic_3d(self):
         """[B, M, K] @ [B, K, N] -> [B, M, N]."""
         B, M, K, N = 4, 10, 15, 8
-        sdfg = _make_batched_matmul_sdfg(
-            [B, M, K], [B, K, N], [B, M, N],
-            dace.float32, 'bmm_cupy_basic_3d')
+        sdfg = _make_batched_matmul_sdfg([B, M, K], [B, K, N], [B, M, N], dace.float32, 'bmm_cupy_basic_3d')
 
         A = np.random.rand(B, M, K).astype(np.float32)
         B_arr = np.random.rand(B, K, N).astype(np.float32)
@@ -373,9 +433,7 @@ class TestCuPyBatchedMatMul:
     def test_basic_3d_float64(self):
         """[B, M, K] @ [B, K, N] -> [B, M, N] with float64."""
         B, M, K, N = 3, 16, 12, 10
-        sdfg = _make_batched_matmul_sdfg(
-            [B, M, K], [B, K, N], [B, M, N],
-            dace.float64, 'bmm_cupy_basic_f64')
+        sdfg = _make_batched_matmul_sdfg([B, M, K], [B, K, N], [B, M, N], dace.float64, 'bmm_cupy_basic_f64')
 
         A = np.random.rand(B, M, K).astype(np.float64)
         B_arr = np.random.rand(B, K, N).astype(np.float64)
@@ -389,9 +447,7 @@ class TestCuPyBatchedMatMul:
     def test_broadcast_rhs(self):
         """[B, M, K] @ [K, N] -> [B, M, N] (broadcast RHS)."""
         B, M, K, N = 3, 16, 32, 8
-        sdfg = _make_batched_matmul_sdfg(
-            [B, M, K], [K, N], [B, M, N],
-            dace.float32, 'bmm_cupy_broadcast_rhs')
+        sdfg = _make_batched_matmul_sdfg([B, M, K], [K, N], [B, M, N], dace.float32, 'bmm_cupy_broadcast_rhs')
 
         A = np.random.rand(B, M, K).astype(np.float32)
         B_arr = np.random.rand(K, N).astype(np.float32)
@@ -405,9 +461,7 @@ class TestCuPyBatchedMatMul:
     def test_broadcast_lhs(self):
         """[M, K] @ [B, K, N] -> [B, M, N] (broadcast LHS)."""
         B, M, K, N = 3, 16, 32, 8
-        sdfg = _make_batched_matmul_sdfg(
-            [M, K], [B, K, N], [B, M, N],
-            dace.float32, 'bmm_cupy_broadcast_lhs')
+        sdfg = _make_batched_matmul_sdfg([M, K], [B, K, N], [B, M, N], dace.float32, 'bmm_cupy_broadcast_lhs')
 
         A = np.random.rand(M, K).astype(np.float32)
         B_arr = np.random.rand(B, K, N).astype(np.float32)
@@ -421,9 +475,7 @@ class TestCuPyBatchedMatMul:
     def test_4d(self):
         """[B1, B2, M, K] @ [B1, B2, K, N] -> [B1, B2, M, N]."""
         B1, B2, M, K, N = 2, 3, 8, 6, 4
-        sdfg = _make_batched_matmul_sdfg(
-            [B1, B2, M, K], [B1, B2, K, N], [B1, B2, M, N],
-            dace.float32, 'bmm_cupy_4d')
+        sdfg = _make_batched_matmul_sdfg([B1, B2, M, K], [B1, B2, K, N], [B1, B2, M, N], dace.float32, 'bmm_cupy_4d')
 
         A = np.random.rand(B1, B2, M, K).astype(np.float32)
         B_arr = np.random.rand(B1, B2, K, N).astype(np.float32)
@@ -437,9 +489,8 @@ class TestCuPyBatchedMatMul:
     def test_4d_broadcast_rhs(self):
         """[B1, B2, M, K] @ [K, N] -> [B1, B2, M, N] (broadcast RHS)."""
         B1, B2, M, K, N = 2, 3, 8, 6, 4
-        sdfg = _make_batched_matmul_sdfg(
-            [B1, B2, M, K], [K, N], [B1, B2, M, N],
-            dace.float32, 'bmm_cupy_4d_broadcast_rhs')
+        sdfg = _make_batched_matmul_sdfg([B1, B2, M, K], [K, N], [B1, B2, M, N], dace.float32,
+                                         'bmm_cupy_4d_broadcast_rhs')
 
         A = np.random.rand(B1, B2, M, K).astype(np.float32)
         B_arr = np.random.rand(K, N).astype(np.float32)
@@ -453,9 +504,7 @@ class TestCuPyBatchedMatMul:
     def test_alpha_scaling(self):
         """BatchedMatMul with alpha=2.5."""
         B, M, K, N = 3, 8, 6, 4
-        sdfg = _make_batched_matmul_sdfg(
-            [B, M, K], [B, K, N], [B, M, N],
-            dace.float32, 'bmm_cupy_alpha', alpha=2.5)
+        sdfg = _make_batched_matmul_sdfg([B, M, K], [B, K, N], [B, M, N], dace.float32, 'bmm_cupy_alpha', alpha=2.5)
 
         A = np.random.rand(B, M, K).astype(np.float32)
         B_arr = np.random.rand(B, K, N).astype(np.float32)
@@ -468,9 +517,7 @@ class TestCuPyBatchedMatMul:
 
     def test_batch_2(self):
         """Smallest non-degenerate batch size."""
-        sdfg = _make_batched_matmul_sdfg(
-            [2, 10, 8], [2, 8, 6], [2, 10, 6],
-            dace.float32, 'bmm_cupy_batch2')
+        sdfg = _make_batched_matmul_sdfg([2, 10, 8], [2, 8, 6], [2, 10, 6], dace.float32, 'bmm_cupy_batch2')
 
         A = np.random.rand(2, 10, 8).astype(np.float32)
         B_arr = np.random.rand(2, 8, 6).astype(np.float32)
@@ -483,9 +530,7 @@ class TestCuPyBatchedMatMul:
     def test_large_batch(self):
         """Larger batch size."""
         B, M, K, N = 32, 4, 6, 3
-        sdfg = _make_batched_matmul_sdfg(
-            [B, M, K], [B, K, N], [B, M, N],
-            dace.float64, 'bmm_cupy_large_batch')
+        sdfg = _make_batched_matmul_sdfg([B, M, K], [B, K, N], [B, M, N], dace.float64, 'bmm_cupy_large_batch')
 
         A = np.random.rand(B, M, K).astype(np.float64)
         B_arr = np.random.rand(B, K, N).astype(np.float64)
@@ -495,10 +540,45 @@ class TestCuPyBatchedMatMul:
         ref = np.matmul(A, B_arr)
         assert np.allclose(C, ref, atol=1e-12)
 
+    def _run_alpha_beta(self, alpha, beta, name):
+        """Fix-3 helper: run BMM with given alpha/beta against NumPy."""
+        B, M, K, N = 3, 8, 6, 4
+        sdfg = _make_batched_matmul_sdfg([B, M, K], [B, K, N], [B, M, N], dace.float64, name, alpha=alpha)
+        state = sdfg.states()[0]
+        for n in state.nodes():
+            if isinstance(n, dace.sdfg.nodes.LibraryNode):
+                n.beta = beta
+
+        A = np.random.rand(B, M, K)
+        B_arr = np.random.rand(B, K, N)
+        C0 = np.random.rand(B, M, N)
+        C = C0.copy()
+        sdfg(A=A, B=B_arr, C=C)
+        ref = alpha * np.matmul(A, B_arr) + beta * C0
+        assert np.allclose(C, ref, atol=1e-12), \
+            f"max diff = {np.max(np.abs(C - ref))}"
+
+    def test_alpha_zero(self):
+        """alpha=0, beta=0 => zeros; used to NameError on a phantom __c."""
+        self._run_alpha_beta(0.0, 0.0, 'bmm_cupy_alpha0')
+
+    def test_alpha_zero_beta(self):
+        """alpha=0, beta=2 => 2*C, read in-place from the output array."""
+        self._run_alpha_beta(0.0, 2.0, 'bmm_cupy_alpha0_beta2')
+
+    def test_beta_accumulate(self):
+        """alpha=1, beta=1 => A@B + C (BLAS accumulate semantics)."""
+        self._run_alpha_beta(1.0, 1.0, 'bmm_cupy_beta_accum')
+
+    def test_alpha_beta_scaled(self):
+        """alpha=2.5, beta=0.5."""
+        self._run_alpha_beta(2.5, 0.5, 'bmm_cupy_alpha_beta_scaled')
+
 
 # ---------------------------------------------------------------------------
 # Einsum GPU integration tests
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.gpu
 class TestCuPyEinsum:
@@ -507,9 +587,7 @@ class TestCuPyEinsum:
     def test_matmul(self):
         """ij,jk->ik (matrix multiply)."""
         M, K, N = 10, 15, 8
-        sdfg = _make_einsum_sdfg(
-            'ij,jk->ik', [[M, K], [K, N]], [M, N],
-            dace.float32, 'einsum_cupy_matmul')
+        sdfg = _make_einsum_sdfg('ij,jk->ik', [[M, K], [K, N]], [M, N], dace.float32, 'einsum_cupy_matmul')
 
         inp_0 = np.random.rand(M, K).astype(np.float32)
         inp_1 = np.random.rand(K, N).astype(np.float32)
@@ -523,9 +601,7 @@ class TestCuPyEinsum:
     def test_matmul_float64(self):
         """ij,jk->ik with float64."""
         M, K, N = 10, 15, 8
-        sdfg = _make_einsum_sdfg(
-            'ij,jk->ik', [[M, K], [K, N]], [M, N],
-            dace.float64, 'einsum_cupy_matmul_f64')
+        sdfg = _make_einsum_sdfg('ij,jk->ik', [[M, K], [K, N]], [M, N], dace.float64, 'einsum_cupy_matmul_f64')
 
         inp_0 = np.random.rand(M, K).astype(np.float64)
         inp_1 = np.random.rand(K, N).astype(np.float64)
@@ -539,9 +615,8 @@ class TestCuPyEinsum:
     def test_batched_matmul(self):
         """aij,ajk->aik (batched matmul via einsum)."""
         B, M, K, N = 4, 8, 6, 5
-        sdfg = _make_einsum_sdfg(
-            'aij,ajk->aik', [[B, M, K], [B, K, N]], [B, M, N],
-            dace.float32, 'einsum_cupy_batched_mm')
+        sdfg = _make_einsum_sdfg('aij,ajk->aik', [[B, M, K], [B, K, N]], [B, M, N], dace.float32,
+                                 'einsum_cupy_batched_mm')
 
         inp_0 = np.random.rand(B, M, K).astype(np.float32)
         inp_1 = np.random.rand(B, K, N).astype(np.float32)
@@ -555,9 +630,7 @@ class TestCuPyEinsum:
     def test_transpose(self):
         """ij->ji (transpose)."""
         M, N = 8, 12
-        sdfg = _make_einsum_sdfg(
-            'ij->ji', [[M, N]], [N, M],
-            dace.float32, 'einsum_cupy_transpose')
+        sdfg = _make_einsum_sdfg('ij->ji', [[M, N]], [N, M], dace.float32, 'einsum_cupy_transpose')
 
         inp_0 = np.random.rand(M, N).astype(np.float32)
         out = np.zeros((N, M), dtype=np.float32)
@@ -569,9 +642,7 @@ class TestCuPyEinsum:
     def test_trace(self):
         """ii->i (diagonal extraction)."""
         N = 10
-        sdfg = _make_einsum_sdfg(
-            'ii->i', [[N, N]], [N],
-            dace.float32, 'einsum_cupy_diag')
+        sdfg = _make_einsum_sdfg('ii->i', [[N, N]], [N], dace.float32, 'einsum_cupy_diag')
 
         inp_0 = np.random.rand(N, N).astype(np.float32)
         out = np.zeros(N, dtype=np.float32)
@@ -583,9 +654,7 @@ class TestCuPyEinsum:
     def test_inner_product(self):
         """i,i-> (inner product / dot)."""
         N = 64
-        sdfg = _make_einsum_sdfg(
-            'i,i->', [[N], [N]], [1],
-            dace.float64, 'einsum_cupy_inner')
+        sdfg = _make_einsum_sdfg('i,i->', [[N], [N]], [1], dace.float64, 'einsum_cupy_inner')
 
         inp_0 = np.random.rand(N).astype(np.float64)
         inp_1 = np.random.rand(N).astype(np.float64)
@@ -599,9 +668,7 @@ class TestCuPyEinsum:
     def test_outer_product(self):
         """i,j->ij (outer product)."""
         M, N = 8, 12
-        sdfg = _make_einsum_sdfg(
-            'i,j->ij', [[M], [N]], [M, N],
-            dace.float32, 'einsum_cupy_outer')
+        sdfg = _make_einsum_sdfg('i,j->ij', [[M], [N]], [M, N], dace.float32, 'einsum_cupy_outer')
 
         inp_0 = np.random.rand(M).astype(np.float32)
         inp_1 = np.random.rand(N).astype(np.float32)
@@ -614,9 +681,7 @@ class TestCuPyEinsum:
     def test_sum_reduction(self):
         """ij-> (sum all elements)."""
         M, N = 16, 8
-        sdfg = _make_einsum_sdfg(
-            'ij->', [[M, N]], [1],
-            dace.float64, 'einsum_cupy_sum')
+        sdfg = _make_einsum_sdfg('ij->', [[M, N]], [1], dace.float64, 'einsum_cupy_sum')
 
         inp_0 = np.random.rand(M, N).astype(np.float64)
         out = np.zeros(1, dtype=np.float64)
@@ -628,9 +693,7 @@ class TestCuPyEinsum:
     def test_alpha_scaling(self):
         """ij,jk->ik with alpha=2.5."""
         M, K, N = 8, 6, 4
-        sdfg = _make_einsum_sdfg(
-            'ij,jk->ik', [[M, K], [K, N]], [M, N],
-            dace.float32, 'einsum_cupy_alpha', alpha=2.5)
+        sdfg = _make_einsum_sdfg('ij,jk->ik', [[M, K], [K, N]], [M, N], dace.float32, 'einsum_cupy_alpha', alpha=2.5)
 
         inp_0 = np.random.rand(M, K).astype(np.float32)
         inp_1 = np.random.rand(K, N).astype(np.float32)
@@ -643,9 +706,7 @@ class TestCuPyEinsum:
     def test_3x2_contraction(self):
         """aik,kj->aij (3D x 2D contraction)."""
         A_dim, M, K, N = 8, 10, 12, 5
-        sdfg = _make_einsum_sdfg(
-            'aik,kj->aij', [[A_dim, M, K], [K, N]], [A_dim, M, N],
-            dace.float32, 'einsum_cupy_3x2')
+        sdfg = _make_einsum_sdfg('aik,kj->aij', [[A_dim, M, K], [K, N]], [A_dim, M, N], dace.float32, 'einsum_cupy_3x2')
 
         inp_0 = np.random.rand(A_dim, M, K).astype(np.float32)
         inp_1 = np.random.rand(K, N).astype(np.float32)
@@ -658,10 +719,8 @@ class TestCuPyEinsum:
     def test_4x4_contraction(self):
         """abik,abkj->abij (4D x 4D contraction)."""
         A, B, M, K, N = 2, 3, 5, 4, 6
-        sdfg = _make_einsum_sdfg(
-            'abik,abkj->abij',
-            [[A, B, M, K], [A, B, K, N]], [A, B, M, N],
-            dace.float32, 'einsum_cupy_4x4')
+        sdfg = _make_einsum_sdfg('abik,abkj->abij', [[A, B, M, K], [A, B, K, N]], [A, B, M, N], dace.float32,
+                                 'einsum_cupy_4x4')
 
         inp_0 = np.random.rand(A, B, M, K).astype(np.float32)
         inp_1 = np.random.rand(A, B, K, N).astype(np.float32)
@@ -674,9 +733,7 @@ class TestCuPyEinsum:
     def test_elementwise_mul(self):
         """ij,ij->ij (element-wise multiply)."""
         M, N = 10, 8
-        sdfg = _make_einsum_sdfg(
-            'ij,ij->ij', [[M, N], [M, N]], [M, N],
-            dace.float32, 'einsum_cupy_elemwise')
+        sdfg = _make_einsum_sdfg('ij,ij->ij', [[M, N], [M, N]], [M, N], dace.float32, 'einsum_cupy_elemwise')
 
         inp_0 = np.random.rand(M, N).astype(np.float32)
         inp_1 = np.random.rand(M, N).astype(np.float32)

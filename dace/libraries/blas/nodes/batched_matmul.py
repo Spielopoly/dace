@@ -430,8 +430,7 @@ class ExpandBatchedMatMulCuPy(ExpandTransformation):
     environments = []
 
     @staticmethod
-    def expansion(node: 'BatchedMatMul', state: dace.SDFGState,
-                  sdfg: dace.SDFG) -> dace.SDFG:
+    def expansion(node: 'BatchedMatMul', state: dace.SDFGState, sdfg: dace.SDFG) -> dace.SDFG:
         node.validate(sdfg, state)
 
         # Gather input/output descriptors from the graph edges.
@@ -445,8 +444,7 @@ class ExpandBatchedMatMulCuPy(ExpandTransformation):
             if e.src_conn == '_c':
                 cdesc = sdfg.arrays[e.data.data]
         if adesc is None or bdesc is None or cdesc is None:
-            raise ValueError(
-                'Expected connectors _a, _b (inputs) and _c (output)')
+            raise ValueError('Expected connectors _a, _b (inputs) and _c (output)')
 
         dtype_a = adesc.dtype
         dtype_b = bdesc.dtype
@@ -460,12 +458,9 @@ class ExpandBatchedMatMulCuPy(ExpandTransformation):
         nsdfg = dace.SDFG(node.label + '_cupy')
         nstate = nsdfg.add_state()
 
-        nsdfg.add_array('_a', shape_a, dtype_a,
-                        strides=adesc.strides, storage=adesc.storage)
-        nsdfg.add_array('_b', shape_b, dtype_b,
-                        strides=bdesc.strides, storage=bdesc.storage)
-        nsdfg.add_array('_c', shape_c, dtype_c,
-                        strides=cdesc.strides, storage=cdesc.storage)
+        nsdfg.add_array('_a', shape_a, dtype_a, strides=adesc.strides, storage=adesc.storage)
+        nsdfg.add_array('_b', shape_b, dtype_b, strides=bdesc.strides, storage=bdesc.storage)
+        nsdfg.add_array('_c', shape_c, dtype_c, strides=cdesc.strides, storage=cdesc.storage)
 
         # Build tasklet code. Operands already on GPU storage (the cuTile
         # pipeline places everything on GPU_Global) are kept device-resident:
@@ -491,20 +486,37 @@ class ExpandBatchedMatMulCuPy(ExpandTransformation):
         if equal_valued(1, alpha):
             code_lines.append('__result = cupy.matmul(__a_t, __b_t)')
         elif equal_valued(0, alpha):
-            code_lines.append(
-                f'__result = cupy.zeros_like({cupy_in_wrap("__c", cdesc.storage)})')
+            # No matmul needed; zeros of the output shape (the ``_c`` output
+            # cannot be read here -- ``BatchedMatMul`` has no C input edge).
+            zeros_shape = '(' + ', '.join(symstr(d) for d in shape_c) + ',)'
+            code_lines.append(f'__result = cupy.zeros({zeros_shape}, '
+                              'dtype=cupy.result_type(__a_t.dtype, __b_t.dtype))')
         else:
             alpha_str = symstr(alpha)
-            code_lines.append(
-                f'__result = {alpha_str} * cupy.matmul(__a_t, __b_t)')
+            code_lines.append(f'__result = {alpha_str} * cupy.matmul(__a_t, __b_t)')
+
+        # Beta scaling: BLAS semantics accumulate into the existing C values
+        # (read in-place from the output array, like the cuBLAS expansion).
+        beta = node.beta
+        has_cin = not equal_valued(0, beta)
+        if has_cin:
+            cin_in = cupy_in_wrap('__cin', cdesc.storage)
+            if equal_valued(1, beta):
+                code_lines.append(f'__result = __result + {cin_in}')
+            else:
+                beta_str = symstr(beta)
+                code_lines.append(f'__result = __result + {beta_str} * {cin_in}')
 
         code_lines.append(f'__c_out = {cupy_out_wrap("__result", cdesc.storage)}')
 
         code = '\n'.join(code_lines)
 
+        in_connectors = {'__a': None, '__b': None}
+        if has_cin:
+            in_connectors['__cin'] = None
         tasklet = dace.sdfg.nodes.Tasklet(
             node.label + '_cupy_tasklet',
-            {'__a': None, '__b': None},
+            in_connectors,
             {'__c_out': None},
             code,
             language=dace.dtypes.Language.Python,
@@ -516,12 +528,12 @@ class ExpandBatchedMatMulCuPy(ExpandTransformation):
         b_read = nstate.add_read('_b')
         c_write = nstate.add_write('_c')
 
-        nstate.add_edge(a_read, None, tasklet, '__a',
-                        dace.Memlet.from_array('_a', nsdfg.arrays['_a']))
-        nstate.add_edge(b_read, None, tasklet, '__b',
-                        dace.Memlet.from_array('_b', nsdfg.arrays['_b']))
-        nstate.add_edge(tasklet, '__c_out', c_write, None,
-                        dace.Memlet.from_array('_c', nsdfg.arrays['_c']))
+        nstate.add_edge(a_read, None, tasklet, '__a', dace.Memlet.from_array('_a', nsdfg.arrays['_a']))
+        nstate.add_edge(b_read, None, tasklet, '__b', dace.Memlet.from_array('_b', nsdfg.arrays['_b']))
+        nstate.add_edge(tasklet, '__c_out', c_write, None, dace.Memlet.from_array('_c', nsdfg.arrays['_c']))
+        if has_cin:
+            c_read = nstate.add_read('_c')
+            nstate.add_edge(c_read, None, tasklet, '__cin', dace.Memlet.from_array('_c', nsdfg.arrays['_c']))
 
         return nsdfg
 

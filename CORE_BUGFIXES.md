@@ -226,6 +226,24 @@ with core APIs (SDFG/state construction, `LoopToMap`, `MapToForLoop`,
 - **Status:** fixed, regression-verified (42 pass; canonicalize + const-prop +
   DCE + loop-to-map blast radius 218P/2xf), pushed.
 
+### 13. `Gemm.validate` checked raw sizes while `SpecializeMatMul` routes on squeezed sizes
+- **Files:** `dace/libraries/blas/nodes/gemm.py` (`Gemm.validate`,
+  `ExpandGemmPure.make_sdfg`)
+- **Bug:** `SpecializeMatMul` routes `MatMul` -> `Gemm` on **squeezed** operand
+  sizes, but `Gemm.validate` (and `ExpandGemmPure`) checked **raw** memlet
+  sizes. A singleton-bearing operand from a reshape view (doitgen's
+  `(NQ, 1, NP) @ (NP, NP)`) was routed to `Gemm` and then rejected with
+  `matrix-matrix product only supported on matrices` (pure/cuBLAS/MKL);
+  sibling nodes (`Gemv.validate`, `Dot.validate`) already squeeze.
+- **Fix:** `Gemm.validate` squeezes provably-size-1 dims for operands whose
+  raw rank != 2 (raw rank-2 operands keep their semantics — an outer product
+  `(M,1)@(1,N)` is not squeezed away), runs K-agreement/shape checks on the
+  squeezed sizes, and returns them for expansions. `ExpandGemmPure` consumes
+  the squeezed shapes/strides from `_get_matmul_operands` for such operands.
+- **Reproducer tests:** `tests/library/cupy_gemm_test.py` —
+  `test_gemm_pure_unit_dim_runs`, `test_gemm_pure_unit_dim_k_mismatch_raises`,
+  `test_gemm_outer_product_still_validates` (pure/CPU, main-safe).
+
 ## Open (separate issue, root-caused)
 
 ### 4. Canonicalize structural non-idempotence on the guarded imperfect nest
