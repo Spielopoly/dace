@@ -250,10 +250,22 @@ def test_transpose_view_supported():
 
 
 def test_inconsistent_stride_raises():
-    """A connector whose strides match no view of the outer subset (and are
-    not C-contiguous) still raises loudly."""
-    sdfg = _build_nested_scale_sdfg('nested_bad_stride', (6, 4), (6, 4), '0:6, 1', '0:6, 1', ((6, ), (8, )),
-                                    ((6, ), (4, )))
+    """A NON-squeeze shape mismatch whose strides match no view of the outer
+    subset (and are not C-contiguous) still raises loudly.
+
+    Connector ``(4, 6)`` with strides ``(3, 7)`` against the full ``(6, 4)``
+    subset: not a squeeze (no size-1 dims; rendered shapes differ), not the
+    transpose view (that would be strides ``(1, 4)``), not C-contiguous
+    (that would be ``(6, 1)``).
+
+    Note: a pure squeeze/unsqueeze mismatch (equal non-singleton dims in
+    order) is accepted REGARDLESS of declared strides — in the Python
+    backend the bound runtime view's strides govern indexing, not the
+    descriptor metadata (correlation regression,
+    ``test_rendered_column_slice_needs_no_reshape``).
+    """
+    sdfg = _build_nested_scale_sdfg('nested_bad_stride', (6, 4), (6, 4), '0:6, 0:4', '0:6, 0:4', ((4, 6), (3, 7)),
+                                    ((6, 4), (4, 1)))
     with pytest.raises(NotImplementedError, match='flat-order-preserving'):
         sdfg.compile()
 
