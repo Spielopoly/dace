@@ -226,7 +226,7 @@ with core APIs (SDFG/state construction, `LoopToMap`, `MapToForLoop`,
 - **Status:** fixed, regression-verified (42 pass; canonicalize + const-prop +
   DCE + loop-to-map blast radius 218P/2xf), pushed.
 
-### 13. `Gemm.validate` checked raw sizes while `SpecializeMatMul` routes on squeezed sizes
+### 14. `Gemm.validate` checked raw sizes while `SpecializeMatMul` routes on squeezed sizes
 - **Files:** `dace/libraries/blas/nodes/gemm.py` (`Gemm.validate`,
   `ExpandGemmPure.make_sdfg`)
 - **Bug:** `SpecializeMatMul` routes `MatMul` -> `Gemm` on **squeezed** operand
