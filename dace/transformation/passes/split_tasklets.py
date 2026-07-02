@@ -471,7 +471,17 @@ class SplitTasklets(ppl.Pass):
 
                 if c.language == dace.dtypes.Language.Python:
                     ssa_statements = to_ssa(c.as_string)
-                    if len(ssa_statements) != 1:
+                    # Split only genuine multi-operation tasklets (``> 1`` SSA lines).
+                    # ``== 1`` is already single-op -> nothing to split. ``== 0`` means
+                    # ``to_ssa`` could not decompose the body into any SSA assignment --
+                    # this happens for a conditional-body tasklet such as a masked
+                    # assignment (``if __in_cond:\n    __out = 1.0``), whose AST is an
+                    # ``ast.If`` (not ``ast.Assign``/``ast.Expr``). Splitting it would
+                    # remove the tasklet and add nothing in its place, leaving an empty
+                    # map body (MapEntry with no successor, MapExit with no predecessor)
+                    # that trips ``scope_dict`` ("Leftover nodes in queue"). Leave such
+                    # tasklets intact for the downstream branch/ITE lowering passes.
+                    if len(ssa_statements) > 1:
                         tasklets_to_split.append((n, g, ssa_statements, input_type))
 
         # Previous tasklet:
@@ -614,6 +624,25 @@ class SplitTasklets(ppl.Pass):
                     state.add_edge(
                         t, out_conn, added_accesses[array_name], None,
                         dace.memlet.Memlet.from_array(dataname=array_name, datadesc=state.sdfg.arrays[array_name]))
+
+            # Anchor every symbol/constant-only split tasklet to the enclosing
+            # scope. An SSA line like ``__t1 = log(R)`` (only symbols/constants on
+            # its RHS) yields a tasklet with no data-input connectors, so the
+            # wiring above leaves it with zero in-edges -- a source node. The
+            # ``i == 0`` branch already anchors the *first* tasklet to the
+            # original input source (typically the map entry) with a dependency
+            # edge, but an *intermediate* constant-only tasklet gets none. Left
+            # unanchored inside a map, it (and the register chain it feeds)
+            # resolves as top-level (scope ``None``): the map body then straddles
+            # two scopes and ``nest_state_subgraph`` raises "Subgraph is contained
+            # in more than one scope" (e.g. stockham_fft's twiddle-factor
+            # ``exp(-2j*pi*.../R**(i+1))`` tasklet). Mirror the ``i == 0``
+            # anchoring for every orphaned source so all pieces stay in one scope.
+            if tasklet_in_degree > 0:
+                for t in added_tasklets:
+                    if state.in_degree(t) == 0:
+                        for ie in tasklet_in_edges:
+                            state.add_edge(ie.src, None, t, None, dace.memlet.Memlet(None))
 
             split_access_counter += 1
 

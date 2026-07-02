@@ -37,6 +37,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <type_traits>
 
 #define STRINGIZE(x) STRINGIZE_IMPL(x)
 #define STRINGIZE_IMPL(x) #x
@@ -48,6 +49,21 @@
 
 namespace dace {
 namespace tileops {
+
+// ``std::is_pointer`` does NOT recognise a ``__restrict__``-qualified pointer
+// (a GCC/Clang extension) as a pointer: ``std::is_pointer_v<T* __restrict__>``
+// is ``false``. DaCe emits tasklet tile-load source connectors as
+// ``T* __restrict__ _src = &arr[...];``, so a raw ``!std::is_pointer_v<Src>``
+// SFINAE guard fails to exclude those pointers from the by-value broadcast
+// ``tile_load`` overload below -- silently splatting ``src[0]`` across every
+// lane instead of doing the strided per-lane load. Strip the ``restrict``
+// qualifier before the pointer test so a restrict-qualified pointer is
+// classified as a pointer (its natural category).
+template <typename T> struct _strip_restrict { using type = T; };
+template <typename T> struct _strip_restrict<T* __restrict__> { using type = T*; };
+template <typename Src>
+inline constexpr bool _is_pointer_like =
+    std::is_pointer_v<typename _strip_restrict<std::remove_reference_t<Src>>::type>;
 
 // Per-lane binary op.
 template <typename T, char Op>
@@ -156,7 +172,7 @@ template <typename T, std::size_t N> inline T tile_load_value(const T (&x)[N]) n
 // for every tile load and the runtime picks pointer-strided vs by-value
 // broadcast through overload resolution.
 template <typename T, int VLEN, bool Masked, typename Src>
-inline std::enable_if_t<(VLEN > 1) && !std::is_pointer_v<std::remove_reference_t<Src>>, void>
+inline std::enable_if_t<(VLEN > 1) && !_is_pointer_like<Src>, void>
 tile_load(T* __restrict__ dst, Src&& src, const bool* __restrict__ mask, std::int64_t /*stride*/ = 1) {
   const T sv = tile_load_value<T>(src);
   _dace_tile_vectorize(VLEN) for (int i = 0; i < VLEN; ++i) {

@@ -202,15 +202,26 @@ class InlineMultistateSDFG(transformation.SingleStateTransformation):
         # type, preserving the strict-typing contract.
         identity_mapping: Dict[Any, Any] = {}
         non_identity_mapping: Dict[str, str] = {}
+        # Non-identity entries whose inner symbol name is already taken by an
+        # outer data descriptor / constant. Such a name can neither be
+        # registered as an outer symbol nor used as an interstate-edge
+        # assignment target (names share one namespace), so we substitute
+        # these entries inline (``inner_K -> outer_expr``), matching the
+        # legacy inlining behavior, instead of planting an iedge assignment.
+        inline_mapping: Dict[Any, Any] = {}
         for k, v in nsdfg_node.symbol_mapping.items():
             if str(k) == str(v):
                 identity_mapping[k] = v
+            elif str(k) in sdfg.arrays or str(k) in sdfg.constants_prop:
+                inline_mapping[k] = v
             else:
                 non_identity_mapping[str(k)] = symbolic.symstr(v)
-        # Two-step replacement (N -> __dacesym_N --> map[N]) for any
-        # identity entries we want safe_replace's clash-handling for.
-        if identity_mapping:
-            symbolic.safe_replace(identity_mapping, nsdfg.replace_dict)
+        # Two-step replacement (N -> __dacesym_N --> map[N]) for identity
+        # entries (for safe_replace's clash-handling) and for collision
+        # entries that must be substituted inline.
+        combined_inline = {**identity_mapping, **inline_mapping}
+        if combined_inline:
+            symbolic.safe_replace(combined_inline, nsdfg.replace_dict)
 
         #######################################################
         # Collect and modify interstate edges as necessary

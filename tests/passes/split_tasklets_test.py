@@ -1042,3 +1042,152 @@ def test_split_handles_arbitrary_function_calls(body_expr):
                 # leaked through as a variable.
                 assert in_conn not in {"sqrt", "tanh", "sin", "cos", "my_custom_func"}, \
                     f"function name {in_conn!r} leaked as an in-connector on {n.label!r}"
+
+
+@pytest.mark.parametrize("body_expr", [
+    "if __in_cond:\n    __out = 1.0",  # single-branch masked assign (correlation: stddev[stddev<=0]=1)
+    "if __in_cond:\n    __out = _a",  # conditional copy
+])
+def test_split_leaves_conditional_tasklet_intact(body_expr):
+    """Regression (pipeline bug 09 "Leftover nodes in queue").
+
+    A conditional-body tasklet -- e.g. the masked assignment
+    ``stddev[stddev <= 0.0] = 1.0`` that DaCe lowers to a tasklet whose code is
+    ``if __in_cond:\\n    __out = 1.0`` -- parses to an ``ast.If`` node, which
+    ``to_ssa`` cannot decompose into any SSA assignment line (it returns ``[]``).
+    The old guard ``len(ssa_statements) != 1`` then queued the tasklet for
+    "splitting": it was removed from the state and NOTHING was added back,
+    leaving the enclosing map with an empty body (MapEntry with no successor,
+    MapExit with no predecessor). The next ``state.scope_dict()`` (via
+    ``symbols_defined_at``) raised ``RuntimeError: Leftover nodes in queue``.
+
+    The fix restricts splitting to genuine multi-op tasklets (``> 1`` SSA lines),
+    leaving conditional tasklets intact for the downstream branch/ITE lowering.
+    """
+    sdfg = dace.SDFG("split_conditional_fixture")
+    sdfg.add_array("Cond", (4, ), dace.bool_, transient=False)
+    sdfg.add_array("A", (4, ), dace.float64, transient=False)
+    sdfg.add_array("Out", (4, ), dace.float64, transient=False)
+    state = sdfg.add_state("s")
+    me, mx = state.add_map("k", {"ii": "0:4"})
+    cond = state.add_access("Cond")
+    a = state.add_access("A")
+    out = state.add_access("Out")
+    t = state.add_tasklet("masked_assign", {"__in_cond", "_a"}, {"__out"}, body_expr)
+    state.add_memlet_path(cond, me, t, dst_conn="__in_cond", memlet=dace.Memlet("Cond[ii]"))
+    state.add_memlet_path(a, me, t, dst_conn="_a", memlet=dace.Memlet("A[ii]"))
+    state.add_memlet_path(t, mx, out, src_conn="__out", memlet=dace.Memlet("Out[ii]", dynamic=True))
+
+    SplitTasklets().apply_pass(sdfg, {})
+
+    # The conditional tasklet must survive (not be deleted into an empty map body).
+    tasklets = [n for n in state.nodes() if isinstance(n, dace.nodes.Tasklet)]
+    assert len(tasklets) == 1, f"expected the conditional tasklet to be left intact, found {tasklets}"
+    # The map body must stay connected -- this is exactly what scope_dict validates.
+    # Before the fix this raised "Leftover nodes in queue".
+    state._scope_dict_toparent_cached = None
+    state.scope_dict()  # must not raise
+    for n in state.nodes():
+        if isinstance(n, dace.nodes.MapEntry):
+            assert state.out_degree(n) > 0, "map entry left with empty body"
+        if isinstance(n, dace.nodes.MapExit):
+            assert state.in_degree(n) > 0, "map exit left with no producer"
+
+
+def _build_symbol_only_intermediate_sdfg() -> dace.SDFG:
+    """Build a map whose single body tasklet decomposes into a symbol-only
+    *intermediate* split tasklet.
+
+    The body ``__out = __in1 / exp(log(R) * (ii + 1))`` lowers (via ``to_ssa``)
+    to::
+
+        __t0 = log(R)          # symbols only -> source (i == 0, anchored)
+        __t1 = ii + 1          # symbols only -> source (i == 1, INTERMEDIATE)
+        __t2 = __t0 * __t1
+        __t3 = exp(__t2)
+        __out = __in1 / __t3
+
+    ``__t1`` reads no data connectors, so ``SplitTasklets`` gives it no in-edge.
+    Only the ``i == 0`` tasklet is anchored to the map entry; ``__t1`` used to be
+    left as a top-level (scope ``None``) source, straddling two scopes. This is
+    the exact shape of the ``stockham_fft`` twiddle-factor
+    ``exp(-2j*pi*.../R**(i+1))`` tasklet.
+    """
+    N = 16
+    sdfg = dace.SDFG("split_symbol_only_intermediate")
+    sdfg.add_symbol("R", dace.int64)
+    sdfg.add_array("A", (N, ), dace.float64, transient=False)
+    sdfg.add_array("Out", (N, ), dace.float64, transient=False)
+    state = sdfg.add_state("s")
+    me, mx = state.add_map("k", {"ii": f"0:{N}"})
+    a = state.add_access("A")
+    out = state.add_access("Out")
+    t = state.add_tasklet("twiddle", {"__in1"}, {"__out"}, "__out = __in1 / exp(log(R) * (ii + 1))")
+    state.add_memlet_path(a, me, t, dst_conn="__in1", memlet=dace.Memlet("A[ii]"))
+    state.add_memlet_path(t, mx, out, src_conn="__out", memlet=dace.Memlet("Out[ii]"))
+    return sdfg
+
+
+def test_split_symbol_only_intermediate_stays_in_one_scope():
+    """Regression (pipeline bug 11 "Subgraph is contained in more than one scope").
+
+    ``SplitTasklets`` anchored only the *first* (``i == 0``) split tasklet to the
+    enclosing map entry. A symbol/constant-only *intermediate* SSA line such as
+    ``__t1 = ii + 1`` produces a tasklet with no data-input connectors, so it got
+    no in-edge and resolved as a top-level (scope ``None``) source. The map body
+    then straddled two scopes and ``nest_state_subgraph`` raised
+    "Subgraph is contained in more than one scope" during cuTile lowering
+    (``stockham_fft``). The fix anchors every zero-in-degree split tasklet to the
+    original input source, so the whole body stays in one scope.
+    """
+    from dace.transformation.helpers import nest_state_subgraph
+    from dace.sdfg.graph import SubgraphView
+
+    sdfg = _build_symbol_only_intermediate_sdfg()
+    SplitTasklets().apply_pass(sdfg, {})
+    sdfg.validate()
+
+    state = sdfg.nodes()[0]
+    me = next(n for n in state.nodes() if isinstance(n, dace.nodes.MapEntry))
+    mx = state.exit_node(me)
+    scope = state.scope_dict()
+
+    body_nodes = {
+        n
+        for n in state.all_nodes_between(me, mx) if not isinstance(n, (dace.nodes.MapEntry, dace.nodes.MapExit))
+    }
+    assert body_nodes, "map body unexpectedly empty after split"
+
+    # Every body node must be enclosed by the single map entry -- no orphan at
+    # top level (scope None). This is exactly what nest_state_subgraph checks.
+    for n in body_nodes:
+        assert scope[n] is me, (f"body node {getattr(n, 'label', getattr(n, 'data', n))} escaped the map scope "
+                                f"(scope={scope[n]}); split tasklet left unanchored")
+
+    # The precise failing operation: nesting the map body must not raise
+    # "Subgraph is contained in more than one scope".
+    nest_state_subgraph(sdfg, state, SubgraphView(state, body_nodes), name="body")
+    sdfg.validate()
+
+
+def test_split_symbol_only_intermediate_end_to_end():
+    """End-to-end (bug 11): the split SDFG compiles and matches NumPy."""
+    N, R = 16, 3
+    A = numpy.random.random((N, )).astype(numpy.float64) + 1.0
+    ii = numpy.arange(N, dtype=numpy.float64)
+    expected = A / numpy.exp(numpy.log(R) * (ii + 1.0))
+
+    sdfg = _build_symbol_only_intermediate_sdfg()
+    ref = sdfg.compile()
+    out_ref = numpy.zeros((N, ), dtype=numpy.float64)
+    ref(A=A.copy(), Out=out_ref, R=R)
+
+    split = copy.deepcopy(sdfg)
+    SplitTasklets().apply_pass(split, {})
+    split.validate()
+    csplit = split.compile()
+    out_split = numpy.zeros((N, ), dtype=numpy.float64)
+    csplit(A=A.copy(), Out=out_split, R=R)
+
+    assert numpy.allclose(out_ref, expected)
+    assert numpy.allclose(out_split, expected)
