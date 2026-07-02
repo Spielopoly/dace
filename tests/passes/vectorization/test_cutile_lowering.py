@@ -129,6 +129,41 @@ def _build_bare_tile_binop_sdfg(widths: Tuple[int, ...]) -> SDFG:
     return sdfg
 
 
+def _build_blas_dot_sdfg() -> SDFG:
+    """Hand-built SDFG whose only library node is a BLAS ``Dot`` (no tileops).
+
+    Models the BLAS-only configuration (e.g. cholesky/trisolv after
+    vectorization, where every reduction became a ``Dot``).
+    """
+    from dace.libraries.blas.nodes import Dot
+    sdfg = dace.SDFG("cutile_lowering_blas_only")
+    sdfg.add_array("x", (8, ), dace.float64)
+    sdfg.add_array("y", (8, ), dace.float64)
+    sdfg.add_array("r", (1, ), dace.float64)
+    state = sdfg.add_state("main")
+    dot = Dot("dot")
+    state.add_node(dot)
+    state.add_edge(state.add_access("x"), None, dot, "_x", dace.Memlet("x[0:8]"))
+    state.add_edge(state.add_access("y"), None, dot, "_y", dace.Memlet("y[0:8]"))
+    state.add_edge(dot, "_result", state.add_access("r"), None, dace.Memlet("r[0]"))
+    return sdfg
+
+
+def _add_residual_gpu_map(sdfg: SDFG, rng: str) -> nodes.MapEntry:
+    """Add a state holding a non-tileops ``GPU_Device`` map over ``rng``.
+
+    :param sdfg: The SDFG to extend.
+    :param rng: Map range string (e.g. ``"0:1024"``).
+    :returns: The new map's entry node.
+    """
+    state = sdfg.add_state("residual")
+    entry, exit_node = state.add_map("residual_map", dict(k=rng), schedule=dtypes.ScheduleType.GPU_Device)
+    tasklet = state.add_tasklet("residual_t", {}, {}, "pass")
+    state.add_nedge(entry, tasklet, dace.Memlet())
+    state.add_nedge(tasklet, exit_node, dace.Memlet())
+    return entry
+
+
 def _build_tile_iota_sdfg() -> SDFG:
     """Hand-built SDFG holding a ``TileIota`` with a 'cutile' expansion."""
     sdfg = dace.SDFG("cutile_lowering_iota")
@@ -308,6 +343,67 @@ class TestGPUDeviceToCuTile:
         sdfg = _build_unvectorized_vadd_sdfg()
         with pytest.raises(ValueError, match="no tileops library nodes found"):
             GPUDeviceToCuTile(strict=True).apply_pass(sdfg, {})
+
+    def test_tiny_residual_map_demotes_silently(self):
+        """A residual GPU_Device map with provably tiny volume (<= 4) is the
+        intended scalar-control case: demoted to Sequential with no warning."""
+        sdfg = _build_vadd_k1_sdfg()
+        sdfg.apply_gpu_transformations(sequential_innermaps=True, register_transients=True, simplify=True)
+        entry = _add_residual_gpu_map(sdfg, "0:2")
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            GPUDeviceToCuTile().apply_pass(sdfg, {})
+        assert not [w for w in caught if "per-element host loop" in str(w.message)]
+        assert entry.map.schedule == dtypes.ScheduleType.Sequential
+
+    def test_large_residual_map_demotion_warns(self):
+        """A large residual GPU_Device map warns (naming map/state/volume and
+        the host-loop consequence) but is still demoted in non-strict mode."""
+        sdfg = _build_vadd_k1_sdfg()
+        sdfg.apply_gpu_transformations(sequential_innermaps=True, register_transients=True, simplify=True)
+        entry = _add_residual_gpu_map(sdfg, "0:1024")
+        with pytest.warns(UserWarning, match="residual_map.*volume 1024.*per-element host loop"):
+            GPUDeviceToCuTile().apply_pass(sdfg, {})
+        assert entry.map.schedule == dtypes.ScheduleType.Sequential
+
+    def test_symbolic_residual_map_demotion_warns(self):
+        """A symbolic-volume residual map is not provably tiny: warns too."""
+        sdfg = _build_vadd_k1_sdfg()
+        sdfg.apply_gpu_transformations(sequential_innermaps=True, register_transients=True, simplify=True)
+        entry = _add_residual_gpu_map(sdfg, "0:N")
+        with pytest.warns(UserWarning, match="per-element host loop"):
+            GPUDeviceToCuTile().apply_pass(sdfg, {})
+        assert entry.map.schedule == dtypes.ScheduleType.Sequential
+
+    def test_large_residual_map_strict_raises(self):
+        """strict=True: the large-residual-map demotion raises instead."""
+        sdfg = _build_vadd_k1_sdfg()
+        sdfg.apply_gpu_transformations(sequential_innermaps=True, register_transients=True, simplify=True)
+        entry = _add_residual_gpu_map(sdfg, "0:1024")
+        with pytest.raises(ValueError, match="per-element host loop"):
+            GPUDeviceToCuTile(strict=True).apply_pass(sdfg, {})
+        # Not demoted: the raise aborts before re-stamping.
+        assert entry.map.schedule == dtypes.ScheduleType.GPU_Device
+
+
+class TestBlasOnlyConfiguration:
+    """Zero tileops anchors + non-tileops library nodes is a supported case:
+    the passes proceed (informational warning) even under ``strict=True``."""
+
+    def test_validate_tiles_strict_proceeds(self):
+        sdfg = _build_blas_dot_sdfg()
+        with pytest.warns(UserWarning, match="BLAS-only configuration"):
+            assert CuTileValidateTiles(strict=True).apply_pass(sdfg, {}) is None
+
+    def test_gpu_device_to_cutile_strict_proceeds(self):
+        sdfg = _build_blas_dot_sdfg()
+        with pytest.warns(UserWarning, match="BLAS-only configuration"):
+            assert GPUDeviceToCuTile(strict=True).apply_pass(sdfg, {}) is None
+
+    def test_set_tile_storage_strict_proceeds(self):
+        sdfg = _build_blas_dot_sdfg()
+        with pytest.warns(UserWarning, match="BLAS-only configuration"):
+            assert CuTileSetTileStorage(strict=True).apply_pass(sdfg, {}) is None
 
     def test_idempotent(self):
         """Running twice on already-CuTile map returns None."""

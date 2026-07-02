@@ -332,6 +332,9 @@ def validate_sdfg(sdfg: 'dace.sdfg.SDFG', references: Set[int] = None, **context
 
         # Check if SDFG is located within a GPU kernel
         context['in_gpu'] = is_devicelevel_gpu(sdfg, None, None)
+        # Compute the root-backend flag once per validation; ``_accessible``
+        # reads it from the context instead of re-walking the parent chain.
+        context['backend_is_python'] = _root_backend_is_python(sdfg)
 
         initialized_transients = {'__pystate'}
         initialized_transients.update(sdfg.constants_prop.keys())
@@ -363,6 +366,9 @@ def _root_backend_is_python(sdfg: 'dace.sdfg.SDFG') -> bool:
     whether its :attr:`~dace.sdfg.SDFG.backend` is
     :attr:`~dace.dtypes.BackendLanguage.Python`.
 
+    Computed once per validation entry point and cached in the validation
+    ``context`` dict as ``'backend_is_python'`` (see :func:`_accessible`).
+
     :param sdfg: Any SDFG in the tree (possibly nested).
     :returns: ``True`` iff the root SDFG's backend is ``Python``.
     """
@@ -387,8 +393,15 @@ def _accessible(sdfg: 'dace.sdfg.SDFG', container: str, context: Dict[str, bool]
         # restricted to ``GPU_Global`` only: ``GPU_Shared``/``GPU_Register`` are
         # not host-addressable even under the Python backend, so they keep the
         # original ``in_gpu`` check.
-        if storage == dtypes.StorageType.GPU_Global and _root_backend_is_python(sdfg):
-            return True
+        if storage == dtypes.StorageType.GPU_Global:
+            backend_is_python = context.get('backend_is_python')
+            if backend_is_python is None:
+                # Entered outside validate_sdfg/validate_state (which seed the
+                # flag); compute lazily and cache it in the context.
+                backend_is_python = _root_backend_is_python(sdfg)
+                context['backend_is_python'] = backend_is_python
+            if backend_is_python:
+                return True
         return context.get('in_gpu', False)
 
     return True
@@ -454,6 +467,9 @@ def validate_state(state: 'dace.sdfg.SDFGState',
     # Obtain whether we are already in an accelerator context
     if not hasattr(context, 'in_gpu'):
         context['in_gpu'] = is_devicelevel_gpu(sdfg, state, None)
+    # Seed the root-backend flag once when entering validation at state level
+    if 'backend_is_python' not in context:
+        context['backend_is_python'] = _root_backend_is_python(sdfg)
 
     # Reference check
     if id(state) in references:

@@ -49,6 +49,14 @@ from dace.transformation import pass_pipeline as ppl
 #: Scope-dictionary cache type: per-state ``state.scope_dict()`` results.
 _ScopeCache = Dict[SDFGState, Dict[nodes.Node, Optional[nodes.Node]]]
 
+#: Maximum provable map volume (total trip count) for which a residual
+#: ``GPU_Device`` map is demoted to ``Sequential`` silently.  Such tiny maps
+#: are the intended scalar-control steps of sequential solvers (e.g.
+#: ``cholesky`` / ``trisolv``); anything larger (or symbolic, hence not
+#: provably tiny) compiles to a pathological per-element host loop over GPU
+#: data and is diagnosed via :func:`_warn_or_raise`.
+_TINY_DEMOTION_VOLUME = 4
+
 
 def _tile_node_types() -> Tuple[Type[nodes.LibraryNode], ...]:
     """Return the tuple of all tileops library-node classes.
@@ -166,6 +174,38 @@ def _warn_or_raise(message: str, strict: bool) -> None:
     warnings.warn(message)
 
 
+def _diagnose_no_anchors(pass_name: str, sdfg: SDFG, strict: bool) -> None:
+    """Diagnose an SDFG that carries zero tileops anchors.
+
+    Two distinct cases:
+
+    * **BLAS-only configuration** (supported): the SDFG has no tileops nodes
+      but *does* contain other library nodes (e.g. BLAS ``Dot`` / ``MatMul``)
+      that :class:`CuTileSetLibraryImplementations` lowers downstream.  This
+      emits an informational ``UserWarning`` and never raises, even under
+      ``strict``.
+    * **Genuinely empty** (probable user error): no tileops nodes and no
+      other library nodes either — the SDFG was most likely never vectorized.
+      This warns, or raises ``ValueError`` when ``strict``.
+
+    :param pass_name: Name of the calling pass (message prefix).
+    :param sdfg: The anchor-less SDFG being diagnosed.
+    :param strict: Whether the genuinely-empty case raises instead of warning.
+    :raises ValueError: When ``strict`` and the SDFG contains no library
+        nodes at all.
+    """
+    non_tile = _collect_non_tile_library_nodes(sdfg)
+    if non_tile:
+        warnings.warn(f"{pass_name}: no tileops library nodes found, but {len(non_tile)} non-tileops "
+                      "library node(s) are present (BLAS-only configuration); proceeding -- "
+                      "CuTileSetLibraryImplementations lowers them")
+    else:
+        _warn_or_raise(
+            f"{pass_name}: no tileops library nodes found and no other library nodes present; "
+            "the SDFG appears not to have been vectorized -- run "
+            "VectorizeCPUMultiDim(target_isa='CUTILE', expand_tile_nodes=False) first", strict)
+
+
 @properties.make_properties
 class _CuTileLoweringPass(ppl.Pass):
     """Shared base of the cuTile lowering passes.
@@ -209,6 +249,11 @@ class CuTileValidateTiles(_CuTileLoweringPass):
     later passes stamp from), and (b) every anchor's ``widths`` are powers of
     two — a hard ``cuda.tile`` runtime requirement that raises ``ValueError``
     unconditionally (not gated by ``strict``).
+
+    Zero anchors with other library nodes present (the BLAS-only
+    configuration, e.g. ``cholesky`` / ``trisolv`` whose reductions became
+    BLAS ``Dot`` nodes) is a supported case: informational warning only,
+    even under ``strict``.
     """
 
     def apply_pass(self, sdfg: SDFG, pipeline_results: Dict[str, Any]) -> Optional[int]:
@@ -217,15 +262,14 @@ class CuTileValidateTiles(_CuTileLoweringPass):
         :param sdfg: The SDFG to validate (not modified).
         :param pipeline_results: Unused pipeline results.
         :returns: The number of tileops anchors found, or ``None`` if there
-            are none (after warning / raising per ``strict``).
+            are none (after diagnosing per :func:`_diagnose_no_anchors`).
         :raises ValueError: If any anchor has a non-power-of-2 tile width
-            (always), or — when ``strict`` — if no anchors exist.
+            (always), or — when ``strict`` — if no anchors exist and the
+            SDFG has no other library nodes either.
         """
         anchors = _collect_tile_nodes(sdfg)
         if not anchors:
-            _warn_or_raise(
-                "CuTileValidateTiles: no tileops library nodes found; run "
-                "VectorizeCPUMultiDim(target_isa='CUTILE', expand_tile_nodes=False) first", self.strict)
+            _diagnose_no_anchors("CuTileValidateTiles", sdfg, self.strict)
             return None
         for node, _ in anchors:
             for width in node.widths:
@@ -269,8 +313,16 @@ class CuTileSetTileStorage(_CuTileLoweringPass):
             exists.
         """
         if next(_iter_cutile_scopes(sdfg), None) is None:
-            _warn_or_raise("CuTileSetTileStorage: no CuTile-scheduled map found; run sdfg.apply_gpu_transformations() + GPUDeviceToCuTile first",
-                           self.strict)
+            if not _collect_tile_nodes(sdfg) and _collect_non_tile_library_nodes(sdfg):
+                # BLAS-only configuration: no cuTile kernels exist by design;
+                # there is nothing to stamp. Informational, never raises.
+                warnings.warn("CuTileSetTileStorage: no CuTile-scheduled map and no tileops anchors, "
+                              "but non-tileops library nodes are present (BLAS-only configuration); "
+                              "nothing to stamp")
+            else:
+                _warn_or_raise(
+                    "CuTileSetTileStorage: no CuTile-scheduled map found; run "
+                    "sdfg.apply_gpu_transformations() + GPUDeviceToCuTile first", self.strict)
             return None
 
         scope_cache: _ScopeCache = {}
@@ -372,7 +424,12 @@ class GPUDeviceToCuTile(_CuTileLoweringPass):
        ``KeyError: ScheduleType.GPU_Device`` at code generation.  It is
        re-stamped ``ScheduleType.Sequential`` and emitted as a host ("driver")
        Python loop that operates directly on the ``GPU_Global`` (``cupy``)
-       arrays, which are host-addressable in this backend.
+       arrays, which are host-addressable in this backend.  Because that host
+       loop pays one device round-trip per element, only maps whose total
+       volume is provably at most :data:`_TINY_DEMOTION_VOLUME` (the intended
+       scalar-control case) are demoted silently; larger or symbolic-volume
+       maps are diagnosed via :func:`_warn_or_raise` first (warn by default,
+       raise under ``strict``) and demoted only in non-strict mode.
     """
 
     def apply_pass(self, sdfg: SDFG, pipeline_results: Dict[str, Any]) -> Optional[int]:
@@ -382,18 +439,19 @@ class GPUDeviceToCuTile(_CuTileLoweringPass):
         :param pipeline_results: Unused pipeline results.
         :returns: The number of maps re-stamped to ``CuTile``, or ``None``
             if there were no tileops anchors.
-        :raises ValueError: When ``strict`` and no tileops anchors exist.
+        :raises ValueError: When ``strict`` and either (a) no tileops anchors
+            and no other library nodes exist, or (b) a residual ``GPU_Device``
+            map with a large / not-provably-tiny volume must be demoted.
         """
         # Step 1: re-stamp tileops-anchored outermost maps to CuTile.  Absence
         # of anchors is not fatal here -- an SDFG whose only reductions became
         # BLAS library nodes (e.g. ``cholesky`` / ``trisolv`` with ``np.dot``)
         # has zero cuTile kernels but still carries GPU_Device host-control maps
-        # that step 2 must demote -- so we warn but continue.
+        # that step 2 must demote -- so we diagnose (BLAS-only: informational;
+        # genuinely empty: warn / strict-raise) and continue.
         anchors = _collect_tile_nodes(sdfg)
         if not anchors:
-            _warn_or_raise(
-                "GPUDeviceToCuTile: no tileops library nodes found; run "
-                "VectorizeCPUMultiDim(target_isa='CUTILE', expand_tile_nodes=False) first", self.strict)
+            _diagnose_no_anchors("GPUDeviceToCuTile", sdfg, self.strict)
 
         scope_cache: _ScopeCache = {}
         cutile_entries: Set[nodes.MapEntry] = set()
@@ -414,10 +472,25 @@ class GPUDeviceToCuTile(_CuTileLoweringPass):
         # control) to Sequential so the Python/cuTile backend can code-generate
         # it as a host driver loop over the GPU_Global (cupy) operands.  Runs
         # unconditionally -- these maps exist even when there are no anchors.
-        for map_node, _ in sdfg.all_nodes_recursive():
-            if (isinstance(map_node, nodes.MapEntry)
-                    and map_node.map.schedule == dtypes.ScheduleType.GPU_Device):
-                map_node.map.schedule = dtypes.ScheduleType.Sequential
+        # Silent only for provably tiny maps (the intended scalar-control
+        # case); large or symbolic volumes warn / strict-raise, since the host
+        # loop pays one device round-trip per element.
+        for map_node, graph in sdfg.all_nodes_recursive():
+            if not (isinstance(map_node, nodes.MapEntry) and map_node.map.schedule == dtypes.ScheduleType.GPU_Device):
+                continue
+            volume = map_node.map.range.num_elements()
+            try:
+                provably_tiny = int(volume) <= _TINY_DEMOTION_VOLUME
+            except (TypeError, ValueError):
+                provably_tiny = False  # Symbolic volume: not provably tiny.
+            if not provably_tiny:
+                _warn_or_raise(
+                    f"GPUDeviceToCuTile: demoting non-tileops GPU_Device map "
+                    f"'{map_node.map.label}' (state '{graph.label}', volume {volume}) to "
+                    "Sequential: it compiles to a per-element host loop over GPU data "
+                    "(one device round-trip per element), which is pathological for "
+                    "anything but tiny scalar-control maps", self.strict)
+            map_node.map.schedule = dtypes.ScheduleType.Sequential
 
         return len(cutile_entries) if cutile_entries else None
 
