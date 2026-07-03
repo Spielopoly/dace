@@ -5,7 +5,7 @@ import copy
 import os
 import warnings
 from collections import defaultdict
-from typing import TYPE_CHECKING, Dict, List, Set
+from typing import TYPE_CHECKING, Dict, List, Optional, Set
 
 import networkx as nx
 
@@ -17,7 +17,7 @@ if TYPE_CHECKING:
     from dace.memlet import Memlet
     from dace.sdfg import SDFG
     from dace.sdfg import graph as gr
-    from dace.sdfg.state import ControlFlowRegion
+    from dace.sdfg.state import ControlFlowRegion, SDFGState
 
 ###########################################
 # Validation
@@ -1035,14 +1035,32 @@ class InvalidSDFGError(Exception):
 
         return f'File "{lineinfo.filename}"'
 
+    def _resolve_state(self) -> Optional['SDFGState']:
+        """Resolve ``state_id`` to a state, or None if it no longer resolves.
+
+        Exception messages may be rendered long after the SDFG was modified
+        (or after the failing state was removed), so a stale id must not
+        crash ``__str__``.
+        """
+        if self.state_id is None:
+            return None
+        try:
+            return self.sdfg.node(self.state_id)
+        except Exception:
+            return None
+
     def to_json(self):
         return dict(message=self.message, cfg_id=self.sdfg.cfg_id, state_id=self.state_id)
 
     def __str__(self):
         if self.state_id is not None:
-            state = self.sdfg.node(self.state_id)
-            locinfo = self._getlineinfo(state)
-            suffix = f' (at state {state.label})'
+            state = self._resolve_state()
+            if state is not None:
+                locinfo = self._getlineinfo(state)
+                suffix = f' (at state {state.label})'
+            else:
+                locinfo = ''
+                suffix = f' (at state with id {self.state_id})'
         else:
             suffix = ''
             if self.sdfg.number_of_nodes() >= 1:
@@ -1073,13 +1091,22 @@ class InvalidSDFGInterstateEdgeError(InvalidSDFGError):
 
     def __str__(self):
         if self.edge_id is not None:
-            e = self.sdfg.edges()[self.edge_id]
-            edgestr = ' (at edge %s -> %s)' % (
-                str(e.src),
-                str(e.dst),
-            )
-            locinfo_src = self._getlineinfo(e.src)
-            locinfo_dst = self._getlineinfo(e.dst)
+            e = None
+            try:
+                e = self.sdfg.edges()[self.edge_id]
+            except Exception:
+                pass
+            if e is not None:
+                edgestr = ' (at edge %s -> %s)' % (
+                    str(e.src),
+                    str(e.dst),
+                )
+                locinfo_src = self._getlineinfo(e.src)
+                locinfo_dst = self._getlineinfo(e.dst)
+            else:
+                # Stale id: report it numerically instead of crashing.
+                edgestr = f' (at edge with id {self.edge_id})'
+                locinfo_src = locinfo_dst = ''
         else:
             edgestr = ''
             locinfo_src = locinfo_dst = ''
@@ -1118,14 +1145,24 @@ class InvalidSDFGNodeError(InvalidSDFGError):
         return dict(message=self.message, cfg_id=self.sdfg.cfg_id, state_id=self.state_id, node_id=self.node_id)
 
     def __str__(self):
-        state = self.sdfg.node(self.state_id)
+        state = self._resolve_state()
+        if state is None:
+            # Stale ids: report them numerically instead of crashing.
+            nodestr = f', node with id {self.node_id}' if self.node_id is not None else ''
+            return f'{self.message} (at state with id {self.state_id}{nodestr})'
         locinfo = ''
 
         if self.node_id is not None:
-            from dace.sdfg.nodes import Node
-            node: Node = state.node(self.node_id)
-            nodestr = f', node {node}'
-            locinfo = self._getlineinfo(node)
+            node = None
+            try:
+                node = state.node(self.node_id)
+            except Exception:
+                pass
+            if node is not None:
+                nodestr = f', node {node}'
+                locinfo = self._getlineinfo(node)
+            else:
+                nodestr = f', node with id {self.node_id}'
         else:
             nodestr = ''
             locinfo = self._getlineinfo(state)
@@ -1163,18 +1200,30 @@ class InvalidSDFGEdgeError(InvalidSDFGError):
         return dict(message=self.message, cfg_id=self.sdfg.cfg_id, state_id=self.state_id, edge_id=self.edge_id)
 
     def __str__(self):
-        state = self.sdfg.node(self.state_id)
+        state = self._resolve_state()
+        if state is None:
+            # Stale ids: report them numerically instead of crashing.
+            edgestr = f', edge with id {self.edge_id}' if self.edge_id is not None else ''
+            return f'{self.message} (at state with id {self.state_id}{edgestr})'
 
         if self.edge_id is not None:
-            e = state.edges()[self.edge_id]
-            edgestr = ", edge %s (%s:%s -> %s:%s)" % (
-                str(e.data),
-                str(e.src),
-                e.src_conn,
-                str(e.dst),
-                e.dst_conn,
-            )
-            locinfo = self._getlineinfo(e.data)
+            e = None
+            try:
+                e = state.edges()[self.edge_id]
+            except Exception:
+                pass
+            if e is not None:
+                edgestr = ", edge %s (%s:%s -> %s:%s)" % (
+                    str(e.data),
+                    str(e.src),
+                    e.src_conn,
+                    str(e.dst),
+                    e.dst_conn,
+                )
+                locinfo = self._getlineinfo(e.data)
+            else:
+                edgestr = f', edge with id {self.edge_id}'
+                locinfo = ''
         else:
             edgestr = ''
             locinfo = self._getlineinfo(state)

@@ -612,3 +612,23 @@ write-up.
   the in-place RMW read (`lo == offset`) and write (`lo == 0`) paths; verified
   against `expand_nested_sdfg_inputs`/`inline_multistate` suites (19P) and the
   jacobi stencil.
+
+## Bug 16 — `InvalidSDFG*Error.__str__` crashes on stale ids (added 2026-07-03)
+
+- **File:** `dace/sdfg/validation.py` (`InvalidSDFGError.__str__`,
+  `InvalidSDFGNodeError.__str__`, `InvalidSDFGEdgeError.__str__`,
+  `InvalidSDFGInterstateEdgeError.__str__`).
+- **Bug:** the exception classes store `state_id`/`node_id`/`edge_id` and
+  resolve them lazily in `__str__` (`self.sdfg.node(self.state_id)`,
+  `state.edges()[self.edge_id]`). The ids can be relative to a nested
+  control-flow region (validation passes `region.node_id(...)` but `__str__`
+  resolves against the top-level SDFG) or stale by the time the exception is
+  rendered, so printing the exception raises `IndexError` and masks the real
+  validation error (observed on NPBench `adi`/`cavity_flow` through the cuTile
+  pipeline: the true `Memlet subset out-of-bounds` error was hidden behind
+  `IndexError` from `validation.py`'s `__str__`).
+- **Fix:** resolve ids defensively in all four `__str__` methods; when a
+  state/node/edge no longer resolves, print the numeric id
+  (`(at state with id 6, edge with id 0)`) instead of crashing.
+- **Reproducer test:** `tests/codegen/python_backend/test_argument_marshalling.py`
+  (`TestInvalidSDFGErrorStr`).

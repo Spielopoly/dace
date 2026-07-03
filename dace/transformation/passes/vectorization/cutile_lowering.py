@@ -100,6 +100,56 @@ def _collect_non_tile_library_nodes(sdfg: SDFG) -> List[Tuple[nodes.LibraryNode,
             if isinstance(node, nodes.LibraryNode) and not isinstance(node, tile_types)]
 
 
+def clamp_propagated_oob_memlets(sdfg: SDFG) -> int:
+    """Clamp provably out-of-bounds memlet subsets to the array domain.
+
+    The tile-op vectorizer emits full-width tile memlets (``x[i, j:j+W]``)
+    whose accesses are mask-guarded at runtime. When a tiled dimension starts
+    near the array end (e.g. a single-column assignment ``x[:, N-1] = v``),
+    memlet propagation unions these to a *provably* out-of-bounds outer subset
+    (``x[0:N, 0:N+W-1]``), which SDFG validation rejects (e.g. inside
+    ``apply_gpu_transformations()``'s ``simplify()``). Since the mask
+    guarantees no element beyond the array end is touched, the declared
+    footprint is soundly narrowed to the array domain.
+
+    Edges incident to library nodes are skipped: tile-op expansions require
+    their own memlet subsets to match ``widths`` exactly (full-tile write
+    contract).
+
+    :param sdfg: SDFG to fix up in place (NestedSDFGs included).
+    :returns: Number of clamped memlet dimensions.
+    """
+    from dace import subsets as sbs
+
+    clamped = 0
+    for nsdfg in sdfg.all_sdfgs_recursive():
+        for state in nsdfg.states():
+            for e in state.edges():
+                if isinstance(e.src, nodes.LibraryNode) or isinstance(e.dst, nodes.LibraryNode):
+                    continue
+                memlet = e.data
+                if memlet is None or memlet.data is None or memlet.data not in nsdfg.arrays:
+                    continue
+                subset = memlet.subset
+                if not isinstance(subset, sbs.Range):
+                    continue
+                desc = nsdfg.arrays[memlet.data]
+                if subset.dims() != len(desc.shape):
+                    continue
+                new_ranges = list(subset.ranges)
+                changed = False
+                for dim, (maxel, size, off) in enumerate(zip(subset.max_element(), desc.shape, desc.offset)):
+                    # Mirror validate_state's provable-OOB check.
+                    if ((maxel + off) >= size) == True:  # noqa: E712 -- sympy provability check
+                        begin, _, step = new_ranges[dim]
+                        new_ranges[dim] = (begin, size - 1 - off, step)
+                        changed = True
+                        clamped += 1
+                if changed:
+                    memlet.subset = sbs.Range(new_ranges)
+    return clamped
+
+
 def _enclosing_map_chain(node: nodes.Node,
                          state: SDFGState,
                          scope_cache: Optional[_ScopeCache] = None) -> List[Tuple[nodes.MapEntry, SDFGState]]:

@@ -22,6 +22,7 @@ from dace.transformation.passes.vectorization.cutile_lowering import (
     CuTileValidateTiles,
     GPUDeviceToCuTile,
     _collect_tile_nodes,
+    clamp_propagated_oob_memlets,
 )
 from dace.transformation.passes.vectorization.vectorize_cpu_multi_dim import VectorizeCPUMultiDim
 
@@ -165,12 +166,24 @@ class VectorizeCuTile(ppl.Pass):
         CuTileValidateTiles(strict=self.strict).apply_pass(sdfg, {})
         debug_save_sdfg()
 
-        # Step 3: GPU transform — scheduling, storage, data copies
+        # Step 3: GPU transform — scheduling, storage, data copies.
+        # Validation and simplify are deferred: GPUTransformSDFG re-propagates
+        # memlets, which can recreate provably-OOB (but mask-guarded) tile
+        # subsets that validation would reject. Clamp those first (step 3b),
+        # then simplify (step 3c, which validates the result).
         sdfg.apply_gpu_transformations(
+            validate=False,
             sequential_innermaps=True,
             register_transients=True,
-            simplify=True,
+            simplify=False,
         )
+        debug_save_sdfg()
+
+        # Step 3b: Clamp provably-OOB propagated tile memlets to array bounds.
+        clamp_propagated_oob_memlets(sdfg)
+
+        # Step 3c: Simplify + validate (previously run inside step 3).
+        sdfg.simplify()
         debug_save_sdfg()
 
         # Step 4: Adapter — re-stamp tileops-anchored maps GPU_Device -> CuTile

@@ -304,6 +304,10 @@ class ExpandTileLoadCutile(ExpandTransformation):
             # tile (its ``shape=`` spans all source dims with singleton unused
             # dims); the gather paths build ``widths``-shaped (rank-K) tiles.
             aligned_rank_ndim = False
+            # Whether the aligned ``ct.load`` path was emitted. Only its result
+            # is in source-dim order (and may need a permute); the ``ct.gather``
+            # paths build ``widths``-shaped tiles already in tile-dim order.
+            emitted_aligned_load = False
             if gather_set:
                 # Gather path: use provided _idx_{d} index tiles directly.
                 # For each source dim k:
@@ -348,6 +352,7 @@ class ExpandTileLoadCutile(ExpandTransformation):
                 # Block-aligned element offsets are folded into the block index
                 # (``__pid + offset // W``).
                 aligned_rank_ndim = ndim > K
+                emitted_aligned_load = True
                 index_expr = "("
                 width_expr = "("
                 for d in range(ndim):
@@ -409,8 +414,10 @@ class ExpandTileLoadCutile(ExpandTransformation):
                 mask_kw = ", mask=_mask" if node.has_mask else ""
                 src_code = f"ct.gather(_src, ({idx_tuple},), padding_value={pad_value}{mask_kw})"
 
-            if all_dimensions != tuple(sorted(all_dimensions)):
-                # We need to permute the loaded tile to match the expected layout
+            if emitted_aligned_load and all_dimensions != tuple(sorted(all_dimensions)):
+                # We need to permute the loaded tile to match the expected layout.
+                # Only the aligned ``ct.load`` result is rank-``ndim`` in source
+                # order; gather results are rank-K and already tile-ordered.
                 permute_order = tuple(all_dimensions.index(d) for d in range(ndim))
                 src_code = f"ct.permute({src_code}, axes={permute_order})"
 
