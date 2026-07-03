@@ -12,7 +12,10 @@ tileops-specific concerns that the generic GPU transform does not cover.
 Required order::
 
     CuTileValidateTiles           # tile-op anchors exist; widths are powers of 2
+    mark_tile_op_memlets_allow_oob  # 2b: allow_oob on tileops-adjacent memlet trees
     sdfg.apply_gpu_transformations(...)  # GPU scheduling, storage, data copies
+    clamp_propagated_oob_memlets  # 3b: re-clamp propagated tileops OOB subsets
+    sdfg.simplify()               # 3c: simplify + validate
     GPUDeviceToCuTile             # re-stamp tileops-anchored maps GPU_Device -> CuTile
     CuTileSetTileStorage          # Register tile transients -> CuTile_Tile
     CuTileSetLibraryImplementations  # non-tileops lib nodes (BLAS MatMul) -> CuPy, expand
@@ -100,8 +103,81 @@ def _collect_non_tile_library_nodes(sdfg: SDFG) -> List[Tuple[nodes.LibraryNode,
             if isinstance(node, nodes.LibraryNode) and not isinstance(node, tile_types)]
 
 
+def _collect_tileops_adjacent_edges(sdfg: SDFG) -> Tuple[Set[int], Set[int]]:
+    """Find every edge whose memlet tree reaches a tileops library node.
+
+    Walks the memlet tree of each tileops-incident edge and follows
+    non-transient (connector) arrays across NestedSDFG boundaries up to the
+    top-level SDFG, covering the ``nest_map_bodies=True`` descent where the
+    tileops nodes live inside a NestedSDFG body.
+
+    :param sdfg: SDFG to search (NestedSDFGs included).
+    :returns: ``(adjacent, boundary)`` sets of edge ``id()``s: ``adjacent``
+        contains every edge in a tileops-reaching memlet tree; ``boundary``
+        is the subset that are NestedSDFG boundary edges carrying a
+        tileops-fed connector (their full-``W`` window subsets must never be
+        narrowed below ``W`` — the inner connector array is ``W`` wide).
+    """
+    adjacent: Set[int] = set()
+    boundary: Set[int] = set()
+    worklist: List[Tuple[Any, SDFGState]] = []
+    for node, state in _collect_tile_nodes(sdfg):
+        worklist.extend((e, state) for e in state.in_edges(node))
+        worklist.extend((e, state) for e in state.out_edges(node))
+    while worklist:
+        edge, state = worklist.pop()
+        if id(edge) in adjacent:
+            continue
+        owning = state.sdfg
+        # Mark the whole memlet tree; collect connector (non-transient)
+        # arrays it touches for the NestedSDFG boundary crossing below.
+        reached_connectors: Set[str] = set()
+        for tree_edge in state.memlet_tree(edge):
+            adjacent.add(id(tree_edge))
+            if tree_edge.data is not None and tree_edge.data.data is not None:
+                desc = owning.arrays.get(tree_edge.data.data)
+                if desc is not None and not desc.transient:
+                    reached_connectors.add(tree_edge.data.data)
+        nsdfg_node = owning.parent_nsdfg_node
+        parent_state = owning.parent
+        if nsdfg_node is None or parent_state is None:
+            continue
+        for pe in parent_state.in_edges(nsdfg_node):
+            if pe.dst_conn in reached_connectors and id(pe) not in adjacent:
+                boundary.add(id(pe))
+                worklist.append((pe, parent_state))
+        for pe in parent_state.out_edges(nsdfg_node):
+            if pe.src_conn in reached_connectors and id(pe) not in adjacent:
+                boundary.add(id(pe))
+                worklist.append((pe, parent_state))
+    return adjacent, boundary
+
+
+def _clamp_subset_to_shape(subset: Any, desc: data.Data) -> Tuple[Any, int]:
+    """Narrow the provably-OOB dimensions of ``subset`` to ``desc``'s domain.
+
+    :param subset: A :class:`~dace.subsets.Range` to clamp.
+    :param desc: The data descriptor providing shape and offset.
+    :returns: ``(new_subset, num_clamped_dims)``; ``new_subset`` is the input
+        object when nothing changed.
+    """
+    from dace import subsets as sbs
+
+    new_ranges = list(subset.ranges)
+    num_clamped = 0
+    for dim, (maxel, size, off) in enumerate(zip(subset.max_element(), desc.shape, desc.offset)):
+        # Mirror validate_state's provable-OOB check.
+        if ((maxel + off) >= size) == True:  # noqa: E712 -- sympy provability check
+            begin, _, step = new_ranges[dim]
+            new_ranges[dim] = (begin, size - 1 - off, step)
+            num_clamped += 1
+    if num_clamped:
+        return sbs.Range(new_ranges), num_clamped
+    return subset, 0
+
+
 def clamp_propagated_oob_memlets(sdfg: SDFG) -> int:
-    """Clamp provably out-of-bounds memlet subsets to the array domain.
+    """Clamp provably out-of-bounds *tileops* memlet subsets to the array domain.
 
     The tile-op vectorizer emits full-width tile memlets (``x[i, j:j+W]``)
     whose accesses are mask-guarded at runtime. When a tiled dimension starts
@@ -112,15 +188,34 @@ def clamp_propagated_oob_memlets(sdfg: SDFG) -> int:
     guarantees no element beyond the array end is touched, the declared
     footprint is soundly narrowed to the array domain.
 
-    Edges incident to library nodes are skipped: tile-op expansions require
-    their own memlet subsets to match ``widths`` exactly (full-tile write
-    contract).
+    The clamp is gated: only memlets already marked ``allow_oob`` (by
+    :func:`mark_tile_op_memlets_allow_oob`) or whose memlet tree reaches a
+    tileops library node — including across NestedSDFG boundaries — are
+    narrowed. Any *other* provably-OOB memlet is a genuine bug with no mask
+    guarding it: it is left untouched (with a diagnostic ``UserWarning``
+    naming the memlet) so downstream validation rejects it loudly instead of
+    silently compiling a truncated footprint.
+
+    Both ``subset`` and ``other_subset`` are clamped, each against its own
+    endpoint's descriptor (resolved from the memlet path the way
+    ``validate_state`` does). After narrowing, ``volume`` is recomputed from
+    the new ``subset``.
+
+    Two kinds of edges are never narrowed:
+
+    * Edges incident to library nodes: tile-op expansions require their own
+      memlet subsets to match ``widths`` exactly (full-tile write contract).
+    * NestedSDFG boundary edges whose connector feeds a tileops node
+      (``nest_map_bodies=True`` descent): the inner connector array is a full
+      ``W``-wide window, so the boundary subset must stay ``W`` wide. When
+      provably OOB they are marked ``allow_oob`` instead of clamped.
 
     :param sdfg: SDFG to fix up in place (NestedSDFGs included).
     :returns: Number of clamped memlet dimensions.
     """
     from dace import subsets as sbs
 
+    adjacent, boundary = _collect_tileops_adjacent_edges(sdfg)
     clamped = 0
     for nsdfg in sdfg.all_sdfgs_recursive():
         for state in nsdfg.states():
@@ -136,17 +231,47 @@ def clamp_propagated_oob_memlets(sdfg: SDFG) -> int:
                 desc = nsdfg.arrays[memlet.data]
                 if subset.dims() != len(desc.shape):
                     continue
-                new_ranges = list(subset.ranges)
-                changed = False
-                for dim, (maxel, size, off) in enumerate(zip(subset.max_element(), desc.shape, desc.offset)):
-                    # Mirror validate_state's provable-OOB check.
-                    if ((maxel + off) >= size) == True:  # noqa: E712 -- sympy provability check
-                        begin, _, step = new_ranges[dim]
-                        new_ranges[dim] = (begin, size - 1 - off, step)
-                        changed = True
-                        clamped += 1
-                if changed:
-                    memlet.subset = sbs.Range(new_ranges)
+
+                # Resolve the other_subset endpoint's descriptor the way
+                # validate_state does: from the memlet path endpoints.
+                other_desc = None
+                if memlet.other_subset is not None and isinstance(memlet.other_subset, sbs.Range):
+                    path = state.memlet_path(e)
+                    src_node, dst_node = path[0].src, path[-1].dst
+                    other_node = (dst_node if isinstance(dst_node, nodes.AccessNode) and memlet.data != dst_node.data
+                                  else src_node)
+                    if isinstance(other_node, nodes.AccessNode) and other_node.data in nsdfg.arrays:
+                        cand = nsdfg.arrays[other_node.data]
+                        if memlet.other_subset.dims() == len(cand.shape):
+                            other_desc = cand
+
+                new_subset, n_sub = _clamp_subset_to_shape(subset, desc)
+                new_other, n_other = (_clamp_subset_to_shape(memlet.other_subset, other_desc)
+                                      if other_desc is not None else (memlet.other_subset, 0))
+                if n_sub == 0 and n_other == 0:
+                    continue
+
+                if id(e) in boundary:
+                    # NestedSDFG boundary edge feeding a tileops node: the
+                    # full-W window must stay W wide (the inner connector
+                    # array is W wide); defer the OOB to the runtime mask.
+                    memlet.allow_oob = True
+                    continue
+                if not (memlet.allow_oob or id(e) in adjacent):
+                    # Genuine OOB with no tileops mask anywhere: leave it
+                    # for validation to reject loudly.
+                    warnings.warn(f"clamp_propagated_oob_memlets: memlet '{memlet}' (edge {e.src} -> {e.dst}, "
+                                  f"state '{state.label}', SDFG '{nsdfg.label}') is provably out-of-bounds but is "
+                                  "neither tileops-adjacent nor marked allow_oob; not clamping -- validation "
+                                  "will reject it")
+                    continue
+
+                if n_sub:
+                    memlet.subset = new_subset
+                    memlet.volume = new_subset.num_elements()
+                if n_other:
+                    memlet.other_subset = new_other
+                clamped += n_sub + n_other
     return clamped
 
 
@@ -237,6 +362,14 @@ def mark_tile_op_memlets_allow_oob(sdfg: SDFG) -> int:
     them outward.  Marking the LEAF memlets suffices for future
     propagations (``propagate_memlet`` shallow-copies the leaf, inheriting
     ``allow_oob``); the current memlet trees are marked too.
+
+    CAVEAT (why :func:`clamp_propagated_oob_memlets` remains load-bearing):
+    ``propagate_subset`` builds the propagated memlet as
+    ``copy.copy(memlets[0])`` of the AGGREGATED memlet list, so with
+    ``union_inner_edges=True`` a neighboring *unmarked* memlet on the same
+    data can be first in that list and the ``allow_oob`` flag is silently
+    dropped from the propagated result.  The clamp step (3b) re-narrows
+    those re-propagated OOB subsets after ``apply_gpu_transformations()``.
 
     :param sdfg: The SDFG whose tileops-adjacent memlets are marked.
     :returns: The number of memlets marked.

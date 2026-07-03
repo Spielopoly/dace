@@ -1117,7 +1117,7 @@ class InvalidSDFGInterstateEdgeError(InvalidSDFGError):
             elif locinfo_src and not locinfo_dst:
                 locinfo = f'at {locinfo_src}'
             elif locinfo_dst and not locinfo_src:
-                locinfo = f'at {locinfo_src}'
+                locinfo = f'at {locinfo_dst}'
             else:
                 locinfo = f'between\n {locinfo_src}\n and\n {locinfo_dst}'
 
@@ -1146,26 +1146,27 @@ class InvalidSDFGNodeError(InvalidSDFGError):
 
     def __str__(self):
         state = self._resolve_state()
+        locinfo = ''
         if state is None:
             # Stale ids: report them numerically instead of crashing.
+            statestr = f'state with id {self.state_id}'
             nodestr = f', node with id {self.node_id}' if self.node_id is not None else ''
-            return f'{self.message} (at state with id {self.state_id}{nodestr})'
-        locinfo = ''
-
-        if self.node_id is not None:
-            node = None
-            try:
-                node = state.node(self.node_id)
-            except Exception:
-                pass
-            if node is not None:
-                nodestr = f', node {node}'
-                locinfo = self._getlineinfo(node)
-            else:
-                nodestr = f', node with id {self.node_id}'
         else:
-            nodestr = ''
-            locinfo = self._getlineinfo(state)
+            statestr = f'state {state.label}'
+            if self.node_id is not None:
+                node = None
+                try:
+                    node = state.node(self.node_id)
+                except Exception:
+                    pass
+                if node is not None:
+                    nodestr = f', node {node}'
+                    locinfo = self._getlineinfo(node)
+                else:
+                    nodestr = f', node with id {self.node_id}'
+            else:
+                nodestr = ''
+                locinfo = self._getlineinfo(state)
 
         if locinfo:
             locinfo = '\nOriginating from source code at ' + locinfo
@@ -1173,7 +1174,7 @@ class InvalidSDFGNodeError(InvalidSDFGError):
         if self.path:
             locinfo += f'\nInvalid SDFG saved for inspection in {os.path.abspath(self.path)}'
 
-        return f'{self.message} (at state {state.label}{nodestr}){locinfo}'
+        return f'{self.message} (at {statestr}{nodestr}){locinfo}'
 
 
 class NodeNotExpandedError(InvalidSDFGNodeError):
@@ -1201,32 +1202,33 @@ class InvalidSDFGEdgeError(InvalidSDFGError):
 
     def __str__(self):
         state = self._resolve_state()
+        locinfo = ''
         if state is None:
             # Stale ids: report them numerically instead of crashing.
+            statestr = f'state with id {self.state_id}'
             edgestr = f', edge with id {self.edge_id}' if self.edge_id is not None else ''
-            return f'{self.message} (at state with id {self.state_id}{edgestr})'
-
-        if self.edge_id is not None:
-            e = None
-            try:
-                e = state.edges()[self.edge_id]
-            except Exception:
-                pass
-            if e is not None:
-                edgestr = ", edge %s (%s:%s -> %s:%s)" % (
-                    str(e.data),
-                    str(e.src),
-                    e.src_conn,
-                    str(e.dst),
-                    e.dst_conn,
-                )
-                locinfo = self._getlineinfo(e.data)
-            else:
-                edgestr = f', edge with id {self.edge_id}'
-                locinfo = ''
         else:
-            edgestr = ''
-            locinfo = self._getlineinfo(state)
+            statestr = f'state {state.label}'
+            if self.edge_id is not None:
+                e = None
+                try:
+                    e = state.edges()[self.edge_id]
+                except Exception:
+                    pass
+                if e is not None:
+                    edgestr = ", edge %s (%s:%s -> %s:%s)" % (
+                        str(e.data),
+                        str(e.src),
+                        e.src_conn,
+                        str(e.dst),
+                        e.dst_conn,
+                    )
+                    locinfo = self._getlineinfo(e.data)
+                else:
+                    edgestr = f', edge with id {self.edge_id}'
+            else:
+                edgestr = ''
+                locinfo = self._getlineinfo(state)
 
         if locinfo:
             locinfo = '\nOriginating from source code at ' + locinfo
@@ -1234,7 +1236,7 @@ class InvalidSDFGEdgeError(InvalidSDFGError):
         if self.path:
             locinfo += f'\nInvalid SDFG saved for inspection in {os.path.abspath(self.path)}'
 
-        return f'{self.message} (at state {state.label}{edgestr}){locinfo}'
+        return f'{self.message} (at {statestr}{edgestr}){locinfo}'
 
 
 def validate_memlet_data(memlet_data: str, access_data: str) -> bool:

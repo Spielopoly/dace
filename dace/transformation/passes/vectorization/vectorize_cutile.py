@@ -177,10 +177,12 @@ class VectorizeCuTile(ppl.Pass):
         # Step 3: GPU transform — scheduling, storage, data copies.
         # Validation and simplify are deferred: GPUTransformSDFG re-propagates
         # memlets, which can recreate provably-OOB (but mask-guarded) tile
-        # subsets that validation would reject (e.g. single-column writes whose
-        # propagated subset is not tileops-adjacent, so step 2b did not mark
-        # it). Clamp those first (step 3b), then simplify (step 3c, which
-        # validates the result).
+        # subsets that validation would reject — propagate_subset copies
+        # memlets[0] of the aggregated list, so the step-2b allow_oob mark can
+        # be dropped from the propagated result (see the caveat in
+        # mark_tile_op_memlets_allow_oob). Clamp those tileops-anchored
+        # subsets first (step 3b), then simplify (step 3c, which validates
+        # the result).
         sdfg.apply_gpu_transformations(
             validate=False,
             sequential_innermaps=True,
