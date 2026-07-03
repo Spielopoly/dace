@@ -107,7 +107,8 @@ class TestScalarArgumentMarshalling:
         """A numpy scalar of a different dtype is cast to the declared one."""
         csdfg = _python_backend(_int_scale)
         x = np.arange(8, dtype=np.int64)
-        # float64 values passed for int64 scalars: truncated like the C++ backend.
+        # Integral float64 values for int64 scalars: lossless, so accepted
+        # (fractional values raise -- see test_lossy_scalar_value_raises).
         out = csdfg(x=x, a=np.float64(4.0), b=np.float64(9.0), N=8)
         np.testing.assert_array_equal(np.asarray(out), x * 4 + 9)
 
@@ -124,6 +125,40 @@ class TestScalarArgumentMarshalling:
         x = np.arange(8, dtype=np.float64)
         with pytest.raises(TypeError, match='expected a scalar'):
             csdfg(x=x, a=np.ones(3), b=1.0, N=8)
+
+    def test_dtype_mismatched_ndarray_scalar_arg_raises(self):
+        """A 1-element ndarray of the wrong dtype raises instead of silently
+        copying (writes would land in the copy, not the caller's buffer)."""
+        csdfg = _python_backend(_axpb)
+        x = np.arange(8, dtype=np.float64)
+        with pytest.raises(TypeError, match='dtype'):
+            csdfg(x=x, a=np.array([2.0], dtype=np.float32), b=1.0, N=8)
+
+    def test_dtype_mismatched_zero_d_array_scalar_arg_raises(self):
+        """Same for a 0-d ndarray of the wrong dtype."""
+        csdfg = _python_backend(_int_scale)
+        x = np.arange(8, dtype=np.int64)
+        with pytest.raises(TypeError, match='dtype'):
+            csdfg(x=x, a=np.asarray(4.0), b=np.int64(9), N=8)
+
+    def test_lossy_scalar_value_raises(self):
+        """A fractional value for an integer Scalar raises instead of
+        silently truncating (np.asarray(3.9, int64) -> 3)."""
+        csdfg = _python_backend(_int_scale)
+        x = np.arange(8, dtype=np.int64)
+        with pytest.raises(TypeError, match='losslessly'):
+            csdfg(x=x, a=np.float64(3.9), b=np.int64(9), N=8)
+        with pytest.raises(TypeError, match='losslessly'):
+            csdfg(x=x, a=3.9, b=9, N=8)
+
+    def test_matching_dtype_ndarray_scalar_writeback_is_view(self):
+        """A matching-dtype 1-element ndarray is bound as a view, so in-SDFG
+        scalar reads see the caller's buffer (no silent copy)."""
+        csdfg = _python_backend(_axpb)
+        x = np.arange(8, dtype=np.float64)
+        a = np.array([2.0], dtype=np.float64)
+        out = csdfg(x=x, a=a, b=np.array(1.0), N=8)
+        np.testing.assert_allclose(np.asarray(out), x * 2.0 + 1.0)
 
     def test_positional_numpy_scalar_args(self):
         """Positional numpy scalars are marshalled too (fast path, no returns).
@@ -324,7 +359,9 @@ class TestScalarCrossStorageCopyEmission:
     def test_host_scalar_to_gpu_emits_assignment(self):
         code = self._emit(src_scalar=True)
         assert '.set(' not in code
-        assert '=' in code
+        # Broadcast assignment of the plain value (transient Scalar source)
+        # into the subset of the GPU array.
+        assert code.strip() == 'g[:1] = s'
 
 
 if __name__ == '__main__':

@@ -73,11 +73,13 @@ def test_finalize_allows_reinitialize():
     )
     csdfg = PythonCompiledSDFG(sdfg, code)
 
-    assert csdfg(1) == (1, 0)
+    # Keyword call: the SDFG declares no arguments, so positional args are
+    # rejected (see test_call_positional_to_argless_sdfg_raises).
+    assert csdfg(value=1) == (1, 0)
     csdfg.finalize()
     assert csdfg._namespace['exit_calls'] == [1]
 
-    assert csdfg(2) == (2, 1)
+    assert csdfg(value=2) == (2, 1)
     csdfg.finalize()
     assert csdfg._namespace['init_calls'] == [1, 2]
     assert csdfg._namespace['exit_calls'] == [1, 2]
@@ -88,11 +90,44 @@ def test_finalize_allows_reinitialize():
 # ---------------------------------------------------------------------------
 
 def test_call_with_args():
-    """__call__ passes positional args correctly."""
+    """__call__ binds positional args onto arglist() order."""
+    sdfg = _make_sdfg("add")
+    sdfg.add_scalar("a", dace.int64)
+    sdfg.add_scalar("b", dace.int64)
+    code = "def add(a, b):\n    return a[()] + b[()]\n"
+    csdfg = PythonCompiledSDFG(sdfg, code)
+    assert csdfg(2, 3) == 5
+
+
+def test_call_positional_to_argless_sdfg_raises():
+    """Positional args to an SDFG that declares none raise (not swallowed)."""
     sdfg = _make_sdfg("add")
     code = "def add(a, b):\n    return a + b\n"
     csdfg = PythonCompiledSDFG(sdfg, code)
-    assert csdfg(2, 3) == 5
+    with pytest.raises(KeyError, match="does not accept them"):
+        csdfg(2, 3)
+
+
+def test_call_excess_positional_args_raise():
+    """More positional args than arglist() entries raise TypeError."""
+    sdfg = _make_sdfg("add")
+    sdfg.add_scalar("a", dace.int64)
+    sdfg.add_scalar("b", dace.int64)
+    code = "def add(a, b):\n    return a[()] + b[()]\n"
+    csdfg = PythonCompiledSDFG(sdfg, code)
+    with pytest.raises(TypeError, match="accepts at most 2"):
+        csdfg(2, 3, 4)
+
+
+def test_call_duplicate_positional_and_keyword_raises():
+    """An argument passed both ways raises ValueError (not swallowed)."""
+    sdfg = _make_sdfg("add")
+    sdfg.add_scalar("a", dace.int64)
+    sdfg.add_scalar("b", dace.int64)
+    code = "def add(a, b):\n    return a[()] + b[()]\n"
+    csdfg = PythonCompiledSDFG(sdfg, code)
+    with pytest.raises(ValueError, match="both positional and keyword"):
+        csdfg(2, a=2, b=3)
 
 
 def test_call_with_kwargs():
@@ -304,6 +339,7 @@ def test_do_not_execute_still_initializes():
 def test_do_not_execute_toggle():
     """do_not_execute can be toggled on and off, matching profiler save/restore pattern."""
     sdfg = _make_sdfg("toggle")
+    sdfg.add_scalar("x", dace.int64)
     code = "def toggle(x):\n    return x * 2\n"
     csdfg = PythonCompiledSDFG(sdfg, code)
 
@@ -366,6 +402,7 @@ def test_cfunc_with_libhandle():
 def test_profiler_interface_complete():
     """PythonCompiledSDFG exposes all attributes the CompiledSDFGProfiler needs."""
     sdfg = _make_sdfg("profiled")
+    sdfg.add_scalar("x", dace.int64)
     code = "def profiled(x):\n    return x\n"
     csdfg = PythonCompiledSDFG(sdfg, code)
 
