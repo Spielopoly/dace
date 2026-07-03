@@ -213,6 +213,8 @@ class PythonCompiledSDFG:
         :param kwargs: Keyword arguments (not modified).
         :returns: A new kwargs dict including the positional bindings.
         :raises KeyError: If the SDFG takes no arguments but ``args`` is nonempty.
+        :raises TypeError: If more positional arguments are passed than the
+            SDFG accepts.
         :raises ValueError: If an argument is passed both ways.
         """
         if not args:
@@ -222,6 +224,9 @@ class PythonCompiledSDFG:
             raise KeyError(
                 "Passed positional arguments to an SDFG that does "
                 "not accept them.")
+        if len(args) > len(argnames):
+            raise TypeError(f"Passed {len(args)} positional arguments to an SDFG that "
+                            f"accepts at most {len(argnames)} ({argnames}).")
         positional = dict(zip(argnames, args))
         if not positional.keys().isdisjoint(kwargs.keys()):
             raise ValueError(
@@ -241,7 +246,10 @@ class PythonCompiledSDFG:
 
         :param kwargs: Keyword arguments as passed by the caller.
         :returns: A new dict with marshalled values.
-        :raises TypeError: If a non-scalar array is passed for a Scalar argument.
+        :raises TypeError: If a non-scalar array is passed for a Scalar
+            argument, if an ndarray argument's dtype does not match the
+            declared dtype, or if a scalar value cannot be losslessly
+            converted to the declared dtype.
         """
         from dace import data
 
@@ -254,10 +262,25 @@ class PythonCompiledSDFG:
                     if value.size != 1:
                         raise TypeError(f'Argument {name!r}: expected a scalar, '
                                         f'got an array of shape {value.shape}')
+                    # A dtype-mismatched buffer would have to be copied
+                    # (np.asarray), so in-SDFG writes would land in the copy
+                    # and the caller's buffer would keep the stale value.
+                    # Mirror the C backend's array behavior and reject it.
+                    if value.dtype != nptype:
+                        raise TypeError(f'Argument {name!r}: passed an ndarray of dtype '
+                                        f'{value.dtype}, expected {np.dtype(nptype)}')
                     # Same-dtype reshape is a view: in-SDFG writes propagate.
-                    marshalled[name] = np.asarray(value.reshape(()), dtype=nptype)
+                    marshalled[name] = value.reshape(())
                 elif isinstance(value, (bool, int, float, complex, np.generic)):
-                    marshalled[name] = np.asarray(value, dtype=nptype)
+                    coerced = np.asarray(value, dtype=nptype)
+                    # Coercing a plain value to an integer/bool dtype must be
+                    # exact (e.g. 3.9 -> int32 would silently truncate to 3,
+                    # and out-of-range numpy ints silently wrap).
+                    if coerced.dtype.kind in 'iub' and coerced[()] != value:
+                        raise TypeError(f'Argument {name!r}: value {value!r} cannot be '
+                                        f'losslessly converted to declared dtype '
+                                        f'{np.dtype(nptype)}')
+                    marshalled[name] = coerced
                 # Anything else (e.g. a cupy scalar buffer) passes through.
             elif desc is None:
                 # Symbol values: native Python scalars only.
@@ -304,12 +327,17 @@ class PythonCompiledSDFG:
         if not self._has_returns:
             if args:
                 try:
-                    kwargs = self._bind_positional(args, kwargs)
-                    args = ()
+                    self._get_argnames()
                 except Exception:
                     # arglist() can fail on nested SDFGs with undeclared
-                    # runtime symbols; fall back to raw positional args.
+                    # runtime symbols; fall back to raw positional args
+                    # (keyword arguments are still marshalled below).
                     pass
+                else:
+                    # Only the argname resolution above is fallible; binding
+                    # errors (duplicate/excess arguments) must propagate.
+                    kwargs = self._bind_positional(args, kwargs)
+                    args = ()
             kwargs = self._marshal_arguments(kwargs)
             self.initialize(*args, **kwargs)
             if self.do_not_execute:

@@ -18,10 +18,18 @@ def int_floor(x, y=1):
 # Sympy boolean if-then-else (emitted verbatim by boundary-ITE tasklets, e.g.
 # ``_o = ITE(cond, _new, _old)``). A plain-bool condition branches directly
 # (cupy.where rejects scalar conditions); array conditions go through
-# ``np.where`` (dispatches to cupy via __array_function__).
+# ``np.where`` (dispatches to cupy via __array_function__). A host (numpy)
+# condition paired with device (cupy) arms would make that dispatch fail, so
+# the condition is coerced into the arms' array namespace first.
 def ITE(cond, then_value, else_value):
     if isinstance(cond, (bool, _np.bool_)):
         return then_value if cond else else_value
+    if not hasattr(cond, '__cuda_array_interface__'):
+        for arm in (then_value, else_value):
+            if hasattr(arm, '__cuda_array_interface__'):
+                import cupy
+                cond = cupy.asarray(cond)
+                break
     return _np.where(cond, then_value, else_value)
 
 

@@ -68,6 +68,31 @@ def test_cholesky(implementation, dtype, storage):
     assert (np.linalg.norm(cholesky_ref - B) / np.linalg.norm(cholesky_ref)) < rtol
 
 
+def test_cholesky_cupy_expansion_batched_strides():
+    """ExpandCholeskyCuPy on a leading-singleton (batched) input: the nested
+    ``_a``/``_b`` strides must be filtered to the kept 2 dims, not the outer
+    array's full 3-stride list (otherwise add_array fails on the 2-D shape)."""
+    from dace.libraries.linalg.nodes.cholesky import ExpandCholeskyCuPy
+
+    n = 4
+    sdfg = dace.SDFG("chol_batched")
+    sdfg.add_array("xin", [1, n, n], dace.float64, storage=dace.StorageType.GPU_Global)
+    sdfg.add_array("xout", [n, n], dace.float64, storage=dace.StorageType.GPU_Global)
+    state = sdfg.add_state()
+    xin = state.add_read("xin")
+    xout = state.add_write("xout")
+    node = Cholesky("cholesky", lower=True)
+    node.implementation = "CuPy"
+    state.add_memlet_path(xin, node, dst_conn="_a", memlet=Memlet(data="xin", subset=f"0, 0:{n}, 0:{n}"))
+    state.add_memlet_path(node, xout, src_conn="_b", memlet=Memlet(data="xout", subset=f"0:{n}, 0:{n}"))
+
+    nsdfg = ExpandCholeskyCuPy.expansion(node, state, sdfg)
+    assert tuple(nsdfg.arrays["_a"].shape) == (n, n)
+    assert len(nsdfg.arrays["_a"].strides) == 2
+    assert tuple(nsdfg.arrays["_a"].strides) == (n, 1)
+    assert len(nsdfg.arrays["_b"].strides) == 2
+
+
 ###############################################################################
 
 if __name__ == "__main__":
@@ -75,3 +100,4 @@ if __name__ == "__main__":
     test_cholesky("MKL", dace.float64, dace.StorageType.Default)
     test_cholesky("cuSolverDn", dace.float32, dace.StorageType.GPU_Global)
     test_cholesky("cuSolverDn", dace.float64, dace.StorageType.GPU_Global)
+    test_cholesky_cupy_expansion_batched_strides()

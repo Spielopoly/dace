@@ -139,10 +139,19 @@ class ExpandCholeskyCuPy(ExpandTransformation):
 
         inp_desc, inp_shape, out_desc, out_shape = node.validate(parent_sdfg, parent_state)
 
+        # ``inp_shape``/``out_shape`` are the *squeezed* 2-D memlet shapes, so
+        # the strides must be filtered to the kept (non-squeezed) dims as well
+        # (mirrors ExpandSolveCuPy): the full outer strides would mismatch the
+        # 2-D shape for batched / leading-singleton operands (e.g. A[0, :, :]).
+        in_subset = copy.deepcopy(next(e.data.subset for e in parent_state.in_edges(node) if e.dst_conn == '_a'))
+        out_subset = copy.deepcopy(next(e.data.subset for e in parent_state.out_edges(node) if e.src_conn == '_b'))
+        in_strides = [inp_desc.strides[d] for d in in_subset.squeeze()]
+        out_strides = [out_desc.strides[d] for d in out_subset.squeeze()]
+
         nsdfg = dace.SDFG(node.label + '_cupy')
         nstate = nsdfg.add_state()
-        nsdfg.add_array('_a', inp_shape, inp_desc.dtype, strides=inp_desc.strides, storage=inp_desc.storage)
-        nsdfg.add_array('_b', out_shape, out_desc.dtype, strides=out_desc.strides, storage=out_desc.storage)
+        nsdfg.add_array('_a', inp_shape, inp_desc.dtype, strides=in_strides, storage=inp_desc.storage)
+        nsdfg.add_array('_b', out_shape, out_desc.dtype, strides=out_strides, storage=out_desc.storage)
 
         a_in = cupy_in_wrap('__a', inp_desc.storage)
         lines = ['import cupy', f'__L = cupy.linalg.cholesky({a_in})']

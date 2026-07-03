@@ -203,5 +203,44 @@ class TestIntCeilFloorSemantics:
         assert isinstance(mod.int_floor(7, 2), int) and mod.int_floor(7, 2) == 3
 
 
+class TestITE:
+    """``ITE`` branches scalars directly and dispatches array conditions
+    through ``np.where`` (which reaches cupy via __array_function__)."""
+
+    @staticmethod
+    def _load_mod():
+        import importlib.util
+        import pathlib
+        path = pathlib.Path(dace.__file__).parent / "codegen" / "py" / "sympy_function_redefinitions.py"
+        spec = importlib.util.spec_from_file_location("sfr_ite_test", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_scalar_condition_branches(self):
+        mod = self._load_mod()
+        assert mod.ITE(True, 1, 2) == 1
+        assert mod.ITE(False, 1, 2) == 2
+
+    def test_host_array_condition(self):
+        mod = self._load_mod()
+        cond = np.array([True, False, True])
+        out = mod.ITE(cond, np.array([1, 1, 1]), np.array([2, 2, 2]))
+        np.testing.assert_array_equal(out, [1, 2, 1])
+
+    @pytest.mark.gpu
+    def test_host_condition_device_arms_coerced(self):
+        """A host (numpy) condition with device (cupy) arms: the condition is
+        coerced into the arms' namespace so np.where dispatches to cupy."""
+        cupy = pytest.importorskip("cupy")
+        mod = self._load_mod()
+        cond = np.array([True, False, True])  # host
+        then_v = cupy.asarray([10.0, 10.0, 10.0])  # device
+        else_v = cupy.asarray([20.0, 20.0, 20.0])
+        out = mod.ITE(cond, then_v, else_v)
+        assert isinstance(out, cupy.ndarray)
+        np.testing.assert_array_equal(cupy.asnumpy(out), [10.0, 20.0, 10.0])
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
