@@ -196,6 +196,20 @@ def _matching_outer_connector(inner_conn: str) -> str:
     return _SCOPE_IN_PREFIX + inner_conn[len(_SCOPE_OUT_PREFIX):]
 
 
+def _is_scalar_buffer_name(name: str, desc: data.Data) -> bool:
+    """Whether ``name`` is bound as a 0-d numpy scalar buffer at runtime.
+
+    Mirrors ``PythonCodeGen._is_scalar_buffer``: non-transient Scalar
+    arguments are marshalled as 0-d numpy arrays; transient Scalars are
+    plain Python values.
+
+    :param name: The data name.
+    :param desc: The data descriptor.
+    :returns: True for non-transient, non-member Scalar descriptors.
+    """
+    return isinstance(desc, data.Scalar) and not desc.transient and '.' not in name
+
+
 def _array_runtime_name(sdfg: "SDFG", name: str) -> str:
     """Return the runtime variable name for a data array.
 
@@ -690,29 +704,33 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
             ``False`` for GPU_Global -> CPU_Heap.
         :param callsite_stream: Stream for call-site code.
         """
+        src_desc = sdfg.arrays[src_node.data]
+        dst_desc = sdfg.arrays[dst_node.data]
+
         # Build source expression (with optional subset).
         src_expr = src_node.data
-        if memlet.src_subset is not None:
+        if not isinstance(src_desc, data.Scalar) and memlet.src_subset is not None:
             src_subset_str = self._subset_to_python(memlet.src_subset)
             if src_subset_str:
                 src_expr = f"{src_node.data}[{src_subset_str}]"
 
-        # Host-side SCALAR endpoints need value semantics: ``.set``/``.get``
-        # (and plain assignment) require arrays, and assigning a cupy 0-d into
-        # a host scalar (or a numpy value into a device slice) fails at runtime.
-        src_desc = sdfg.arrays[src_node.data]
-        dst_desc = sdfg.arrays[dst_node.data]
+        # Host-side Scalars are Python values or 0-d buffers, not arrays:
+        # ``.set()``/``.get(out=...)`` do not apply to them.
         if not cpu_to_gpu and isinstance(dst_desc, data.Scalar):
+            # GPU element -> host scalar. ``.item()`` transfers and unwraps.
             value_expr = f"{src_expr}.item()"
-            if dst_desc.transient:
-                # Plain Python local: rebinding is the correct write.
-                callsite_stream.write(f"{dst_node.data} = {value_expr}", cfg, state_id)
-            else:
-                # Non-transient scalars are 0-d numpy buffers (caller-aliased).
+            if _is_scalar_buffer_name(dst_node.data, dst_desc):
                 callsite_stream.write(f"{dst_node.data}[...] = {value_expr}", cfg, state_id)
+            else:
+                callsite_stream.write(f"{dst_node.data} = {value_expr}", cfg, state_id)
             return
         if cpu_to_gpu and isinstance(src_desc, data.Scalar):
-            value_expr = src_node.data if src_desc.transient else f"{src_node.data}.item()"
+            # Host scalar -> GPU element: broadcast assignment (``.set()``
+            # requires an array source).
+            if _is_scalar_buffer_name(src_node.data, src_desc):
+                value_expr = f"{src_node.data}.item()"
+            else:
+                value_expr = src_node.data
             dst_subset_str = self._subset_to_python(memlet.dst_subset) if memlet.dst_subset is not None else ""
             dst_expr = f"{dst_node.data}[{dst_subset_str or '...'}]"
             callsite_stream.write(f"{dst_expr} = {value_expr}", cfg, state_id)
@@ -729,7 +747,15 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
             dst_lhs = f"{dst_node.data}"
 
         if cpu_to_gpu:
-            callsite_stream.write(f"{dst_lhs}.set({src_expr})", cfg, state_id)
+            if isinstance(src_desc, data.Scalar):
+                # Host scalar -> GPU: broadcast-assign the value (cupy
+                # supports scalar assignment); ``.set()`` needs an ndarray.
+                if _is_scalar_buffer_name(src_node.data, src_desc):
+                    src_expr = f"{src_node.data}[()]"
+                target = dst_lhs if dst_lhs != dst_node.data else f"{dst_node.data}[...]"
+                callsite_stream.write(f"{target} = {src_expr}", cfg, state_id)
+            else:
+                callsite_stream.write(f"{dst_lhs}.set({src_expr})", cfg, state_id)
         else:
             callsite_stream.write(f"{src_expr}.get(out={dst_lhs})", cfg, state_id)
 
@@ -1778,6 +1804,38 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
     # Scope generation (kernel wrapper + launch)
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _launch_arg_expr(sdfg: "SDFG", name: str, is_output: bool) -> str:
+        """Return the ``ct.launch`` argument expression for a data name.
+
+        Input-only Scalar arguments are unwrapped to native Python scalars:
+        at runtime they may be 0-d numpy buffers (scalar SDFG arguments),
+        numpy scalars, or 0-d cupy arrays (values read from GPU memory), all
+        of which ``ct.launch`` rejects. Arrays and kernel-written scalars are
+        passed through unchanged.
+
+        :param sdfg: The SDFG containing the data descriptor.
+        :param name: The data name.
+        :param is_output: Whether the kernel writes to this data.
+        :returns: The Python expression string for the launch argument.
+        """
+        expr = _array_runtime_name(sdfg, name)
+        desc = sdfg.arrays.get(name)
+        if isinstance(desc, data.Scalar) and not is_output:
+            if _is_float_scalar(desc):
+                # Float scalars go through device memory as 1-element arrays
+                # (``cupy.asarray(x).reshape(1)`` -- a no-copy view for
+                # device-resident values) and are bound as 0-d tiles
+                # in-kernel: by-value floats are typed float32 by cuda.tile,
+                # silently losing float64 precision.
+                np_name = desc.dtype.as_numpy_dtype().name
+                return f"cupy.asarray({expr}, dtype=numpy.{np_name}).reshape(1)"
+            # Integer/bool scalars are passed by value; ``.item()`` covers
+            # cupy 0-d arrays, numpy scalars, and 0-d numpy buffers; plain
+            # Python numbers pass through.
+            return f"({expr}.item() if hasattr({expr}, 'item') else {expr})"
+        return expr
+
     def generate_scope(self, sdfg: "SDFG", cfg: object, dfg_scope: object, state_id: int,
                        function_stream: PythonCodeIOStream, callsite_stream: PythonCodeIOStream) -> None:
         """Generate the cuTile kernel wrapper and launch call for a map scope.
@@ -1846,27 +1904,10 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
         # host-side value may be a 0-d device array (e.g. a scalar computed by
         # host tasklets from ``gpu_arr[i]``), which the cuda.tile kernel cannot
         # use as an arithmetic operand (and 0-d ``ct.load`` crashes the tile
-        # compiler).
-        #
-        # * Float scalars go through device memory as 1-element arrays
-        #   (``cupy.asarray(x).reshape(1)`` — a no-copy view for device-resident
-        #   values) and are bound as 0-d tiles in-kernel: by-value floats are
-        #   typed float32 by cuda.tile, silently losing float64 precision.
-        # * Integer/bool scalars are passed by value; ``.item()`` covers cupy
-        #   0-d arrays and numpy scalars, plain Python numbers pass through.
-        output_set = set(output_arrays)
-        launch_args = []
-        for n in deduped_arrays:
-            expr = _array_runtime_name(sdfg, n)
-            desc = sdfg.arrays.get(n)
-            if isinstance(desc, data.Scalar) and n not in output_set:
-                if _is_float_scalar(desc):
-                    np_name = desc.dtype.as_numpy_dtype().name
-                    expr = f"cupy.asarray({expr}, dtype=numpy.{np_name}).reshape(1)"
-                else:
-                    expr = f"({expr}.item() if hasattr({expr}, 'item') else {expr})"
-            launch_args.append(expr)
-        launch_args += free_syms
+        # compiler). See ``_launch_arg_expr`` for the per-dtype normalization.
+        launch_args = [
+            self._launch_arg_expr(sdfg, n, is_output=n in output_arrays) for n in deduped_arrays
+        ] + free_syms
         args_tuple = (f"({', '.join(launch_args)},)" if len(launch_args) == 1 else f"({', '.join(launch_args)})")
         instrumented = (entry.map.instrument != dtypes.InstrumentationType.No_Instrumentation)
 

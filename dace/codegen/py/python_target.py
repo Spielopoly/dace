@@ -581,7 +581,7 @@ class PythonCodeGen(PythonTargetCodeGenerator):
 
     def _nested_bridge_value_expr(self, name: str, desc: data.Data) -> str:
         if isinstance(desc, data.Scalar):
-            return f'{name}[...]'
+            return f'{name}[()]'
         if self._is_singleton_buffer_desc(desc):
             if len(desc.shape) == 0:
                 return f'{name}[()]'
@@ -601,13 +601,14 @@ class PythonCodeGen(PythonTargetCodeGenerator):
             if symname in free_symbols and symname not in node.sdfg.constants and symname not in runtime_defined_names
         ]
 
-    def _data_expr(self, name: str, desc: data.Data, subset=None) -> str:
+    def _data_expr(self, name: str, desc: data.Data, subset=None, is_write: bool = False) -> str:
         # TODO: Pass sdfg as argument instead of relying on self._current_sdfg
         runtime_name = self._runtime_data_name(self._current_sdfg, name) if hasattr(self, '_current_sdfg') else name
         return pyutils.data_access_expression(runtime_name,
                                               desc,
                                               self._normalize_subset(subset),
-                                              scalar_buffer=self._is_scalar_buffer(name, desc))
+                                              scalar_buffer=self._is_scalar_buffer(name, desc),
+                                              is_write=is_write)
 
     def _read_expr(self, sdfg: SDFG, memlet: mmlt.Memlet, data_name: Optional[str] = None, subset=None) -> str:
         name = data_name or memlet.data
@@ -630,7 +631,7 @@ class PythonCodeGen(PythonTargetCodeGenerator):
         self._current_sdfg = sdfg
         # TODO: After changing self._data_expr to take sdfg as argument, remove the need to set self._current_sdfg here
         try:
-            return self._data_expr(data_name, desc, actual_subset)
+            return self._data_expr(data_name, desc, actual_subset, is_write=True)
         finally:
             self._current_sdfg = previous_sdfg
 
