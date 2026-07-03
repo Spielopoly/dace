@@ -4,9 +4,13 @@
 ``_emit_scalar_bridge_binding`` binds a Register scalar bridge (staged by the
 vectorizer's ``stage_constant_access``) to its traced source. The vectorizer
 can stage a single ELEMENT of an array (``src_subset`` like ``aa[0, j]``); the
-binding must then index the source (``aa_const = aa[0, j]``) instead of
-aliasing the whole tensor. Untraceable bridges must warn, not silently emit
-nothing.
+binding must then load exactly that element as a 0-d tile
+(``aa_const = ct.load(aa, (0, j), shape=())``) — cuTile arrays are not
+subscriptable in-kernel and the propagated outer subset is a non-constant
+slice the cuda.tile compiler rejects. Float scalar sources also bind via a
+0-d tile load (the launch site passes them as 1-element device arrays to keep
+f64 precision); integer scalars keep the plain rename. Untraceable bridges
+must warn, not silently emit nothing.
 """
 import warnings as _warnings
 
@@ -63,29 +67,28 @@ def _make_sdfg_with_bridge(name: str, src_memlet: Memlet, add_symbol: str = None
 
 
 class TestArrayElementBridge:
-    """Array-element sources must be bound with a ``ct.load`` at the staged
-    element: cuda.tile arrays are not subscriptable inside kernels, so a raw
-    ``aa[0, 1]`` subscript would raise at kernel compile time."""
+    """Array-element sources must be bound with a 0-d ``ct.load`` at the
+    memlet subset (arrays are not subscriptable inside a ct kernel)."""
 
     def test_constant_element_index(self):
-        """``aa[0, 1]`` staged into the bridge -> a (1, 1)-shaped ``ct.load``."""
+        """``aa[0, 1]`` staged -> ``aa_const = ct.load(aa, (0, 1), shape=())``."""
         sdfg, state, bridge = _make_sdfg_with_bridge("bridge_const_idx", Memlet(data="aa", subset="0, 1"))
-        code = _emit_bridge_binding(sdfg, state, bridge)
-        assert "aa_const = ct.reshape(ct.load(aa, index=((0), (1),), shape=(1, 1,)), (1,))" in code
-        # Neither the whole-tensor alias nor a raw subscript may be emitted.
+        code = _emit_bridge_binding(sdfg, state, bridge).replace(" ", "")
+        assert "aa_const=ct.load(aa,(0,1,),shape=())" in code
+        # The whole-tensor alias must NOT be emitted.
         assert "aa_const = aa\n" not in code
         assert "aa_const = aa[" not in code
 
     def test_symbolic_element_index(self):
-        """``aa[0, j]`` with a free symbol loads at the symbolic index."""
+        """``aa[0, j]`` -> ``aa_const = ct.load(aa, (0, j), shape=())``."""
         sdfg, state, bridge = _make_sdfg_with_bridge("bridge_sym_idx", Memlet(data="aa", subset="0, j"), add_symbol="j")
-        code = _emit_bridge_binding(sdfg, state, bridge)
-        assert "aa_const = ct.reshape(ct.load(aa, index=((0), (j),), shape=(1, 1,)), (1,))" in code
+        code = _emit_bridge_binding(sdfg, state, bridge).replace(" ", "")
+        assert "aa_const=ct.load(aa,(0,j,),shape=())" in code
 
     def test_per_iteration_element_uses_inner_subset(self):
         """The binding must index by the INNER (per-iteration) memlet subset.
 
-        The outer edge spans the whole map range (``aa[0:4, 0:8]``); the staged
+        The outer edge spans the whole map range (``aa[0:4, 3]``); the staged
         element varies per iteration (``aa[tile_i, 3]``). Using the outer
         subset would emit a non-constant slice of the wrong elements
         (softmax/conv2d_bias regression).
@@ -102,18 +105,20 @@ class TestArrayElementBridge:
         me.add_out_connector("OUT_aa")
         state.add_edge(aa_node, None, me, "IN_aa", Memlet(data="aa", subset="0:4, 3"))
         state.add_edge(me, "OUT_aa", bridge, None, Memlet(data="aa", subset="tile_i, 3"))
-        code = _emit_bridge_binding(sdfg, state, bridge)
-        assert "aa_const = ct.reshape(ct.load(aa, index=((tile_i), (3),), shape=(1, 1,)), (1,))" in code
+        code = _emit_bridge_binding(sdfg, state, bridge).replace(" ", "")
+        assert "aa_const=ct.load(aa,(tile_i,3,),shape=())" in code
 
-    def test_non_single_element_subset_warns(self):
-        """A multi-element staged subset cannot be a scalar bridge: warn."""
+    def test_non_single_element_subset_warns_and_uses_begins(self):
+        """A multi-element staged subset warns and anchors at the per-dim
+        begins (best-effort scalar bridge)."""
         sdfg, state, bridge = _make_sdfg_with_bridge("bridge_multi_elem", Memlet(data="aa", subset="0:2, 1"))
-        with pytest.warns(UserWarning, match="non-single-element"):
+        with pytest.warns(UserWarning, match="non-element"):
             code = _emit_bridge_binding(sdfg, state, bridge)
-        assert "aa_const =" not in code
+        assert "ct.load(aa, (0, 1,), shape=())" in code
 
-    def test_scalar_source_binds_bare_name(self):
-        """A true scalar source keeps the plain rename (``alpha_const = alpha``)."""
+    def test_float_scalar_source_binds_scalar_tile_load(self):
+        """A float scalar source is a 1-element device array at runtime and
+        binds via a 0-d tile load (f64 precision; by-value floats are f32)."""
         sdfg = SDFG("bridge_scalar_src")
         sdfg.backend = dtypes.BackendLanguage.Python
         sdfg.add_scalar("alpha", dace.float64)
@@ -123,9 +128,23 @@ class TestArrayElementBridge:
         a_node = state.add_read("alpha")
         bridge = state.add_access("alpha_const")
         state.add_memlet_path(a_node, me, bridge, memlet=Memlet(data="alpha", subset="0"))
+        code = _emit_bridge_binding(sdfg, state, bridge).replace(" ", "")
+        assert "alpha_const=ct.load(alpha,(0,),shape=())" in code
+
+    def test_int_scalar_source_binds_bare_name(self):
+        """An integer scalar source keeps the plain rename (passed by value)."""
+        sdfg = SDFG("bridge_int_scalar_src")
+        sdfg.backend = dtypes.BackendLanguage.Python
+        sdfg.add_scalar("kk", dace.int64)
+        sdfg.add_scalar("kk_const", dace.int64, storage=StorageType.Register, transient=True)
+        state = sdfg.add_state("main")
+        me, _mx = state.add_map("cutile_map", {"tile_i": "0:8"}, schedule=ScheduleType.CuTile)
+        a_node = state.add_read("kk")
+        bridge = state.add_access("kk_const")
+        state.add_memlet_path(a_node, me, bridge, memlet=Memlet(data="kk", subset="0"))
         code = _emit_bridge_binding(sdfg, state, bridge)
-        assert "alpha_const = alpha" in code
-        assert "alpha[" not in code
+        assert "kk_const = kk" in code
+        assert "kk[" not in code
 
 
 class TestBridgeWarnings:

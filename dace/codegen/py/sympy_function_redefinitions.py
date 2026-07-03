@@ -15,6 +15,16 @@ def int_floor(x, y=1):
     return x // y
 
 
+# Sympy boolean if-then-else (emitted verbatim by boundary-ITE tasklets, e.g.
+# ``_o = ITE(cond, _new, _old)``). A plain-bool condition branches directly
+# (cupy.where rejects scalar conditions); array conditions go through
+# ``np.where`` (dispatches to cupy via __array_function__).
+def ITE(cond, then_value, else_value):
+    if isinstance(cond, (bool, _np.bool_)):
+        return then_value if cond else else_value
+    return _np.where(cond, then_value, else_value)
+
+
 # Math functions emitted verbatim by DaCe tasklets (e.g. ``np.sqrt`` lowered to
 # ``__out = sqrt(__in1)``). The canonical name set comes from the tasklet
 # bodies in ``dace/frontend/python/replacements/`` (mostly ``ufunc.py``) and

@@ -11,6 +11,19 @@ and uses :func:`tile_offset` to flatten the tile transient's index
 from typing import List, Sequence
 
 
+def ct_dtype_name(dtype) -> str:
+    """``cuda.tile`` dtype attribute name for a DaCe typeclass.
+
+    ``ct`` exposes numpy-style names (``ct.float64``, ``ct.int32``, ...);
+    only ``bool`` is spelled ``bool_``.
+
+    :param dtype: A :class:`dace.dtypes.typeclass`.
+    :returns: The attribute name on the ``cuda.tile`` module.
+    """
+    name = dtype.as_numpy_dtype().name
+    return "bool_" if name == "bool" else name
+
+
 def nested_loops(widths: Sequence[int], body: str, indent: str = "    ") -> str:
     """Wrap ``body`` in a K-fold nested for-loop iterating per-dim
     lane indices ``__l0, __l1, ...``.
