@@ -12,7 +12,10 @@ tileops-specific concerns that the generic GPU transform does not cover.
 Required order::
 
     CuTileValidateTiles           # tile-op anchors exist; widths are powers of 2
+    mark_tile_op_memlets_allow_oob  # 2b: allow_oob on tileops-adjacent memlet trees
     sdfg.apply_gpu_transformations(...)  # GPU scheduling, storage, data copies
+    clamp_propagated_oob_memlets  # 3b: re-clamp propagated tileops OOB subsets
+    sdfg.simplify()               # 3c: simplify + validate
     GPUDeviceToCuTile             # re-stamp tileops-anchored maps GPU_Device -> CuTile
     CuTileSetTileStorage          # Register tile transients -> CuTile_Tile
     CuTileSetLibraryImplementations  # non-tileops lib nodes (BLAS MatMul) -> CuPy, expand
@@ -49,6 +52,14 @@ from dace.transformation import pass_pipeline as ppl
 #: Scope-dictionary cache type: per-state ``state.scope_dict()`` results.
 _ScopeCache = Dict[SDFGState, Dict[nodes.Node, Optional[nodes.Node]]]
 
+#: Maximum provable map volume (total trip count) for which a residual
+#: ``GPU_Device`` map is demoted to ``Sequential`` silently.  Such tiny maps
+#: are the intended scalar-control steps of sequential solvers (e.g.
+#: ``cholesky`` / ``trisolv``); anything larger (or symbolic, hence not
+#: provably tiny) compiles to a pathological per-element host loop over GPU
+#: data and is diagnosed via :func:`_warn_or_raise`.
+_TINY_DEMOTION_VOLUME = 4
+
 
 def _tile_node_types() -> Tuple[Type[nodes.LibraryNode], ...]:
     """Return the tuple of all tileops library-node classes.
@@ -59,8 +70,8 @@ def _tile_node_types() -> Tuple[Type[nodes.LibraryNode], ...]:
     :returns: All tile-op ``LibraryNode`` classes exported by
         :mod:`dace.libraries.tileops.nodes` (including :class:`TileIota`).
     """
-    from dace.libraries.tileops.nodes import (TileBinop, TileIota, TileITE, TileLoad, TileMaskGen, TileMMA,
-                                              TileReduce, TileStore, TileUnop)
+    from dace.libraries.tileops.nodes import (TileBinop, TileIota, TileITE, TileLoad, TileMaskGen, TileMMA, TileReduce,
+                                              TileStore, TileUnop)
     return (TileBinop, TileIota, TileITE, TileLoad, TileMaskGen, TileMMA, TileReduce, TileStore, TileUnop)
 
 
@@ -90,6 +101,178 @@ def _collect_non_tile_library_nodes(sdfg: SDFG) -> List[Tuple[nodes.LibraryNode,
     tile_types = _tile_node_types()
     return [(node, graph) for node, graph in sdfg.all_nodes_recursive()
             if isinstance(node, nodes.LibraryNode) and not isinstance(node, tile_types)]
+
+
+def _collect_tileops_adjacent_edges(sdfg: SDFG) -> Tuple[Set[int], Set[int]]:
+    """Find every edge whose memlet tree reaches a tileops library node.
+
+    Walks the memlet tree of each tileops-incident edge and follows
+    non-transient (connector) arrays across NestedSDFG boundaries up to the
+    top-level SDFG, covering the ``nest_map_bodies=True`` descent where the
+    tileops nodes live inside a NestedSDFG body.
+
+    :param sdfg: SDFG to search (NestedSDFGs included).
+    :returns: ``(adjacent, boundary)`` sets of edge ``id()``s: ``adjacent``
+        contains every edge in a tileops-reaching memlet tree; ``boundary``
+        is the subset that are NestedSDFG boundary edges carrying a
+        tileops-fed connector (their full-``W`` window subsets must never be
+        narrowed below ``W`` — the inner connector array is ``W`` wide).
+    """
+    adjacent: Set[int] = set()
+    boundary: Set[int] = set()
+    worklist: List[Tuple[Any, SDFGState]] = []
+    for node, state in _collect_tile_nodes(sdfg):
+        worklist.extend((e, state) for e in state.in_edges(node))
+        worklist.extend((e, state) for e in state.out_edges(node))
+    while worklist:
+        edge, state = worklist.pop()
+        if id(edge) in adjacent:
+            continue
+        owning = state.sdfg
+        # Mark the whole memlet tree; collect connector (non-transient)
+        # arrays it touches for the NestedSDFG boundary crossing below.
+        reached_connectors: Set[str] = set()
+        for tree_edge in state.memlet_tree(edge):
+            adjacent.add(id(tree_edge))
+            if tree_edge.data is not None and tree_edge.data.data is not None:
+                desc = owning.arrays.get(tree_edge.data.data)
+                if desc is not None and not desc.transient:
+                    reached_connectors.add(tree_edge.data.data)
+        nsdfg_node = owning.parent_nsdfg_node
+        parent_state = owning.parent
+        if nsdfg_node is None or parent_state is None:
+            continue
+        for pe in parent_state.in_edges(nsdfg_node):
+            if pe.dst_conn in reached_connectors and id(pe) not in adjacent:
+                boundary.add(id(pe))
+                worklist.append((pe, parent_state))
+        for pe in parent_state.out_edges(nsdfg_node):
+            if pe.src_conn in reached_connectors and id(pe) not in adjacent:
+                boundary.add(id(pe))
+                worklist.append((pe, parent_state))
+    return adjacent, boundary
+
+
+def _clamp_subset_to_shape(subset: Any, desc: data.Data) -> Tuple[Any, int]:
+    """Narrow the provably-OOB dimensions of ``subset`` to ``desc``'s domain.
+
+    :param subset: A :class:`~dace.subsets.Range` to clamp.
+    :param desc: The data descriptor providing shape and offset.
+    :returns: ``(new_subset, num_clamped_dims)``; ``new_subset`` is the input
+        object when nothing changed.
+    """
+    from dace import subsets as sbs
+
+    new_ranges = list(subset.ranges)
+    num_clamped = 0
+    for dim, (maxel, size, off) in enumerate(zip(subset.max_element(), desc.shape, desc.offset)):
+        # Mirror validate_state's provable-OOB check.
+        if ((maxel + off) >= size) == True:  # noqa: E712 -- sympy provability check
+            begin, _, step = new_ranges[dim]
+            new_ranges[dim] = (begin, size - 1 - off, step)
+            num_clamped += 1
+    if num_clamped:
+        return sbs.Range(new_ranges), num_clamped
+    return subset, 0
+
+
+def clamp_propagated_oob_memlets(sdfg: SDFG) -> int:
+    """Clamp provably out-of-bounds *tileops* memlet subsets to the array domain.
+
+    The tile-op vectorizer emits full-width tile memlets (``x[i, j:j+W]``)
+    whose accesses are mask-guarded at runtime. When a tiled dimension starts
+    near the array end (e.g. a single-column assignment ``x[:, N-1] = v``),
+    memlet propagation unions these to a *provably* out-of-bounds outer subset
+    (``x[0:N, 0:N+W-1]``), which SDFG validation rejects (e.g. inside
+    ``apply_gpu_transformations()``'s ``simplify()``). Since the mask
+    guarantees no element beyond the array end is touched, the declared
+    footprint is soundly narrowed to the array domain.
+
+    The clamp is gated: only memlets already marked ``allow_oob`` (by
+    :func:`mark_tile_op_memlets_allow_oob`) or whose memlet tree reaches a
+    tileops library node — including across NestedSDFG boundaries — are
+    narrowed. Any *other* provably-OOB memlet is a genuine bug with no mask
+    guarding it: it is left untouched (with a diagnostic ``UserWarning``
+    naming the memlet) so downstream validation rejects it loudly instead of
+    silently compiling a truncated footprint.
+
+    Both ``subset`` and ``other_subset`` are clamped, each against its own
+    endpoint's descriptor (resolved from the memlet path the way
+    ``validate_state`` does). After narrowing, ``volume`` is recomputed from
+    the new ``subset``.
+
+    Two kinds of edges are never narrowed:
+
+    * Edges incident to library nodes: tile-op expansions require their own
+      memlet subsets to match ``widths`` exactly (full-tile write contract).
+    * NestedSDFG boundary edges whose connector feeds a tileops node
+      (``nest_map_bodies=True`` descent): the inner connector array is a full
+      ``W``-wide window, so the boundary subset must stay ``W`` wide. When
+      provably OOB they are marked ``allow_oob`` instead of clamped.
+
+    :param sdfg: SDFG to fix up in place (NestedSDFGs included).
+    :returns: Number of clamped memlet dimensions.
+    """
+    from dace import subsets as sbs
+
+    adjacent, boundary = _collect_tileops_adjacent_edges(sdfg)
+    clamped = 0
+    for nsdfg in sdfg.all_sdfgs_recursive():
+        for state in nsdfg.states():
+            for e in state.edges():
+                if isinstance(e.src, nodes.LibraryNode) or isinstance(e.dst, nodes.LibraryNode):
+                    continue
+                memlet = e.data
+                if memlet is None or memlet.data is None or memlet.data not in nsdfg.arrays:
+                    continue
+                subset = memlet.subset
+                if not isinstance(subset, sbs.Range):
+                    continue
+                desc = nsdfg.arrays[memlet.data]
+                if subset.dims() != len(desc.shape):
+                    continue
+
+                # Resolve the other_subset endpoint's descriptor the way
+                # validate_state does: from the memlet path endpoints.
+                other_desc = None
+                if memlet.other_subset is not None and isinstance(memlet.other_subset, sbs.Range):
+                    path = state.memlet_path(e)
+                    src_node, dst_node = path[0].src, path[-1].dst
+                    other_node = (dst_node if isinstance(dst_node, nodes.AccessNode) and memlet.data != dst_node.data
+                                  else src_node)
+                    if isinstance(other_node, nodes.AccessNode) and other_node.data in nsdfg.arrays:
+                        cand = nsdfg.arrays[other_node.data]
+                        if memlet.other_subset.dims() == len(cand.shape):
+                            other_desc = cand
+
+                new_subset, n_sub = _clamp_subset_to_shape(subset, desc)
+                new_other, n_other = (_clamp_subset_to_shape(memlet.other_subset, other_desc)
+                                      if other_desc is not None else (memlet.other_subset, 0))
+                if n_sub == 0 and n_other == 0:
+                    continue
+
+                if id(e) in boundary:
+                    # NestedSDFG boundary edge feeding a tileops node: the
+                    # full-W window must stay W wide (the inner connector
+                    # array is W wide); defer the OOB to the runtime mask.
+                    memlet.allow_oob = True
+                    continue
+                if not (memlet.allow_oob or id(e) in adjacent):
+                    # Genuine OOB with no tileops mask anywhere: leave it
+                    # for validation to reject loudly.
+                    warnings.warn(f"clamp_propagated_oob_memlets: memlet '{memlet}' (edge {e.src} -> {e.dst}, "
+                                  f"state '{state.label}', SDFG '{nsdfg.label}') is provably out-of-bounds but is "
+                                  "neither tileops-adjacent nor marked allow_oob; not clamping -- validation "
+                                  "will reject it")
+                    continue
+
+                if n_sub:
+                    memlet.subset = new_subset
+                    memlet.volume = new_subset.num_elements()
+                if n_other:
+                    memlet.other_subset = new_other
+                clamped += n_sub + n_other
+    return clamped
 
 
 def _enclosing_map_chain(node: nodes.Node,
@@ -166,6 +349,114 @@ def _warn_or_raise(message: str, strict: bool) -> None:
     warnings.warn(message)
 
 
+def mark_tile_op_memlets_allow_oob(sdfg: SDFG) -> int:
+    """Set ``allow_oob=True`` on every memlet adjacent to a tileops node.
+
+    Masked tile ops address a full ``W``-wide window whose tail lanes are
+    inactive (the ``full_mask`` remainder strategy); at a non-divisible or
+    single-point boundary the window's SUBSET exceeds the array bounds even
+    though the masked runtime accesses (``ct.load`` / ``ct.gather`` /
+    ``ct.scatter``) never touch the out-of-bounds lanes.  SDFG validation
+    would reject such memlets ("Memlet subset out-of-bounds"), notably
+    inside ``apply_gpu_transformations()`` whose simplify step re-propagates
+    them outward.  Marking the LEAF memlets suffices for future
+    propagations (``propagate_memlet`` shallow-copies the leaf, inheriting
+    ``allow_oob``); the current memlet trees are marked too.
+
+    CAVEAT (why :func:`clamp_propagated_oob_memlets` remains load-bearing):
+    ``propagate_subset`` builds the propagated memlet as
+    ``copy.copy(memlets[0])`` of the AGGREGATED memlet list, so with
+    ``union_inner_edges=True`` a neighboring *unmarked* memlet on the same
+    data can be first in that list and the ``allow_oob`` flag is silently
+    dropped from the propagated result.  The clamp step (3b) re-narrows
+    those re-propagated OOB subsets after ``apply_gpu_transformations()``.
+
+    :param sdfg: The SDFG whose tileops-adjacent memlets are marked.
+    :returns: The number of memlets marked.
+    """
+    marked = 0
+    for node, state in _collect_tile_nodes(sdfg):
+        for edge in list(state.in_edges(node)) + list(state.out_edges(node)):
+            if edge.data is None or edge.data.data is None:
+                continue
+            for tree_edge in state.memlet_tree(edge):
+                if not tree_edge.data.allow_oob:
+                    tree_edge.data.allow_oob = True
+                    marked += 1
+    return marked
+
+
+def _demote_residual_gpu_device_maps(sdfg: SDFG, strict: bool, pass_name: str) -> int:
+    """Demote every remaining ``GPU_Device`` map to ``Sequential``.
+
+    The Python/cuTile backend has no ``GPU_Device`` scope dispatcher, so any
+    such map surviving to code generation raises ``KeyError: GPU_Device``.
+    Demoted maps become host ("driver") Python loops over the ``GPU_Global``
+    (cupy) operands.  Silent only for provably tiny maps (total volume at
+    most :data:`_TINY_DEMOTION_VOLUME` — the intended scalar-control case);
+    larger or symbolic volumes are diagnosed via :func:`_warn_or_raise`
+    first, since the host loop pays one device round-trip per element.
+
+    :param sdfg: The SDFG to re-stamp in place (NestedSDFGs included).
+    :param strict: Whether the large-volume diagnostic raises.
+    :param pass_name: Name of the calling pass (message prefix).
+    :returns: The number of maps demoted.
+    :raises ValueError: When ``strict`` and a residual map is not provably
+        tiny.
+    """
+    demoted = 0
+    for map_node, graph in sdfg.all_nodes_recursive():
+        if not (isinstance(map_node, nodes.MapEntry) and map_node.map.schedule == dtypes.ScheduleType.GPU_Device):
+            continue
+        volume = map_node.map.range.num_elements()
+        try:
+            provably_tiny = int(volume) <= _TINY_DEMOTION_VOLUME
+        except (TypeError, ValueError):
+            provably_tiny = False  # Symbolic volume: not provably tiny.
+        if not provably_tiny:
+            _warn_or_raise(
+                f"{pass_name}: demoting non-tileops GPU_Device map "
+                f"'{map_node.map.label}' (state '{graph.label}', volume {volume}) to "
+                "Sequential: it compiles to a per-element host loop over GPU data "
+                "(one device round-trip per element), which is pathological for "
+                "anything but tiny scalar-control maps", strict)
+        map_node.map.schedule = dtypes.ScheduleType.Sequential
+        demoted += 1
+    return demoted
+
+
+def _diagnose_no_anchors(pass_name: str, sdfg: SDFG, strict: bool) -> None:
+    """Diagnose an SDFG that carries zero tileops anchors.
+
+    Two distinct cases:
+
+    * **BLAS-only configuration** (supported): the SDFG has no tileops nodes
+      but *does* contain other library nodes (e.g. BLAS ``Dot`` / ``MatMul``)
+      that :class:`CuTileSetLibraryImplementations` lowers downstream.  This
+      emits an informational ``UserWarning`` and never raises, even under
+      ``strict``.
+    * **Genuinely empty** (probable user error): no tileops nodes and no
+      other library nodes either — the SDFG was most likely never vectorized.
+      This warns, or raises ``ValueError`` when ``strict``.
+
+    :param pass_name: Name of the calling pass (message prefix).
+    :param sdfg: The anchor-less SDFG being diagnosed.
+    :param strict: Whether the genuinely-empty case raises instead of warning.
+    :raises ValueError: When ``strict`` and the SDFG contains no library
+        nodes at all.
+    """
+    non_tile = _collect_non_tile_library_nodes(sdfg)
+    if non_tile:
+        warnings.warn(f"{pass_name}: no tileops library nodes found, but {len(non_tile)} non-tileops "
+                      "library node(s) are present (BLAS-only configuration); proceeding -- "
+                      "CuTileSetLibraryImplementations lowers them")
+    else:
+        _warn_or_raise(
+            f"{pass_name}: no tileops library nodes found and no other library nodes present; "
+            "the SDFG appears not to have been vectorized -- run "
+            "VectorizeCPUMultiDim(target_isa='CUTILE', expand_tile_nodes=False) first", strict)
+
+
 @properties.make_properties
 class _CuTileLoweringPass(ppl.Pass):
     """Shared base of the cuTile lowering passes.
@@ -209,6 +500,11 @@ class CuTileValidateTiles(_CuTileLoweringPass):
     later passes stamp from), and (b) every anchor's ``widths`` are powers of
     two — a hard ``cuda.tile`` runtime requirement that raises ``ValueError``
     unconditionally (not gated by ``strict``).
+
+    Zero anchors with other library nodes present (the BLAS-only
+    configuration, e.g. ``cholesky`` / ``trisolv`` whose reductions became
+    BLAS ``Dot`` nodes) is a supported case: informational warning only,
+    even under ``strict``.
     """
 
     def apply_pass(self, sdfg: SDFG, pipeline_results: Dict[str, Any]) -> Optional[int]:
@@ -217,15 +513,14 @@ class CuTileValidateTiles(_CuTileLoweringPass):
         :param sdfg: The SDFG to validate (not modified).
         :param pipeline_results: Unused pipeline results.
         :returns: The number of tileops anchors found, or ``None`` if there
-            are none (after warning / raising per ``strict``).
+            are none (after diagnosing per :func:`_diagnose_no_anchors`).
         :raises ValueError: If any anchor has a non-power-of-2 tile width
-            (always), or — when ``strict`` — if no anchors exist.
+            (always), or — when ``strict`` — if no anchors exist and the
+            SDFG has no other library nodes either.
         """
         anchors = _collect_tile_nodes(sdfg)
         if not anchors:
-            _warn_or_raise(
-                "CuTileValidateTiles: no tileops library nodes found; run "
-                "VectorizeCPUMultiDim(target_isa='CUTILE', expand_tile_nodes=False) first", self.strict)
+            _diagnose_no_anchors("CuTileValidateTiles", sdfg, self.strict)
             return None
         for node, _ in anchors:
             for width in node.widths:
@@ -269,8 +564,16 @@ class CuTileSetTileStorage(_CuTileLoweringPass):
             exists.
         """
         if next(_iter_cutile_scopes(sdfg), None) is None:
-            _warn_or_raise("CuTileSetTileStorage: no CuTile-scheduled map found; run sdfg.apply_gpu_transformations() + GPUDeviceToCuTile first",
-                           self.strict)
+            if not _collect_tile_nodes(sdfg) and _collect_non_tile_library_nodes(sdfg):
+                # BLAS-only configuration: no cuTile kernels exist by design;
+                # there is nothing to stamp. Informational, never raises.
+                warnings.warn("CuTileSetTileStorage: no CuTile-scheduled map and no tileops anchors, "
+                              "but non-tileops library nodes are present (BLAS-only configuration); "
+                              "nothing to stamp")
+            else:
+                _warn_or_raise(
+                    "CuTileSetTileStorage: no CuTile-scheduled map found; run "
+                    "sdfg.apply_gpu_transformations() + GPUDeviceToCuTile first", self.strict)
             return None
 
         scope_cache: _ScopeCache = {}
@@ -290,8 +593,7 @@ class CuTileSetTileStorage(_CuTileLoweringPass):
                 if not isinstance(neighbor, nodes.AccessNode):
                     continue
                 desc = owning_arrays.get(neighbor.data)
-                if (isinstance(desc, data.Array) and desc.transient
-                        and desc.storage == dtypes.StorageType.Register):
+                if (isinstance(desc, data.Array) and desc.transient and desc.storage == dtypes.StorageType.Register):
                     _stamp(desc)
 
         # Rule (b): NSDFG boundary propagation (fixpoint).
@@ -310,8 +612,8 @@ class CuTileSetTileStorage(_CuTileLoweringPass):
                         continue
                     outer_arrays = graph.sdfg.arrays
                     inner_arrays = node.sdfg.arrays
-                    boundary = ([(e.dst_conn, e) for e in graph.in_edges(node)] +
-                                [(e.src_conn, e) for e in graph.out_edges(node)])
+                    boundary = ([(e.dst_conn, e) for e in graph.in_edges(node)] + [(e.src_conn, e)
+                                                                                   for e in graph.out_edges(node)])
                     for conn, edge in boundary:
                         if conn is None or edge.data.data is None:
                             continue
@@ -336,8 +638,7 @@ class CuTileSetTileStorage(_CuTileLoweringPass):
             if not isinstance(node, nodes.AccessNode):
                 continue
             desc = graph.sdfg.arrays.get(node.data)
-            if not (isinstance(desc, data.Array) and desc.transient
-                    and desc.storage == dtypes.StorageType.Register):
+            if not (isinstance(desc, data.Array) and desc.transient and desc.storage == dtypes.StorageType.Register):
                 continue
             chain = _enclosing_map_chain(node, graph, scope_cache)
             if any(entry.map.schedule == dtypes.ScheduleType.CuTile for entry, _ in chain):
@@ -352,37 +653,54 @@ class CuTileSetTileStorage(_CuTileLoweringPass):
 @properties.make_properties
 @transformation.explicit_cf_compatible
 class GPUDeviceToCuTile(_CuTileLoweringPass):
-    """Convert GPU_Device-scheduled maps containing tileops anchors to CuTile.
+    """Convert GPU_Device-scheduled maps to CuTile (tileops) or Sequential.
 
     This adapter pass runs AFTER ``sdfg.apply_gpu_transformations()``, which
     stamps top-level maps as ``ScheduleType.GPU_Device`` and inner maps as
-    ``ScheduleType.Sequential``.  This pass re-stamps only those outermost
-    maps that enclose tileops library nodes from ``GPU_Device`` to ``CuTile``,
-    leaving non-tileops maps (e.g. free-tasklet wrappers added by
-    :class:`~dace.transformation.interstate.gpu_transform_sdfg.GPUTransformSDFG`)
-    at their original schedule.
+    ``ScheduleType.Sequential``.  It performs two re-stamping steps:
 
-    The pass is tileops-anchored: for each tileops library node the chain
-    of enclosing maps (walked across NestedSDFG boundaries via
-    :func:`_enclosing_map_chain`) is inspected; if the outermost map has
-    ``ScheduleType.GPU_Device`` it is re-stamped ``ScheduleType.CuTile``.
+    1. **Tileops-anchored -> CuTile.**  For each tileops library node the chain
+       of enclosing maps (walked across NestedSDFG boundaries via
+       :func:`_enclosing_map_chain`) is inspected; if the outermost map has
+       ``ScheduleType.GPU_Device`` it is re-stamped ``ScheduleType.CuTile`` --
+       these become the cuTile kernels.
+    2. **Everything else -> Sequential.**  Any remaining ``GPU_Device`` map is
+       a non-tileops map (e.g. the scalar / small-elementwise control steps of
+       a sequential solver such as ``cholesky`` / ``trisolv`` / ``durbin``,
+       which ``apply_gpu_transformations()`` blindly stamps ``GPU_Device``).
+       The Python/cuTile backend has **no** ``GPU_Device`` scope dispatcher --
+       only ``Sequential`` / CPU / ``CuTile`` -- so such a map would raise
+       ``KeyError: ScheduleType.GPU_Device`` at code generation.  It is
+       re-stamped ``ScheduleType.Sequential`` and emitted as a host ("driver")
+       Python loop that operates directly on the ``GPU_Global`` (``cupy``)
+       arrays, which are host-addressable in this backend.  Because that host
+       loop pays one device round-trip per element, only maps whose total
+       volume is provably at most :data:`_TINY_DEMOTION_VOLUME` (the intended
+       scalar-control case) are demoted silently; larger or symbolic-volume
+       maps are diagnosed via :func:`_warn_or_raise` first (warn by default,
+       raise under ``strict``) and demoted only in non-strict mode.
     """
 
     def apply_pass(self, sdfg: SDFG, pipeline_results: Dict[str, Any]) -> Optional[int]:
-        """Re-stamp GPU_Device maps containing tile-ops to CuTile.
+        """Re-stamp GPU_Device maps to CuTile (tileops) or Sequential (rest).
 
         :param sdfg: The SDFG to transform in place.
         :param pipeline_results: Unused pipeline results.
         :returns: The number of maps re-stamped to ``CuTile``, or ``None``
             if there were no tileops anchors.
-        :raises ValueError: When ``strict`` and no tileops anchors exist.
+        :raises ValueError: When ``strict`` and either (a) no tileops anchors
+            and no other library nodes exist, or (b) a residual ``GPU_Device``
+            map with a large / not-provably-tiny volume must be demoted.
         """
+        # Step 1: re-stamp tileops-anchored outermost maps to CuTile.  Absence
+        # of anchors is not fatal here -- an SDFG whose only reductions became
+        # BLAS library nodes (e.g. ``cholesky`` / ``trisolv`` with ``np.dot``)
+        # has zero cuTile kernels but still carries GPU_Device host-control maps
+        # that step 2 must demote -- so we diagnose (BLAS-only: informational;
+        # genuinely empty: warn / strict-raise) and continue.
         anchors = _collect_tile_nodes(sdfg)
         if not anchors:
-            _warn_or_raise(
-                "GPUDeviceToCuTile: no tileops library nodes found; run "
-                "VectorizeCPUMultiDim(target_isa='CUTILE', expand_tile_nodes=False) first", self.strict)
-            return None
+            _diagnose_no_anchors("GPUDeviceToCuTile", sdfg, self.strict)
 
         scope_cache: _ScopeCache = {}
         cutile_entries: Set[nodes.MapEntry] = set()
@@ -398,6 +716,12 @@ class GPUDeviceToCuTile(_CuTileLoweringPass):
             if outermost_entry.map.schedule == dtypes.ScheduleType.GPU_Device:
                 outermost_entry.map.schedule = dtypes.ScheduleType.CuTile
                 cutile_entries.add(outermost_entry)
+
+        # Step 2: demote every remaining GPU_Device map (non-tileops host
+        # control) to Sequential so the Python/cuTile backend can code-generate
+        # it as a host driver loop over the GPU_Global (cupy) operands.  Runs
+        # unconditionally -- these maps exist even when there are no anchors.
+        _demote_residual_gpu_device_maps(sdfg, self.strict, "GPUDeviceToCuTile")
 
         return len(cutile_entries) if cutile_entries else None
 
@@ -516,5 +840,13 @@ class CuTileSetLibraryImplementations(_CuTileLoweringPass):
                 node.expand(state, impl)
                 expanded += 1
                 progressed = True
+
+        # Expansion can introduce NEW GPU_Device-scheduled maps: the expansion
+        # framework re-stamps a nested expansion's default-scheduled maps with
+        # the library node's schedule (GPU_Device from
+        # apply_gpu_transformations()), and GPUDeviceToCuTile has already run.
+        # Re-run its demotion so no such map survives to codegen.
+        if expanded:
+            _demote_residual_gpu_device_maps(sdfg, self.strict, "CuTileSetLibraryImplementations")
 
         return expanded or None

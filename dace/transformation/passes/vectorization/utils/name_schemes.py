@@ -376,6 +376,28 @@ class TileNameScheme:
         return False
 
 
+def sanitize_transient_name_hint(base: str, suffix: str = "") -> str:
+    """Name hint for a transient minted from data name ``base`` that can
+    never land in DaCe's reserved ``__return*`` namespace.
+
+    Return-value arrays are named exactly ``__return`` / ``__return_<int>``
+    and ``CompiledSDFG`` asserts that no *other* top-level array shares the
+    ``__return_`` prefix. A hint minted as ``f"{data}_tile"`` from
+    ``data == '__return'`` violates that as soon as simplify hoists the
+    transient to the top level, so the reserved prefix is stripped here:
+    ``__return`` becomes ``tile_return``.
+
+    :param base: Data name the transient is derived from.
+    :param suffix: Suffix appended to the hint (e.g. ``"_tile_out"``).
+    :returns: ``base + suffix`` with ``base`` rewritten to
+        ``tile_<base without leading underscores>`` when it starts with
+        ``__return``.
+    """
+    if base.startswith('__return'):
+        base = f"tile_{base.lstrip('_')}"
+    return f"{base}{suffix}"
+
+
 def _walk_sdfgs(sdfg: SDFG) -> Iterator[SDFG]:
     """Yield ``sdfg`` plus every ``NestedSDFG`` body reachable from it.
 

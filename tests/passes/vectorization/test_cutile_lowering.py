@@ -24,6 +24,7 @@ now handled by ``sdfg.apply_gpu_transformations()`` and ``GPUDeviceToCuTile``.
 import warnings
 from typing import Dict, List, Set, Tuple
 
+import numpy as np
 import pytest
 
 import dace
@@ -31,16 +32,18 @@ from dace import data, dtypes
 from dace.libraries.tileops import TileBinop
 from dace.libraries.tileops.nodes import TileIota
 from dace.sdfg import SDFG, nodes
+from dace.sdfg.validation import InvalidSDFGEdgeError
 from dace.transformation.passes.vectorization.cutile_lowering import (
     CuTileSetImplementations,
     CuTileSetTileStorage,
     CuTileValidateTiles,
     GPUDeviceToCuTile,
+    _collect_tileops_adjacent_edges,
     _tile_node_types,
+    clamp_propagated_oob_memlets,
 )
 from dace.transformation.passes.vectorization.vectorize_cpu_multi_dim import (
-    VectorizeCPUMultiDim,
-)
+    VectorizeCPUMultiDim, )
 
 # ============================================================
 # Fixture builders
@@ -129,6 +132,41 @@ def _build_bare_tile_binop_sdfg(widths: Tuple[int, ...]) -> SDFG:
     return sdfg
 
 
+def _build_blas_dot_sdfg() -> SDFG:
+    """Hand-built SDFG whose only library node is a BLAS ``Dot`` (no tileops).
+
+    Models the BLAS-only configuration (e.g. cholesky/trisolv after
+    vectorization, where every reduction became a ``Dot``).
+    """
+    from dace.libraries.blas.nodes import Dot
+    sdfg = dace.SDFG("cutile_lowering_blas_only")
+    sdfg.add_array("x", (8, ), dace.float64)
+    sdfg.add_array("y", (8, ), dace.float64)
+    sdfg.add_array("r", (1, ), dace.float64)
+    state = sdfg.add_state("main")
+    dot = Dot("dot")
+    state.add_node(dot)
+    state.add_edge(state.add_access("x"), None, dot, "_x", dace.Memlet("x[0:8]"))
+    state.add_edge(state.add_access("y"), None, dot, "_y", dace.Memlet("y[0:8]"))
+    state.add_edge(dot, "_result", state.add_access("r"), None, dace.Memlet("r[0]"))
+    return sdfg
+
+
+def _add_residual_gpu_map(sdfg: SDFG, rng: str) -> nodes.MapEntry:
+    """Add a state holding a non-tileops ``GPU_Device`` map over ``rng``.
+
+    :param sdfg: The SDFG to extend.
+    :param rng: Map range string (e.g. ``"0:1024"``).
+    :returns: The new map's entry node.
+    """
+    state = sdfg.add_state("residual")
+    entry, exit_node = state.add_map("residual_map", dict(k=rng), schedule=dtypes.ScheduleType.GPU_Device)
+    tasklet = state.add_tasklet("residual_t", {}, {}, "pass")
+    state.add_nedge(entry, tasklet, dace.Memlet())
+    state.add_nedge(tasklet, exit_node, dace.Memlet())
+    return entry
+
+
 def _build_tile_iota_sdfg() -> SDFG:
     """Hand-built SDFG holding a ``TileIota`` with a 'cutile' expansion."""
     sdfg = dace.SDFG("cutile_lowering_iota")
@@ -195,7 +233,6 @@ def _storage_snapshot(sdfg: SDFG) -> Dict[Tuple[str, str], dtypes.StorageType]:
         for name, desc in nested.arrays.items():
             snapshot[(nested.label, name)] = desc.storage
     return snapshot
-
 
 
 def _apply_gpu_and_adapt(sdfg: SDFG) -> None:
@@ -272,10 +309,7 @@ class TestGPUDeviceToCuTile:
             simplify=True,
         )
         # Before the adapter pass, tileops-anchored maps should be GPU_Device
-        gpu_device_maps = [
-            n for n, _ in _all_map_entries(sdfg)
-            if n.map.schedule == dtypes.ScheduleType.GPU_Device
-        ]
+        gpu_device_maps = [n for n, _ in _all_map_entries(sdfg) if n.map.schedule == dtypes.ScheduleType.GPU_Device]
         assert len(gpu_device_maps) >= 1, "Expected at least one GPU_Device map"
 
         GPUDeviceToCuTile().apply_pass(sdfg, {})
@@ -308,6 +342,67 @@ class TestGPUDeviceToCuTile:
         sdfg = _build_unvectorized_vadd_sdfg()
         with pytest.raises(ValueError, match="no tileops library nodes found"):
             GPUDeviceToCuTile(strict=True).apply_pass(sdfg, {})
+
+    def test_tiny_residual_map_demotes_silently(self):
+        """A residual GPU_Device map with provably tiny volume (<= 4) is the
+        intended scalar-control case: demoted to Sequential with no warning."""
+        sdfg = _build_vadd_k1_sdfg()
+        sdfg.apply_gpu_transformations(sequential_innermaps=True, register_transients=True, simplify=True)
+        entry = _add_residual_gpu_map(sdfg, "0:2")
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            GPUDeviceToCuTile().apply_pass(sdfg, {})
+        assert not [w for w in caught if "per-element host loop" in str(w.message)]
+        assert entry.map.schedule == dtypes.ScheduleType.Sequential
+
+    def test_large_residual_map_demotion_warns(self):
+        """A large residual GPU_Device map warns (naming map/state/volume and
+        the host-loop consequence) but is still demoted in non-strict mode."""
+        sdfg = _build_vadd_k1_sdfg()
+        sdfg.apply_gpu_transformations(sequential_innermaps=True, register_transients=True, simplify=True)
+        entry = _add_residual_gpu_map(sdfg, "0:1024")
+        with pytest.warns(UserWarning, match="residual_map.*volume 1024.*per-element host loop"):
+            GPUDeviceToCuTile().apply_pass(sdfg, {})
+        assert entry.map.schedule == dtypes.ScheduleType.Sequential
+
+    def test_symbolic_residual_map_demotion_warns(self):
+        """A symbolic-volume residual map is not provably tiny: warns too."""
+        sdfg = _build_vadd_k1_sdfg()
+        sdfg.apply_gpu_transformations(sequential_innermaps=True, register_transients=True, simplify=True)
+        entry = _add_residual_gpu_map(sdfg, "0:N")
+        with pytest.warns(UserWarning, match="per-element host loop"):
+            GPUDeviceToCuTile().apply_pass(sdfg, {})
+        assert entry.map.schedule == dtypes.ScheduleType.Sequential
+
+    def test_large_residual_map_strict_raises(self):
+        """strict=True: the large-residual-map demotion raises instead."""
+        sdfg = _build_vadd_k1_sdfg()
+        sdfg.apply_gpu_transformations(sequential_innermaps=True, register_transients=True, simplify=True)
+        entry = _add_residual_gpu_map(sdfg, "0:1024")
+        with pytest.raises(ValueError, match="per-element host loop"):
+            GPUDeviceToCuTile(strict=True).apply_pass(sdfg, {})
+        # Not demoted: the raise aborts before re-stamping.
+        assert entry.map.schedule == dtypes.ScheduleType.GPU_Device
+
+
+class TestBlasOnlyConfiguration:
+    """Zero tileops anchors + non-tileops library nodes is a supported case:
+    the passes proceed (informational warning) even under ``strict=True``."""
+
+    def test_validate_tiles_strict_proceeds(self):
+        sdfg = _build_blas_dot_sdfg()
+        with pytest.warns(UserWarning, match="BLAS-only configuration"):
+            assert CuTileValidateTiles(strict=True).apply_pass(sdfg, {}) is None
+
+    def test_gpu_device_to_cutile_strict_proceeds(self):
+        sdfg = _build_blas_dot_sdfg()
+        with pytest.warns(UserWarning, match="BLAS-only configuration"):
+            assert GPUDeviceToCuTile(strict=True).apply_pass(sdfg, {}) is None
+
+    def test_set_tile_storage_strict_proceeds(self):
+        sdfg = _build_blas_dot_sdfg()
+        with pytest.warns(UserWarning, match="BLAS-only configuration"):
+            assert CuTileSetTileStorage(strict=True).apply_pass(sdfg, {}) is None
 
     def test_idempotent(self):
         """Running twice on already-CuTile map returns None."""
@@ -361,10 +456,7 @@ class TestSetTileStorage:
         """No Scalar descriptor changes storage (and none becomes a tile)."""
         sdfg = _build_vadd_k1_sdfg()
         _apply_gpu_and_adapt(sdfg)
-        scalar_storage_before = {
-            (owner, name): storage
-            for (owner, name), storage in _storage_snapshot(sdfg).items()
-        }
+        scalar_storage_before = {(owner, name): storage for (owner, name), storage in _storage_snapshot(sdfg).items()}
         CuTileSetTileStorage().apply_pass(sdfg, {})
         for nested in sdfg.all_sdfgs_recursive():
             for name, desc in nested.arrays.items():
@@ -510,13 +602,11 @@ class TestPipelineOrdering:
         assert "@ct.kernel" in code
         assert "ct.load(" in code
 
-    @pytest.mark.skip(
-        reason="apply_gpu_transformations() on already-vectorized SDFGs "
-        "with non-divisible concrete sizes triggers out-of-bounds "
-        "memlet validation (remainder region accesses beyond array "
-        "bounds after GPU clone creation). Known limitation of the "
-        "GPU-transform-based pipeline."
-    )
+    @pytest.mark.skip(reason="apply_gpu_transformations() on already-vectorized SDFGs "
+                      "with non-divisible concrete sizes triggers out-of-bounds "
+                      "memlet validation (remainder region accesses beyond array "
+                      "bounds after GPU clone creation). Known limitation of the "
+                      "GPU-transform-based pipeline.")
     def test_full_sequence_k1_concrete_non_divisible(self):
         """Concrete non-divisible size (100 % 8 != 0) through the sequence."""
         sdfg = _build_vadd_concrete_sdfg()
@@ -548,6 +638,201 @@ class TestPipelineOrdering:
         _apply_gpu_and_adapt(sdfg)
         result = CuTileSetTileStorage().apply_pass(sdfg, {})
         assert result is not None and result > 0
+
+
+# ============================================================
+# 6. clamp_propagated_oob_memlets gating
+# ============================================================
+
+
+def _build_genuine_oob_sdfg(name: str) -> SDFG:
+    """A(16) -> B(17) copy with a genuinely OOB memlet ``A[0:17]``: no mask,
+    no tileops node anywhere (the reviewer's silent-truncation repro)."""
+    sdfg = dace.SDFG(name)
+    sdfg.add_array("A", (16, ), dace.float64)
+    sdfg.add_array("B", (17, ), dace.float64)
+    state = sdfg.add_state("main")
+    state.add_nedge(state.add_access("A"), state.add_access("B"), dace.Memlet("A[0:17]"))
+    return sdfg
+
+
+def _build_tileops_tree_oob_sdfg(name: str) -> SDFG:
+    """A/B/C(20) map around a ``TileBinop`` with provably-OOB propagated
+    outer memlets (``0:24`` on shape-20 arrays)."""
+    sdfg = dace.SDFG(name)
+    for arr in ("A", "B", "C"):
+        sdfg.add_array(arr, (20, ), dace.float64)
+    state = sdfg.add_state("main")
+    entry, exit_node = state.add_map("tiles", dict(i="0:24:8"))
+    binop = TileBinop(name="tb", widths=(8, ), op="+")
+    state.add_node(binop)
+    for arr, conn in (("A", "_a"), ("B", "_b")):
+        entry.add_in_connector(f"IN_{arr}")
+        entry.add_out_connector(f"OUT_{arr}")
+        state.add_edge(state.add_access(arr), None, entry, f"IN_{arr}", dace.Memlet(f"{arr}[0:24]"))
+        state.add_edge(entry, f"OUT_{arr}", binop, conn, dace.Memlet(f"{arr}[i:i+8]", allow_oob=True))
+    exit_node.add_in_connector("IN_C")
+    exit_node.add_out_connector("OUT_C")
+    state.add_edge(binop, "_c", exit_node, "IN_C", dace.Memlet("C[i:i+8]", allow_oob=True))
+    state.add_edge(exit_node, "OUT_C", state.add_access("C"), None, dace.Memlet("C[0:24]"))
+    return sdfg
+
+
+def _build_nsdfg_boundary_sdfg(name: str, with_tileops: bool) -> SDFG:
+    """Parent A(100)/C(100) with a NestedSDFG consuming a full-8 window
+    through provably-OOB boundary memlets (``96:104``).
+
+    :param with_tileops: When ``True`` the inner body is a ``TileBinop``
+        (tileops-fed connector); otherwise a plain tasklet chain.
+    """
+    inner = dace.SDFG(f"{name}_inner")
+    inner.add_array("_in_A", (8, ), dace.float64)
+    inner.add_array("_out_C", (8, ), dace.float64)
+    istate = inner.add_state("body")
+    if with_tileops:
+        binop = TileBinop(name="tb", widths=(8, ), op="+")
+        istate.add_node(binop)
+        istate.add_edge(istate.add_access("_in_A"), None, binop, "_a", dace.Memlet("_in_A[0:8]"))
+        istate.add_edge(istate.add_access("_in_A"), None, binop, "_b", dace.Memlet("_in_A[0:8]"))
+        istate.add_edge(binop, "_c", istate.add_access("_out_C"), None, dace.Memlet("_out_C[0:8]"))
+    else:
+        tasklet = istate.add_tasklet("t", {"_a"}, {"_c"}, "_c = _a")
+        istate.add_edge(istate.add_access("_in_A"), None, tasklet, "_a", dace.Memlet("_in_A[0]"))
+        istate.add_edge(tasklet, "_c", istate.add_access("_out_C"), None, dace.Memlet("_out_C[0]"))
+
+    sdfg = dace.SDFG(name)
+    sdfg.add_array("A", (100, ), dace.float64)
+    sdfg.add_array("C", (100, ), dace.float64)
+    state = sdfg.add_state("main")
+    nsdfg_node = state.add_nested_sdfg(inner, {"_in_A"}, {"_out_C"})
+    state.add_edge(state.add_access("A"), None, nsdfg_node, "_in_A", dace.Memlet("A[96:104]"))
+    state.add_edge(nsdfg_node, "_out_C", state.add_access("C"), None, dace.Memlet("C[96:104]"))
+    return sdfg
+
+
+class TestClampPropagatedOOBMemlets:
+    """Gating of the OOB clamp: tileops-adjacent / allow_oob only."""
+
+    def test_genuine_oob_not_clamped_and_still_rejected(self):
+        """The Major repro: an unmasked off-by-one read must stay OOB and
+        fail validation loudly instead of being silently truncated."""
+        sdfg = _build_genuine_oob_sdfg("clamp_genuine_oob")
+        with pytest.warns(UserWarning, match="neither tileops-adjacent nor marked allow_oob"):
+            assert clamp_propagated_oob_memlets(sdfg) == 0
+        edge = next(iter(list(sdfg.states())[0].edges()))
+        assert str(edge.data.subset) == "0:17"  # untouched
+        with pytest.raises(InvalidSDFGEdgeError, match="out-of-bounds"):
+            sdfg.validate()
+
+    def test_allow_oob_memlet_clamped_and_volume_recomputed(self):
+        """A memlet already marked allow_oob is clamped; volume follows."""
+        sdfg = dace.SDFG("clamp_allow_oob_volume")
+        sdfg.add_array("A", (16, ), dace.float64)
+        sdfg.add_array("B", (20, ), dace.float64)
+        state = sdfg.add_state("main")
+        memlet = dace.Memlet("A[0:20]")
+        memlet.allow_oob = True
+        state.add_nedge(state.add_access("A"), state.add_access("B"), memlet)
+        assert clamp_propagated_oob_memlets(sdfg) == 1
+        edge = next(iter(state.edges()))
+        assert str(edge.data.subset) == "0:16"
+        assert int(edge.data.volume) == 16
+
+    def test_tileops_adjacent_tree_clamped_without_allow_oob(self):
+        """Propagated outer memlets of a tileops memlet tree are clamped
+        even when re-propagation dropped their allow_oob flag."""
+        sdfg = _build_tileops_tree_oob_sdfg("clamp_tileops_tree")
+        assert clamp_propagated_oob_memlets(sdfg) == 3  # A, B, C outer edges
+        state = list(sdfg.states())[0]
+        outer = [e for e in state.edges() if isinstance(e.src, nodes.AccessNode) or isinstance(e.dst, nodes.AccessNode)]
+        assert outer, "fixture must expose outer AccessNode edges"
+        for e in outer:
+            assert str(e.data.subset) == "0:20"
+            assert int(e.data.volume) == 20
+        # Library-node-incident edges keep their full-tile subsets.
+        binop = next(n for n in state.nodes() if isinstance(n, TileBinop))
+        for e in list(state.in_edges(binop)) + list(state.out_edges(binop)):
+            assert str(e.data.subset) == "i:i + 8"
+
+    def test_other_subset_clamped_under_same_gating(self):
+        """``other_subset`` is clamped against the other endpoint's
+        descriptor when the memlet is eligible."""
+        sdfg = dace.SDFG("clamp_other_subset")
+        sdfg.add_array("A", (16, ), dace.float64)
+        sdfg.add_array("B", (16, ), dace.float64)
+        state = sdfg.add_state("main")
+        memlet = dace.Memlet("A[0:8]")
+        memlet.other_subset = dace.subsets.Range.from_string("8:20")
+        memlet.allow_oob = True
+        state.add_nedge(state.add_access("A"), state.add_access("B"), memlet)
+        assert clamp_propagated_oob_memlets(sdfg) == 1
+        edge = next(iter(state.edges()))
+        assert str(edge.data.subset) == "0:8"  # in-bounds side untouched
+        assert str(edge.data.other_subset) == "8:16"
+
+    def test_nsdfg_boundary_edge_marked_not_clamped(self):
+        """A full-W window on a NestedSDFG boundary edge feeding a tileops
+        node is marked allow_oob but never narrowed below W."""
+        sdfg = _build_nsdfg_boundary_sdfg("clamp_nsdfg_boundary", with_tileops=True)
+        adjacent, boundary = _collect_tileops_adjacent_edges(sdfg)
+        state = list(sdfg.states())[0]
+        outer_edges = [e for e in state.edges()]
+        assert all(id(e) in boundary for e in outer_edges)
+        assert clamp_propagated_oob_memlets(sdfg) == 0
+        for e in outer_edges:
+            assert str(e.data.subset) in ("96:104", )  # full window kept
+            assert e.data.allow_oob
+        sdfg.validate()  # allow_oob defers the boundary OOB to the mask
+
+    def test_nsdfg_boundary_without_tileops_not_marked(self):
+        """The same boundary shape WITHOUT tileops inside is a genuine OOB:
+        neither marked nor clamped, and validation rejects it."""
+        sdfg = _build_nsdfg_boundary_sdfg("clamp_nsdfg_plain", with_tileops=False)
+        with pytest.warns(UserWarning, match="neither tileops-adjacent nor marked allow_oob"):
+            assert clamp_propagated_oob_memlets(sdfg) == 0
+        state = list(sdfg.states())[0]
+        for e in state.edges():
+            assert not e.data.allow_oob
+            assert str(e.data.subset) == "96:104"
+        with pytest.raises(InvalidSDFGEdgeError, match="out-of-bounds"):
+            sdfg.validate()
+
+    def test_propagate_subset_drops_allow_oob_from_aggregated_list(self):
+        """Pin the propagation-inheritance caveat: ``propagate_subset``
+        copies ``memlets[0]``, so an unmarked first memlet drops the flag
+        of a marked neighbor (why the clamp stays load-bearing)."""
+        from dace import subsets as sbs
+        from dace.sdfg.propagation import propagate_subset
+        arr = data.Array(dace.float64, (100, ))
+        unmarked = dace.Memlet("A[i:i+8]")
+        marked = dace.Memlet("A[i:i+8]")
+        marked.allow_oob = True
+        rng = sbs.Range.from_string("0:100:8")
+        dropped = propagate_subset([unmarked, marked], arr, ["i"], rng)
+        assert not dropped.allow_oob  # flag of memlets[1] silently dropped
+        kept = propagate_subset([marked, unmarked], arr, ["i"], rng)
+        assert kept.allow_oob
+
+    @pytest.mark.gpu
+    def test_nest_map_bodies_boundary_tail_gpu(self):
+        """``nest_map_bodies=True`` descent with a non-divisible concrete
+        size: the boundary-tail window survives the clamp gate and the
+        kernel matches NumPy end-to-end."""
+        from dace.transformation.passes.vectorization import VectorizeCuTile
+
+        @dace.program
+        def clamp_nest_boundary_vadd(A: dace.float64[100], B: dace.float64[100], C: dace.float64[100]):
+            for i in dace.map[0:100]:
+                C[i] = A[i] + B[i]
+
+        sdfg = clamp_nest_boundary_vadd.to_sdfg()
+        VectorizeCuTile(widths=(8, ), nest_map_bodies=True).apply_pass(sdfg, {})
+        rng = np.random.default_rng(0)
+        A = rng.random(100)
+        B = rng.random(100)
+        C = np.zeros(100)
+        sdfg(A=A, B=B, C=C)
+        np.testing.assert_allclose(C, A + B)
 
 
 if __name__ == "__main__":

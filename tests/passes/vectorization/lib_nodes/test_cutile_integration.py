@@ -663,6 +663,62 @@ class TestMultiDimGather:
 
 
 # ============================================================
+# Scalar-parameter kernels (regression: bug 03)
+# ============================================================
+
+
+class TestScalarParams:
+    """Runtime scalar parameters threaded into the cuTile kernel.
+
+    Regression tests for bug 03: a loop-invariant scalar (``alpha``) used
+    inside a tiled elementwise op is staged as a ``Register`` scalar bridge
+    (``alpha_const``) by the vectorizer. The cuTile codegen must emit the
+    rename ``alpha_const = alpha`` so the kernel body can read it; otherwise
+    the ``cuda.tile`` compiler raised ``Undefined variable alpha_const``.
+    """
+
+    @pytest.mark.parametrize("n", [64, 17])
+    @pytest.mark.parametrize("alpha_val", [1.5, -2.0, 0.0])
+    def test_scale_by_scalar(self, n, alpha_val):
+        """Y[i] = alpha * X[i] with a runtime scalar, aligned and unaligned N."""
+        N = dace.symbol("N")
+
+        @dace.program
+        def cutile_scale(alpha: dace.float64, X: dace.float64[N], Y: dace.float64[N]):
+            Y[:] = alpha * X[:]
+
+        sdfg = cutile_scale.to_sdfg()
+        _apply_cutile_pipeline(sdfg, widths=(8,))
+
+        rng = np.random.default_rng(101)
+        X = rng.random(n)
+        Y = np.zeros(n)
+        results = _run_cutile(sdfg, alpha=alpha_val, X=X, Y=Y, N=n)
+        np.testing.assert_allclose(results["Y"], alpha_val * X, rtol=1e-14)
+
+    def test_two_scalars_axpy(self):
+        """Z[i] = alpha * X[i] + beta * Y[i] -- two runtime scalar bridges."""
+        N = dace.symbol("N")
+
+        @dace.program
+        def cutile_axpby(alpha: dace.float64, beta: dace.float64, X: dace.float64[N], Y: dace.float64[N],
+                         Z: dace.float64[N]):
+            Z[:] = alpha * X[:] + beta * Y[:]
+
+        sdfg = cutile_axpby.to_sdfg()
+        _apply_cutile_pipeline(sdfg, widths=(8,))
+
+        n = 100  # unaligned to 8
+        alpha_val, beta_val = 2.5, -0.75
+        rng = np.random.default_rng(102)
+        X = rng.random(n)
+        Y = rng.random(n)
+        Z = np.zeros(n)
+        results = _run_cutile(sdfg, alpha=alpha_val, beta=beta_val, X=X, Y=Y, Z=Z, N=n)
+        np.testing.assert_allclose(results["Z"], alpha_val * X + beta_val * Y, rtol=1e-14)
+
+
+# ============================================================
 # Entry point
 # ============================================================
 

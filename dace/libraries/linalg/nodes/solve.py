@@ -130,11 +130,79 @@ class ExpandSolveCuSolverDn(ExpandTransformation):
         return _make_sdfg_getrs(node, parent_state, parent_sdfg, "cuSolverDn")
 
 
+@dace.library.expansion
+class ExpandSolveCuPy(ExpandTransformation):
+    """CuPy-based GPU linear solve via ``cupy.linalg.solve``.
+
+    Produces a nested SDFG with a single Python-language tasklet, usable by
+    the Python/cuTile backend (no CPP tasklets, no LAPACK environment).
+    Device-resident (``GPU_Global``) operands stay on the device.
+    """
+
+    environments = []
+
+    @staticmethod
+    def expansion(node: 'Solve', parent_state: SDFGState, parent_sdfg: SDFG) -> SDFG:
+        """Build the nested SDFG calling ``cupy.linalg.solve``.
+
+        :param node: The ``Solve`` node being expanded.
+        :param parent_state: State that owns the node.
+        :param parent_sdfg: SDFG that owns ``parent_state``.
+        :returns: The nested SDFG implementing the node.
+        """
+        from dace.libraries.blas.blas_helpers import cupy_in_wrap, cupy_out_wrap
+
+        (ain_shape, ain_dtype, ain_strides, bin_shape, bin_dtype, bin_strides, out_shape, out_dtype, out_strides, _n,
+         _rhs, _storage) = node.validate(parent_sdfg, parent_state)
+
+        # Per-operand storages from the outer descriptors (drives the
+        # device-residency decision of cupy_in_wrap / cupy_out_wrap).
+        storage_a = storage_b = storage_out = dace.dtypes.StorageType.Default
+        for e in parent_state.in_edges(node):
+            if e.dst_conn == '_ain':
+                storage_a = parent_sdfg.arrays[e.data.data].storage
+            elif e.dst_conn == '_bin':
+                storage_b = parent_sdfg.arrays[e.data.data].storage
+        for e in parent_state.out_edges(node):
+            if e.src_conn == '_bout':
+                storage_out = parent_sdfg.arrays[e.data.data].storage
+
+        nsdfg = dace.SDFG(node.label + '_cupy')
+        nstate = nsdfg.add_state()
+        nsdfg.add_array('_ain', ain_shape, ain_dtype, strides=ain_strides, storage=storage_a)
+        nsdfg.add_array('_bin', bin_shape, bin_dtype, strides=bin_strides, storage=storage_b)
+        nsdfg.add_array('_bout', out_shape, out_dtype, strides=out_strides, storage=storage_out)
+
+        a_in = cupy_in_wrap('__a', storage_a)
+        b_in = cupy_in_wrap('__b', storage_b)
+        code = '\n'.join([
+            'import cupy',
+            f'__sol = cupy.linalg.solve({a_in}, {b_in})',
+            f"__bout_out = {cupy_out_wrap('__sol', storage_out)}",
+        ])
+        tasklet = nstate.add_tasklet(node.label + '_cupy_tasklet', {'__a', '__b'}, {'__bout_out'},
+                                     code,
+                                     language=dace.dtypes.Language.Python)
+
+        a_read = nstate.add_read('_ain')
+        b_read = nstate.add_read('_bin')
+        out_write = nstate.add_write('_bout')
+        nstate.add_edge(a_read, None, tasklet, '__a', Memlet.from_array('_ain', nsdfg.arrays['_ain']))
+        nstate.add_edge(b_read, None, tasklet, '__b', Memlet.from_array('_bin', nsdfg.arrays['_bin']))
+        nstate.add_edge(tasklet, '__bout_out', out_write, None, Memlet.from_array('_bout', nsdfg.arrays['_bout']))
+        return nsdfg
+
+
 @dace.library.node
 class Solve(dace.sdfg.nodes.LibraryNode):
 
     # Global properties
-    implementations = {"OpenBLAS": ExpandSolveOpenBLAS, "MKL": ExpandSolveMKL, "cuSolverDn": ExpandSolveCuSolverDn}
+    implementations = {
+        "OpenBLAS": ExpandSolveOpenBLAS,
+        "MKL": ExpandSolveMKL,
+        "cuSolverDn": ExpandSolveCuSolverDn,
+        "CuPy": ExpandSolveCuPy,
+    }
     default_implementation = None
 
     overwrite = dace.properties.Property(dtype=bool, default=False)

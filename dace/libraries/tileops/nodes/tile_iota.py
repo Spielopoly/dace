@@ -109,6 +109,19 @@ class ExpandTileIotaCutile(ExpandTransformation):
         K = len(widths)
         inputs = {c: None for c in node.extra_inputs}
 
+        # Derive the lane-array dtype from the ``_dst`` descriptor so the
+        # declared descriptor dtype and the runtime tile dtype agree (the
+        # lane-id tiles are declared int64; ct.arange defaults would yield
+        # int32 tiles). Falls back to int32 when the descriptor is unknown.
+        ct_dtype = "ct.int32"
+        for out_edge in parent_state.out_edges(node):
+            if out_edge.src_conn != "_dst" or out_edge.data is None or out_edge.data.data is None:
+                continue
+            dst_desc = parent_sdfg.arrays.get(out_edge.data.data)
+            if dst_desc is not None:
+                ct_dtype = f"ct.{dst_desc.dtype.to_string()}"
+            break
+
         # Degenerate single-lane case: all widths are 1.
         if all(w == 1 for w in widths):
             expr = node.expr
@@ -131,16 +144,15 @@ class ExpandTileIotaCutile(ExpandTransformation):
 
         # Per-dim lane-index arrays, broadcast to full tile shape for K>=2.
         if K == 1:
-            lines.append(f"__l0 = ct.arange({widths[0]}, dtype=ct.int32)")
+            lines.append(f"__l0 = ct.arange({widths[0]}, dtype={ct_dtype})")
         else:
             for k in range(K):
                 slc = ["None"] * K
                 slc[k] = ":"
                 slc_str = "[" + ", ".join(slc) + "]"
-                lines.append(
-                    f"__l{k} = ct.broadcast_to("
-                    f"ct.arange({widths[k]}, dtype=ct.int32){slc_str}, "
-                    f"({shape_tuple}))")
+                lines.append(f"__l{k} = ct.broadcast_to("
+                             f"ct.arange({widths[k]}, dtype={ct_dtype}){slc_str}, "
+                             f"({shape_tuple}))")
 
         # The expression uses __l0..__l{K-1} which are now cuTile arrays.
         lines.append(f"_dst = {node.expr}")

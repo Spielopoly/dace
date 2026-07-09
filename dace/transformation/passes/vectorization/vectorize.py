@@ -2314,7 +2314,7 @@ class Vectorize(ppl.Pass):
         if isinstance(current_global_code, CodeBlock):
             current_global_code = current_global_code.as_string
         if self.global_code not in current_global_code:
-            sdfg.append_global_code(cpp_code=self.global_code, location=self.global_code_location)
+            sdfg.append_global_code(code=self.global_code, location=self.global_code_location)
         # Set zero for all transients
         # Vectorization requires all transient to be 0 to not accidentally read trash data
         # All access nodes of the same array need to be setzero=True so the first node that triggers allocation

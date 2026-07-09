@@ -14,8 +14,9 @@ from dace import library, properties
 from dace.sdfg import nodes
 from dace.transformation.transformation import ExpandTransformation
 
-from .._pure_codegen import (cutile_grid_dim_offset, cutile_tile_dim_bids, gather_lane_offset, nested_loops,
-                             offset_via_strides, resolve_gather_deps, tile_offset)
+from .._pure_codegen import (ct_dtype_name, cutile_bid_lines, cutile_grid_dim_offset, cutile_offset_block_shift,
+                             cutile_offset_is_nonzero, cutile_tile_dim_bids, cutile_tile_dim_offsets,
+                             gather_lane_offset, nested_loops, offset_via_strides, resolve_gather_deps, tile_offset)
 from .. import _isa_codegen
 
 
@@ -312,15 +313,22 @@ class ExpandTileLoadCutile(ExpandTransformation):
             ``ct.load`` with the :attr:`TileLoad.pad_mode` padding mode.
         """
         from dace.symbolic import symstr
-        
+
         widths = tuple(node.widths)
         K = len(widths)
-        
+
         if node.pad_mode not in _PAD_MODE_CUTILE:
             raise ValueError(f"TileLoad cutile expansion: unrecognized pad_mode {node.pad_mode!r}; "
                              f"must be one of {list(_PAD_MODE_CUTILE.keys())}")
         pad_mode = _PAD_MODE_CUTILE[node.pad_mode]
-        
+
+        def _dst_ct_dtype() -> str:
+            """``ct`` dtype name of the result tile, for dtype-correct constant
+            fills (a bare literal like ``0.0`` would otherwise materialize a
+            float32 tile that cannot be stored into e.g. an int32 array)."""
+            _dst_edge = next(e for e in parent_state.out_edges(node) if e.src_conn == "_dst")
+            return ct_dtype_name(parent_sdfg.arrays[_dst_edge.data.data].dtype)
+
         if node.src_kind == "Scalar":
             # Broadcast a single value
             # If the source comes from a global array, we need to load it first
@@ -330,11 +338,19 @@ class ExpandTileLoadCutile(ExpandTransformation):
                              and all(bool(dace.symbolic.simplify(s == 1)) for s in desc.shape))
             if is_len1_array:
                 ref = f"ct.load(_src, index=({'0,' * len(desc.shape)}), shape=({'1,' * len(desc.shape)})).item()"
+                src_code = f"ct.broadcast_to({ref}, {widths})"
+            elif isinstance(desc, dace.data.Scalar):
+                # Scalar kernel parameters are normalized at the launch site
+                # (cutile_target): floats arrive as 0-d tiles (device path,
+                # keeps f64 precision), ints/bools as plain Python values.
+                if desc.dtype.as_numpy_dtype().kind == "f":
+                    src_code = f"ct.broadcast_to(_src, {widths})"
+                else:
+                    src_code = f"ct.full({widths}, _src, ct.{_dst_ct_dtype()})"
             else:
-                ref = "_src.item()"
-            src_code = f"ct.broadcast_to({ref}, {widths})"
+                src_code = f"ct.broadcast_to(_src.item(), {widths})"
         elif node.src_kind == "Symbol":
-            src_code = f"ct.broadcast_to(({symstr(node.src_expr, cpp_mode=False)}), {widths})"
+            src_code = f"ct.full({widths}, ({symstr(node.src_expr, cpp_mode=False)}), ct.{_dst_ct_dtype()})"
         elif node.src_kind == "Tile":
             src_edge = next(e for e in parent_state.in_edges(node) if e.dst_conn == "_src")
             src_arr = parent_sdfg.arrays[src_edge.data.data]
@@ -361,6 +377,19 @@ class ExpandTileLoadCutile(ExpandTransformation):
             # block id (the positional trailing-K offset is wrong there).
             _tile_bids = cutile_tile_dim_bids(node, parent_state, parent_sdfg, used_dimensions,
                                               _src_begins if _src_begins is not None else [], K)
+            # Constant per-tile-dim element offset carried by the memlet begin
+            # (e.g. ``A[1:-1]`` -> begin ``__i0 + 1`` -> offset ``1``). The
+            # block-aligned ``ct.load`` index only reconstructs ``__pid*W`` and
+            # drops this offset, so a non-zero offset must go through the
+            # per-element ``ct.gather`` path with the offset added to each index.
+            _tile_offsets = cutile_tile_dim_offsets(node, parent_state, parent_sdfg, used_dimensions,
+                                                    _src_begins if _src_begins is not None else [], K)
+            # Per-dim block-index shift for offsets that are provably nonnegative
+            # multiples of the tile width (``offset // W``); ``None`` where not
+            # provable. All-provable keeps the ALIGNED ``ct.load`` fast path with
+            # shifted block indices instead of falling back to ``ct.gather``.
+            _shifts = [cutile_offset_block_shift(_tile_offsets[d], widths[d]) for d in range(K)]
+            aligned_shift_ok = all(s is not None for s in _shifts)
             # cutile currently does not offer a way to reduce the number of indexing dimensions so we need to specify
             # all dimensions
             unused_dimensions = tuple(sorted(set(range(ndim)) - set(used_dimensions)))
@@ -369,7 +398,8 @@ class ExpandTileLoadCutile(ExpandTransformation):
             if node.dim_strides:
                 coeffs = tuple(node.dim_strides)
                 if len(coeffs) != K:
-                    raise ValueError(f"TileLoad cutile expansion: dim_strides length {len(coeffs)} != widths length {K}")
+                    raise ValueError(
+                        f"TileLoad cutile expansion: dim_strides length {len(coeffs)} != widths length {K}")
                 is_default_coeffs = all(s == 1 for s in coeffs)
             else:
                 coeffs = tuple(1 for _ in range(K))
@@ -379,6 +409,15 @@ class ExpandTileLoadCutile(ExpandTransformation):
             has_replicate = any(r != 1 for r in replicate)
 
             gather_set = set(node.gather_dims)
+            # Whether the emitted runtime tile has source rank (ndim) instead of
+            # tile rank (K). Only the aligned ``ct.load`` path produces such a
+            # tile (its ``shape=`` spans all source dims with singleton unused
+            # dims); the gather paths build ``widths``-shaped (rank-K) tiles.
+            aligned_rank_ndim = False
+            # Whether the aligned ``ct.load`` path was emitted. Only its result
+            # is in source-dim order (and may need a permute); the ``ct.gather``
+            # paths build ``widths``-shaped tiles already in tile-dim order.
+            emitted_aligned_load = False
             if gather_set:
                 # Gather path: use provided _idx_{d} index tiles directly.
                 # For each source dim k:
@@ -406,6 +445,8 @@ class ExpandTileLoadCutile(ExpandTransformation):
                         base = f"({arange} + __pid{d} * {widths[d]})"
                         if coeffs[d] != 1:
                             base = f"({base}) * {coeffs[d]}"
+                        if cutile_offset_is_nonzero(_tile_offsets[d]):
+                            base = f"({base}) + {_tile_offsets[d]}"
                         if K > 1:
                             slicer = ", ".join(":" if a == d else "None" for a in range(K))
                             idx_entries.append(f"ct.broadcast_to(({base})[{slicer}], {widths})")
@@ -416,14 +457,21 @@ class ExpandTileLoadCutile(ExpandTransformation):
                 idx_tuple = ", ".join(idx_entries)
                 mask_kw = f", mask=_mask" if node.has_mask else ""
                 src_code = f"ct.gather(_src, ({idx_tuple},), padding_value={pad_value}{mask_kw})"
-            elif is_default_coeffs and not has_replicate:
-                # Simple case: direct load with no striding and no replication
+            elif is_default_coeffs and not has_replicate and aligned_shift_ok:
+                # Simple case: direct load with no striding and no replication.
+                # Block-aligned element offsets are folded into the block index
+                # (``__pid + offset // W``).
+                aligned_rank_ndim = ndim > K
+                emitted_aligned_load = True
                 index_expr = "("
                 width_expr = "("
                 for d in range(ndim):
                     if d in used_dimensions:
                         dim_idx = used_dimensions.index(d)
-                        index_expr += f"__pid{dim_idx}, "
+                        if cutile_offset_is_nonzero(_shifts[dim_idx]):
+                            index_expr += f"__pid{dim_idx} + {symstr(_shifts[dim_idx], cpp_mode=False)}, "
+                        else:
+                            index_expr += f"__pid{dim_idx}, "
                         width_expr += f"{widths[dim_idx]}, "
                     else:
                         index_expr += f"{_unused_dim_index(d)}, "
@@ -456,18 +504,41 @@ class ExpandTileLoadCutile(ExpandTransformation):
                         if replicate[dim_idx] != 1:
                             arange = f"({arange} // {replicate[dim_idx]})"
                         base = f"({arange} + __pid{dim_idx} * {widths[dim_idx]}) * {coeffs[dim_idx]}"
-                        # place the W arange on tile axis dim_idx (singleton elsewhere)
-                        slicer = ", ".join(":" if a == dim_idx else "None" for a in range(K))
-                        idx_entries.append(f"ct.broadcast_to(({base})[{slicer}], {widths})")
+                        # Add the constant slice offset carried by the memlet
+                        # begin (e.g. ``A[1:-1]`` -> ``+ 1``) so the per-lane
+                        # element index is absolute, not block-relative.
+                        if cutile_offset_is_nonzero(_tile_offsets[dim_idx]):
+                            base = f"({base}) + {_tile_offsets[dim_idx]}"
+                        if K == 1:
+                            # 1-D gather: the index tile is already ``widths``-shaped;
+                            # indexing/broadcasting it (``[:]``) is both unnecessary
+                            # and rejected by cuTile (tiles are not subscriptable).
+                            idx_entries.append(base)
+                        else:
+                            # place the W arange on tile axis dim_idx (singleton elsewhere)
+                            slicer = ", ".join(":" if a == dim_idx else "None" for a in range(K))
+                            idx_entries.append(f"ct.broadcast_to(({base})[{slicer}], {widths})")
                     else:
                         idx_entries.append(_unused_dim_index(d))  # base index along unused source dims
                 idx_tuple = ", ".join(idx_entries)
-                src_code = f"ct.gather(_src, ({idx_tuple},), padding_value={pad_value})"
+                mask_kw = ", mask=_mask" if node.has_mask else ""
+                src_code = f"ct.gather(_src, ({idx_tuple},), padding_value={pad_value}{mask_kw})"
 
-            if all_dimensions != tuple(sorted(all_dimensions)):
-                # We need to permute the loaded tile to match the expected layout
+            if emitted_aligned_load and all_dimensions != tuple(sorted(all_dimensions)):
+                # We need to permute the loaded tile to match the expected layout.
+                # Only the aligned ``ct.load`` result is rank-``ndim`` in source
+                # order; gather results are rank-K and already tile-ordered.
                 permute_order = tuple(all_dimensions.index(d) for d in range(ndim))
                 src_code = f"ct.permute({src_code}, axes={permute_order})"
+
+            # Rank normalization (bug 07): the aligned ``ct.load`` returns a
+            # source-rank tile (singleton axes on non-tiled dims); collapse it
+            # to the declared rank-K descriptor shape HERE so every consumer
+            # (elementwise ops, TileReduce axis numbering, TileMMA, the store)
+            # sees a K-dim tile. Squeezing size-1 axes preserves row-major
+            # lane order, so this only relabels the axes.
+            if aligned_rank_ndim:
+                src_code = f"ct.reshape({src_code}, {widths})"
 
             # Mask gating: on the gather_dims path, ct.gather handles mask
             # directly via mask= kwarg. On other paths, use ct.where post-load.
@@ -502,11 +573,11 @@ class ExpandTileLoadCutile(ExpandTransformation):
 
         else:
             raise ValueError(f"TileLoad cutile expansion: unrecognized src_kind {node.src_kind!r}")
-        
+
         _bids = _tile_bids if node.src_kind == "Tile" else [
             cutile_grid_dim_offset(node, parent_state, parent_sdfg, K) + d for d in range(K)
         ]
-        code = ''.join(f"__pid{d} = ct.bid({_bids[d]})\n" for d in range(K))
+        code = ''.join(line + "\n" for line in cutile_bid_lines(node, parent_state, parent_sdfg, _bids))
         code += f"_dst = {src_code}"
         inputs = (set() if node.src_kind == "Symbol" else {"_src"}) | ({"_mask"} if node.has_mask else set())
         inputs |= {f"_idx_{d}" for d in node.gather_dims}

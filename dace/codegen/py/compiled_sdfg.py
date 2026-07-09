@@ -3,6 +3,7 @@
 
 import builtins
 import linecache
+import re
 import types
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
@@ -10,6 +11,23 @@ import numpy as np
 
 if TYPE_CHECKING:
     from dace.codegen.codeobject import CodeObject
+
+#: A return-value array is named exactly ``__return`` (single value) or
+#: ``__return_<int>`` (tuple element).  Transients that merely share the
+#: ``__return`` prefix -- e.g. the ``__return_tile`` / ``__return_tile_out``
+#: buffers the tile vectorizer creates when the program's return value is
+#: written through a cuTile kernel -- are NOT return values and must be
+#: excluded from return marshaling.
+_RETURN_ARRAY_RE = re.compile(r'^__return(_[0-9]+)?$')
+
+
+def _is_return_array_name(name: str) -> bool:
+    """Whether ``name`` is a genuine SDFG return-value array name.
+
+    :param name: A data-descriptor name from ``sdfg.arrays``.
+    :returns: ``True`` for ``__return`` and ``__return_<int>`` only.
+    """
+    return _RETURN_ARRAY_RE.match(name) is not None
 
 
 def _build_aux_module(co: 'CodeObject') -> types.ModuleType:
@@ -100,14 +118,15 @@ class PythonCompiledSDFG:
         self._is_single_value_ret: bool = False
         if '__return' in self._sdfg.arrays:
             assert not any(
-                aname.startswith('__return_')
+                _is_return_array_name(aname) and aname != '__return'
                 for aname in self._sdfg.arrays.keys()
             )
             self._is_single_value_ret = True
 
-        # Whether the SDFG has any __return* arrays (cached for fast __call__)
+        # Whether the SDFG has any genuine return arrays (cached for fast
+        # __call__); tile transients sharing the __return prefix don't count.
         self._has_returns: bool = any(
-            aname.startswith('__return') for aname in self._sdfg.arrays
+            _is_return_array_name(aname) for aname in self._sdfg.arrays
         )
 
         # Argument name list for positional arg conversion (includes __return*).
@@ -187,11 +206,95 @@ class PythonCompiledSDFG:
         self._initialized = False
         self._finalized = True
 
+    def _bind_positional(self, args: tuple, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        """Convert positional arguments to keyword arguments.
+
+        :param args: Positional argument values, mapped onto ``arglist()`` order.
+        :param kwargs: Keyword arguments (not modified).
+        :returns: A new kwargs dict including the positional bindings.
+        :raises KeyError: If the SDFG takes no arguments but ``args`` is nonempty.
+        :raises TypeError: If more positional arguments are passed than the
+            SDFG accepts.
+        :raises ValueError: If an argument is passed both ways.
+        """
+        if not args:
+            return dict(kwargs)
+        argnames = self._get_argnames()
+        if not argnames:
+            raise KeyError(
+                "Passed positional arguments to an SDFG that does "
+                "not accept them.")
+        if len(args) > len(argnames):
+            raise TypeError(f"Passed {len(args)} positional arguments to an SDFG that "
+                            f"accepts at most {len(argnames)} ({argnames}).")
+        positional = dict(zip(argnames, args))
+        if not positional.keys().isdisjoint(kwargs.keys()):
+            raise ValueError(
+                "Arguments passed as both positional and keyword: "
+                f"{set(positional) & set(kwargs)}")
+        merged = dict(kwargs)
+        merged.update(positional)
+        return merged
+
+    def _marshal_arguments(self, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        """Coerce runtime arguments to the Python-backend calling convention.
+
+        Scalar data arguments are bound as 0-d numpy buffers of the declared
+        dtype (generated code reads them as ``x[()]`` and writes ``x[...]``),
+        and numpy scalars passed for symbols are converted to native Python
+        values (kernel launch grids and ``range()`` bounds require them).
+
+        :param kwargs: Keyword arguments as passed by the caller.
+        :returns: A new dict with marshalled values.
+        :raises TypeError: If a non-scalar array is passed for a Scalar
+            argument, if an ndarray argument's dtype does not match the
+            declared dtype, or if a scalar value cannot be losslessly
+            converted to the declared dtype.
+        """
+        from dace import data
+
+        marshalled = dict(kwargs)
+        for name, value in kwargs.items():
+            desc = self._sdfg.arrays.get(name)
+            if isinstance(desc, data.Scalar):
+                nptype = desc.dtype.as_numpy_dtype()
+                if isinstance(value, np.ndarray):
+                    if value.size != 1:
+                        raise TypeError(f'Argument {name!r}: expected a scalar, '
+                                        f'got an array of shape {value.shape}')
+                    # A dtype-mismatched buffer would have to be copied
+                    # (np.asarray), so in-SDFG writes would land in the copy
+                    # and the caller's buffer would keep the stale value.
+                    # Mirror the C backend's array behavior and reject it.
+                    if value.dtype != nptype:
+                        raise TypeError(f'Argument {name!r}: passed an ndarray of dtype '
+                                        f'{value.dtype}, expected {np.dtype(nptype)}')
+                    # Same-dtype reshape is a view: in-SDFG writes propagate.
+                    marshalled[name] = value.reshape(())
+                elif isinstance(value, (bool, int, float, complex, np.generic)):
+                    coerced = np.asarray(value, dtype=nptype)
+                    # Coercing a plain value to an integer/bool dtype must be
+                    # exact (e.g. 3.9 -> int32 would silently truncate to 3,
+                    # and out-of-range numpy ints silently wrap).
+                    if coerced.dtype.kind in 'iub' and coerced[()] != value:
+                        raise TypeError(f'Argument {name!r}: value {value!r} cannot be '
+                                        f'losslessly converted to declared dtype '
+                                        f'{np.dtype(nptype)}')
+                    marshalled[name] = coerced
+                # Anything else (e.g. a cupy scalar buffer) passes through.
+            elif desc is None:
+                # Symbol values: native Python scalars only.
+                if isinstance(value, np.generic):
+                    marshalled[name] = value.item()
+                elif isinstance(value, np.ndarray) and value.ndim == 0:
+                    marshalled[name] = value.item()
+        return marshalled
+
     def _get_return_names(self) -> List[str]:
         """Sorted names of ``__return*`` arrays in the SDFG."""
         if self._return_names is None:
             self._return_names = sorted(
-                n for n in self._sdfg.arrays if n.startswith('__return')
+                n for n in self._sdfg.arrays if _is_return_array_name(n)
             )
         return self._return_names
 
@@ -220,26 +323,30 @@ class PythonCompiledSDFG:
         return np.empty(shape, dtype=dtype)
 
     def __call__(self, *args, **kwargs):
-        # Fast path: no return values -- forward directly
+        # Fast path: no return values
         if not self._has_returns:
+            if args:
+                try:
+                    self._get_argnames()
+                except Exception:
+                    # arglist() can fail on nested SDFGs with undeclared
+                    # runtime symbols; fall back to raw positional args
+                    # (keyword arguments are still marshalled below).
+                    pass
+                else:
+                    # Only the argname resolution above is fallible; binding
+                    # errors (duplicate/excess arguments) must propagate.
+                    kwargs = self._bind_positional(args, kwargs)
+                    args = ()
+            kwargs = self._marshal_arguments(kwargs)
             self.initialize(*args, **kwargs)
             if self.do_not_execute:
                 return None
             return self._func(*args, **kwargs)
 
         # Convert positional args to keyword args
-        if args:
-            argnames = self._get_argnames()
-            if not argnames:
-                raise KeyError(
-                    "Passed positional arguments to an SDFG that does "
-                    "not accept them.")
-            positional = dict(zip(argnames, args))
-            if not positional.keys().isdisjoint(kwargs.keys()):
-                raise ValueError(
-                    "Arguments passed as both positional and keyword: "
-                    f"{set(positional) & set(kwargs)}")
-            kwargs.update(positional)
+        kwargs = self._bind_positional(args, kwargs)
+        kwargs = self._marshal_arguments(kwargs)
 
         # Resolve symbols for shape evaluation
         syms = {k: v for k, v in kwargs.items()

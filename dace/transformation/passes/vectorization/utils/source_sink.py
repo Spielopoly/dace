@@ -310,21 +310,23 @@ def reduce_before_use(state: dace.SDFGState, name: str, vector_width: int, op: s
         dst = edge.dst
         src = edge.src
         if isinstance(dst, dace.nodes.Tasklet) and edge.data is not None and edge.data.data == name:
+            from dace.transformation.passes.vectorization.utils.name_schemes import sanitize_transient_name_hint
             arr = state.sdfg.arrays[name]
-            state.sdfg.add_scalar(name=name + "_scl",
+            scl_name = sanitize_transient_name_hint(name, "_scl")
+            state.sdfg.add_scalar(name=scl_name,
                                   dtype=arr.dtype,
                                   storage=arr.storage,
                                   transient=True,
                                   lifetime=arr.lifetime)
-            an = state.add_access(name + "_scl")
+            an = state.add_access(scl_name)
             an.setzero = True
             red = Reduce(f"scalarize_{name}", wcr=_OP_TO_WCR[op], axes=[0])
             red.implementation = "vectorized"
             red.schedule = dace.dtypes.ScheduleType.Sequential
             state.add_node(red)
             state.add_edge(src, None, red, None, copy.deepcopy(edge.data))
-            state.add_edge(red, None, an, None, dace.memlet.Memlet(f"{name}_scl[0]"))
-            state.add_edge(an, None, edge.dst, edge.dst_conn, dace.memlet.Memlet(f"{name}_scl[0]"))
+            state.add_edge(red, None, an, None, dace.memlet.Memlet(f"{scl_name}[0]"))
+            state.add_edge(an, None, edge.dst, edge.dst_conn, dace.memlet.Memlet(f"{scl_name}[0]"))
             state.remove_edge(edge)
             # Expand inline via the registered schedule-aware
             # ``ExpandReduceVectorized`` (Sequential -> the vectorized

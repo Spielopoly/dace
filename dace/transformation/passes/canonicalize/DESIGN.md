@@ -4,6 +4,13 @@ Authoritative, **living** design doc for the SDFG canonicalization pipeline. It
 lives next to the code (`dace/transformation/passes/canonicalize/`) and is
 updated in lockstep with it.
 
+> **Known OPEN soundness bug**: the pipeline outcome is not a pure function of
+> the input SDFG (pattern-match order depends on the process's hash-seed /
+> allocation history), and on some trajectories it *miscompiles* in-place
+> multi-statement stencils (jacobi_1d: a duplicated statement is re-scheduled
+> across a dependence). Details, evidence chain, and repro:
+> [`SOUNDNESS_BUG_INPLACE_STENCIL.md`](SOUNDNESS_BUG_INPLACE_STENCIL.md).
+
 ## Purpose
 
 Rewrite any SDFG into one deterministic canonical form so later passes (fusion,

@@ -5,7 +5,7 @@ import copy
 import os
 import warnings
 from collections import defaultdict
-from typing import TYPE_CHECKING, Dict, List, Set
+from typing import TYPE_CHECKING, Dict, List, Optional, Set
 
 import networkx as nx
 
@@ -17,7 +17,7 @@ if TYPE_CHECKING:
     from dace.memlet import Memlet
     from dace.sdfg import SDFG
     from dace.sdfg import graph as gr
-    from dace.sdfg.state import ControlFlowRegion
+    from dace.sdfg.state import ControlFlowRegion, SDFGState
 
 ###########################################
 # Validation
@@ -332,6 +332,9 @@ def validate_sdfg(sdfg: 'dace.sdfg.SDFG', references: Set[int] = None, **context
 
         # Check if SDFG is located within a GPU kernel
         context['in_gpu'] = is_devicelevel_gpu(sdfg, None, None)
+        # Compute the root-backend flag once per validation; ``_accessible``
+        # reads it from the context instead of re-walking the parent chain.
+        context['backend_is_python'] = _root_backend_is_python(sdfg)
 
         initialized_transients = {'__pystate'}
         initialized_transients.update(sdfg.constants_prop.keys())
@@ -355,12 +358,50 @@ def validate_sdfg(sdfg: 'dace.sdfg.SDFG', references: Set[int] = None, **context
         raise
 
 
+def _root_backend_is_python(sdfg: 'dace.sdfg.SDFG') -> bool:
+    """Whether the root SDFG of ``sdfg`` targets the Python backend.
+
+    Walks the ``parent_sdfg`` chain to the top-level SDFG (the backend is a
+    property of the root only; nested SDFGs inherit it implicitly) and reports
+    whether its :attr:`~dace.sdfg.SDFG.backend` is
+    :attr:`~dace.dtypes.BackendLanguage.Python`.
+
+    Computed once per validation entry point and cached in the validation
+    ``context`` dict as ``'backend_is_python'`` (see :func:`_accessible`).
+
+    :param sdfg: Any SDFG in the tree (possibly nested).
+    :returns: ``True`` iff the root SDFG's backend is ``Python``.
+    """
+    root = sdfg
+    while root.parent_sdfg is not None:
+        root = root.parent_sdfg
+    return root.backend == dtypes.BackendLanguage.Python
+
+
 def _accessible(sdfg: 'dace.sdfg.SDFG', container: str, context: Dict[str, bool]):
     """
     Helper function that returns False if a data container cannot be accessed in the current SDFG context.
     """
     storage = sdfg.arrays[container].storage
     if storage == dtypes.StorageType.GPU_Global or storage in dtypes.GPU_STORAGES:
+        # The Python/cuTile backend represents ``GPU_Global`` data as ``cupy``
+        # arrays, which are addressable from host ("driver") Python code -- a
+        # host tasklet may index them, pass them to ``cupy.dot``, or launch a
+        # ``cuda.tile`` kernel over them.  The "GPU storage cannot be accessed
+        # on host" restriction is a C++/CUDA-backend invariant that does not
+        # hold there, so it is lifted for Python-backend SDFGs.  The bypass is
+        # restricted to ``GPU_Global`` only: ``GPU_Shared``/``GPU_Register`` are
+        # not host-addressable even under the Python backend, so they keep the
+        # original ``in_gpu`` check.
+        if storage == dtypes.StorageType.GPU_Global:
+            backend_is_python = context.get('backend_is_python')
+            if backend_is_python is None:
+                # Entered outside validate_sdfg/validate_state (which seed the
+                # flag); compute lazily and cache it in the context.
+                backend_is_python = _root_backend_is_python(sdfg)
+                context['backend_is_python'] = backend_is_python
+            if backend_is_python:
+                return True
         return context.get('in_gpu', False)
 
     return True
@@ -426,6 +467,9 @@ def validate_state(state: 'dace.sdfg.SDFGState',
     # Obtain whether we are already in an accelerator context
     if not hasattr(context, 'in_gpu'):
         context['in_gpu'] = is_devicelevel_gpu(sdfg, state, None)
+    # Seed the root-backend flag once when entering validation at state level
+    if 'backend_is_python' not in context:
+        context['backend_is_python'] = _root_backend_is_python(sdfg)
 
     # Reference check
     if id(state) in references:
@@ -991,14 +1035,32 @@ class InvalidSDFGError(Exception):
 
         return f'File "{lineinfo.filename}"'
 
+    def _resolve_state(self) -> Optional['SDFGState']:
+        """Resolve ``state_id`` to a state, or None if it no longer resolves.
+
+        Exception messages may be rendered long after the SDFG was modified
+        (or after the failing state was removed), so a stale id must not
+        crash ``__str__``.
+        """
+        if self.state_id is None:
+            return None
+        try:
+            return self.sdfg.node(self.state_id)
+        except Exception:
+            return None
+
     def to_json(self):
         return dict(message=self.message, cfg_id=self.sdfg.cfg_id, state_id=self.state_id)
 
     def __str__(self):
         if self.state_id is not None:
-            state = self.sdfg.node(self.state_id)
-            locinfo = self._getlineinfo(state)
-            suffix = f' (at state {state.label})'
+            state = self._resolve_state()
+            if state is not None:
+                locinfo = self._getlineinfo(state)
+                suffix = f' (at state {state.label})'
+            else:
+                locinfo = ''
+                suffix = f' (at state with id {self.state_id})'
         else:
             suffix = ''
             if self.sdfg.number_of_nodes() >= 1:
@@ -1029,13 +1091,22 @@ class InvalidSDFGInterstateEdgeError(InvalidSDFGError):
 
     def __str__(self):
         if self.edge_id is not None:
-            e = self.sdfg.edges()[self.edge_id]
-            edgestr = ' (at edge %s -> %s)' % (
-                str(e.src),
-                str(e.dst),
-            )
-            locinfo_src = self._getlineinfo(e.src)
-            locinfo_dst = self._getlineinfo(e.dst)
+            e = None
+            try:
+                e = self.sdfg.edges()[self.edge_id]
+            except Exception:
+                pass
+            if e is not None:
+                edgestr = ' (at edge %s -> %s)' % (
+                    str(e.src),
+                    str(e.dst),
+                )
+                locinfo_src = self._getlineinfo(e.src)
+                locinfo_dst = self._getlineinfo(e.dst)
+            else:
+                # Stale id: report it numerically instead of crashing.
+                edgestr = f' (at edge with id {self.edge_id})'
+                locinfo_src = locinfo_dst = ''
         else:
             edgestr = ''
             locinfo_src = locinfo_dst = ''
@@ -1046,7 +1117,7 @@ class InvalidSDFGInterstateEdgeError(InvalidSDFGError):
             elif locinfo_src and not locinfo_dst:
                 locinfo = f'at {locinfo_src}'
             elif locinfo_dst and not locinfo_src:
-                locinfo = f'at {locinfo_src}'
+                locinfo = f'at {locinfo_dst}'
             else:
                 locinfo = f'between\n {locinfo_src}\n and\n {locinfo_dst}'
 
@@ -1074,17 +1145,28 @@ class InvalidSDFGNodeError(InvalidSDFGError):
         return dict(message=self.message, cfg_id=self.sdfg.cfg_id, state_id=self.state_id, node_id=self.node_id)
 
     def __str__(self):
-        state = self.sdfg.node(self.state_id)
+        state = self._resolve_state()
         locinfo = ''
-
-        if self.node_id is not None:
-            from dace.sdfg.nodes import Node
-            node: Node = state.node(self.node_id)
-            nodestr = f', node {node}'
-            locinfo = self._getlineinfo(node)
+        if state is None:
+            # Stale ids: report them numerically instead of crashing.
+            statestr = f'state with id {self.state_id}'
+            nodestr = f', node with id {self.node_id}' if self.node_id is not None else ''
         else:
-            nodestr = ''
-            locinfo = self._getlineinfo(state)
+            statestr = f'state {state.label}'
+            if self.node_id is not None:
+                node = None
+                try:
+                    node = state.node(self.node_id)
+                except Exception:
+                    pass
+                if node is not None:
+                    nodestr = f', node {node}'
+                    locinfo = self._getlineinfo(node)
+                else:
+                    nodestr = f', node with id {self.node_id}'
+            else:
+                nodestr = ''
+                locinfo = self._getlineinfo(state)
 
         if locinfo:
             locinfo = '\nOriginating from source code at ' + locinfo
@@ -1092,7 +1174,7 @@ class InvalidSDFGNodeError(InvalidSDFGError):
         if self.path:
             locinfo += f'\nInvalid SDFG saved for inspection in {os.path.abspath(self.path)}'
 
-        return f'{self.message} (at state {state.label}{nodestr}){locinfo}'
+        return f'{self.message} (at {statestr}{nodestr}){locinfo}'
 
 
 class NodeNotExpandedError(InvalidSDFGNodeError):
@@ -1119,21 +1201,34 @@ class InvalidSDFGEdgeError(InvalidSDFGError):
         return dict(message=self.message, cfg_id=self.sdfg.cfg_id, state_id=self.state_id, edge_id=self.edge_id)
 
     def __str__(self):
-        state = self.sdfg.node(self.state_id)
-
-        if self.edge_id is not None:
-            e = state.edges()[self.edge_id]
-            edgestr = ", edge %s (%s:%s -> %s:%s)" % (
-                str(e.data),
-                str(e.src),
-                e.src_conn,
-                str(e.dst),
-                e.dst_conn,
-            )
-            locinfo = self._getlineinfo(e.data)
+        state = self._resolve_state()
+        locinfo = ''
+        if state is None:
+            # Stale ids: report them numerically instead of crashing.
+            statestr = f'state with id {self.state_id}'
+            edgestr = f', edge with id {self.edge_id}' if self.edge_id is not None else ''
         else:
-            edgestr = ''
-            locinfo = self._getlineinfo(state)
+            statestr = f'state {state.label}'
+            if self.edge_id is not None:
+                e = None
+                try:
+                    e = state.edges()[self.edge_id]
+                except Exception:
+                    pass
+                if e is not None:
+                    edgestr = ", edge %s (%s:%s -> %s:%s)" % (
+                        str(e.data),
+                        str(e.src),
+                        e.src_conn,
+                        str(e.dst),
+                        e.dst_conn,
+                    )
+                    locinfo = self._getlineinfo(e.data)
+                else:
+                    edgestr = f', edge with id {self.edge_id}'
+            else:
+                edgestr = ''
+                locinfo = self._getlineinfo(state)
 
         if locinfo:
             locinfo = '\nOriginating from source code at ' + locinfo
@@ -1141,7 +1236,7 @@ class InvalidSDFGEdgeError(InvalidSDFGError):
         if self.path:
             locinfo += f'\nInvalid SDFG saved for inspection in {os.path.abspath(self.path)}'
 
-        return f'{self.message} (at state {state.label}{edgestr}){locinfo}'
+        return f'{self.message} (at {statestr}{edgestr}){locinfo}'
 
 
 def validate_memlet_data(memlet_data: str, access_data: str) -> bool:

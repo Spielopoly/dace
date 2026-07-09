@@ -11,8 +11,9 @@ from dace import library, properties
 from dace.sdfg import nodes
 from dace.transformation.transformation import ExpandTransformation
 
-from .._pure_codegen import (cutile_tile_dim_bids, gather_lane_offset, nested_loops, offset_via_strides,
-                             resolve_gather_deps, tile_offset)
+from .._pure_codegen import (ct_dtype_name, cutile_bid_lines, cutile_offset_block_shift, cutile_offset_is_nonzero,
+                             cutile_tile_dim_bids, cutile_tile_dim_offsets, gather_lane_offset, nested_loops,
+                             offset_via_strides, resolve_gather_deps, tile_offset)
 from .. import _isa_codegen
 
 
@@ -150,10 +151,9 @@ class ExpandTileStoreCutile(ExpandTransformation):
         from dace.symbolic import symstr
 
         if node.wcr is not None:
-            raise NotImplementedError(
-                f"{node.label}: TileStore cuTile expansion does not support WCR "
-                f"(write-conflict resolution); atomic scatter is not yet implemented. "
-                f"Use the pure (CPP) expansion for WCR stores.")
+            raise NotImplementedError(f"{node.label}: TileStore cuTile expansion does not support WCR "
+                                      f"(write-conflict resolution); atomic scatter is not yet implemented. "
+                                      f"Use the pure (CPP) expansion for WCR stores.")
 
         widths = tuple(node.widths)
         K = len(widths)
@@ -175,6 +175,11 @@ class ExpandTileStoreCutile(ExpandTransformation):
                 return _dst_begins[d]
             return "0"
 
+        # The destination dtype, for dtype-correct constant fills (a bare
+        # literal like ``0.0`` would otherwise materialize a float32 tile that
+        # cannot be stored into e.g. an int32 array).
+        _dst_ct_dtype = ct_dtype_name(dst_arr.dtype)
+
         # Resolve the stored tile expression per src_kind (mirrors TileLoad).
         if node.src_kind == "Scalar":
             # Broadcast a single value. If the source comes from a global
@@ -186,12 +191,31 @@ class ExpandTileStoreCutile(ExpandTransformation):
                              and all(bool(dace.symbolic.simplify(s == 1)) for s in desc.shape))
             if is_len1_array:
                 ref = f"ct.load(_src, index=({'0,' * len(desc.shape)}), shape=({'1,' * len(desc.shape)})).item()"
+                tile_expr = f"ct.broadcast_to({ref}, {widths})"
+            elif isinstance(desc, dace.data.Scalar):
+                # Scalar kernel parameters are normalized at the launch site
+                # (cutile_target): floats arrive as 0-d tiles (device path,
+                # keeps f64 precision), ints/bools as plain Python values.
+                if desc.dtype.as_numpy_dtype().kind == "f":
+                    tile_expr = f"ct.broadcast_to(_src, {widths})"
+                else:
+                    tile_expr = f"ct.full({widths}, _src, ct.{_dst_ct_dtype})"
             else:
-                ref = "_src.item()"
-            tile_expr = f"ct.broadcast_to({ref}, {widths})"
+                tile_expr = f"ct.broadcast_to(_src.item(), {widths})"
         elif node.src_kind == "Symbol":
-            tile_expr = f"ct.broadcast_to(({symstr(node.src_expr, cpp_mode=False)}), {widths})"
+            tile_expr = f"ct.full({widths}, ({symstr(node.src_expr, cpp_mode=False)}), ct.{_dst_ct_dtype})"
         elif node.src_kind == "Tile":
+            # Rank invariant (bug 07): the value tile arriving here must be
+            # rank-K (``widths``-shaped) — TileLoad normalizes source-rank
+            # tiles at the LOAD. A rank mismatch means an upstream producer
+            # broke the invariant; fail loudly instead of silently reshaping.
+            src_edge = next(e for e in parent_state.in_edges(node) if e.dst_conn == "_src")
+            src_shape = tuple(parent_sdfg.arrays[src_edge.data.data].shape)
+            if len(src_shape) != K:
+                raise ValueError(f"{node.label}: TileStore cutile expansion requires a rank-{K} "
+                                 f"(widths={widths}) value tile, but '_src' descriptor "
+                                 f"'{src_edge.data.data}' has shape {src_shape}. Runtime tile rank must equal "
+                                 f"the declared descriptor rank K (normalized at TileLoad).")
             tile_expr = "_src"
         else:
             raise ValueError(f"TileStore cutile expansion: unrecognized src_kind {node.src_kind!r}")
@@ -227,7 +251,9 @@ class ExpandTileStoreCutile(ExpandTransformation):
 
             _bids = cutile_tile_dim_bids(node, parent_state, parent_sdfg, used_dimensions,
                                          _dst_begins if _dst_begins is not None else [], K)
-            lines = [f"__pid{k} = ct.bid({_bids[k]})" for k in range(K)]
+            lines = cutile_bid_lines(node, parent_state, parent_sdfg, _bids)
+            _tile_offsets = cutile_tile_dim_offsets(node, parent_state, parent_sdfg, used_dimensions,
+                                                    _dst_begins if _dst_begins is not None else [], K)
 
             idx_entries = []
             for d in range(ndim):
@@ -243,6 +269,9 @@ class ExpandTileStoreCutile(ExpandTransformation):
                     base = f"ct.arange({widths[k]}, dtype=ct.int32) + __pid{k} * {widths[k]}"
                     if coeffs[k] != 1:
                         base = f"({base}) * {coeffs[k]}"
+                    # Add the constant slice offset carried by the dest memlet begin.
+                    if cutile_offset_is_nonzero(_tile_offsets[k]):
+                        base = f"({base}) + {_tile_offsets[k]}"
                     if K == 1:
                         lines.append(f"__idx{k} = {base}")
                     else:
@@ -263,7 +292,8 @@ class ExpandTileStoreCutile(ExpandTransformation):
 
             return nodes.Tasklet(
                 label=f"{node.label}_cutile",
-                inputs={c: None for c in inputs},
+                inputs={c: None
+                        for c in inputs},
                 outputs={"_dst": None},
                 code="\n".join(lines),
                 language=dace.dtypes.Language.Python,
@@ -288,9 +318,24 @@ class ExpandTileStoreCutile(ExpandTransformation):
 
         _bids = cutile_tile_dim_bids(node, parent_state, parent_sdfg, used_dimensions,
                                      _dst_begins if _dst_begins is not None else [], K)
-        lines = [f"__pid{k} = ct.bid({_bids[k]})" for k in range(K)]
+        lines = cutile_bid_lines(node, parent_state, parent_sdfg, _bids)
 
-        if is_default_coeffs and not node.has_mask:
+        # Constant per-tile-dim element offset carried by the dest memlet begin
+        # (e.g. ``B[1:-1]`` -> begin ``__i0 + 1`` -> offset ``1``). The
+        # block-aligned ``ct.store`` index / ``ct.arange + __pid*W`` scatter
+        # index only reconstruct ``__pid*W`` and drop this offset, so a non-zero
+        # offset must go through the per-element ``ct.scatter`` path with the
+        # offset added to each index.
+        _tile_offsets = cutile_tile_dim_offsets(node, parent_state, parent_sdfg, used_dimensions,
+                                                _dst_begins if _dst_begins is not None else [], K)
+        # Per-dim block-index shift for offsets that are provably nonnegative
+        # multiples of the tile width; ``None`` where not provable. All-provable
+        # keeps the ALIGNED ``ct.store`` fast path with shifted block indices
+        # instead of falling back to per-element ``ct.scatter``.
+        _shifts = [cutile_offset_block_shift(_tile_offsets[k], widths[k]) for k in range(K)]
+        aligned_shift_ok = all(s is not None for s in _shifts)
+
+        if is_default_coeffs and not node.has_mask and aligned_shift_ok:
             # Aligned block store. The stored tile must be in array-dim
             # order with singleton extents on unused dims: insert the
             # singleton axes first (tile axes then follow ``all_dimensions``
@@ -304,7 +349,11 @@ class ExpandTileStoreCutile(ExpandTransformation):
             index_entries = []
             for d in range(ndim):
                 if d in used_dimensions:
-                    index_entries.append(f"__pid{used_dimensions.index(d)}")
+                    k = used_dimensions.index(d)
+                    if cutile_offset_is_nonzero(_shifts[k]):
+                        index_entries.append(f"__pid{k} + {symstr(_shifts[k], cpp_mode=False)}")
+                    else:
+                        index_entries.append(f"__pid{k}")
                 else:
                     index_entries.append(_unused_dim_index(d))
             if tile_expr != "_src":
@@ -332,6 +381,11 @@ class ExpandTileStoreCutile(ExpandTransformation):
                     base = f"ct.arange({widths[k]}, dtype=ct.int32) + __pid{k} * {widths[k]}"
                     if coeffs[k] != 1:
                         base = f"({base}) * {coeffs[k]}"
+                    # Add the constant slice offset carried by the dest memlet
+                    # begin (e.g. ``B[1:-1]`` -> ``+ 1``) so the per-lane element
+                    # index is absolute, not block-relative.
+                    if cutile_offset_is_nonzero(_tile_offsets[k]):
+                        base = f"({base}) + {_tile_offsets[k]}"
                     if K == 1:
                         lines.append(f"__idx{k} = {base}")
                     else:

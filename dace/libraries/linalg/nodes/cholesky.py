@@ -113,6 +113,64 @@ class ExpandCholeskyCuSolverDn(ExpandTransformation):
         return _make_sdfg(node, parent_state, parent_sdfg, "cuSolverDn")
 
 
+@dace.library.expansion
+class ExpandCholeskyCuPy(ExpandTransformation):
+    """CuPy-based GPU Cholesky factorization via ``cupy.linalg.cholesky``.
+
+    Produces a nested SDFG with a single Python-language tasklet, usable by
+    the Python/cuTile backend (no CPP tasklets, no LAPACK environment).
+    ``cupy.linalg.cholesky`` returns the lower-triangular factor; for
+    ``lower=False`` the conjugate transpose (upper factor) is emitted.
+    Device-resident (``GPU_Global``) operands stay on the device.
+    """
+
+    environments = []
+
+    @staticmethod
+    def expansion(node: 'Cholesky', parent_state: dace.SDFGState, parent_sdfg: dace.SDFG) -> dace.SDFG:
+        """Build the nested SDFG calling ``cupy.linalg.cholesky``.
+
+        :param node: The ``Cholesky`` node being expanded.
+        :param parent_state: State that owns the node.
+        :param parent_sdfg: SDFG that owns ``parent_state``.
+        :returns: The nested SDFG implementing the node.
+        """
+        from dace.libraries.blas.blas_helpers import cupy_in_wrap, cupy_out_wrap
+
+        inp_desc, inp_shape, out_desc, out_shape = node.validate(parent_sdfg, parent_state)
+
+        # ``inp_shape``/``out_shape`` are the *squeezed* 2-D memlet shapes, so
+        # the strides must be filtered to the kept (non-squeezed) dims as well
+        # (mirrors ExpandSolveCuPy): the full outer strides would mismatch the
+        # 2-D shape for batched / leading-singleton operands (e.g. A[0, :, :]).
+        in_subset = copy.deepcopy(next(e.data.subset for e in parent_state.in_edges(node) if e.dst_conn == '_a'))
+        out_subset = copy.deepcopy(next(e.data.subset for e in parent_state.out_edges(node) if e.src_conn == '_b'))
+        in_strides = [inp_desc.strides[d] for d in in_subset.squeeze()]
+        out_strides = [out_desc.strides[d] for d in out_subset.squeeze()]
+
+        nsdfg = dace.SDFG(node.label + '_cupy')
+        nstate = nsdfg.add_state()
+        nsdfg.add_array('_a', inp_shape, inp_desc.dtype, strides=in_strides, storage=inp_desc.storage)
+        nsdfg.add_array('_b', out_shape, out_desc.dtype, strides=out_strides, storage=out_desc.storage)
+
+        a_in = cupy_in_wrap('__a', inp_desc.storage)
+        lines = ['import cupy', f'__L = cupy.linalg.cholesky({a_in})']
+        if not node.lower:
+            # Upper factor U with A = U^H U is the conjugate transpose of L.
+            lines.append('__L = __L.swapaxes(-1, -2).conj()')
+        lines.append(f"__b_out = {cupy_out_wrap('__L', out_desc.storage)}")
+
+        tasklet = nstate.add_tasklet(node.label + '_cupy_tasklet', {'__a'}, {'__b_out'},
+                                     '\n'.join(lines),
+                                     language=dace.dtypes.Language.Python)
+
+        a_read = nstate.add_read('_a')
+        b_write = nstate.add_write('_b')
+        nstate.add_edge(a_read, None, tasklet, '__a', Memlet.from_array('_a', nsdfg.arrays['_a']))
+        nstate.add_edge(tasklet, '__b_out', b_write, None, Memlet.from_array('_b', nsdfg.arrays['_b']))
+        return nsdfg
+
+
 @dace.library.node
 class Cholesky(dace.sdfg.nodes.LibraryNode):
 
@@ -120,7 +178,8 @@ class Cholesky(dace.sdfg.nodes.LibraryNode):
     implementations = {
         "OpenBLAS": ExpandCholeskyOpenBLAS,
         "MKL": ExpandCholeskyMKL,
-        "cuSolverDn": ExpandCholeskyCuSolverDn
+        "cuSolverDn": ExpandCholeskyCuSolverDn,
+        "CuPy": ExpandCholeskyCuPy,
     }
     default_implementation = None
 

@@ -60,10 +60,14 @@ def subset_to_python_indices(desc: data.Data, subset: subsets.Subset | None) -> 
 def data_access_expression(name: str,
                            desc: data.Data,
                            subset: subsets.Subset | None = None,
-                           scalar_buffer: bool = False) -> str:
+                           scalar_buffer: bool = False,
+                           is_write: bool = False) -> str:
     if isinstance(desc, data.Scalar):
         if scalar_buffer:
-            return f'{name}[...]'
+            # Scalar buffers are 0-d numpy arrays. Reads use ``[()]`` so the
+            # value is a numpy scalar (usable in cupy expressions); write
+            # targets use ``[...]`` so assignment mutates the buffer in place.
+            return f'{name}[...]' if is_write else f'{name}[()]'
         return name
 
     indices = subset_to_python_indices(desc, subset)

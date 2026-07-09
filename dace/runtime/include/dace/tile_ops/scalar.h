@@ -78,6 +78,21 @@ inline constexpr bool _is_pointer_like =
 namespace dace {
 namespace tileops {
 
+// ``std::is_pointer`` does NOT recognise a ``__restrict__``-qualified pointer
+// (a GCC/Clang extension) as a pointer: ``std::is_pointer_v<T* __restrict__>``
+// is ``false``. DaCe emits tasklet tile-load source connectors as
+// ``T* __restrict__ _src = &arr[...];``, so a raw ``!std::is_pointer_v<Src>``
+// SFINAE guard fails to exclude those pointers from the by-value broadcast
+// ``tile_load`` overload below -- silently splatting ``src[0]`` across every
+// lane instead of doing the strided per-lane load. Strip the ``restrict``
+// qualifier before the pointer test so a restrict-qualified pointer is
+// classified as a pointer (its natural category).
+template <typename T> struct _strip_restrict { using type = T; };
+template <typename T> struct _strip_restrict<T* __restrict__> { using type = T*; };
+template <typename Src>
+inline constexpr bool _is_pointer_like =
+    std::is_pointer_v<typename _strip_restrict<std::remove_reference_t<Src>>::type>;
+
 // Per-lane binary op.
 template <typename T, char Op>
 inline T tile_apply(T a, T b) {

@@ -21,6 +21,9 @@ from dace.transformation.passes.vectorization.cutile_lowering import (
     CuTileSetTileStorage,
     CuTileValidateTiles,
     GPUDeviceToCuTile,
+    _collect_tile_nodes,
+    clamp_propagated_oob_memlets,
+    mark_tile_op_memlets_allow_oob,
 )
 from dace.transformation.passes.vectorization.vectorize_cpu_multi_dim import VectorizeCPUMultiDim
 
@@ -30,10 +33,10 @@ from dace.transformation.passes.vectorization.vectorize_cpu_multi_dim import Vec
 class VectorizeCuTile(ppl.Pass):
     """Vectorize an SDFG into cuTile kernels for the Python backend.
 
-    Imperative stages, run once, in order (:class:`CanonicalizationPipeline`
-    style — this is a :class:`~dace.transformation.pass_pipeline.Pass`, not a
-    ``Pipeline``, because the lowering passes must run between the vectorizer
-    and library-node expansion and the vectorizer is itself a Pipeline):
+    Imperative stages, run once, in order (this is a
+    :class:`~dace.transformation.pass_pipeline.Pass`, not a ``Pipeline``,
+    because the lowering passes must run between the vectorizer and
+    library-node expansion and the vectorizer is itself a Pipeline):
 
     1. ``VectorizeCPUMultiDim(widths=..., target_isa="CUTILE",
        expand_tile_nodes=False, ...)`` — emit ``tileops`` library nodes.
@@ -46,13 +49,13 @@ class VectorizeCuTile(ppl.Pass):
        outermost maps from ``GPU_Device`` to ``CuTile``.
     5. :class:`CuTileSetTileStorage` — ``Register`` tile transients inside
        CuTile scopes become ``CuTile_Tile``.
-    6. :class:`CuTileSetImplementations` — lib nodes ->
+    6. :class:`CuTileSetLibraryImplementations` — select and expand
+       *non*-tileops library nodes (e.g. BLAS ``MatMul``) that the cuTile
+       codegen cannot handle.
+    7. :class:`CuTileSetImplementations` — lib nodes ->
        ``target_isa="CUTILE"``, ``implementation="cutile"``.
-    7. ``sdfg.backend = dtypes.BackendLanguage.Python``
+    8. ``sdfg.backend = dtypes.BackendLanguage.Python``
 
-    **Canonicalization is NOT run** (parity with ``VectorizeCPUMultiDim``):
-    callers wanting the full front-door flow run
-    ``dace.transformation.passes.canonicalize.canonicalize(sdfg)`` first.
 
     The cuTile configuration is pinned: ``target_isa`` is always ``"CUTILE"``
     and ``expand_tile_nodes`` is always ``False`` internally (expansion happens
@@ -154,16 +157,45 @@ class VectorizeCuTile(ppl.Pass):
         self._vectorizer.apply_pass(sdfg, {})
         debug_save_sdfg()
 
+        # Anchor census: zero anchors is either the supported BLAS-only
+        # configuration (all reductions became BLAS library nodes, lowered in
+        # step 6) or a genuinely un-vectorized SDFG; the lowering passes
+        # diagnose which. No anchors can appear after this point.
+        has_anchors = bool(_collect_tile_nodes(sdfg))
+
         # Step 2: Validate — anchors exist, widths are powers of 2
         CuTileValidateTiles(strict=self.strict).apply_pass(sdfg, {})
         debug_save_sdfg()
 
-        # Step 3: GPU transform — scheduling, storage, data copies
+        # Step 2b: Masked tile ops address a full W-wide window whose tail
+        # lanes are inactive; at non-divisible boundaries the memlet SUBSET
+        # exceeds the array bounds even though the masked runtime accesses do
+        # not.  Mark those memlets allow_oob so the re-propagation inside
+        # apply_gpu_transformations() (and any later validation) accepts them.
+        mark_tile_op_memlets_allow_oob(sdfg)
+
+        # Step 3: GPU transform — scheduling, storage, data copies.
+        # Validation and simplify are deferred: GPUTransformSDFG re-propagates
+        # memlets, which can recreate provably-OOB (but mask-guarded) tile
+        # subsets that validation would reject — propagate_subset copies
+        # memlets[0] of the aggregated list, so the step-2b allow_oob mark can
+        # be dropped from the propagated result (see the caveat in
+        # mark_tile_op_memlets_allow_oob). Clamp those tileops-anchored
+        # subsets first (step 3b), then simplify (step 3c, which validates
+        # the result).
         sdfg.apply_gpu_transformations(
+            validate=False,
             sequential_innermaps=True,
             register_transients=True,
-            simplify=True,
+            simplify=False,
         )
+        debug_save_sdfg()
+
+        # Step 3b: Clamp provably-OOB propagated tile memlets to array bounds.
+        clamp_propagated_oob_memlets(sdfg)
+
+        # Step 3c: Simplify + validate (previously run inside step 3).
+        sdfg.simplify()
         debug_save_sdfg()
 
         # Step 4: Adapter — re-stamp tileops-anchored maps GPU_Device -> CuTile
@@ -179,8 +211,12 @@ class VectorizeCuTile(ppl.Pass):
         CuTileSetLibraryImplementations(strict=self.strict).apply_pass(sdfg, {})
         debug_save_sdfg()
 
-        # Step 7: Stamp cuTile implementations on tileops library nodes
-        CuTileSetImplementations(strict=self.strict).apply_pass(sdfg, {})
+        # Step 7: Stamp cuTile implementations on tileops library nodes.
+        # Skipped when step 1 produced no anchors: the pass would be a no-op,
+        # and its "already expanded?" diagnostic is misleading here (in the
+        # BLAS-only configuration step 6 legitimately expanded everything).
+        if has_anchors:
+            CuTileSetImplementations(strict=self.strict).apply_pass(sdfg, {})
 
         # Step 8: Python backend stamp
         sdfg.backend = dtypes.BackendLanguage.Python

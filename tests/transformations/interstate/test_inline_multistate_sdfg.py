@@ -204,6 +204,86 @@ def test_inline_renames_inner_connector_to_outer_array_name():
     assert np.allclose(out_inlined, expected, atol=1e-12)
 
 
+def _build_inner_symbol_collides_with_outer_data_sdfg() -> SDFG:
+    """Regression for the ``nit`` collision (cavity_flow / channel_flow).
+
+    The inner NSDFG uses a symbol whose name (``nit``) is ALSO the name of
+    a *data descriptor* in the outer SDFG (a scalar parameter), while the
+    symbol mapping binds the inner ``nit`` to a *different* outer symbol
+    (``M``). The non-identity handling must not try to register ``nit`` as
+    an outer symbol (it is taken by the data descriptor); it must instead
+    substitute ``nit`` inline with ``M``.
+    """
+    outer = SDFG('inner_sym_collides_with_outer_data')
+    # ``nit`` exists as a data descriptor in the outer scope.
+    outer.add_array('nit', [1], dtypes.int64)
+    outer.add_array('a', [N], dtypes.float64)
+    outer.add_array('b', [N], dtypes.float64)
+    outer.add_symbol('M', dtypes.int64)
+    s = outer.add_state('main', is_start_block=True)
+
+    inner = SDFG('inner')
+    inner.add_symbol('nit', dtypes.int64)
+    inner.add_array('a', [N], dtypes.float64)
+    inner.add_array('b', [N], dtypes.float64)
+    ist = inner.add_state('inner_main', is_start_block=True)
+    me, mx = ist.add_map('m', dict(j='0:N'))
+    t = ist.add_tasklet('t', {'x'}, {'y'}, 'y = x + nit')
+    ist.add_memlet_path(ist.add_read('a'), me, t, dst_conn='x', memlet=Memlet('a[j]'))
+    ist.add_memlet_path(t, mx, ist.add_write('b'), src_conn='y', memlet=Memlet('b[j]'))
+    inner.validate()
+
+    # Inner symbol ``nit`` is bound to the outer symbol ``M`` (non-identity),
+    # while the outer scope separately owns a data descriptor named ``nit``.
+    nsdfg_node = s.add_nested_sdfg(inner, {'a'}, {'b'}, symbol_mapping={'N': 'N', 'nit': 'M'})
+    s.add_edge(s.add_read('a'), None, nsdfg_node, 'a', Memlet('a[0:N]'))
+    s.add_edge(nsdfg_node, 'b', s.add_write('b'), None, Memlet('b[0:N]'))
+    outer.validate()
+    return outer
+
+
+def test_inline_inner_symbol_collides_with_outer_data_descriptor():
+    """Inlining must not raise ``FileExistsError`` when an inner symbol name
+    is already taken by an outer data descriptor (pipeline bug 10 / CORE_BUGFIXES #13)."""
+    sdfg = _build_inner_symbol_collides_with_outer_data_sdfg()
+    _apply_inline(sdfg)  # must not raise FileExistsError
+
+    # ``nit`` must remain a data descriptor and NOT have been registered as
+    # a symbol.
+    assert 'nit' in sdfg.arrays
+    assert 'nit' not in sdfg.symbols
+    # The inner ``nit`` must have been substituted inline by ``M`` (no iedge
+    # assignment planted for the colliding name).
+    for e in sdfg.all_interstate_edges():
+        assert 'nit' not in e.data.assignments
+
+
+def test_inline_inner_symbol_collides_end_to_end():
+    """End-to-end: a global symbol shadowed by a same-named parameter and
+    used inside a nested @dace.program (cavity_flow's exact shape) must
+    lower, compile and run, matching NumPy."""
+    K = dace.symbol('K', dace.int64)
+
+    @dace.program
+    def _inner_scale(a: dace.float64[N], b: dace.float64[N]):
+        for _ in range(K):
+            b[:] = a + K
+
+    @dace.program
+    def _outer_scale(K: dace.int64, a: dace.float64[N], b: dace.float64[N]):
+        _inner_scale(a, b, K=K)
+
+    # simplify=True runs the multistate inline that triggered pipeline bug 10 (CORE_BUGFIXES #13).
+    sdfg = _outer_scale.to_sdfg(simplify=True)
+
+    n, kval = 16, 3
+    rng = np.random.default_rng(0xBEEF)
+    a = rng.standard_normal(n).astype(np.float64)
+    b = np.zeros(n, dtype=np.float64)
+    sdfg(K=kval, a=a.copy(), b=b, N=n)
+    assert np.allclose(b, a + kval, atol=1e-12)
+
+
 def test_inline_refuses_inside_map_scope():
     """An NSDFG nested inside a Map scope must not be inlined."""
 
@@ -234,5 +314,7 @@ if __name__ == '__main__':
     test_inline_preserves_pre_and_post_numerics()
     test_inline_lowers_non_identity_symbol_mapping_to_iedge_assignment()
     test_inline_renames_inner_connector_to_outer_array_name()
+    test_inline_inner_symbol_collides_with_outer_data_descriptor()
+    test_inline_inner_symbol_collides_end_to_end()
     test_inline_refuses_inside_map_scope()
     print('all ok')
