@@ -510,7 +510,7 @@ class InsertTileLoadStore(ppl.Pass):
                                                      an,
                                                      widths=tuple(self.widths),
                                                      src_subset=src_subset_memlet,
-                                                     name_hint=sanitize_transient_name_hint(an.data, "_gather"),
+                                                     name_hint=f"{an.data}_gather",
                                                      dim_strides=_g_strides,
                                                      replicate_factor_per_dim=_g_repl,
                                                      src_dims=_g_src_dims,
@@ -561,7 +561,7 @@ class InsertTileLoadStore(ppl.Pass):
                         continue
                     bridge_name = stage_constant_access(inner_state,
                                                         an,
-                                                        name_hint=sanitize_transient_name_hint(an.data, "_const"),
+                                                        name_hint=f"{an.data}_const",
                                                         src_subset=const_sub)
                     self._rewire_consumers_to_bridge(inner_state, an, bridge_name, s_edges, iter_vars=iter_vars)
                     staged += 1
@@ -585,7 +585,7 @@ class InsertTileLoadStore(ppl.Pass):
                                                  an,
                                                  widths=tuple(self.widths),
                                                  src_subset=src_subset_memlet,
-                                                 name_hint=sanitize_transient_name_hint(an.data, "_tile"),
+                                                 name_hint=f"{an.data}_tile",
                                                  dim_strides=dim_strides,
                                                  replicate_factor_per_dim=replicate,
                                                  src_dims=_s_src_dims,
@@ -673,7 +673,7 @@ class InsertTileLoadStore(ppl.Pass):
                                                   an,
                                                   widths=tuple(self.widths),
                                                   dst_subset=dst_subset_memlet,
-                                                  name_hint=sanitize_transient_name_hint(an.data, "_scatter_out"),
+                                                  name_hint=f"{an.data}_scatter_out",
                                                   dim_strides=_w_strides,
                                                   dst_dims=_w_dst_dims,
                                                   gather_dims=scatter_source_dims,
@@ -695,7 +695,7 @@ class InsertTileLoadStore(ppl.Pass):
                                               an,
                                               widths=tuple(self.widths),
                                               dst_subset=dst_subset_memlet,
-                                              name_hint=sanitize_transient_name_hint(an.data, "_tile_out"),
+                                              name_hint=f"{an.data}_tile_out",
                                               dim_strides=dim_strides_w,
                                               dst_dims=_s_dst_dims,
                                               mask_an=mask_an_for_this)

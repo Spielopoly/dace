@@ -244,7 +244,7 @@ class ConvertTaskletsToTileOps(ppl.Pass):
         )
         out_an = inner_state.add_access(arr_name)
         out_subset = ", ".join(f"0:{w}" for w in widths)
-        inner_state.add_edge(iota, "_dst", out_an, None, _Memlet(f"{arr_name}[{out_subset}]"))
+        inner_state.add_edge(tasklet, "_out", out_an, None, _Memlet(f"{arr_name}[{out_subset}]"))
         return arr_name
 
     def _find_mask_an(self, inner_state: SDFGState):

@@ -137,7 +137,7 @@ class _MultiOutputReductionMapFission(MapFission):
 
 #: "AUTO" resolves to the host's best ISA at expansion time
 #: (``dace.libraries.tileops._dispatch.detect_host_isa``); the others pin one.
-_VALID_ISAS = ("AUTO", "AVX512", "AVX2", "ARM_SVE", "ARM_NEON", "SCALAR", "CUDA")
+_VALID_ISAS = ("AUTO", "AVX512", "AVX2", "ARM_SVE", "ARM_NEON", "SCALAR", "CUDA", "CUTILE")
 _VALID_REMAINDER = ("full_mask", "masked_tail", "scalar_postamble")
 _VALID_BRANCH = ("merge", "fp_factor")
 _VALID_SCALAR_REMAINDER = ("scalar", "tile_k1")
@@ -353,7 +353,7 @@ class VectorizeMultiDim(ppl.Pipeline):
 
     def __init__(self,
                  widths: Tuple[int, ...],
-                 target_isa: Literal["AUTO", "AVX512", "AVX2", "ARM_SVE", "ARM_NEON", "SCALAR", "CUDA"] = "AUTO",
+                 target_isa: Literal["AUTO", "AVX512", "AVX2", "ARM_SVE", "ARM_NEON", "SCALAR", "CUDA", "CUTILE"] = "AUTO",
                  remainder_strategy: Literal["full_mask", "masked_tail", "scalar_postamble"] = "masked_tail",
                  branch_mode: Literal["merge", "fp_factor"] = "merge",
                  loop_to_map_permissive: bool = False,
