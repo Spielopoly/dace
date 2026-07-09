@@ -17,6 +17,19 @@ from .._pure_codegen import (ct_dtype_name, cutile_bid_lines, cutile_offset_bloc
 from .. import _isa_codegen
 
 
+def _extents_equal(a, e) -> bool:
+    """True when tile-extent expressions ``a`` and ``e`` are equal.
+
+    Robust to same-name symbols carrying different sympy assumptions (e.g. a tile
+    base ``jl`` staged as nonnegative vs. the loop's plain ``jl``), which blocks
+    ``jl - jl`` from cancelling and would false-reject a genuine full-tile store.
+    Re-parsing the difference from its string form unifies symbols by name.
+    """
+    if dace.symbolic.simplify(a - e) == 0:
+        return True
+    return dace.symbolic.pystr_to_symbolic(str(a - e)) == 0
+
+
 @library.expansion
 class ExpandTileStorePure(ExpandTransformation):
     """Correctness-only CPP tasklet copying ``_src`` into the tile region of ``_dst``."""
@@ -685,7 +698,7 @@ class TileStore(nodes.LibraryNode):
             if subset_sizes is not None:
                 expected = tuple(widths[i] for i in range(K))
                 actual = tuple(subset_sizes[d] for d in dims) if max(dims, default=-1) < len(subset_sizes) else None
-                if actual is None or any(bool(dace.symbolic.simplify(a - e)) != 0 for a, e in zip(actual, expected)):
+                if actual is None or any(not _extents_equal(a, e) for a, e in zip(actual, expected)):
                     raise NotImplementedError(
                         f"{self.label}: non-full-tile structured store -- dest memlet "
                         f"subset sizes {subset_sizes} on dims {dims} != widths {expected}. Per user "
