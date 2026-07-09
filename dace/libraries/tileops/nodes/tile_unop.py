@@ -238,7 +238,15 @@ class ExpandTileUnopCutile(ExpandTransformation):
             return conn
 
         a = _cutile_operand(node.kind_a, "_a", node.expr_a)
-        rhs_expr = _CUTE_UNOP_EXPR[node.op].format(a=a)
+        if node.op in _CAST_OP_TO_CPP:
+            # Explicit dtype cast (VTI keeps casts rather than stripping them; the op
+            # label IS the target dtype). Mirror the pure path's ``dace::<dtype>(x)``
+            # with cuTile's ``ct.astype(x, ct.<dtype>)`` -- the same convert form the
+            # ``not`` op already uses (``ct.astype(_a, ct.bool_)``).
+            ct_dtype = "bool_" if node.op == "bool" else node.op
+            rhs_expr = f"ct.astype({a}, ct.{ct_dtype})"
+        else:
+            rhs_expr = _CUTE_UNOP_EXPR[node.op].format(a=a)
         inputs = set()
         if node.kind_a == _TILE:
             inputs.add("_a")

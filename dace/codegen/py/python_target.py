@@ -1,5 +1,6 @@
 # Copyright 2019-2026 ETH Zurich and the DaCe authors. All rights reserved.
 import ast
+import re
 from typing import TYPE_CHECKING, Optional
 import warnings
 
@@ -26,6 +27,21 @@ def _python_expr(expr) -> str:
     if isinstance(expr, ast.AST):
         return astutils.unparse(expr) or ''
     return symbolic.symstr(expr, cpp_mode=False)
+
+
+#: Dtype names a kept cast can carry, built from the dtype registry.
+_PY_CAST_DTYPES = {s.split('::')[-1] for s in dtypes.TYPECLASS_TO_STRING.values()}
+_DACE_DTYPE_CAST_RE = re.compile(r'\bdace\.(' + '|'.join(sorted(_PY_CAST_DTYPES, key=len, reverse=True)) + r')\b')
+
+
+def _rewrite_dace_dtype_casts(body: str) -> str:
+    """Repoint a kept ``dace.<dtype>(x)`` cast at ``numpy``.
+
+    VTI keeps dtype casts rather than stripping them, so a host Python tasklet can
+    carry ``dace.float64(x)``; the generated module imports ``numpy`` but not ``dace``.
+    Only the ``dace.<dtype>`` token is rewritten -- the rest of the body is untouched.
+    """
+    return _DACE_DTYPE_CAST_RE.sub(r'numpy.\1', body)
 
 
 def _python_view_component(start, end, step) -> str:
@@ -951,7 +967,7 @@ class PythonCodeGen(PythonTargetCodeGenerator):
             callsite_stream.write(f'{edge.dst_conn} = {self._read_expr(sdfg, edge.data)}', cfg, state_id)
             self._dispatcher.defined_vars.add(edge.dst_conn, dispatcher_mod.DefinedType.Scalar, 'object')
 
-        tasklet_body = codeblock_to_python(node.code).strip()
+        tasklet_body = _rewrite_dace_dtype_casts(codeblock_to_python(node.code).strip())
 
         callsite_stream.write(f'\n####### Tasklet: {node.label}\n\n', cfg, state_id)
 

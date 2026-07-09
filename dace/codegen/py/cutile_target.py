@@ -69,6 +69,12 @@ _CT_MATH_FUNCS: Dict[str, str] = {
     'maximum': 'maximum',
 }
 
+#: Dtype names an explicit cast can carry (``float64`` / ``int32`` / ``bool`` / ...),
+#: built from the dtype registry. VTI keeps casts rather than stripping them, so a
+#: kept ``dace.float64(x)`` / ``np.int32(x)`` reaches the kernel module-qualified;
+#: cuda.tile can't resolve ``dace``/``np``, so it is rewritten to ``ct.astype``.
+_CT_CAST_DTYPES = {s.split('::')[-1] for s in dtypes.TYPECLASS_TO_STRING.values()}
+
 
 def _ct_attr(name: str) -> ast.Attribute:
     """Build an ``ast`` node for ``ct.<name>``.
@@ -173,6 +179,15 @@ class _CuTileTaskletRewriter(ast.NodeTransformer):
         """
         from dace.codegen.py.sympy_function_redefinitions import _NUMPY_EQUIVALENTS
         self.generic_visit(node)
+        if (isinstance(node.func, ast.Attribute) and node.func.attr in _CT_CAST_DTYPES
+                and isinstance(node.func.value, ast.Name) and node.func.value.id in ('dace', 'numpy', 'np')
+                and len(node.args) == 1):
+            # A kept dtype cast reaches the kernel module-qualified (``dace.float64(x)``);
+            # cuda.tile can't resolve ``dace``/``np``, so rewrite to ``ct.astype(x, ct.<dtype>)``.
+            dt = node.func.attr
+            return ast.Call(func=_ct_attr('astype'),
+                            args=[node.args[0], _ct_attr('bool_' if dt == 'bool' else dt)],
+                            keywords=node.keywords)
         if isinstance(node.func, ast.Name):
             ct_name = _CT_MATH_FUNCS.get(node.func.id)
             if ct_name is not None:
