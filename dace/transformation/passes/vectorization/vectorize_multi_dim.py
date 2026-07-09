@@ -80,9 +80,10 @@ from dace.transformation.passes.vectorization.split_map_for_tile_remainder impor
 # expansion handles only TileLoad / TileStore / TileMaskGen.
 from dace.transformation.dataflow import MapCollapse, MapFission, WCRToAugAssign
 from dace.transformation.dataflow.lift_einsum import LiftEinsum
-from dace.transformation.interstate import (InlineMultistateSDFG, InlineSDFG, LoopToMap, RefineNestedAccess)
-from dace.transformation.interstate.expand_nested_sdfg_inputs import ExpandNestedSDFGInputs
-from dace.transformation.interstate import InlineSDFG, InlineMultistateSDFG
+# NOTE: interstate transforms (InlineSDFG, InlineMultistateSDFG, LoopToMap,
+# RefineNestedAccess, ExpandNestedSDFGInputs) are imported function-locally at their
+# use sites — a module-level import re-enters the partially-initialized
+# ``dace.transformation.interstate`` package (circular import) on some import orders.
 from dace.transformation.passes.pattern_matching import PatternMatchAndApplyRepeated
 from dace.transformation.passes.vectorization.split_multi_output_tasklets import SplitMultiOutputTasklets
 from dace.transformation.passes.vectorization.normalize_masked_write_tasklets import NormalizeMaskedWriteTasklets
@@ -167,6 +168,7 @@ class _RunExpandNestedSDFGInputs(ppl.Pass):
         return set()
 
     def apply_pass(self, sdfg: dace.SDFG, pipeline_results) -> Optional[int]:
+        from dace.transformation.interstate.expand_nested_sdfg_inputs import ExpandNestedSDFGInputs
         applied = sdfg.apply_transformations_repeated(ExpandNestedSDFGInputs, permissive=False, validate=False)
         return applied or None
 
@@ -289,6 +291,7 @@ def normalize_loop_nests(sdfg: dace.SDFG) -> None:
 
     :param sdfg: SDFG to normalise in place.
     """
+    from dace.transformation.interstate import InlineSDFG, InlineMultistateSDFG
     sdfg.apply_transformations_repeated([InlineSDFG, InlineMultistateSDFG], permissive=False, validate=False)
     sdfg.apply_transformations_repeated(MapCollapse, permissive=False, validate=False)
     _resolve_body_nsdfg_symbol_aliases(sdfg)
@@ -685,6 +688,7 @@ class VectorizeMultiDim(ppl.Pipeline):
         sdfg.apply_transformations_repeated(WCRToAugAssign, permissive=False, validate=False)
         # LoopToMap parallelises data-parallel `for` loops; RefineNestedAccess tightens the body's
         # outer memlet to the per-iteration slice (LoopToMap on its own emits whole-array body edges).
+        from dace.transformation.interstate import LoopToMap, RefineNestedAccess
         self._refine_loop_to_map_bodies(sdfg, LoopToMap, RefineNestedAccess)
         # Inline wrapper NSDFGs + collapse adjacent perfectly-nested single-param maps so the K-dim
         # tile spans K genuine map dims.
