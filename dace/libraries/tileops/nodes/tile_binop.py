@@ -123,8 +123,12 @@ _OP_CPP = {
     # Python ``%`` differs from C ``%`` on negative operands (Python follows the divisor's
     # sign; C follows the dividend's). DaCe runtime ships ``dace::math::py_mod`` which
     # matches Python semantics; use it so the vectorised body matches the unvectorised
-    # reference bit-for-bit.
-    "%": ("dace::math::py_mod(", ", ", ")"),
+    # reference bit-for-bit. ``py_mod`` is the function-call spelling of the same op
+    # (the ``RewriteModuloToPyMod`` cleaning step rewrites ``%`` to it); both lower here.
+    # ``py_mod`` is a GLOBAL runtime function (it lives outside ``dace::math`` -- see
+    # math.h "must reside outside of the DaCe namespace"); call it unqualified.
+    "%": ("py_mod(", ", ", ")"),
+    "py_mod": ("py_mod(", ", ", ")"),
     "<": ("(", " < ", ")"),
     "<=": ("(", " <= ", ")"),
     ">": ("(", " > ", ")"),
@@ -141,9 +145,24 @@ _OP_CPP = {
     "min": ("std::min(", ", ", ")"),
     "max": ("std::max(", ", ", ")"),
     # Python ``**`` -> ``std::pow``. ``PowerOperatorExpansion`` runs upstream in the
-    # multi-dim pipeline and rewrites integer-constant exponents (``x**2`` -> ``x*x``);
-    # only true runtime / non-constant exponents reach this lowering.
+    # multi-dim pipeline: it rewrites integer-constant exponents (``x**2`` -> ``x*x``) and
+    # every other ``**`` to the canonical ``pow(base, exp)`` call; only a residual bare
+    # ``**`` (never produced by that pass, kept for robustness) reaches this lowering.
     "**": ("std::pow(", ", ", ")"),
+    # ``pow(base, exp)`` (the canonical spelling ``PowerOperatorExpansion`` emits) ->
+    # ``std::pow`` (libm ``double``); vectorizes via libmvec through the pure per-lane loop.
+    "pow": ("std::pow(", ", ", ")"),
+    # ``ipow(base, exp)`` -- an integer-exponent power ``RelaxIntegerPowers`` relaxed from
+    # ``pow`` / ``**``. ``dace::math::ipow`` is exact repeated multiply (bit-exact with
+    # NumPy integer powers, and correct for a negative base where ``std::pow`` is not).
+    "ipow": ("dace::math::ipow(", ", ", ")"),
+    # Binary elemental math functions (``np.arctan2`` -> the frontend's bare
+    # ``atan2(a, b)``; likewise ``hypot`` / ``fmod``). Emitted as a per-lane
+    # ``std::atan2(a[i], b[i])`` inside the tile for-loop; the ``_dace_tile_vectorize``
+    # pragma lets the compiler's vector-math library (libmvec) capture the call.
+    "atan2": ("std::atan2(", ", ", ")"),
+    "hypot": ("std::hypot(", ", ", ")"),
+    "fmod": ("std::fmod(", ", ", ")"),
 }
 
 
@@ -288,7 +307,9 @@ _CUTE_OP_EXPR = {
     # TODO: address Python's different modulo semantics for negative numbers (math.fmod for floating point) (integers: r = a - (a / b) * b (with C++ division))
     # (maybe https://stackoverflow.com/questions/34291760/how-to-easily-implement-c-like-modulo-remainder-operation-in-python-2-7 but this is 2.7-specific) (https://en.wikipedia.org/wiki/Modulo#In_programming_languages) (https://www.youtube.com/watch?v=xVNYurap-lk)
     # actually we decided to just emit python modulo lol
+    # cuTile is Python-semantics, so a bare ``%`` already matches ``py_mod``.
     "%": "({lhs} % {rhs})",
+    "py_mod": "({lhs} % {rhs})",
     "<": "({lhs} < {rhs})",
     "<=": "({lhs} <= {rhs})",
     ">": "({lhs} > {rhs})",

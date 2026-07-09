@@ -292,6 +292,19 @@ static DACE_CONSTEXPR DACE_HDFI T py_mod(const T& numerator,
   return (T)(numerator - quotient * denominator);
 }
 
+// Mixed-operand-type overload (e.g. ``i % 64`` where ``i`` is ``int64_t`` and the
+// literal ``64`` is ``int``): promote both operands to their common arithmetic
+// type and delegate. C's ``%`` applies the usual arithmetic conversions
+// implicitly, but the single-type template above cannot deduce ``T`` from two
+// different types. Guarded so the same-type call still binds the (more
+// specialized) overload above -- no ambiguity.
+template <typename T1, typename T2, std::enable_if_t<!std::is_same<T1, T2>::value>* = nullptr>
+static DACE_CONSTEXPR DACE_HDFI auto py_mod(const T1& numerator, const T2& denominator)
+    -> decltype(numerator + denominator) {
+  using T = decltype(numerator + denominator);
+  return py_mod<T>((T)numerator, (T)denominator);
+}
+
 // Computes C/C++ modulus (operator % and fmod)
 template <typename T, std::enable_if_t<std::is_integral<T>::value>* = nullptr>
 static DACE_CONSTEXPR DACE_HDFI T cpp_mod(const T& numerator,
@@ -602,8 +615,20 @@ static DACE_CONSTEXPR DACE_HDFI unsigned int pow(const unsigned int& a,
   return result;
 }
 
-template <typename T>
-DACE_HDFI T ipow(const T& a, const unsigned int& b) {
+// Scalar types seed at ``T(1)`` so ``ipow(a, 0) == 1``.
+template <typename T,
+          typename std::enable_if<std::is_constructible<T, int>::value>::type* = nullptr>
+DACE_HDFI T ipow(const T a, const unsigned int b) {
+  T result = T(1);
+  for (unsigned int i = 0; i < b; ++i) result *= a;
+  return result;
+}
+
+// Vector types have no scalar constructor, so seed at ``a``. Only ever reached with a
+// compile-time exponent >= 1 (the constant-power path emits a literal 1 for exponent 0).
+template <typename T,
+          typename std::enable_if<!std::is_constructible<T, int>::value>::type* = nullptr>
+DACE_HDFI T ipow(const T a, const unsigned int b) {
   T result = a;
   for (unsigned int i = 1; i < b; ++i) result *= a;
   return result;
@@ -686,5 +711,12 @@ DACE_CONSTEXPR DACE_HDFI thrust::complex<T> conj(const thrust::complex<T>& a) {
 }  // namespace cmath
 
 }  // namespace dace
+
+// Global-scope wrapper (like ``min`` / ``max`` / ``int_ceil``) so codegen can emit the
+// bare ``ipow`` in loop bounds / interstate edges; forwards to ``dace::math::ipow``.
+template <typename T, typename U>
+static DACE_HDFI T ipow(const T& a, const U& b) {
+  return dace::math::ipow(a, b);
+}
 
 #endif  // __DACE_MATH_H

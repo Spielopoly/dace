@@ -41,7 +41,7 @@ class StateReachability(ppl.Pass):
         return modified & ppl.Modifies.CFG
 
     def depends_on(self):
-        return {ControlFlowBlockReachability}
+        return [ControlFlowBlockReachability]
 
     def apply_pass(self, top_sdfg: SDFG, pipeline_res: Dict) -> Dict[int, Dict[SDFGState, Set[SDFGState]]]:
         """
@@ -475,7 +475,7 @@ class SymbolWriteScopes(ppl.ControlFlowRegionPass):
         return modified & ppl.Modifies.Symbols | ppl.Modifies.CFG | ppl.Modifies.Edges | ppl.Modifies.Nodes
 
     def depends_on(self):
-        return {SymbolAccessSets, ControlFlowBlockReachability}
+        return [SymbolAccessSets, ControlFlowBlockReachability]
 
     def _find_dominating_write(self, sym: str, read: Union[ControlFlowBlock, Edge[InterstateEdge]],
                                block_idom: Dict[ControlFlowBlock, ControlFlowBlock]) -> Optional[Edge[InterstateEdge]]:
@@ -577,7 +577,7 @@ class ScalarWriteShadowScopes(ppl.Pass):
         return modified & ppl.Modifies.States
 
     def depends_on(self):
-        return {AccessSets, FindAccessNodes, ControlFlowBlockReachability}
+        return [AccessSets, FindAccessNodes, ControlFlowBlockReachability]
 
     def _find_dominating_write(self,
                                desc: str,
@@ -681,7 +681,13 @@ class ScalarWriteShadowScopes(ppl.Pass):
 
             anames = sdfg.arrays.keys()
             for desc in sdfg.arrays:
-                desc_states_with_nodes = set(access_nodes[desc].keys())
+                # Restrict to states this SDFG owns. With cloned NestedSDFGs after loop
+                # fission, cfg_id collisions can make ``FindAccessNodes[sdfg.cfg_id]`` surface
+                # states owned by a *different* clone, whose regions are absent from this
+                # SDFG's ``idom_dict`` -- ``_find_dominating_write`` then walks up into a
+                # missing region and raises ``KeyError``. Mirrors the foreign-block guard on
+                # the interstate-edge loop below (``if block.sdfg is not sdfg``).
+                desc_states_with_nodes = {s for s in access_nodes[desc].keys() if s.sdfg is sdfg}
                 for state in desc_states_with_nodes:
                     for read_node in access_nodes[desc][state][0]:
                         write = self._find_dominating_write(desc, state, read_node, access_nodes, idom_dict,
@@ -931,7 +937,7 @@ class StatePropagation(ppl.ControlFlowRegionPass):
         self.apply_to_conditionals = True
 
     def depends_on(self):
-        return {ControlFlowBlockReachability}
+        return [ControlFlowBlockReachability]
 
     def _propagate_in_cfg(self, cfg: ControlFlowRegion, reachable: Dict[ControlFlowBlock, Set[ControlFlowBlock]],
                           starting_executions: int, starting_dynamic_executions: bool):
@@ -1085,7 +1091,7 @@ class ConditionUniqueWrites(ppl.Pass):
         return modified & ppl.Modifies.CFG
 
     def depends_on(self):
-        return {}
+        return []
 
     def apply_pass(self, top_sdfg: SDFG, pipeline_res: Dict) -> Set[nd.AccessNode]:
         """

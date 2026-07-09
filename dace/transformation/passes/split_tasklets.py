@@ -1,15 +1,19 @@
 # Copyright 2019-2025 ETH Zurich and the DaCe authors. All rights reserved.
 import copy
+import functools
 import re
 
+import networkx as nx
+
 import dace
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from dace import SDFG
 from dace.transformation import pass_pipeline as ppl, transformation
 
 import ast
 from dace.sdfg.nodes import CodeBlock
+from dace.sdfg.type_inference import infer_types
 
 
 class ASTSplitter:
@@ -274,6 +278,47 @@ def _ssa_lhs_is_bool(ssa_line: str) -> bool:
     return False
 
 
+def _infer_ssa_intermediate_types(ssa_statements: List[str], leaf_types: Dict[str, Any], fallback) -> Dict[str, Any]:
+    """Infer the dtype of every SSA intermediate, threading resolved types forward.
+
+    The primary inference is DaCe's ``infer_types`` (operand promotion via
+    ``result_type_of``, comparisons -> ``bool``, integer-power special cases). When it
+    cannot type a statement -- an unknown function-call return such as ``tanh(a)``
+    yields ``None`` -- the result is the promotion of that statement's OWN known operand
+    types: a single float operand keeps its float, several operands promote by
+    ``result_type_of`` (the same rule the primary path applies). Only a statement with
+    no known operand type at all falls back to the coarse whole-tasklet ``fallback``.
+
+    Resolved types are threaded forward, so a later statement that reads an earlier
+    (fallback-typed) intermediate sees its resolved type rather than ``None``.
+
+    :param ssa_statements: The single-op ``lhs = rhs`` SSA statements, in order.
+    :param leaf_types: Known dtypes of the leaf operands (input connectors + symbols).
+    :param fallback: Dtype to use for an intermediate with no known operand type.
+    :returns: ``{intermediate name -> dtype}`` for every typed SSA assignment.
+    """
+    known: Dict[str, Any] = dict(leaf_types)
+    inferred: Dict[str, Any] = {}
+    for stmt in ssa_statements:
+        try:
+            stmt_types = infer_types([stmt], known)
+        except Exception:
+            stmt_types = {}
+        for lhs, t in stmt_types.items():
+            if t is None:
+                # infer_types could not type this statement (an unknown function-call
+                # return such as ``tanh(a)``). Promote the operand types it DOES know --
+                # same float in => same float out; multiple operands => result_type_of --
+                # and only then the coarse fallback. (A dtype-cast call ``double(N)`` is
+                # typed by ``infer_types`` itself now, via ``_infer_dtype``.)
+                _, rhs_vars = _get_vars(stmt)
+                operand_types = [known[v] for v in rhs_vars if known.get(v) is not None]
+                t = functools.reduce(dace.dtypes.result_type_of, operand_types) if operand_types else fallback
+            known[lhs] = t
+            inferred[lhs] = t
+    return inferred
+
+
 @transformation.explicit_cf_compatible
 class SplitTasklets(ppl.Pass):
     """
@@ -293,7 +338,7 @@ class SplitTasklets(ppl.Pass):
         return False
 
     def depends_on(self):
-        return {}
+        return []
 
     tmp_access_identifier = "_split_"
 
@@ -396,6 +441,235 @@ class SplitTasklets(ppl.Pass):
                 names.update(str(s) for s in dace.symbolic.arrays(symexpr))
         return names
 
+    def _plan_multi_output_split(self, tasklet: dace.nodes.Tasklet, state) -> Optional[List[Dict[str, Any]]]:
+        """
+        Validate and plan splitting a tasklet with more than one output connector into one
+        single-output tasklet per output connector.
+
+        The body must be a list of top-level ``target = expr`` assignments, one per output
+        connector, in producer-before-consumer order. A statement may read an earlier
+        statement's output connector (a RAW that is routed through the produced array by
+        :meth:`_apply_multi_output_split`). The split is refused -- ``None`` is returned,
+        leaving the tasklet intact -- when a precondition does not hold or when it cannot be
+        proven sound (a WAR/WAW that the split would reorder).
+
+        :param tasklet: The candidate multi-output tasklet.
+        :param state: The state the tasklet lives in.
+        :returns: An ordered list of per-output plan dicts, or ``None`` to refuse the split.
+        """
+        if tasklet.code.language != dace.dtypes.Language.Python:
+            return None
+        try:
+            body = ast.parse(tasklet.code.as_string).body
+        except (SyntaxError, ValueError):
+            return None
+        if len(body) < 2:
+            return None
+        # Every top-level statement must be a plain ``name = expr`` assignment: no
+        # AugAssign, no ``if``, no subscripted / tuple / starred / multiple targets.
+        for stmt in body:
+            if not isinstance(stmt, ast.Assign):
+                return None
+            if len(stmt.targets) != 1 or not isinstance(stmt.targets[0], ast.Name):
+                return None
+
+        targets = [stmt.targets[0].id for stmt in body]
+        out_conns = set(tasklet.out_connectors.keys())
+        # One statement per output connector, and no statement targets a shared local temp
+        # (a target that is not an output connector cannot be materialised per output).
+        if len(targets) != len(set(targets)) or set(targets) != out_conns:
+            return None
+
+        in_conns = set(tasklet.in_connectors.keys())
+        out_edge_by_conn: Dict[str, Any] = {}
+        for oe in state.out_edges(tasklet):
+            if oe.src_conn in out_edge_by_conn or oe.data is None or oe.data.data is None:
+                return None  # fan-out of one output connector, or a dataless output: refuse
+            out_edge_by_conn[oe.src_conn] = oe
+        if set(out_edge_by_conn.keys()) != out_conns:
+            return None
+        in_edge_by_conn: Dict[str, Any] = {}
+        for ie in state.in_edges(tasklet):
+            if ie.dst_conn is not None:
+                in_edge_by_conn[ie.dst_conn] = ie
+
+        # In-place read-modify-write: an input connector reads an array that an output
+        # connector also writes (polybench covariance's finalize -- ``cov_ij_in << cov[i,j]``
+        # AND ``cov_ij_out >> cov[i,j]``, where ``cov[i,j]`` is produced by an upstream WCR
+        # sum-reduction over ``k``). Splitting would route the output through an intermediate
+        # access node of that same array while the input still reads the original (WCR-reduced)
+        # source; the read / in-place-normalize / mirror ordering is NOT reliably preserved
+        # through the downstream nested-SDFG / reduction lowering (the finalize reads
+        # ``cov[i,j]`` before it is written and the kernel produces NaN). Leave the tasklet
+        # intact -- exactly the pre-existing behaviour that keeps covariance correct.
+        read_arrays = {
+            ie.data.data
+            for ie in in_edge_by_conn.values() if ie.data is not None and ie.data.data is not None
+        }
+        write_arrays = {oe.data.data for oe in out_edge_by_conn.values()}
+        if read_arrays & write_arrays:
+            return None
+
+        target_index = {t: k for k, t in enumerate(targets)}
+
+        # Classify every right-hand-side name of each statement.
+        ordered: List[Dict[str, Any]] = []
+        for k, stmt in enumerate(body):
+            rhs_names = {node.id for node in ast.walk(stmt.value) if isinstance(node, ast.Name)}
+            input_reads: Set[str] = set()
+            cross_reads: Set[str] = set()
+            for name in rhs_names:
+                if name in target_index and target_index[name] < k:
+                    # Reads an output connector produced by an earlier statement (RAW).
+                    # A reassigned name shadows any same-named input connector (Python
+                    # last-write-wins), so this branch takes priority.
+                    cross_reads.add(name)
+                elif name in in_conns:
+                    if name not in in_edge_by_conn:
+                        return None  # an input connector with no in-edge: cannot route
+                    input_reads.add(name)  # entry-value read of the input array
+                elif name in out_conns:
+                    # An output connector referenced at or before its own definition without
+                    # also being an input connector: reading an undefined value. Refuse.
+                    return None
+                # Otherwise a symbol / function / constant: inlined into the body verbatim.
+            ordered.append({
+                'out_conn': targets[k],
+                'code': ast.unparse(stmt),
+                'input_reads': input_reads,
+                'cross_reads': cross_reads,
+            })
+
+        # ``reaches[j][k]`` == statement ``k`` is forced (transitively, through RAW reads)
+        # to run strictly after statement ``j``.
+        n = len(body)
+        reaches = [[False] * n for _ in range(n)]
+        for k, plan in enumerate(ordered):
+            for name in plan['cross_reads']:
+                reaches[target_index[name]][k] = True
+        for mid in range(n):
+            for a in range(n):
+                if reaches[a][mid]:
+                    for b in range(n):
+                        if reaches[mid][b]:
+                            reaches[a][b] = True
+
+        # WAW: two outputs writing the same array at possibly-overlapping subsets must be
+        # ordered by a RAW chain; otherwise the surviving value is order dependent. Distinct
+        # arrays are assumed non-aliasing (DaCe's standard model); the same array is
+        # conservatively treated as possibly overlapping. (Input/output aliasing -- an
+        # in-place read-modify-write -- was already refused above.)
+        for a in range(n):
+            a_arr = out_edge_by_conn[ordered[a]['out_conn']].data.data
+            for b in range(a + 1, n):
+                b_arr = out_edge_by_conn[ordered[b]['out_conn']].data.data
+                if a_arr == b_arr and not (reaches[a][b] or reaches[b][a]):
+                    return None
+        return ordered
+
+    def _route_read_output_to_destination(self, state, base_name: str, k: int, mid: dace.nodes.AccessNode,
+                                          out_edge) -> None:
+        """
+        Forward a read-later output's intermediate access node ``mid`` (holding the produced
+        subset of its array) on to the original output destination.
+
+        The intermediate and the destination name the same array, so the copy reads and
+        writes the same subset. How that is expressed depends on the destination:
+
+        - **Access node** (top-level / loop-body state): a direct ``mid -> destination``
+          self-copy carrying ``subset`` and a matching ``other_subset``. A same-array
+          access-node-to-access-node single-element copy is handled by the downstream
+          nested-SDFG passes; without ``other_subset`` the backend would copy from offset 0.
+        - **Map exit** (or any non-access-node): the same-array-with-``other_subset`` form is
+          rejected on a ``-> MapExit`` edge, so the value is copied out through a scalar
+          store tasklet, which also keeps the map scope's write set complete.
+
+        :param state: The state being rewritten.
+        :param base_name: The original tasklet name, used to name a store tasklet.
+        :param k: The output index, used to name a store tasklet.
+        :param mid: The intermediate access node holding the produced value.
+        :param out_edge: The original output edge (its ``dst``/``dst_conn``/memlet are reused).
+        """
+        if isinstance(out_edge.dst, dace.nodes.AccessNode):
+            forward = copy.deepcopy(out_edge.data)
+            forward.other_subset = copy.deepcopy(forward.subset)
+            state.add_edge(mid, None, out_edge.dst, out_edge.dst_conn, forward)
+        else:
+            store = state.add_tasklet(name=f"{base_name}_out_{k}_store",
+                                      inputs={'_store_in'},
+                                      outputs={'_store_out'},
+                                      code='_store_out = _store_in')
+            state.add_edge(mid, None, store, '_store_in', copy.deepcopy(out_edge.data))
+            state.add_edge(store, '_store_out', out_edge.dst, out_edge.dst_conn, copy.deepcopy(out_edge.data))
+
+    def _apply_multi_output_split(self, tasklet: dace.nodes.Tasklet, state, ordered: List[Dict[str, Any]]) -> None:
+        """
+        Rewrite a validated multi-output tasklet into one single-output tasklet per output
+        connector (plan produced by :meth:`_plan_multi_output_split`).
+
+        A cross-statement read of an earlier output connector is materialised through that
+        output's array via an intermediate access node, so the producer-before-consumer
+        order survives as a real data dependence in the same state.
+
+        :param tasklet: The multi-output tasklet to replace.
+        :param state: The state the tasklet lives in.
+        :param ordered: The ordered per-output plan from :meth:`_plan_multi_output_split`.
+        """
+        out_edge_by_conn = {oe.src_conn: oe for oe in state.out_edges(tasklet)}
+        in_edge_by_conn = {ie.dst_conn: ie for ie in state.in_edges(tasklet) if ie.dst_conn is not None}
+        scope_entry = state.entry_node(tasklet)
+
+        # Output connectors that a later statement reads need an intermediate access node
+        # (through which the consumer reads the produced array).
+        read_outputs: Set[str] = set()
+        for plan in ordered:
+            read_outputs.update(plan['cross_reads'])
+
+        state.remove_node(tasklet)
+
+        emitted: List[dace.nodes.Tasklet] = []
+        mid_access: Dict[str, dace.nodes.AccessNode] = {}
+        for k, plan in enumerate(ordered):
+            out_conn = plan['out_conn']
+            out_edge = out_edge_by_conn[out_conn]
+            input_conns = set(plan['input_reads']) | set(plan['cross_reads'])
+            t = state.add_tasklet(name=f"{tasklet.name}_out_{k}",
+                                  inputs=set(input_conns),
+                                  outputs={out_conn},
+                                  code=plan['code'])
+            emitted.append(t)
+            # Inputs read from the original input edges (entry values). A fresh memlet per
+            # edge -- DaCe rejects a reused subset object.
+            for in_conn in plan['input_reads']:
+                ie = in_edge_by_conn[in_conn]
+                state.add_edge(ie.src, ie.src_conn, t, in_conn, copy.deepcopy(ie.data))
+            # Cross-statement RAW reads route through the earlier output's array node.
+            for name in plan['cross_reads']:
+                state.add_edge(mid_access[name], None, t, name, copy.deepcopy(out_edge_by_conn[name].data))
+            # Output: a value read by a later statement is materialised on its own access
+            # node of the produced array (the consumer reads it back from there); otherwise
+            # the value goes straight to the original destination.
+            if out_conn in read_outputs:
+                mid = state.add_access(out_edge.data.data)
+                state.add_edge(t, out_conn, mid, None, copy.deepcopy(out_edge.data))
+                mid_access[out_conn] = mid
+                self._route_read_output_to_destination(state, tasklet.name, k, mid, out_edge)
+            else:
+                state.add_edge(t, out_conn, out_edge.dst, out_edge.dst_conn, copy.deepcopy(out_edge.data))
+            # A data-less sub-tasklet (constant / symbol-only output) inside a scope must be
+            # anchored to the scope entry so it does not float outside the map.
+            if state.in_degree(t) == 0 and scope_entry is not None:
+                state.add_edge(scope_entry, None, t, None, dace.memlet.Memlet(None))
+
+        # Independent outputs (distinct arrays, no cross-statement read, no shared scope /
+        # input) leave their sub-tasklets in separate weakly-connected components -- floating
+        # disconnected islands. Chain any such consecutive pair with an empty-Memlet ordering
+        # edge in body order. A real RAW (routed through the array) or a shared scope /
+        # access node already connects the pair, so no extra edge is added there.
+        for k in range(len(emitted) - 1):
+            if not nx.has_path(state.nx.to_undirected(as_view=True), emitted[k], emitted[k + 1]):
+                state.add_edge(emitted[k], None, emitted[k + 1], None, dace.memlet.Memlet(None))
+
     def apply_pass(self, sdfg: SDFG, pipeline_results) -> Optional[Dict[str, Set[str]]]:
         """
         Split every multi-operation Python tasklet in the SDFG into single-op tasklets.
@@ -410,12 +684,35 @@ class SplitTasklets(ppl.Pass):
         symbol_lifted_data = self._symbol_lifted_data(sdfg)
 
         tasklets_to_split = list()  # tasklet, parent_graph, ssa_statements
+        multi_output_to_split = list()  # tasklet, parent_graph, ordered per-output plan
         for n, g in sdfg.all_nodes_recursive():
             if isinstance(n, dace.nodes.Tasklet):
                 c: CodeBlock = n.code
-                # Can't split a tasklet that has >1 outputs
+                # A tasklet with >1 output connector cannot take the single-output SSA path.
+                # Split it into one tasklet per output connector instead (materialising each
+                # write independently for downstream loop-fission / lift). Respect the same
+                # "leave a symbol-lifted producer intact" guard as the single-output path;
+                # ``_plan_multi_output_split`` leaves the tasklet intact (returns ``None``)
+                # when its preconditions or WAR/WAW soundness do not hold.
                 if len(n.out_connectors) > 1:
+                    if any(oe.data is not None and oe.data.data in symbol_lifted_data for oe in g.out_edges(n)):
+                        continue
+                    plan = self._plan_multi_output_split(n, g)
+                    if plan is not None:
+                        multi_output_to_split.append((n, g, plan))
                     continue
+
+                # Leave a conditional-write tasklet (``if cond: out = e`` -- the frontend's
+                # ``A[mask] = value`` form, newast.py:2868) intact. It is not straight-line,
+                # so the SSA split below mangles it into a dangling map connector; instead
+                # ``ConvertTaskletsToTileOps`` lowers it to a masked ``TileStore`` (the mask
+                # ``cond`` gates the store, no old-value read).
+                try:
+                    _body = ast.parse(c.as_string).body
+                    if len(_body) == 1 and isinstance(_body[0], ast.If) and not _body[0].orelse:
+                        continue
+                except (SyntaxError, ValueError):
+                    pass
 
                 # Leave intact a producer whose scalar output is symbol-lifted on an
                 # interstate edge (the value is reconstructed symbolically downstream
@@ -450,21 +747,29 @@ class SplitTasklets(ppl.Pass):
                         if str(free_sym) in g.sdfg.symbols:
                             input_types.add(g.sdfg.symbols[str(free_sym)])
 
-                # It is complicated to split a tasklet with mixed precision input
-                # Need to bookkeep the mapping of intermediate results to precision
-                if len(input_types) > 1:
-                    # It might be zero due to symbols
-                    has_float_type = any({
-                        itype
-                        for itype in input_types
-                        if itype in {dace.dtypes.float64, dace.dtypes.float32, dace.dtypes.float16}
-                    })
-                    if has_float_type:
-                        input_type = dace.float64
-                    else:
-                        input_type = dace.int64
-                elif len(input_types) == 1:
-                    input_type = next(iter(input_types))
+                # Loop-region iterators (e.g. ``_loop_it_0``) are int64 index
+                # variables -- the tile path materialises an int64 lane-id tile for
+                # them -- but they are not registered in ``sdfg.symbols`` (only
+                # interstate-assignment targets are; see ``_add_missing_symbols``).
+                # Without counting them the width inference sees only a narrower
+                # visible symbol and mis-types an iterator-fed integer intermediate:
+                # TSVC s315 ``(7 * _loop_it_0) % LEN_1D`` with ``LEN_1D`` int32 yields
+                # an int32 intermediate that then narrows the int64 iterator operand.
+                # Count each unregistered free symbol as int64.
+                for free_sym in n.free_symbols:
+                    if str(free_sym) not in g.sdfg.symbols:
+                        input_types.add(dace.int64)
+
+                # Best-effort *fallback* dtype, used only for an intermediate that the
+                # rigorous per-statement inference below cannot type (e.g. an
+                # unparseable nested compare). Promote ALL input operand types together
+                # via the DaCe promotion lattice (``result_type_of``) rather than a
+                # hard-coded float/int bucket -- this covers every dtype uniformly
+                # (bool, int8..int64, float16/32/64, complex64/128) with the standard
+                # widening rules (same-kind widening; int promotes to float; real
+                # promotes to complex).
+                if input_types:
+                    input_type = functools.reduce(dace.dtypes.result_type_of, input_types)
                 else:
                     # Default to float when the tasklet consists purely of constants.
                     input_type = dace.float64
@@ -472,7 +777,23 @@ class SplitTasklets(ppl.Pass):
                 if c.language == dace.dtypes.Language.Python:
                     ssa_statements = to_ssa(c.as_string)
                     if len(ssa_statements) != 1:
-                        tasklets_to_split.append((n, g, ssa_statements, input_type))
+                        # Rigorously infer EACH split intermediate's type from its
+                        # operands (DaCe promotion: same-kind widening, fp32->fp64,
+                        # int32->int64, complex64->complex128, ...) instead of stamping
+                        # the whole chain with one coarse ``input_type``. The leaf types
+                        # are the input connectors' array dtypes and the body symbols
+                        # (unregistered ones -- e.g. loop iterators -- are int64 index
+                        # vars). ``input_type`` stays as the best-effort fallback for any
+                        # intermediate the inference cannot type.
+                        leaf_types = {}
+                        for ie in g.in_edges(n):
+                            if ie.data is not None and ie.data.data is not None and ie.dst_conn is not None:
+                                leaf_types[ie.dst_conn] = g.sdfg.arrays[ie.data.data].dtype
+                        for free_sym in n.free_symbols:
+                            nm = str(free_sym)
+                            leaf_types[nm] = g.sdfg.symbols[nm] if nm in g.sdfg.symbols else dace.int64
+                        inferred = _infer_ssa_intermediate_types(ssa_statements, leaf_types, input_type)
+                        tasklets_to_split.append((n, g, ssa_statements, input_type, inferred))
 
         # Previous tasklet:
         # i1 -> |         |
@@ -486,7 +807,7 @@ class SplitTasklets(ppl.Pass):
         # For the case a tasklet goes to a taskelt that needs to be split
         # If we have t1 -> t2 but then split t1 to (t1.1, t1.2) -> t2
         # For each tasklet we split we need to track the new input and output maps
-        for tasklet, state, ssa_statements, input_type in tasklets_to_split:
+        for tasklet, state, ssa_statements, input_type, inferred in tasklets_to_split:
             assert isinstance(state, dace.SDFGState)
             assert isinstance(tasklet, dace.nodes.Tasklet)
             assert tasklet in state.nodes()
@@ -495,6 +816,15 @@ class SplitTasklets(ppl.Pass):
 
             tasklet_in_degree = state.in_degree(tasklet)
             tasklet_in_edges = state.in_edges(tasklet)
+            # The scope entry (MapEntry) the tasklet lives under, captured before it
+            # is removed. A split sub-tasklet whose SSA statement is symbol-only (e.g.
+            # ``__t1 = double(N)`` -- N is a symbol inlined into the body, so the
+            # sub-tasklet has NO data inputs) would otherwise have zero in-edges and
+            # float OUTSIDE this scope, corrupting scope_dict and making the
+            # transient-feeding edges cross into the scope illegally ("sink node should
+            # be a data node"). Every such sub-tasklet is anchored to ``scope_entry``
+            # with an empty dependency memlet so it stays within the map.
+            scope_entry = state.entry_node(tasklet)
             # A body name is a symbol (to be inlined) rather than a data input
             # connector iff it is in scope as a symbol. ``symbols_defined_at`` and
             # ``sdfg.symbols`` miss loop-region iterators (e.g. ``_loop_it_0``),
@@ -572,7 +902,7 @@ class SplitTasklets(ppl.Pass):
                             if array_name not in state.sdfg.arrays:
                                 state.sdfg.add_scalar(
                                     name=array_name,
-                                    dtype=dace.bool_ if in_conn in bool_vars else input_type,
+                                    dtype=dace.bool_ if in_conn in bool_vars else inferred.get(in_conn, input_type),
                                     storage=dace.dtypes.StorageType.Register,
                                     transient=True,
                                 )
@@ -605,7 +935,7 @@ class SplitTasklets(ppl.Pass):
                     if array_name not in state.sdfg.arrays:
                         state.sdfg.add_scalar(
                             name=array_name,
-                            dtype=dace.bool_ if out_conn in bool_vars else input_type,
+                            dtype=dace.bool_ if out_conn in bool_vars else inferred.get(out_conn, input_type),
                             storage=dace.dtypes.StorageType.Register,
                             transient=True,
                         )
@@ -615,7 +945,29 @@ class SplitTasklets(ppl.Pass):
                         t, out_conn, added_accesses[array_name], None,
                         dace.memlet.Memlet.from_array(dataname=array_name, datadesc=state.sdfg.arrays[array_name]))
 
+            # Anchor every sub-tasklet that ended up with NO incoming edge into the
+            # original scope. A symbol-only SSA statement (``__t1 = double(N)``) has no
+            # data inputs, so its sub-tasklet has zero in-edges; without an edge from
+            # the scope entry it floats outside the map (the i==0 branch only anchors
+            # the FIRST sub-tasklet). The empty dependency memlet from ``scope_entry``
+            # keeps it inside the map scope (top-level tasklets, scope_entry=None, are
+            # legitimately allowed to be sources and need no anchor).
+            if scope_entry is not None:
+                for t in added_tasklets:
+                    if state.in_degree(t) == 0:
+                        state.add_edge(scope_entry, None, t, None, dace.memlet.Memlet(None))
+
             split_access_counter += 1
+
+        # Split every multi-output tasklet into one single-output tasklet per output
+        # connector. These tasklets are disjoint from ``tasklets_to_split`` (the
+        # single-output SSA path never collected them), so the two rewrites are
+        # independent; each plan re-reads the tasklet's edges at apply time.
+        for tasklet, state, ordered in multi_output_to_split:
+            assert isinstance(state, dace.SDFGState)
+            assert isinstance(tasklet, dace.nodes.Tasklet)
+            assert tasklet in state.nodes()
+            self._apply_multi_output_split(tasklet, state, ordered)
 
         sdfg.validate()
         return None

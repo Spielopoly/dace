@@ -144,6 +144,13 @@ class CPUCodeGen(TargetCodeGenerator):
         # the OMP runtime privatizes-by-value rather than by-pointer).
         self._omp_reduction_scope_stack = []
 
+        # Accumulator data-names whose map-exit WCR is folded by an enclosing GPU
+        # thread-block reduction (cub::BlockReduce + one atomic/block, emitted by CUDA
+        # codegen at device-map exit). While present, write_and_resolve_expr must NOT
+        # emit the per-thread atomic (partial stays in register, block reduce drains it).
+        # CUDA codegen adds/removes the names.
+        self._gpu_block_reduction_covered = set()
+
         # Keep track of generated NestedSDG, and the name of the assigned function
         self._generated_nested_sdfg = dict()
 
@@ -983,6 +990,11 @@ class CPUCodeGen(TargetCodeGenerator):
         """
 
         redtype = operations.detect_reduction_type(memlet.wcr)
+        # Enclosing GPU device map folds this target via thread-block reduction:
+        # partial stays in register, cub::BlockReduce at map exit drains it (one
+        # atomic/block). Emitting the per-thread atomic here would double-count.
+        if memlet.data in self._gpu_block_reduction_covered:
+            return '/* WCR folded by GPU block reduction at map exit */'
         # Skip the atomic call entirely when an enclosing OMP map has put this
         # target in a ``reduction(...)`` clause -- the OMP runtime privatizes
         # the variable per thread and tree-reduces at the end, so adding an
@@ -1897,6 +1909,12 @@ class CPUCodeGen(TargetCodeGenerator):
             # ``arr[0]`` with shape (N,)) need ``PrivatizeReductionAccumulator``
             # to rewrite into a transient ``Scalar`` first.
             if not isinstance(desc, data.Scalar):
+                continue
+            # A persistent / external accumulator is emitted as a state-struct member
+            # (``__state->x``), which is not a valid ``reduction(op:var)`` lvalue. Only
+            # a non-persistent (locally-declared) scalar can be privatized by the OMP
+            # runtime; persistent targets fall through to the atomic path (old style).
+            if desc.lifetime in (dtypes.AllocationLifetime.Persistent, dtypes.AllocationLifetime.External):
                 continue
             # Loop-invariant subset (independent of the map's iter variables).
             if iedge.data.subset is not None:

@@ -84,6 +84,12 @@ _OP_TO_CHAR = {
     "-": "-",
     "*": "*",
     "/": "/",
+    # Python/NumPy modulo: the backend headers lower the ``%`` op char to
+    # ``dace::math::py_mod`` (divisor-sign semantics), never C's truncated ``%``.
+    # ``py_mod`` is the function-call spelling of the same op (emitted by the
+    # ``RewriteModuloToPyMod`` cleaning step) and maps to the SAME backend char.
+    "%": "%",
+    "py_mod": "%",
     "min": "m",
     "max": "M",
     "<": "<",
@@ -181,21 +187,22 @@ def _operand_exprs(node, conns):
 def _scalar_ref(conn: str, desc, subset) -> str:
     """C++ reference for a Scalar/broadcast operand connector.
 
-    DaCe passes a tasklet input connector by value (``T conn``) for a true
-    :class:`dace.data.Scalar` and for a single-element access into a larger array
-    (``a[j]`` -> ``double conn = a[j]``); only a genuine length-1 *array*
-    connector is passed as a pointer (``T* conn``) and must be dereferenced
-    ``conn[0]``. The earlier code dereferenced every non-Scalar source, which
-    faulted on the ``a[j]`` loop-invariant broadcast (``conn[0]`` on a scalar).
+    DaCe passes a tasklet input connector by value (``T conn``) for ANY
+    single-element access -- a true :class:`dace.data.Scalar`, a single-element
+    read of a larger array (``a[j]`` -> ``double conn = a[j]``), AND a length-1
+    array sliced at its sole element (``a[0]`` -> ``bool conn = a[0]``). Only a
+    genuine MULTI-element source is staged to a pointer connector (``T* conn``)
+    and must be dereferenced ``conn[0]``. The discriminator is the access's
+    element COUNT, not the descriptor shape: a length-1 array read at ``[0]`` is
+    by value, so keying on ``isinstance(desc, Array)`` faulted (``conn[0]`` on a
+    by-value scalar).
 
     :param conn: Connector name.
-    :param desc: Source array/scalar descriptor.
+    :param desc: Source array/scalar descriptor (unused; kept for call-site symmetry).
     :param subset: The connector edge's subset (the access into ``desc``).
-    :returns: ``conn`` (by value) or ``conn[0]`` (length-1 array pointer).
+    :returns: ``conn`` (by value) or ``conn[0]`` (multi-element array pointer).
     """
-    is_len1_array = (isinstance(desc, dace.data.Array)
-                     and all(bool(dace.symbolic.simplify(s == 1)) for s in desc.shape))
-    return f"{conn}[0]" if is_len1_array else conn
+    return conn if subset.num_elements() == 1 else f"{conn}[0]"
 
 
 def make_binop_tasklet(node, parent_state, parent_sdfg, suffix: str) -> nodes.Tasklet:
@@ -207,6 +214,15 @@ def make_binop_tasklet(node, parent_state, parent_sdfg, suffix: str) -> nodes.Ta
     ``Broadcast=true``, casting to the output type); ``has_mask`` -> ``Masked``.
     """
     node.validate(parent_sdfg, parent_state)
+    # A scalar-shaped output (a volume-1 Scalar / length-1 Array, emitted by value as
+    # ``T _c;``) cannot bind to ``tile_binop``'s ``T* out`` pointer argument. Delegate
+    # to the pure expansion's ``out_is_scalar`` branch (mirrors ``make_unop_tasklet``
+    # and the differing-dtype deferral below). Gated on both operands non-Tile, matching
+    # the pure path's own ``out_is_scalar`` predicate.
+    from dace.libraries.tileops.nodes.tile_binop import ExpandTileBinopPure, _is_scalar_shape
+    out_desc = parent_sdfg.arrays[next(e for e in parent_state.out_edges(node) if e.src_conn == "_c").data.data]
+    if node.kind_a != _TILE and node.kind_b != _TILE and _is_scalar_shape(out_desc):
+        return ExpandTileBinopPure.expansion(node, parent_state, parent_sdfg)
     vlen = _require_k1(node)
     in_e = {e.dst_conn: e for e in parent_state.in_edges(node) if e.dst_conn is not None}
     out_dtype = _out_ctype(node, parent_state, parent_sdfg, "_c")
@@ -279,6 +295,25 @@ def make_unop_tasklet(node, parent_state, parent_sdfg, suffix: str) -> nodes.Tas
     ``has_mask`` -> ``Masked``.
     """
     node.validate(parent_sdfg, parent_state)
+    # A dtype-name cast op (``float64`` / ``int32`` / ...) changes dtype by definition;
+    # there is no per-ISA ``tile_unop`` op char for it, so lower it via the pure
+    # per-lane ``dace::<dtype>(x)`` cast (the operand != output fallback below also
+    # catches the usual differing-dtype cast, but a no-op same-dtype cast must route
+    # here too rather than KeyError on _UNOP_TO_CHAR).
+    from dace.libraries.tileops.nodes.tile_unop import _CAST_OP_TO_CPP, ExpandTileUnopPure
+    if node.op in _CAST_OP_TO_CPP:
+        return ExpandTileUnopPure.expansion(node, parent_state, parent_sdfg)
+    # A scalar-shaped output (``_c`` a volume-1 Scalar / length-1 Array, which codegen
+    # emits by value as ``T _c;``) cannot bind to ``tile_unop``'s ``T* out`` pointer
+    # argument -- e.g. ``!`` of a scalar bool condition (s274). The pure expansion's
+    # ``out_is_scalar`` branch emits the bare ``_c = <op>(...)`` assignment instead;
+    # delegate to it (the same escape hatch the cast-op case above and the
+    # differing-dtype case below use). Gated on a non-Tile operand to mirror the pure
+    # path's own ``out_is_scalar`` predicate (a Tile operand always yields a tile output).
+    from dace.libraries.tileops.nodes.tile_binop import _is_scalar_shape
+    out_desc = parent_sdfg.arrays[next(e for e in parent_state.out_edges(node) if e.src_conn == "_c").data.data]
+    if node.kind_a != _TILE and _is_scalar_shape(out_desc):
+        return ExpandTileUnopPure.expansion(node, parent_state, parent_sdfg)
     vlen = _require_k1(node)
     in_e = {e.dst_conn: e for e in parent_state.in_edges(node) if e.dst_conn is not None}
     out_dtype = _out_ctype(node, parent_state, parent_sdfg, "_c")
@@ -341,14 +376,43 @@ def make_ite_tasklet(node, parent_state, parent_sdfg, suffix: str) -> nodes.Task
     vlen = _require_k1(node)
     out_dtype = _out_ctype(node, parent_state, parent_sdfg, "_o")
     cond_dtype = _in_ctype(node, parent_state, parent_sdfg, "_mask")
-    call = (f"dace::tileops::tile_ite<{out_dtype}, {cond_dtype}, {vlen}, false, false, false>"
-            f"(_o, _mask, _t, _e, nullptr);")
+    in_e = {e.dst_conn: e for e in parent_state.in_edges(node) if e.dst_conn is not None}
+    pre = []
+
+    def arm(kind, conn, expr):
+        """An arm lowers to a per-lane Tile read (``Broadcast=false``, via its
+        connector) or a length-1 broadcast buffer (``Broadcast=true``) for a
+        Scalar source / inline Symbol expression -- mirrors ``make_binop_tasklet``.
+        Returns ``(broadcast_flag, ptr_expr)``."""
+        if kind == _TILE:
+            return "false", conn
+        if kind == _SYMBOL:
+            val = f"({out_dtype})({expr})"
+        else:  # _SCALAR
+            desc = parent_sdfg.arrays[in_e[conn].data.data]
+            val = f"({out_dtype})({_scalar_ref(conn, desc, in_e[conn].data.subset)})"
+        buf = f"_bc{conn}"
+        pre.append(f"{out_dtype} {buf}[1] = {{ {val} }};")
+        return "true", buf
+
+    t_bcast, t_ptr = arm(node.kind_t, "_t", node.expr_t)
+    e_bcast, e_ptr = arm(node.kind_e, "_e", node.expr_e)
+    call = (f"dace::tileops::tile_ite<{out_dtype}, {cond_dtype}, {vlen}, "
+            f"{t_bcast}, {e_bcast}, false>(_o, _mask, {t_ptr}, {e_ptr}, nullptr);")
+    # A Symbol arm embeds its expression inline (no connector); only Tile / Scalar
+    # arms read through a connector. ``_mask`` is always a connector (the select
+    # predicate is materialised to a tile by ``_convert_ite``).
+    inputs = {"_mask"}
+    if node.kind_t in (_TILE, _SCALAR):
+        inputs.add("_t")
+    if node.kind_e in (_TILE, _SCALAR):
+        inputs.add("_e")
     return nodes.Tasklet(
         label=f"{node.label}_{suffix}",
         inputs={c: None
-                for c in ("_mask", "_t", "_e")},
+                for c in inputs},
         outputs={"_o": None},
-        code=call,
+        code="\n".join(pre + [call]),
         language=dace.dtypes.Language.CPP,
     )
 
@@ -496,6 +560,9 @@ def make_load_tasklet(node, parent_state, parent_sdfg, suffix: str) -> nodes.Tas
     # ``replicate_factor_per_dim[d] > 1`` (e.g. ``c[i // 2]`` -> factor 2 means
     # lanes 0,1 share c[i//2], ...), the intrinsic produces wrong values. Fall
     # back to the pure expansion (``src[(__l/replicate) * stride]`` per lane).
+    # A non-dividing factor (``c[i // 3]`` with ``W % 3 != 0``, or a symbolic
+    # divisor) likewise routes here: ``_has_replicate_gt1`` treats both as >1,
+    # and the pure expansion emits the phase-aware per-lane index.
     if _has_replicate_gt1(node):
         from dace.libraries.tileops.nodes.tile_load import ExpandTileLoadPure
         return ExpandTileLoadPure.expansion(node, parent_state, parent_sdfg)
@@ -511,6 +578,44 @@ def make_load_tasklet(node, parent_state, parent_sdfg, suffix: str) -> nodes.Tas
         label=f"{node.label}_{suffix}",
         inputs={c: None
                 for c in inputs},
+        outputs={"_dst": None},
+        code=call,
+        language=dace.dtypes.Language.CPP,
+    )
+
+
+def make_reduce_tasklet(node, parent_state, parent_sdfg, suffix: str) -> nodes.Tasklet:
+    """CPP/CUDA tasklet calling ``dace::tileops::tile_reduce`` (full K=1 horizontal reduce).
+
+    The ``tile_reduce`` intrinsic collapses a VLEN-lane tile to ONE scalar (an
+    in-map / per-tile reduction ``acc = sum/prod/min/max over the tile``). Every
+    backend header ships its own self-contained lowering (no shared dispatch
+    header): AVX-512 accumulates the lane groups then collapses with the one-shot
+    ``_mm512_reduce_<op>_p{s,d}``; scalar / avx2 / neon / sve use a portable
+    balanced log-depth tree over the header's own ``tile_apply``; and the CUDA
+    fp16 path folds pairwise via ``__hadd2`` / ... then combines the 2 surviving
+    lanes into one ``__half`` (there is no native "reduce half2 -> half"
+    intrinsic), with the generic CUDA template keeping the per-lane fold for every
+    other element type. Only a shape the intrinsic cannot express -- a single-axis
+    reduce (``axis is not None``), a mask, or K>=2 -- delegates to
+    :class:`ExpandTileReducePure`.
+    """
+    from dace.libraries.tileops.nodes.tile_reduce import ExpandTileReducePure
+    if node.axis is not None or node.has_mask or len(node.widths) != 1:
+        return ExpandTileReducePure.expansion(node, parent_state, parent_sdfg)
+    vlen = _require_k1(node)
+    src_dtype = _in_ctype(node, parent_state, parent_sdfg, "_src")
+    op_char = _OP_TO_CHAR[node.op]
+    # Full reduction -> length-1 output. DaCe emits a volume-1 output by value
+    # (``T _dst;``) so it is referenced bare; a genuine multi-element pointer
+    # target is dereferenced ``_dst[0]`` (mirrors ExpandTileReducePure.writeback).
+    out_edge = next(e for e in parent_state.out_edges(node) if e.src_conn == "_dst")
+    scalar_dst = out_edge.data.subset is None or out_edge.data.subset.num_elements() == 1
+    dst_ref = "_dst" if scalar_dst else "_dst[0]"
+    call = f"{dst_ref} = dace::tileops::tile_reduce<{src_dtype}, {vlen}, '{op_char}'>(_src);"
+    return nodes.Tasklet(
+        label=f"{node.label}_{suffix}",
+        inputs={"_src": None},
         outputs={"_dst": None},
         code=call,
         language=dace.dtypes.Language.CPP,

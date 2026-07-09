@@ -12,7 +12,7 @@ from dace.transformation import pass_pipeline as ppl, transformation
 from dace import SDFG, properties, SDFGState
 from typing import Any, Dict, Set, Optional
 from dace import data as dt
-from dace.symbolic import pystr_to_symbolic, scalars
+from dace.symbolic import pystr_to_symbolic, scalars, symstr
 
 
 def _free_symbols(value) -> Set[str]:
@@ -89,7 +89,13 @@ def _resolve(value, table: Dict[str, Any]):
                 repl[s] = pystr_to_symbolic(known)
         if repl:
             expr = expr.subs(repl)
-        return str(expr)
+        # Render with the DaCe printer, not sympy's ``str``: the operator-backed
+        # functions (``__bitwise_and``, ``__right_shift``, ...) print as their
+        # class names under ``str`` (``__right_shift(a, 1)``), which is neither
+        # valid Python (the codeblock language) nor valid C++. ``symstr`` lowers
+        # them to the corresponding operator, so the propagated value round-trips
+        # through the Python codeblock and the C++ codegen alike.
+        return symstr(expr)
     except Exception:
         return value
 
@@ -113,6 +119,14 @@ class SymbolPropagation(ppl.Pass):
 
     def apply_pass(self, sdfg: SDFG, _) -> Optional[Set[str]]:
         # Assumption: Symbols can only change in InterStateEdges
+
+        # Postcondition (checked at the end): propagation only ever *eliminates*
+        # symbols (substitutes known values forward, drops dead assignments), so
+        # it must never INTRODUCE a free (externally-required / undefined) symbol.
+        # Recording the entry set lets a value rendered into a bad spelling -- e.g.
+        # an operator-function printed as its sympy class name ``__right_shift`` --
+        # be caught here instead of leaking into a condition / codegen.
+        before_free: Set[str] = {str(s) for s in sdfg.free_symbols}
 
         # Get all CFG blocks present in the SDFG
         all_cfg_blks = dict()
@@ -175,6 +189,17 @@ class SymbolPropagation(ppl.Pass):
         eliminated = self._eliminate_dead_iedge_assignments(sdfg)
         if eliminated:
             propagated |= eliminated
+
+        # Postcondition: propagation must not introduce a new free symbol. A
+        # violation means a propagated value was rendered into a name that does
+        # not resolve (e.g. ``__right_shift(a, 1)`` instead of ``(a >> 1)``);
+        # fail here rather than emit an SDFG with an unbound symbol.
+        new_free: Set[str] = {str(s) for s in sdfg.free_symbols} - before_free
+        if new_free:
+            raise ValueError(f"SymbolPropagation introduced free symbol(s) {sorted(new_free)}: a propagated "
+                             f"value rendered to an unresolvable name. Symbol propagation must only eliminate "
+                             f"symbols, never introduce them.")
+
         return propagated if propagated else None
 
     def _eliminate_dead_iedge_assignments(self, sdfg: SDFG) -> Set[str]:
@@ -460,6 +485,18 @@ class SymbolPropagation(ppl.Pass):
         # cyclic symbols un-substituted, which is conservative and correct).
         max_iters = len(new_in_syms) + len(new_out_syms) + 2
 
+        # Symbols reassigned inside a loop body are loop-carried: the loop's
+        # condition and update statement observe their body-updated value on
+        # every iteration past the first, not the value flowing in from before
+        # the loop. Substituting the incoming value into these meta-accesses
+        # would fold a stale first-iteration value into the condition -- e.g.
+        # ``while udiff > 0.001`` with ``udiff = 1.0`` ahead of the loop and
+        # ``udiff = <reduction>`` inside collapses to ``1.0 > 0.001``, an
+        # infinite loop -- so a read by the condition keeps the symbol live.
+        loop_carried: Set[str] = set()
+        if isinstance(cfg_blk, LoopRegion):
+            loop_carried = {s for e in cfg_blk.all_interstate_edges() for s in e.data.assignments.keys()}
+
         changed = True
         iters = 0
         while changed and iters < max_iters:
@@ -470,7 +507,8 @@ class SymbolPropagation(ppl.Pass):
 
             # Replace all symbols in the cfg_blk with their values
             if isinstance(cfg_blk, LoopRegion):
-                cfg_blk.replace_meta_accesses(new_in_syms)
+                meta_syms = {s: v for s, v in new_in_syms.items() if s not in loop_carried}
+                cfg_blk.replace_meta_accesses(meta_syms)
             elif isinstance(cfg_blk, ConditionalBlock):
                 cfg_blk.replace_meta_accesses(new_in_syms)
             elif isinstance(cfg_blk, SDFGState):
