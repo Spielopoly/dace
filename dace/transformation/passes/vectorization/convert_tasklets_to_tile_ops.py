@@ -110,12 +110,18 @@ def _normalize_python_tasklet_body(body: str) -> Optional[str]:
     for ``_detect_unop`` (→ ``TileUnop(op='!')``); mapping it to ``x ^ 1`` would be
     XOR-with-1, not logical NOT, and break on a scalar-bool ``x``.
 
+    ``np.fmod`` reaches here as ``cpp_mod(a, b)`` (the frontend's C-sign modulo
+    helper); rewrite it to the ``fmod`` op name the detectors match, so it lowers
+    to ``TileBinop(op='fmod')`` (-> ``std::fmod`` on CPU, decomposed on cuTile)
+    instead of staying a scalar ``cpp_mod`` tasklet.
+
     :param body: Stripped tasklet body (no trailing ``;``).
     """
     if '@' in body:
         return None
     out = re.sub(r'\bor\b', '||', body)
     out = re.sub(r'\band\b', '&&', out)
+    out = re.sub(r'\bcpp_mod\b', 'fmod', out)
     return out
 
 

@@ -323,7 +323,26 @@ _CUTE_OP_EXPR = {
     "^": "({lhs} ^ {rhs})",
     "min": "ct.minimum({lhs}, {rhs})",
     "max": "ct.maximum({lhs}, {rhs})",
+    # ``**`` and the canonical ``pow(base, exp)`` spelling that
+    # ``PowerOperatorExpansion`` rewrites it to, plus the integer-exponent
+    # ``ipow`` from ``RelaxIntegerPowers`` -- all Python ``**`` (cuTile is
+    # Python-semantics, so this matches the unvectorized reference).
     "**": "({lhs} ** {rhs})",
+    "pow": "({lhs} ** {rhs})",
+    "ipow": "({lhs} ** {rhs})",
+    # Binary elemental math functions (from ``np.arctan2`` / ``np.hypot`` /
+    # ``np.fmod``). ``atan2`` is native to cuda.tile (13.x); ``hypot`` and
+    # ``fmod`` are NOT (probed 2026-07: no ``ct.hypot``/``ct.fmod``/``ct.trunc``),
+    # so they are decomposed with confirmed primitives (``sqrt``/``floor``/
+    # ``ceil``/``where``). Operands are parenthesized because a Symbol-kind
+    # operand is an inlined expression, not a bare name.
+    "atan2": "ct.atan2({lhs}, {rhs})",
+    "hypot": "ct.sqrt(({lhs}) * ({lhs}) + ({rhs}) * ({rhs}))",
+    # C ``fmod`` (sign of dividend): a - b*trunc(a/b). No ``ct.trunc``, so
+    # trunc(q) = q>=0 ? floor(q) : ceil(q). Differs from ``%``/``ct.mod``, which
+    # follow the divisor's sign (Python semantics).
+    "fmod": ("(({lhs}) - ({rhs}) * ct.where(({lhs}) / ({rhs}) >= 0, "
+             "ct.floor(({lhs}) / ({rhs})), ct.ceil(({lhs}) / ({rhs}))))"),
 }
 
 
