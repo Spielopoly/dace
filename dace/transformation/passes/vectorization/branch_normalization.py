@@ -8,6 +8,7 @@ overlapping-but-not-identical write sets unsupported (``NotImplementedError``).
 No ``ConditionalBlock`` remains afterwards.
 """
 import copy
+import re
 from typing import Dict, Optional, Set
 
 import dace
@@ -20,6 +21,35 @@ from dace.sdfg.construction_utils import (
 from dace.sdfg.state import ConditionalBlock, ControlFlowRegion
 from dace.transformation import pass_pipeline as ppl
 from dace.transformation.passes.vectorization.utils.symbolic_polymorphism import free_symbol_names
+
+
+def splice_condition_snapshot(cb: ConditionalBlock, cond_text: str, prefix: str) -> str:
+    """Snapshot ``cond_text`` into a fresh bool symbol evaluated BEFORE ``cb``.
+
+    Splices an empty state in front of ``cb`` whose outgoing interstate edge
+    assigns ``sym = (cond_text)``. Any serialization of an if/else into
+    sequential single-arm blocks must test the NEGATED arm against this
+    snapshot: re-evaluating the condition live after the if-arm ran is unsound
+    when the arm writes a condition operand (crc16's ``if c: crc = f(crc)``
+    followed by ``if not c: ...`` fired BOTH arms).
+
+    :param cb: The conditional block about to be serialized.
+    :param cond_text: The condition expression text.
+    :param prefix: Symbol-name prefix (e.g. ``"__bn"``).
+    :returns: The fresh symbol name.
+    """
+    parent = cb.parent_graph
+    sdfg = parent.sdfg
+    sym = sdfg.find_new_symbol(re.sub(r"\W", "_", f"{prefix}_{cb.label}"))
+    sdfg.add_symbol(sym, dace.bool_)
+    in_edges = list(parent.in_edges(cb))
+    snap = parent.add_state(f"{cb.label}_condsnap", is_start_block=(len(in_edges) == 0))
+    for ie in in_edges:
+        parent.remove_edge(ie)
+        parent.add_edge(ie.src, snap, ie.data)
+    parent.add_edge(snap, cb, dace.InterstateEdge(assignments={sym: f"({cond_text})"}))
+    parent.reset_cfg_list()
+    return sym
 
 
 def compute_arm_escape_writes(sdfg: dace.SDFG, cb: ConditionalBlock) -> Dict[int, Set[str]]:
@@ -294,9 +324,10 @@ class BranchNormalization(ppl.Pass):
 
         Pure CFG rewrite: ``cb`` keeps the if-arm; a new negated single-arm
         block holds the else-arm, stitched sequentially after ``cb``. Later
-        cycles normalize each single-arm form. Valid for a shared write set:
-        the condition is not mutated by the arms, so exactly one arm's writes
-        take effect — identical to the original if/else.
+        cycles normalize each single-arm form. The negated block tests a
+        PRE-``cb`` snapshot of the condition (see
+        :func:`splice_condition_snapshot`): the if-arm may mutate a condition
+        operand, and re-evaluating live would then fire both arms.
 
         :param cb: two-arm conditional (becomes the if-arm only).
         :param cond0: if condition.
@@ -306,9 +337,10 @@ class BranchNormalization(ppl.Pass):
         """
         parent = cb.parent_graph
         cond_text = cond0.as_string if isinstance(cond0, CodeBlock) else str(cond0)
+        snap_sym = splice_condition_snapshot(cb, cond_text, "__bn")
         cb.remove_branch(body1)
         neg_block = ConditionalBlock(label=f"{cb.label}_negated", sdfg=parent.sdfg, parent=parent)
-        neg_block.add_branch(CodeBlock(f"not ({cond_text})"), body1)
+        neg_block.add_branch(CodeBlock(f"not {snap_sym}"), body1)
         parent.add_node(neg_block)
         out_edges = list(parent.out_edges(cb))
         for oe in out_edges:
@@ -548,13 +580,16 @@ class BranchNormalization(ppl.Pass):
                 f"cannot flatten it without dropping or duplicating writes")
 
         # Split into two single-arm conditionals: else-body -> new
-        # ``if not cond0: body1`` block after ``cb`` (now if-arm only); later
-        # cycles rewrite each single-arm form.
+        # ``if not <snapshot>: body1`` block after ``cb`` (now if-arm only);
+        # later cycles rewrite each single-arm form. The negation tests a
+        # pre-``cb`` snapshot (splice_condition_snapshot): the if-arm may
+        # mutate a condition operand.
         parent = cb.parent_graph
         cond_text = cond0.as_string if isinstance(cond0, CodeBlock) else str(cond0)
+        snap_sym = splice_condition_snapshot(cb, cond_text, "__bn")
         cb.remove_branch(body1)
         neg_block = ConditionalBlock(label=f"{cb.label}_negated", sdfg=parent.sdfg, parent=parent)
-        neg_block.add_branch(CodeBlock(f"not ({cond_text})"), body1)
+        neg_block.add_branch(CodeBlock(f"not {snap_sym}"), body1)
         parent.add_node(neg_block)
 
         # Rewire cb's out-edges to flow through neg_block.

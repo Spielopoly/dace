@@ -764,6 +764,19 @@ class RemoveViews(ppl.Pass):
                         print(f'[{_PASS}]       memlet {m.data}:'
                               f' {old_other}'
                               f' -> other_subset={m.other_subset}')
+                elif tree_edge is edge:
+                    # Memlet expressed in the OTHER array's space with an
+                    # implicit (None) view-side subset = the full view.
+                    # Materialize it in array space; keeping None would drop
+                    # the view's offset into the viewed array on reconnection
+                    # (covariance's ``cov_0_0[0:M-i] = __return[i, i:M]``
+                    # mirror-copy silently became a rank-mismatched
+                    # ``__return[0:M-i]`` slice).
+                    m.other_subset = _compute_rewritten_subset(mapping, viewed_subset, full_view_range)
+                    if _DEBUGPRINT:
+                        print(f'[{_PASS}]       memlet {m.data}:'
+                              f' other_subset=None'
+                              f' -> other_subset={m.other_subset}')
 
     def _reconnect_edges(self, state, view_node, viewed_node, view_edge, is_viewed_src):
         # Reconnect to the IMMEDIATE endpoint of the view edge. This is the

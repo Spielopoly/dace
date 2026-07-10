@@ -619,14 +619,16 @@ class ExpandGemmCuPy(ExpandTransformation):
         storage_c = cdata[1].storage
         code_lines = ['import cupy']
 
-        # Reduce operands to 2-D matrices (dropping redundant unit dims) so the
-        # matmul and any beta*C term stay 2-D; the result is reshaped back at the end.
-        a_in = cupy_in_wrap('__a', storage_a)
-        b_in = cupy_in_wrap('__b', storage_b)
-        if len(shape_a) != 2:
-            a_in = f'({a_in}).reshape({_tuple_str(squeezed_a)})'
-        if len(shape_b) != 2:
-            b_in = f'({b_in}).reshape({_tuple_str(squeezed_b)})'
+        # Reshape operands to their 2-D matrix form unconditionally. This drops
+        # redundant unit dims (e.g. doitgen's ``(NQ, 1, NP)`` slice), and -- more
+        # importantly -- re-expands operands the backend squeezed to <2-D: the
+        # Python backend renders a singleton memlet subset (``_a[0:N, 0]``) as a
+        # scalar index, collapsing an outer-product operand ``(N, 1)`` to a 1-D
+        # vector. Without the reshape, ``cupy.matmul`` of two 1-D arrays computes
+        # an inner product (a scalar broadcast across C) instead of the outer
+        # product -- silently miscompiling e.g. gemver's ``multiply.outer``.
+        a_in = f'({cupy_in_wrap("__a", storage_a)}).reshape({_tuple_str(base_a)})'
+        b_in = f'({cupy_in_wrap("__b", storage_b)}).reshape({_tuple_str(base_b)})'
         if node.transA:
             code_lines.append(f'__a_t = ({a_in}).T')
         else:

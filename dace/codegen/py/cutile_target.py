@@ -265,6 +265,40 @@ def _scalar_tile_load(name: str) -> str:
     return f"ct.load({name}, (0,), shape=())"
 
 
+def _is_device_float_scalar(desc: object) -> bool:
+    """Whether *desc* is a float ``data.Scalar`` materialized as a 1-element
+    DEVICE array at kernel entry — either a non-transient kernel parameter
+    (launch-site normalization, see :func:`_is_float_scalar`) or a transient
+    staged in ``GPU_Global`` storage by the data-copy insertion. Both need the
+    0-d ``ct.load`` binding; a transient in Register/Default storage is a plain
+    in-kernel Python variable and must be bound by rename instead.
+
+    :param desc: A data descriptor (or ``None``).
+    :returns: ``True`` when the in-kernel binding must be a 0-d tile load.
+    """
+    if not _is_float_scalar(desc):
+        return False
+    return (not desc.transient) or desc.storage == dtypes.StorageType.GPU_Global
+
+
+def _element_index_exprs(subset: object) -> Optional[str]:
+    """Comma-joined index expressions when ``subset`` addresses exactly one
+    element; ``None`` when it spans more than one element (or size cannot be
+    proven 1 symbolically).
+
+    :param subset: A memlet subset (``Indices`` or ``Range``).
+    :returns: ``"i, j"``-style index string, or ``None``.
+    """
+    if isinstance(subset, subsets.Indices):
+        return ", ".join(symstr(i) for i in subset.indices)
+    try:
+        if any(sp.simplify(sp.sympify(r[1] - r[0])) != 0 for r in subset):
+            return None
+    except Exception:  # noqa: BLE001 -- unprovable extent: treat as non-element.
+        return None
+    return ", ".join(symstr(r[0]) for r in subset)
+
+
 def _matching_inner_connector(outer_conn: str) -> str:
     """Convert an outer (input) scope connector name to the matching inner (output) name.
 
@@ -1313,6 +1347,48 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
             return set()
         return {e.data.data for e in state.out_edges(exit_node) if e.data is not None and e.data.data is not None}
 
+    @staticmethod
+    def _kernel_input_names(state: "SDFGState", entry: nodes.MapEntry) -> set:
+        """Data names passed into the kernel (in-edges of the map entry) —
+        exactly the ``input_arrays`` the launch site normalizes (a float Scalar
+        param always becomes a 1-element device array; see ``generate_scope``).
+
+        :param state: The state containing the map scope.
+        :param entry: The CuTile-scheduled MapEntry of the kernel scope.
+        :returns: The set of input data names.
+        """
+        return {
+            e.data.data
+            for e in state.in_edges(entry)
+            if e.data is not None and e.data.data is not None and isinstance(e.src, nodes.AccessNode)
+        }
+
+    def _float_scalar_needs_tile_load(self, state: "SDFGState", entry: Optional[nodes.MapEntry], name: str,
+                                      desc: object) -> bool:
+        """Whether a float-Scalar read must be bound as a 0-d tile load.
+
+        Mirrors the launch site exactly when the kernel entry is at hand: every
+        float Scalar in the kernel's INPUT list is a 1-element device array
+        (regardless of transience/storage — covariance's host-created transient
+        prefactor is still a param), while kernel-written scalars and scalars
+        defined inside the kernel are plain values. Without an entry (a nested
+        SDFG inside the kernel), fall back to the descriptor heuristic
+        (:func:`_is_device_float_scalar`).
+
+        :param state: The state owning the read.
+        :param entry: The enclosing CuTile MapEntry, or ``None`` inside a
+            nested SDFG.
+        :param name: The data name being bound.
+        :param desc: Its data descriptor.
+        :returns: ``True`` when the binding must be ``ct.load(name, (0,), shape=())``.
+        """
+        if not _is_float_scalar(desc):
+            return False
+        if entry is not None:
+            return (name in self._kernel_input_names(state, entry)
+                    and name not in self._kernel_output_names(state, entry))
+        return _is_device_float_scalar(desc)
+
     def _emit_scalar_bridge_binding(self, sdfg: "SDFG", state: "SDFGState", node: nodes.AccessNode, cfg: object,
                                     state_id: int, callsite_stream: PythonCodeIOStream) -> None:
         """Bind a Register-storage scalar bridge to its source kernel parameter.
@@ -1364,10 +1440,15 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
             src_name = outer_edge.data.data if outer_edge.data else outer_edge.src.data
             src_desc = sdfg.arrays.get(src_name)
             # Mirror the launch-site convention (``_launch_arg_expr``): only
-            # *input-only* float Scalars are passed as 1-element device arrays
-            # and bound as 0-d tiles; a kernel-written scalar is passed raw
-            # (and float input+output scalars are rejected in generate_scope).
-            if _is_float_scalar(src_desc) and src_name not in kernel_outputs:
+            # *input-only* float Scalars in DEVICE memory (kernel params, or
+            # GPU_Global-staged transients like gramschmidt's ``R_index``) are
+            # 1-element device arrays bound as 0-d tiles; a kernel-written
+            # scalar is passed raw (and float input+output scalars are
+            # rejected in generate_scope). A Register/Default TRANSIENT float
+            # scalar is bound in-kernel as a plain Python variable (e.g.
+            # syrk's ``alpha_times_A_slice``), so a ``ct.load`` on it would be
+            # invalid -- it takes the rename path.
+            if self._float_scalar_needs_tile_load(state, kernel_entry, src_name, src_desc):
                 # Float scalar: the kernel parameter is a 1-element device
                 # array (launch-site normalization, full f64 precision); bind
                 # it as a 0-d tile.
@@ -1612,6 +1693,29 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
                 rhs: Optional[str] = None
                 if isinstance(edge.src, nodes.AccessNode):
                     rhs = edge.src.data
+                    src_desc = sdfg.arrays.get(rhs)
+                    if (src_desc is not None and src_desc.storage not in
+                        (dtypes.StorageType.CuTile_Tile, dtypes.StorageType.Register)):
+                        # Non-tile source at kernel scope. Binding the bare name
+                        # hands the tasklet the WHOLE ct array, dropping the
+                        # memlet subset (syrk's ``alpha * A[i, k]`` became
+                        # ``alpha * A`` -- a mixed-rank TileTypeError at
+                        # runtime). Bind the addressed element instead.
+                        if self._float_scalar_needs_tile_load(state, entry, rhs, src_desc):
+                            # Float-scalar kernel param: 1-element device
+                            # array (launch-site convention) -> 0-d tile.
+                            rhs = _scalar_tile_load(rhs)
+                        elif (isinstance(src_desc, data.Array) and not isinstance(src_desc, data.View)
+                              and edge.data is not None and edge.data.data == rhs):
+                            # Global array read: 0-d tile load of the addressed
+                            # element. Multi-element subsets (e.g. gather
+                            # sources) keep the raw array binding.
+                            idx = _element_index_exprs(edge.data.subset)
+                            if idx is not None:
+                                rhs = f"ct.load({rhs}, ({idx},), shape=())"
+                        # Transient scalars are plain in-kernel Python variables
+                        # (bound by rename); integer scalar params carry the
+                        # plain value -- both keep the bare-name binding.
                 elif isinstance(edge.src, (nodes.MapEntry, nodes.ConsumeEntry)):
                     # Trace through the scope entries to the root AccessNode.
                     # The memlet path walks ALL enclosing entries (a one-level
@@ -1621,15 +1725,32 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
                     root = state.memlet_path(edge)[0].src
                     if isinstance(root, nodes.AccessNode):
                         rhs = root.data
-                        # An *input-only* float-scalar kernel parameter is a
-                        # 1-element device array; bind as 0-d tile. Mirrors
-                        # the launch-site condition in ``_launch_arg_expr``
+                        # An *input-only* float scalar in device memory (kernel
+                        # param or GPU_Global-staged transient) is a 1-element
+                        # device array; bind as 0-d tile. Mirrors the
+                        # launch-site condition in ``_launch_arg_expr``
                         # (kernel-written scalars are passed raw; float
                         # input+output scalars are rejected in
-                        # ``generate_scope``).
-                        if (_is_float_scalar(sdfg.arrays.get(rhs))
-                                and (entry is None or rhs not in self._kernel_output_names(state, entry))):
+                        # ``generate_scope``; Register/Default transient
+                        # scalars are plain in-kernel variables -- rename
+                        # only).
+                        root_desc = sdfg.arrays.get(rhs)
+                        if self._float_scalar_needs_tile_load(state, entry, rhs, root_desc):
                             rhs = _scalar_tile_load(rhs)
+                        elif (isinstance(root_desc, data.Array) and not isinstance(root_desc, data.View)
+                              and root_desc.storage not in
+                              (dtypes.StorageType.CuTile_Tile, dtypes.StorageType.Register)
+                              and edge.data is not None and edge.data.data == rhs):
+                            # Global-array element read through the scope
+                            # entry (symm's ``alpha * B[i, j]``): binding the
+                            # bare name hands the tasklet the whole ct array.
+                            # The INNER memlet subset carries the per-element
+                            # index in map params bound in-kernel; emit the
+                            # 0-d element load from it. Multi-element subsets
+                            # (tile loads, gathers) keep the raw binding.
+                            idx = _element_index_exprs(edge.data.subset)
+                            if idx is not None:
+                                rhs = f"ct.load({rhs}, ({idx},), shape=())"
                     elif edge.data is not None and edge.data.data is not None:
                         rhs = edge.data.data
                     elif edge.src_conn is not None:

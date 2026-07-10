@@ -595,12 +595,29 @@ def resolve_gather_deps(idx_shape, widths):
     return tuple(deps)
 
 
+def _no_ipow(expr):
+    """Rewrite ``ipow(b, e)`` (dace's opaque integer-power function, e.g. from
+    ``RelaxIntegerPowers``) back to ``b**e`` so sympy comparisons see through it.
+
+    :param expr: A stride/shape entry (int or sympy expression).
+    :returns: The expression with every ``ipow`` replaced by ``Pow``.
+    """
+    import sympy
+
+    import dace
+    if not isinstance(expr, sympy.Basic):
+        return expr
+    return expr.replace(dace.symbolic.ipow, lambda b, e: b**e)
+
+
 def _strides_match_packed(shape, strides, order):
     """True when ``strides`` is the packed contiguous form for ``shape`` in
     ``order`` ("C" -- innermost-last, stride 1 on the last dim; or "F" --
     innermost-first, stride 1 on the first dim) with NO padding between dims.
 
-    Symbolic shapes / strides are compared via sympy ``simplify == 0``.
+    Symbolic shapes / strides are compared via sympy ``simplify == 0``, after
+    normalizing ``ipow`` to ``Pow`` (``ipow(SM, 2)`` is otherwise opaque to
+    sympy and a packed ``SM**2`` stride would be falsely rejected).
 
     :param shape: Tuple of dim sizes (may be symbolic).
     :param strides: Tuple of per-dim strides (may be symbolic).
@@ -619,12 +636,12 @@ def _strides_match_packed(shape, strides, order):
     expected = 1
     for d in order_range:
         try:
-            diff = dace.symbolic.simplify(strides[d] - expected)
+            diff = dace.symbolic.simplify(_no_ipow(strides[d]) - expected)
             if diff != 0:
                 return False
         except Exception:  # noqa: BLE001 -- conservative refusal on un-comparable expressions.
             return False
-        expected = expected * shape[d]
+        expected = expected * _no_ipow(shape[d])
     return True
 
 
@@ -653,7 +670,7 @@ def validate_packed_layout(node_label, conn_name, desc):
         return
     if len(shape) == 1:
         try:
-            if dace.symbolic.simplify(strides[0] - 1) != 0:
+            if dace.symbolic.simplify(_no_ipow(strides[0]) - 1) != 0:
                 raise NotImplementedError(f"{node_label}: {conn_name!r} has non-unit stride "
                                           f"{strides[0]} on its single dim; only packed layouts are "
                                           f"supported (section 2.3).")

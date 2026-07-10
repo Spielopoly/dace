@@ -78,17 +78,16 @@ class ExpandTileMaskGenCutile(ExpandTransformation):
         K = len(widths)
         shape_tuple = ", ".join(str(w) for w in widths)
         # The iteration mask spans ALL K tiled dims, which are the innermost K
-        # loops (the ``widths`` innermost-last tiling contract).  A dim whose
-        # iter var IS a grid param gets the reconstructed ``__pid*W`` base; a
-        # dim driven by a SEQUENTIAL tile loop inside the kernel (dependent
-        # range, e.g. ``j = i+1 : N : W``) has no grid axis
-        # (``cutile_tile_dim_bids`` returns None) and uses the loop variable
-        # itself, which is in scope in the kernel body — exactly like the
-        # pure expansion.
+        # loops (the ``widths`` innermost-last tiling contract).  The mask
+        # contract is ``iter_var + lane < ub`` (absolute), so every dim uses
+        # the iter var itself (in scope in the kernel body) as base — exactly
+        # like the pure expansion.  The reconstructed ``__pid*W`` base equals
+        # the iter var only for begin-0 map ranges and miscomputes the mask
+        # for nonzero-begin ranges (e.g. ``1:N-1``).
         _axes = cutile_tile_dim_bids(node, parent_state, parent_sdfg, list(range(K)), [str(v) for v in iter_vars], K)
         lines = cutile_bid_lines(node, parent_state, parent_sdfg, _axes)
         for k, (iv, ub, w) in enumerate(zip(iter_vars, global_ubs, widths)):
-            base = f"__pid{k} * {w}" if _axes[k] is not None else f"({iv})"
+            base = f"({iv})"
             lines.append(f"__offsets{k} = ct.arange({w}, dtype=ct.int32)")
             lines.append(f"__mask{k} = __offsets{k} + {base} < ({ub})")
         if K == 1:

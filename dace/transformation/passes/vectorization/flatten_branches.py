@@ -24,6 +24,7 @@ accumulated condition becomes a per-lane mask. Two-arm ``if/else`` is LEFT for
 ``SameWriteSetIfElseToITECFG`` / ``BranchNormalization`` (a tighter ``ITE(c, t, e)``
 blend); this pass only fires where those give up.
 """
+import re
 from typing import List, Optional, Tuple
 
 import dace
@@ -81,8 +82,18 @@ class FlattenBranches(ppl.Pass):
         return cond.as_string if isinstance(cond, CodeBlock) else str(cond)
 
     def _flatten(self, cb: ConditionalBlock) -> None:
-        """Replace ``cb`` with a sequential chain of single-arm blocks."""
+        """Replace ``cb`` with a sequential chain of single-arm blocks.
+
+        Every arm condition is SNAPSHOT into a fresh boolean symbol on an
+        interstate edge BEFORE the chain runs. The sequential arms re-evaluate
+        their conditions after earlier arms already executed — when an arm
+        writes a variable its (or a later arm's) condition reads, live
+        re-evaluation changes the outcome (crc16: ``if c: crc = f(crc)`` /
+        ``elif not c: ...`` fired BOTH arms because arm 1's write flipped
+        ``c``). With pre-chain snapshots, first-match semantics hold exactly.
+        """
         parent = cb.parent_graph
+        sdfg = parent.sdfg
         # Snapshot the arms in order, then detach every body from ``cb`` so each
         # can be re-parented onto its own single-arm block.
         arms: List[Tuple[Optional[CodeBlock], ControlFlowRegion]] = list(cb.branches)
@@ -92,25 +103,44 @@ class FlattenBranches(ppl.Pass):
         in_edges = list(parent.in_edges(cb))
         out_edges = list(parent.out_edges(cb))
 
-        prior_neg: List[str] = []  # negations of earlier arms' conditions
+        # Pre-chain condition snapshot: one fresh bool symbol per conditioned
+        # arm, assigned on the edge INTO the chain (single evaluation point).
+        snap_assignments: dict = {}
+        snap_syms: List[Optional[str]] = []
+        for i, (cond, _body) in enumerate(arms):
+            if cond is None:
+                snap_syms.append(None)
+                continue
+            sym = sdfg.find_new_symbol(re.sub(r"\W", "_", f"__fb_{cb.label}_{i}"))
+            sdfg.add_symbol(sym, dace.bool_)
+            snap_assignments[sym] = f"({self._cond_text(cond)})"
+            snap_syms.append(sym)
+
+        prior_neg: List[str] = []  # negations of earlier arms' snapshot symbols
         new_blocks: List[ConditionalBlock] = []
         for i, (cond, body) in enumerate(arms):
             terms = list(prior_neg)
             if cond is not None:
-                terms.append(f"({self._cond_text(cond)})")
+                terms.append(snap_syms[i])
             # Empty term list = unconditional arm (a leading bare ``else`` as the sole
             # branch); guard as ``True`` so the block stays a well-formed single-arm cond.
             eff = " and ".join(terms) if terms else "True"
-            blk = ConditionalBlock(label=f"{cb.label}_flat{i}", sdfg=parent.sdfg, parent=parent)
+            blk = ConditionalBlock(label=f"{cb.label}_flat{i}", sdfg=sdfg, parent=parent)
             blk.add_branch(CodeBlock(eff), body)
             parent.add_node(blk)
             new_blocks.append(blk)
             if cond is not None:
-                prior_neg.append(f"(not ({self._cond_text(cond)}))")
+                prior_neg.append(f"(not {snap_syms[i]})")
 
-        # Stitch: in-edges -> first block, chain the blocks, last -> cb's out.
+        # Snapshot state: in-edges land here unchanged; the single outgoing
+        # edge into the chain carries the condition-snapshot assignments (so
+        # they evaluate AFTER any incoming edge's own assignments).
+        snap_state = parent.add_state(f"{cb.label}_condsnap", is_start_block=(len(in_edges) == 0))
         for ie in in_edges:
-            parent.add_edge(ie.src, new_blocks[0], ie.data)
+            parent.add_edge(ie.src, snap_state, ie.data)
+        parent.add_edge(snap_state, new_blocks[0], dace.InterstateEdge(assignments=snap_assignments))
+
+        # Stitch: chain the blocks, last -> cb's out.
         for a, b in zip(new_blocks, new_blocks[1:]):
             parent.add_edge(a, b, dace.InterstateEdge())
         for oe in out_edges:

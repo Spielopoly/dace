@@ -10,7 +10,7 @@ Symbol pair belongs outside the tile path.
 The pure expansion returns a CPP tasklet whose body is a single
 ``for``-loop over the flattened tile (correctness-only).
 """
-from typing import Optional, Tuple
+from typing import Optional, Set, Tuple
 
 import numpy as np
 
@@ -519,6 +519,21 @@ class TileBinop(nodes.LibraryNode):
         self.kind_b = kind_b
         self.expr_a = expr_a
         self.expr_b = expr_b
+
+    @property
+    def free_symbols(self) -> Set[str]:
+        """Symbols used by the inline ``Symbol``-kind operand expressions.
+
+        Without this override the base ``Node.free_symbols`` is empty, so
+        ``RemoveUnusedSymbols`` prunes a symbol referenced only via
+        ``expr_a``/``expr_b`` — and the post-expansion tasklet then leaks it
+        as an unknown free symbol (arglist ``KeyError``).
+        """
+        result: Set[str] = set()
+        for expr in (self.expr_a, self.expr_b):
+            if expr:
+                result |= {str(s) for s in dace.symbolic.pystr_to_symbolic(expr).free_symbols}
+        return result
 
     def validate(self, sdfg: dace.SDFG, state: dace.SDFGState) -> None:
         """Validate connector counts + output-kind rule at expansion time.

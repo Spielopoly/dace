@@ -406,6 +406,26 @@ class TestCuPyGemm:
         assert np.allclose(C, ref, atol=1e-12), \
             f"max diff = {np.max(np.abs(C - ref))}"
 
+    def test_outer_product_runtime(self):
+        """(M, 1) @ (1, N) outer product survives the Python backend.
+
+        gemver regression: the Python backend renders a singleton memlet
+        subset as a scalar index, collapsing the ``(M, 1)`` / ``(1, N)``
+        operands to 1-D vectors. Without the expansion's unconditional 2-D
+        reshape, ``cupy.matmul`` then computes an inner product (a scalar
+        broadcast across C) instead of the outer product.
+        """
+        M, N = 10, 8
+        sdfg = _make_gemm_sdfg(dace.float64, [M, 1], [1, N], [M, N], False, False, 1.0, 0.0,
+                               'cupy_gemm_outer_product_runtime')
+        A = np.random.rand(M, 1)
+        B = np.random.rand(1, N)
+        C = np.zeros((M, N))
+        sdfg(A=A, B=B, C=C)
+        ref = A @ B
+        assert np.allclose(C, ref, atol=1e-12), \
+            f"max diff = {np.max(np.abs(C - ref))}"
+
 
 # ---------------------------------------------------------------------------
 # BatchedMatMul GPU integration tests

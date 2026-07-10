@@ -78,7 +78,8 @@ from dace.transformation.passes.canonicalize.loop_to_symmetrize import LoopToSym
 from dace.transformation.passes.canonicalize.loop_to_symm import LoopToSymm
 from dace.transformation.passes.canonicalize.loop_to_einsum import LoopToEinsum
 from dace.transformation.passes.canonicalize.distribute_producer_consumer import DistributeProducerConsumerLoop
-from dace.transformation.passes.canonicalize.assume_symbols_nonnegative import AssumeSymbolConstraints
+from dace.transformation.passes.canonicalize.assume_symbols_nonnegative import (AssumeSymbolConstraints,
+                                                                                 SetSymbolNonnegativeAssumptions)
 from dace.transformation.interstate.trivial_loop_elimination import TrivialLoopElimination
 
 from dace.transformation.interstate.loop_to_map import LoopToMap
@@ -253,7 +254,9 @@ def _build_stages(unroll_limit: int = DEFAULT_UNROLL_LIMIT,
                   fast: bool = False,
                   lift: bool = True,
                   lift_copy: bool = True,
-                  semantic_lifting: bool = True) -> List[Tuple[str, ppl.Pass]]:
+                  semantic_lifting: bool = True,
+                  assumption_guard: bool = True,
+                  reduction_to_wcr_map: bool = True) -> List[Tuple[str, ppl.Pass]]:
     """Build the loop-centric canonicalization recipe as one flat list.
 
     :param unroll_limit: Fully unroll constant-trip loops with at most this many
@@ -711,16 +714,23 @@ def _build_stages(unroll_limit: int = DEFAULT_UNROLL_LIMIT,
     # downstream WCR codegen can lower to a clean OMP ``reduction(op:scalar)``
     # clause. Folded into one stage because the four steps (AugWCR, L2M,
     # inline+fuse, privatize) form an atomic logical transformation.
-    s += [('reduction_to_wcr_map', LoopToReduce(prefer='wcr-scalar'))]
-    s += [('reduction_to_wcr_map', PatternMatchAndApplyRepeated([LoopToMap()]))]
-    # ``LoopToMap`` splits the loop body into per-iteration NestedSDFG
-    # states whose intermediate scalar transients share names across
-    # siblings. Running ``PrivatizeScalars`` here renames each scope's
-    # transient so the downstream structural cleanup's same-name candidate
-    # list is short -- defence-in-depth for the StateFusionExtended same-
-    # name writer-merge guard.
-    s += [('reduction_to_wcr_map', _PrivatizeScalarsStage())]
-    s += _structural_cleanup('reduction_to_wcr_map')
+    #
+    # ``reduction_to_wcr_map=False`` (set by the cuTile/vectorizer path): the
+    # privatized-WCR-map form is a CPU-codegen (OMP reduction clause) shape;
+    # the tile vectorizer refuses any WCR inside a body NSDFG (its own
+    # reduction lift wants the accumulator loop left alone), so the stage is
+    # skipped there and the surviving accumulator loops stay sequential.
+    if reduction_to_wcr_map:
+        s += [('reduction_to_wcr_map', LoopToReduce(prefer='wcr-scalar'))]
+        s += [('reduction_to_wcr_map', PatternMatchAndApplyRepeated([LoopToMap()]))]
+        # ``LoopToMap`` splits the loop body into per-iteration NestedSDFG
+        # states whose intermediate scalar transients share names across
+        # siblings. Running ``PrivatizeScalars`` here renames each scope's
+        # transient so the downstream structural cleanup's same-name candidate
+        # list is short -- defence-in-depth for the StateFusionExtended same-
+        # name writer-merge guard.
+        s += [('reduction_to_wcr_map', _PrivatizeScalarsStage())]
+        s += _structural_cleanup('reduction_to_wcr_map')
 
     # scatter: ``ScatterToGuardedMaps`` inserts a runtime ``IntegerSort + WCR-summed
     # adjacent-equal collision count + post-region trap`` guard on each scatter
@@ -935,7 +945,16 @@ def _build_stages(unroll_limit: int = DEFAULT_UNROLL_LIMIT,
     # -- avoids that entirely while still yielding a first-state guard at codegen.
     # The external free-symbol set is unchanged by canonicalization (only loop
     # iterators are renamed, and those are bound).
-    s += [('end', AssumeSymbolConstraints())]
+    #
+    # ``assumption_guard=False`` (set by the cuTile/Python-backend path): keep the
+    # compile-time nonnegativity assumption but DROP the runtime ``__builtin_trap``
+    # guard state -- that guard is a CPP tasklet the Python backend cannot codegen
+    # ("Python backend only supports Python tasklets"). ``SetSymbolNonnegativeAssumptions``
+    # is the guard-less half of the same contract.
+    if assumption_guard:
+        s += [('end', AssumeSymbolConstraints())]
+    else:
+        s += [('end', SetSymbolNonnegativeAssumptions())]
     return s
 
 
@@ -1060,6 +1079,18 @@ class CanonicalizationPipeline(ppl.Pass):
         default=True,
         desc='Master gate for the post-LoopToMap map->library-node lifts (Einsum + Copy/Memset). '
         'False (set by the vectorizer) keeps the residual as raw maps it can lower.')
+    assumption_guard = properties.Property(
+        dtype=bool,
+        default=True,
+        desc='Emit the terminal runtime __builtin_trap assumption guard. False (set by the '
+        'cuTile/Python-backend path) keeps the compile-time nonnegativity assumption but drops '
+        'the CPP guard tasklet the Python backend cannot codegen.')
+    reduction_to_wcr_map = properties.Property(
+        dtype=bool,
+        default=True,
+        desc='Lift accumulator loops to privatized-WCR parallel maps (the CPU OMP-reduction '
+        'shape). False (set by the cuTile/vectorizer path) keeps them sequential loops -- the '
+        'tile vectorizer refuses WCR inside a body NSDFG and lifts reductions itself.')
 
     def __init__(self,
                  validate: bool = False,
@@ -1074,7 +1105,9 @@ class CanonicalizationPipeline(ppl.Pass):
                  fast: bool = False,
                  lift: bool = True,
                  lift_copy: bool = True,
-                 semantic_lifting: bool = True):
+                 semantic_lifting: bool = True,
+                 assumption_guard: bool = True,
+                 reduction_to_wcr_map: bool = True):
         if target not in _TARGET_DEFAULTS:
             raise ValueError(f"target must be one of {sorted(_TARGET_DEFAULTS)}; got {target!r}")
         self.validate = validate
@@ -1099,6 +1132,8 @@ class CanonicalizationPipeline(ppl.Pass):
         self.lift = lift
         self.lift_copy = lift_copy
         self.semantic_lifting = semantic_lifting
+        self.assumption_guard = assumption_guard
+        self.reduction_to_wcr_map = reduction_to_wcr_map
         self._specialize_constants = specialize_constants or {}
 
     def modifies(self) -> ppl.Modifies:
@@ -1134,7 +1169,9 @@ class CanonicalizationPipeline(ppl.Pass):
                                fast=self.fast,
                                lift=self.lift,
                                lift_copy=self.lift_copy,
-                               semantic_lifting=self.semantic_lifting)
+                               semantic_lifting=self.semantic_lifting,
+                               assumption_guard=self.assumption_guard,
+                               reduction_to_wcr_map=self.reduction_to_wcr_map)
         for _label, unit in stages:
             _assert_self_contained(unit)
             unit.apply_pass(sdfg, {})
@@ -1158,7 +1195,9 @@ def canonicalize(sdfg: SDFG,
                  fast: bool = False,
                  lift: bool = True,
                  lift_copy: bool = True,
-                 semantic_lifting: bool = True) -> SDFG:
+                 semantic_lifting: bool = True,
+                 assumption_guard: bool = True,
+                 reduction_to_wcr_map: bool = True) -> SDFG:
     """Canonicalize ``sdfg`` in place and return it.
 
     One-call recipe analogous to ``auto_optimize``.
@@ -1199,6 +1238,16 @@ def canonicalize(sdfg: SDFG,
                              lifts (Einsum + Copy/Memset). Default ``True``; the
                              vectorizer sets ``False`` to keep the residual as raw
                              maps (a library node is not vectorizable).
+    :param assumption_guard: Emit the terminal runtime ``__builtin_trap`` guard
+                             state (default ``True``). The cuTile/Python-backend
+                             path sets ``False``: the guard is a CPP tasklet the
+                             Python backend cannot codegen, so only the
+                             compile-time nonnegativity assumption is kept.
+    :param reduction_to_wcr_map: Lift accumulator loops to privatized-WCR
+                             parallel maps, the CPU OMP-reduction shape (default
+                             ``True``). The cuTile/vectorizer path sets
+                             ``False``: the tile vectorizer refuses WCR inside a
+                             body NSDFG and lifts reductions itself.
     :returns: The same ``sdfg`` instance, canonicalized.
     """
     CanonicalizationPipeline(validate=validate,
@@ -1213,5 +1262,7 @@ def canonicalize(sdfg: SDFG,
                              fast=fast,
                              lift=lift,
                              lift_copy=lift_copy,
-                             semantic_lifting=semantic_lifting).apply_pass(sdfg, {})
+                             semantic_lifting=semantic_lifting,
+                             assumption_guard=assumption_guard,
+                             reduction_to_wcr_map=reduction_to_wcr_map).apply_pass(sdfg, {})
     return sdfg

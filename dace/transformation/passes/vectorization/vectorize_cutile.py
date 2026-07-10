@@ -38,6 +38,15 @@ class VectorizeCuTile(ppl.Pass):
     because the lowering passes must run between the vectorizer and
     library-node expansion and the vectorizer is itself a Pipeline):
 
+    0. :meth:`canonicalize_for_cutile` — rewrite the SDFG into canonical
+       loop/map form before vectorization (see that method's docstring for
+       the cuTile knob row and rationale). Gated by the ``run_canonicalize``
+       knob (default ``True``); callers compiling one program at several
+       widths should canonicalize once via the static method and pass
+       ``run_canonicalize=False`` here. Note the known canonicalize soundness
+       caveats (see the module docstrings in ``passes/canonicalize/``); this
+       stage may miscompile some in-place stencils, but the coverage it buys
+       on the corpus is worth the tradeoff.
     1. ``VectorizeCPUMultiDim(widths=..., target_isa="CUTILE",
        expand_tile_nodes=False, ...)`` — emit ``tileops`` library nodes.
     2. :class:`CuTileValidateTiles` — anchors exist; widths are powers of 2.
@@ -73,6 +82,11 @@ class VectorizeCuTile(ppl.Pass):
                                  desc="When True, lowering-pass precondition violations raise "
                                  "ValueError instead of emitting a UserWarning.")
 
+    run_canonicalize = properties.Property(dtype=bool,
+                                           default=True,
+                                           desc="When True, run the canonicalize pipeline as step 0 "
+                                           "(before vectorization).")
+
     def __init__(self,
                  widths: Tuple[int, ...],
                  *,
@@ -81,6 +95,7 @@ class VectorizeCuTile(ppl.Pass):
                  loop_to_map_permissive: bool = False,
                  nest_map_bodies: bool = False,
                  strict: bool = False,
+                 run_canonicalize: bool = True,
                  debug_save: bool = False):
         """Build the orchestrator (validates the configuration eagerly).
 
@@ -97,6 +112,8 @@ class VectorizeCuTile(ppl.Pass):
         :param strict: When ``True``, lowering-pass precondition violations
             (e.g. a partially-vectorized SDFG) raise ``ValueError`` instead of
             emitting a ``UserWarning``.
+        :param run_canonicalize: When ``True`` (default), run the canonicalize
+            pipeline as step 0 before vectorization.
         :param debug_save: When ``True``, save intermediate SDFG files
             after each pipeline stage for debugging.
         :raises NotImplementedError: On any configuration
@@ -105,6 +122,7 @@ class VectorizeCuTile(ppl.Pass):
         """
         super().__init__()
         self.strict = strict
+        self.run_canonicalize = run_canonicalize
         self._debug_save = debug_save
         # Eager construction: VectorizeCPUMultiDim.__init__ validates the
         # whole knob row (widths count/powers of 2, remainder/branch combos),
@@ -125,6 +143,39 @@ class VectorizeCuTile(ppl.Pass):
 
     def depends_on(self) -> Set[Type[ppl.Pass]]:
         return set()
+
+    @staticmethod
+    def canonicalize_for_cutile(sdfg: SDFG) -> SDFG:
+        """Run canonicalize with the cuTile knob row (step 0 of this pass).
+
+        The canonical form is width-independent, so callers compiling one
+        program at several tile widths should call this ONCE on the base SDFG
+        and then run ``VectorizeCuTile(..., run_canonicalize=False)`` on
+        deep copies — canonicalize dominates pipeline time.
+
+        Knobs: ``target="gpu"`` (cuTile is a GPU backend);
+        ``semantic_lifting=False`` keeps raw maps the vectorizer can lower;
+        ``assumption_guard=False`` drops the terminal CPP ``__builtin_trap``
+        guard the Python backend cannot codegen; ``reduction_to_wcr_map=False``
+        keeps accumulator loops out of the privatized-WCR-map shape the tiler
+        refuses; ``peel_limit=0`` skips ``BestEffortLoopPeeling`` — its
+        per-stuck-loop probing dominates canonicalize time (~105 of 117s on
+        adi) and the boundary-conflict loops it unblocks don't occur on the
+        cuTile corpus.
+
+        :param sdfg: The SDFG to canonicalize in place.
+        :returns: The same ``sdfg`` instance.
+        """
+        # Deferred import: the canonicalize pipeline imports from this
+        # (vectorization) subpackage, so a module-level import would be
+        # circular.
+        from dace.transformation.passes.canonicalize import canonicalize
+        return canonicalize(sdfg,
+                            target="gpu",
+                            semantic_lifting=False,
+                            assumption_guard=False,
+                            reduction_to_wcr_map=False,
+                            peel_limit=0)
 
     def apply_pass(self, sdfg: SDFG, pipeline_results: Dict[str, Any]) -> Optional[int]:
         """Run the full cuTile pipeline on ``sdfg`` in place.
@@ -152,8 +203,14 @@ class VectorizeCuTile(ppl.Pass):
                 sdfg.save(DEBUG_SAVE_NAME.format(stage=stage))
                 stage += 1
 
-        # Step 1: Vectorize — emit tileops library nodes
+        # Step 0: Canonicalize — rewrite into canonical loop/map form before
+        # vectorization (knob rationale: see canonicalize_for_cutile).
         debug_save_sdfg()
+        if self.run_canonicalize:
+            self.canonicalize_for_cutile(sdfg)
+            debug_save_sdfg()
+
+        # Step 1: Vectorize — emit tileops library nodes
         self._vectorizer.apply_pass(sdfg, {})
         debug_save_sdfg()
 

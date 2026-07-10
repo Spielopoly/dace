@@ -192,32 +192,32 @@ def _identity_literal_cutile(op: str, dtype: str) -> str:
     :returns: A cuTile expression suitable as the inactive-lane value.
     """
     if op == "+":
-        return f"ct.astype(0, dtype={dtype})"
+        return f"ct.astype(0, ct.{dtype})"
     elif op == "*":
-        return f"ct.astype(1, dtype={dtype})"
+        return f"ct.astype(1, ct.{dtype})"
     elif op == "min":
         if _is_cutile_float_type(dtype):
-            return f"ct.astype(float('inf'), dtype={dtype})"
+            return f"ct.astype(float('inf'), ct.{dtype})"
         elif _is_cutile_bool_type(dtype):
             return "True"
         elif _is_cutile_unsigned_int_type(dtype):
             bitwidth = _cutile_integer_bitwidth(dtype)
-            return f"ct.astype({2**bitwidth - 1}, dtype={dtype})"
+            return f"ct.astype({2**bitwidth - 1}, ct.{dtype})"
         elif _is_cutile_signed_int_type(dtype):
             bitwidth = _cutile_integer_bitwidth(dtype)
-            return f"ct.astype({2**(bitwidth - 1) - 1}, dtype={dtype})"
+            return f"ct.astype({2**(bitwidth - 1) - 1}, ct.{dtype})"
         else:
             raise ValueError(f"unsupported type for min identity: {dtype!r}")
     elif op == "max":
         if _is_cutile_float_type(dtype):
-            return f"ct.astype(float('-inf'), dtype={dtype})"
+            return f"ct.astype(float('-inf'), ct.{dtype})"
         elif _is_cutile_bool_type(dtype):
             return "False"
         elif _is_cutile_unsigned_int_type(dtype):
-            return f"ct.astype(0, dtype={dtype})"
+            return f"ct.astype(0, ct.{dtype})"
         elif _is_cutile_signed_int_type(dtype):
             bitwidth = _cutile_integer_bitwidth(dtype)
-            return f"ct.astype({-2**(bitwidth - 1)}, dtype={dtype})"
+            return f"ct.astype({-2**(bitwidth - 1)}, ct.{dtype})"
         else:
             raise ValueError(f"unsupported type for max identity: {dtype!r}")
     else:
@@ -257,7 +257,11 @@ class ExpandTileReduceCutile(ExpandTransformation):
         op = node.op
 
         if node.has_mask:
-            dtype = parent_sdfg.arrays[next(e for e in parent_state.in_edges(node) if e.dst_conn == "_src").data.data].dtype
+            # to_string(): the cuTile spelling ('float64'), NOT str(typeclass)
+            # which is the C ctype ('double') and would leak into the tasklet
+            # as an undefined bare name.
+            dtype = parent_sdfg.arrays[next(e for e in parent_state.in_edges(node)
+                                            if e.dst_conn == "_src").data.data].dtype.to_string()
             identity = _identity_literal_cutile(op, dtype)
             rhs = f"ct.where(_mask, _src, {identity})"
         else:

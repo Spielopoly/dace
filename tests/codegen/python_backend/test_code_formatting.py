@@ -12,7 +12,6 @@ import pytest
 import dace
 from dace import dtypes
 from dace.codegen.py.prettycode import format_python_code
-from dace.transformation.passes.canonicalize import canonicalize
 from dace.transformation.passes.vectorization.vectorize_cutile import VectorizeCuTile
 
 # yapf is an optional (linting-extra) dependency; formatting fails soft without
@@ -72,7 +71,9 @@ def _build_vadd_cutile_sdfg():
         {"_c": dace.Memlet("C[i]")},
         external_edges=True,
     )
-    canonicalize(sdfg)
+    # VectorizeCuTile runs canonicalize itself (step 0, with the cuTile knob
+    # row -- a hand-run default canonicalize would plant a CPP trap guard the
+    # Python backend cannot codegen).
     VectorizeCuTile(widths=(8,)).apply_pass(sdfg, {})
     return sdfg
 

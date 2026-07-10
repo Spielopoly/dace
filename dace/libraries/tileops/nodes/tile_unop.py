@@ -12,7 +12,7 @@ The pure expansion returns a CPP tasklet whose body is a single ``for``-loop
 over the flattened tile (correctness-only); the K=1 ISA backends call
 ``dace::tileops::tile_unop`` in ``dace/tile_ops/<backend>.h``.
 """
-from typing import Optional, Tuple
+from typing import Optional, Set, Tuple
 
 import numpy as np
 
@@ -369,6 +369,20 @@ class TileUnop(nodes.LibraryNode):
         self.has_mask = has_mask
         self.kind_a = kind_a
         self.expr_a = expr_a
+
+    @property
+    def free_symbols(self) -> Set[str]:
+        """Symbols used by the inline ``Symbol``-kind operand expression.
+
+        Without this override the base ``Node.free_symbols`` is empty, so
+        ``RemoveUnusedSymbols`` prunes a symbol referenced only via ``expr_a``
+        — and the post-expansion tasklet then leaks it as an unknown free
+        symbol (arglist ``KeyError``).
+        """
+        result: Set[str] = set()
+        if self.expr_a:
+            result |= {str(s) for s in dace.symbolic.pystr_to_symbolic(self.expr_a).free_symbols}
+        return result
 
     def validate(self, sdfg: dace.SDFG, state: dace.SDFGState) -> None:
         """Validate connectors + the operand promotion at expansion time.
