@@ -72,7 +72,7 @@ def _append_cfg(base: SDFG, tail: SDFG) -> None:
     edges = list(tail.edges())
     for b in blocks:
         tail.remove_node(b)
-        base.add_node(b)
+        base.add_node(b, ensure_unique_name=True)  # deepcopy siblings share labels; wired by object ref
     for e in edges:
         base.add_edge(e.src, e.dst, e.data)
     tail_start.is_start_block = False
@@ -147,22 +147,21 @@ class NormalizeMapBody(ppl.Pass):
             _append_cfg(base, tail)
 
             # Re-point drop's boundary edges onto keep with (possibly renamed) connectors.
-            # force=True: an NSDFG legitimately carries same-name in+out connector
-            # pairs (read-modify-write data). The unforced add_*_connector silently
-            # returns False when the name already exists on the OTHER side, which
-            # dropped the out-connector of any in-place-updated array (mvt's
-            # ``x2 += ...`` sibling) and left its edge dangling. Guarded so an
-            # already-present connector's dtype is not clobbered.
+            # ``force=True``: a carrier read by one sibling and written by another (an
+            # in-place update like ``b`` in TSVC s212 -- ``a = a*b`` then ``b = b + ...``)
+            # legitimately becomes BOTH an in- and an out-connector of the merged nested
+            # SDFG. Without ``force`` the second ``add_*_connector`` silently no-ops
+            # because the name already exists on the other side, leaving an edge that
+            # references a nonexistent connector (invalid SDFG: "b written but only given
+            # as an input connector").
             for e in list(state.in_edges(drop)):
                 conn = drepl.get(e.dst_conn, e.dst_conn)
-                if conn not in keep.in_connectors:
-                    keep.add_in_connector(conn, force=True)
+                keep.add_in_connector(conn, force=True)
                 state.add_edge(e.src, e.src_conn, keep, conn, copy.deepcopy(e.data))
                 state.remove_edge(e)
             for e in list(state.out_edges(drop)):
                 conn = drepl.get(e.src_conn, e.src_conn)
-                if conn not in keep.out_connectors:
-                    keep.add_out_connector(conn, force=True)
+                keep.add_out_connector(conn, force=True)
                 state.add_edge(keep, conn, e.dst, e.dst_conn, copy.deepcopy(e.data))
                 state.remove_edge(e)
 

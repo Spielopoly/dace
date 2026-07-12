@@ -347,14 +347,54 @@ def _build_symbol_definition_map(inner_sdfg: Optional[SDFG], state=None) -> Dict
         expr = _safe_sympify(next(iter(rhs_set)))
         if expr is not None:
             defs[name] = expr
-    # Self-referential def (``j = j + 1``) = loop-carried RECURRENCE, not a resolvable index. Such a
-    # loop is never a tiled parallel map (LoopToMap refuses recurrences) → access stays in scalar
-    # control flow, so leave symbol UNRESOLVED, preserve subset (``a[j]``) verbatim. Substituting
-    # would run ``resolve_index_expr``'s fixpoint to the cap (``j`` -> ``j + _max_depth``) and corrupt
-    # the subset (TSVC s123). (Tiled access carrying such an index is refused downstream by the
-    # tile-index builder, not rewritten -- see InsertTileLoadStore.)
-    defs = {k: v for k, v in defs.items() if k not in {str(s) for s in v.free_symbols}}
-    return defs
+    # A symbol whose own definition references itself (``j = j + 1``) is a loop-carried RECURRENCE:
+    # its value changes between program points. Such a loop is never a tiled parallel map (LoopToMap
+    # refuses recurrences) → access stays in scalar control flow, so leave the symbol UNRESOLVED,
+    # preserving the subset (``a[j]``) verbatim. Substituting would run ``resolve_index_expr``'s
+    # fixpoint to the cap (``j`` -> ``j + _max_depth``) and corrupt the subset (TSVC s123). The same
+    # instability propagates transitively: an index DEFINED from a recurrence symbol (``k = j + 1``,
+    # snapshotted at loop-top while ``j`` is bumped before the ``b[k]``/``c[k]`` use -- TSVC s128) is
+    # equally unstable, because the substituted ``j`` would read its post-update value at the use
+    # site. Collect every recurrence symbol from the raw assignment RHSs and drop both the
+    # self-referential defs AND any def whose RHS depends on one. (Tiled access carrying such an
+    # index is refused downstream by the tile-index builder, not rewritten -- see InsertTileLoadStore.)
+    recurrence_syms: Set[str] = set()
+    for sym, rhs_set in ise_rhs.items():
+        for rhs in rhs_set:
+            rexpr = _safe_sympify(rhs)
+            if rexpr is not None and sym in {str(s) for s in rexpr.free_symbols}:
+                recurrence_syms.add(sym)
+                break
+    for name, rhs_set in scalar_defs.items():
+        for rhs in rhs_set:
+            rexpr = _safe_sympify(rhs)
+            if rexpr is not None and name in {str(s) for s in rexpr.free_symbols}:
+                recurrence_syms.add(name)
+                break
+    # Taint every def transitively reaching a recurrence symbol, to a fixpoint. A def that
+    # references a recurrence symbol is itself unstable (``LEN_1D_minus_k = LEN_1D - k``, ``k``
+    # carried; ``k = j + 1``, ``j`` carried), and so is any def that references such a tainted mint
+    # in turn (``__sym_LEN_1D_minus_k = LEN_1D_minus_k`` -- the frontend's promoted subset symbol).
+    # Propagating the taint UP the whole chain is essential: dropping only the leaf ``LEN_1D - k``
+    # link while keeping ``__sym_LEN_1D_minus_k -> LEN_1D_minus_k`` leaves resolution stranded at the
+    # dropped intermediate ``LEN_1D_minus_k`` -- a scalar the frontend already promoted away and no
+    # longer declares in the tiled scope, so the subset ``b[LEN_1D_minus_k]`` compiles to an
+    # undeclared reference (TSVC s122). Dropping the whole chain instead leaves the ORIGINAL promoted
+    # subset symbol unresolved (matching s128's fully-unresolved ``b[k]``), which the downstream
+    # tile-index builder refuses cleanly.
+    tainted: Set[str] = set(recurrence_syms)
+    changed = True
+    while changed:
+        changed = False
+        for k, v in defs.items():
+            if k in tainted:
+                continue
+            v_syms = {str(s) for s in v.free_symbols}
+            if k in v_syms or (v_syms & tainted):  # self-ref, or reaches a tainted symbol
+                tainted.add(k)
+                changed = True
+    filtered = {k: v for k, v in defs.items() if k not in tainted}
+    return filtered
 
 
 def resolve_index_expr(expr: sympy.Expr,
@@ -395,13 +435,46 @@ def resolve_index_expr(expr: sympy.Expr,
     return cur
 
 
+def _scalar_loaded_from_array(sdfg: SDFG, name: str) -> bool:
+    """True if ``name`` is a transient Scalar whose value is loaded from a (non-Scalar) Array -- a
+    gather-index scalar (``N__slice = Xiv[j]``, written by a memlet COPY). The frontend promotes such
+    a scalar to a subset symbol (``__sym_N__slice = N__slice``); ``_build_symbol_definition_map``
+    source 2 only rewrites TASKLET-defined scalars to their source array, so a COPY-defined one is
+    missed and the array name never surfaces. The scalar is state-local, so inlining it into a later
+    state's subset references it out of scope (undeclared-identifier compile error) -- keep the
+    promoted symbol instead.
+    """
+    import dace.data as _dd
+    desc = sdfg.arrays.get(name)
+    if not (isinstance(desc, _dd.Scalar) and desc.transient):
+        return False
+    for state in sdfg.states():
+        for node in state.nodes():
+            if not (isinstance(node, nodes.AccessNode) and node.data == name):
+                continue
+            for edge in state.in_edges(node):
+                src = edge.src
+                if isinstance(src, nodes.AccessNode):
+                    sources = [src.data]
+                elif isinstance(src, nodes.Tasklet):
+                    sources = [e.data.data for e in state.in_edges(src) if e.data is not None and e.data.data is not None]
+                else:
+                    sources = []
+                for sname in sources:
+                    sdesc = sdfg.arrays.get(sname)
+                    if isinstance(sdesc, _dd.Array) and not isinstance(sdesc, _dd.Scalar):
+                        return True
+    return False
+
+
 def expr_is_data_dependent(expr: sympy.Expr, sdfg: SDFG) -> bool:
     """True if ``expr`` is a data-dependent index -- reads an array value (a gather like ``idx[i]``),
     so must NOT be inlined into a memlet subset (stays gather form for the gather machinery).
 
-    Detected two ways: a :class:`~dace.symbolic.Subscript` node anywhere, or a free symbol naming a
+    Detected three ways: a :class:`~dace.symbolic.Subscript` node anywhere, a free symbol naming a
     non-Scalar :class:`~dace.data.Array` descriptor (resolver rewrites a gather scalar's defining
-    tasklet to read the source array name, so ``idx`` shows up as a free symbol).
+    tasklet to read the source array name, so ``idx`` shows up as a free symbol), or a transient
+    Scalar loaded from an Array (a copy-defined gather-index scalar the tasklet-only rewrite misses).
     """
     if expr is None:
         return False
@@ -414,6 +487,8 @@ def expr_is_data_dependent(expr: sympy.Expr, sdfg: SDFG) -> bool:
     for s in expr.free_symbols:
         desc = sdfg.arrays.get(str(s))
         if isinstance(desc, _dd.Array) and not isinstance(desc, _dd.Scalar):
+            return True
+        if _scalar_loaded_from_array(sdfg, str(s)):  # gather-index scalar (copy-defined)
             return True
     return False
 
@@ -591,7 +666,7 @@ def _affine_coeff_for(expr: sympy.Expr, var_name: str) -> Optional[sympy.Expr]:
     rest``, ``rest`` free of ``var_name``). ``None`` if non-affine or unresolvable."""
     if expr is None:
         return None
-    sym = _find_named_symbol(expr, var_name) or sympy.Symbol(var_name)
+    sym = _find_named_symbol(expr, var_name) or symbolic.pystr_to_symbolic(var_name)
     try:
         poly = sympy.Poly(expr, sym)
     except (sympy.PolynomialError, sympy.GeneratorsError, TypeError):
@@ -608,7 +683,7 @@ def _affine_offset_for(expr: sympy.Expr, var_name: str) -> Optional[sympy.Expr]:
     non-affine."""
     if expr is None:
         return None
-    sym = _find_named_symbol(expr, var_name) or sympy.Symbol(var_name)
+    sym = _find_named_symbol(expr, var_name) or symbolic.pystr_to_symbolic(var_name)
     try:
         poly = sympy.Poly(expr, sym)
     except (sympy.PolynomialError, sympy.GeneratorsError, TypeError):
@@ -824,18 +899,22 @@ def classify_tile_access(subset: Range,
                 iter_var_in_dim[tvar].append(d)
                 dim_to_canonical_iter_var.append(list(iter_vars).index(tvar))
                 continue
-            # Stop 3b: ``(c * tvar + c0) % N`` -> MODULAR. Codegen falls back to GATHER for the
-            # general case; tile-aligned reduction to LINEAR is future work (design section 4.2).
+            # Stop 3b: ``(c * tvar + c0) % N`` (a tile iter-var nested inside ``mod``) -> GATHER.
+            # The value ``a[(c*l+c0) mod N]`` is single-element but NOT contiguous across lanes
+            # (it wraps), so it cannot be a structured contiguous-widened tile. The emitter builds
+            # a per-lane index tile ``[f(l+0), .., f(l+W-1)]`` (expand the modulus per lane, then
+            # gather), exactly as VECTORIZATION_MODEL.md documents for ``MODULAR`` ("per-lane index
+            # + gather"). Recorded as GATHER so the shared emit dispatch routes it to the gather
+            # path; the per-lane expression is recovered from the subset-begin text.
             modular_N = _detect_modular_factor(lo_sym, tvar)
             if modular_N is not None:
-                per_dim_kind.append(PerDimKind.MODULAR)
+                per_dim_kind.append(PerDimKind.GATHER)
                 dim_strides.append(None)
-                dim_iter_var.append(tvar)
+                dim_iter_var.append(None)
                 gather_index_per_dim.append(None)
                 dim_offset.append(None)
                 replicate_factor_per_dim.append(None)
-                iter_var_in_dim[tvar].append(d)
-                dim_to_canonical_iter_var.append(list(iter_vars).index(tvar))
+                dim_to_canonical_iter_var.append(None)
                 continue
             coeff = _affine_coeff_for(lo_sym, tvar)
             offset = _affine_offset_for(lo_sym, tvar)
@@ -885,16 +964,19 @@ def classify_tile_access(subset: Range,
                 iter_var_in_dim[tvar].append(d)
                 dim_to_canonical_iter_var.append(list(iter_vars).index(tvar))
                 continue
-            # Non-affine, not int_floor/int_ceil (e.g. ``i**2``): AFFINE without an int stride;
-            # emitter degrades to GATHER with the per-lane expression.
-            per_dim_kind.append(PerDimKind.AFFINE)
+            # Non-affine, not int_floor/int_ceil (e.g. ``i**2`` or ``py_mod(i, K)`` whose modulus
+            # is symbolic / whose name ``_detect_modular_factor`` doesn't match): a tile iter-var
+            # nested inside a function with no resolvable integer stride. NOT contiguous across
+            # lanes -> GATHER with the per-lane expression, evaluated ``f(l+0), .., f(l+W-1)`` and
+            # gathered (matches the Stop-3b modular case; the emitter recovers the expression from
+            # the subset-begin text).
+            per_dim_kind.append(PerDimKind.GATHER)
             dim_strides.append(None)
-            dim_iter_var.append(tvar)
+            dim_iter_var.append(None)
             gather_index_per_dim.append(None)
             dim_offset.append(None)
             replicate_factor_per_dim.append(None)
-            iter_var_in_dim[tvar].append(d)
-            dim_to_canonical_iter_var.append(list(iter_vars).index(tvar))
+            dim_to_canonical_iter_var.append(None)
             continue
 
         # Stop 4: multiple tile iter-vars in the dim. AFFINE only if JOINTLY affine -- each tile
@@ -935,6 +1017,27 @@ def classify_tile_access(subset: Range,
             iter_var_in_dim[tv].append(d)
         dim_to_canonical_iter_var.append(list(iter_vars).index(rep))
 
+    # Diagonal: any tile iter-var that DIRECTLY drives >= 2 subset dims (``a[i, i]``, ``a[2i, i]``).
+    diagonal = {v: tuple(dims) for v, dims in iter_var_in_dim.items() if len(dims) >= 2}
+    # A coupled access like this is NOT per-dim contiguously widenable: widening each dim to
+    # ``[beg : beg + W]`` reads a W×W block, not the W diagonal elements ``a[f(i+l), g(i+l)]``.
+    # Route the coupled dims to GATHER so the emitter builds a per-lane index per dim (from the
+    # subset-begin expression) and gathers / scatters the coupled position -- the same treatment as
+    # a modular / non-affine single-dim index. Only DIRECT-index dims reach ``diagonal`` (a GATHER /
+    # BROADCAST dim never appends to ``iter_var_in_dim``), so this only re-marks structured dims.
+    for _coupled_dims in diagonal.values():
+        for d in _coupled_dims:
+            # Clear ALL per-dim fields (matching every other GATHER site) so a re-marked diagonal
+            # dim carries no stale STRUCTURED/AFFINE ``dim_offset`` / ``replicate_factor`` that a
+            # gather-emit consumer could later read for a GATHER dim.
+            per_dim_kind[d] = PerDimKind.GATHER
+            dim_strides[d] = None
+            dim_iter_var[d] = None
+            gather_index_per_dim[d] = None
+            dim_offset[d] = None
+            replicate_factor_per_dim[d] = None
+            dim_to_canonical_iter_var[d] = None
+
     # Whole-subset kind: strongest per-dim kind. MODULAR / REPLICATE share the STRUCTURED bucket
     # (both perfectly regular; codegen picks the intrinsic from the per-dim records).
     kinds = set(per_dim_kind)
@@ -947,9 +1050,6 @@ def classify_tile_access(subset: Range,
         kind = TileAccessKind.STRUCTURED
     else:
         kind = TileAccessKind.BROADCAST
-
-    # Diagonal: any iter-var spans >= 2 dims.
-    diagonal = {v: tuple(dims) for v, dims in iter_var_in_dim.items() if len(dims) >= 2}
 
     # Transpose: STRUCTURED with iter-vars in non-canonical order (canonical: dim ``d`` carries
     # ``iter_vars[d]``).

@@ -6,6 +6,8 @@ that walks the K-fold nested index space.
 """
 from typing import Optional, Tuple
 
+import sympy
+
 import dace
 from dace import library, properties
 from dace.sdfg import nodes
@@ -15,19 +17,6 @@ from .._pure_codegen import (ct_dtype_name, cutile_bid_lines, cutile_offset_bloc
                              cutile_tile_dim_bids, cutile_tile_dim_offsets, gather_lane_offset, nested_loops,
                              offset_via_strides, resolve_gather_deps, tile_offset)
 from .. import _isa_codegen
-
-
-def _extents_equal(a, e) -> bool:
-    """True when tile-extent expressions ``a`` and ``e`` are equal.
-
-    Robust to same-name symbols carrying different sympy assumptions (e.g. a tile
-    base ``jl`` staged as nonnegative vs. the loop's plain ``jl``), which blocks
-    ``jl - jl`` from cancelling and would false-reject a genuine full-tile store.
-    Re-parsing the difference from its string form unifies symbols by name.
-    """
-    if dace.symbolic.simplify(a - e) == 0:
-        return True
-    return dace.symbolic.pystr_to_symbolic(str(a - e)) == 0
 
 
 @library.expansion
@@ -698,7 +687,15 @@ class TileStore(nodes.LibraryNode):
             if subset_sizes is not None:
                 expected = tuple(widths[i] for i in range(K))
                 actual = tuple(subset_sizes[d] for d in dims) if max(dims, default=-1) < len(subset_sizes) else None
-                if actual is None or any(not _extents_equal(a, e) for a, e in zip(actual, expected)):
+                # Compare each per-dim extent to its width with symbol-name reconciliation:
+                # a full-tile size arrives as ``end - begin + W`` whose ``begin``/``end`` are the
+                # SAME iterator under DIFFERENT assumption objects, so it does NOT self-cancel under
+                # a plain ``simplify`` (``i - i`` stays). ``inequal_symbols`` equalizes same-name
+                # symbols first, so a genuine full tile reads equal and only a real partial-tile size
+                # trips the guard.
+                if actual is None or any(
+                        dace.symbolic.inequal_symbols(sympy.sympify(a), sympy.sympify(e))
+                        for a, e in zip(actual, expected)):
                     raise NotImplementedError(
                         f"{self.label}: non-full-tile structured store -- dest memlet "
                         f"subset sizes {subset_sizes} on dims {dims} != widths {expected}. Per user "

@@ -1,11 +1,19 @@
-"""Native C++ reference harness: compile tsvc{2,2_5}_core.cpp with LLVM/clang
-(the default vendor, matching DaCe's own preferred compiler), in both a
-plain-serial and Polly-autopar form, and call each kernel's
-``<name>_run_timed`` function via ctypes -- it times itself (std::chrono) and
-writes the elapsed nanoseconds to its trailing ``time_ns`` output pointer.
+"""Native C++ reference harness: compile tsvc{2,2_5}_core.cpp and call each
+kernel's ``<name>_run_timed`` function via ctypes -- it times itself
+(std::chrono) and writes the elapsed nanoseconds to its trailing ``time_ns``
+output pointer.
 
-If clang++ isn't on PATH, both lanes are skipped (compile_lane returns an
-error for that lane) rather than falling back to a different vendor.
+Two native baselines the DaCe pipelines are compared against:
+  * SINGLE-CORE: ``native-clang`` -- plain serial clang.
+  * MULTI-CORE AUTO-PAR (compiler auto-parallelization): ``native-clang-polly-
+    autopar`` (clang + Polly ``-polly-parallel``) and ``native-gcc-autopar``
+    (gcc ``-ftree-parallelize-loops=<n> -floop-parallelize-all -fopenmp``).
+    Both are OpenMP/GOMP-threaded; either one supplies the multi-core baseline
+    (whichever this machine's toolchain can actually build).
+
+A lane whose compiler isn't on PATH (or whose auto-par flag isn't supported) is
+skipped for that lane -- compile_lane returns an error and the sweep moves on --
+never falling back to a different vendor.
 """
 import ctypes
 import os
@@ -13,18 +21,63 @@ import re
 import shutil
 import subprocess
 
-#: The one default vendor is LLVM/clang -- also DaCe's own preferred
-#: compiler (find_best_cpp_compiler()), so the native and DaCe-compiled
-#: sides of a comparison use the same toolchain. Serial and Polly-autopar
-#: forms of that vendor; skipped entirely if clang++ isn't on PATH.
-LANES = ('native-clang', 'native-clang-polly-autopar')
+#: Serial (single-core) and two multi-core auto-parallelizing forms, plus the
+#: two experiment-facing lanes the unified run_perf.py sweeps:
+#:   compiler-seq      single-core -O3 -march=native -ffast-math (autovectorized,
+#:                     single thread) -- the sequential C++ baseline
+#:   compiler-autopar  multi-core auto-parallel (gcc -ftree-parallelize-loops=N
+#:                     -floop-parallelize-all -fopenmp); at -O3 this also autovecs
+#: A lane is skipped entirely if its compiler isn't on PATH.
+LANES = ('native-clang', 'native-clang-polly-autopar', 'native-gcc-autopar', 'compiler-seq', 'compiler-autopar')
+
+#: Roles used by the perf scripts / boxplot: the single-core native baseline and
+#: the multi-core auto-par native baselines (first one with data is preferred).
+SINGLE_CORE_LANE = 'native-clang'
+MULTICORE_LANES = ('native-clang-polly-autopar', 'native-gcc-autopar')
+
+
+def _autopar_threads():
+    """Thread count baked into gcc's ``-ftree-parallelize-loops=<n>`` -- take
+    OMP_NUM_THREADS (the same knob the runtime honors), default 4."""
+    try:
+        return max(1, int(os.environ.get('OMP_NUM_THREADS', '4')))
+    except ValueError:
+        return 4
 
 #: Optimization flags shared with DaCe's own compiler.cpu.args (see
 #: engine.configure_dace_process, which ensures these are present there too)
 #: so a native lane and a DaCe lane are compiled at the same optimization
 #: level -- otherwise a "canon is faster than native" or vice versa result
 #: could just be reflecting a flags mismatch, not a real difference.
-OPT_FLAGS = ('-O3', '-march=native', '-ffast-math')
+#: `-fopenmp` is always on so every lane honors OpenMP pragmas (DaCe's parallel
+#: maps need it; the serial native cores have no `#pragma omp`, so it only links
+#: the runtime there and stays single-threaded) and links against the same
+#: OpenMP runtime across lanes -- see openmp_rpath_flags for making that runtime
+#: loadable at ctypes time.
+OPT_FLAGS = ('-O3', '-march=native', '-ffast-math', '-fopenmp')
+
+
+def openmp_rpath_flags(cc):
+    """Linker ``-rpath`` entries so a compiled ``.so`` can find the OpenMP runtime it
+    links (``libomp`` for clang, ``libgomp`` for gcc) when it is loaded via ctypes.
+
+    ``spack load`` does not put these lib dirs on ``LD_LIBRARY_PATH`` and the compilers
+    bake no ``RUNPATH`` of their own, so a ``-fopenmp`` library otherwise fails to load
+    with ``libomp.so: cannot open shared object file``. The dirs are asked of the compiler
+    itself (``-print-file-name``), so this follows whatever toolchain is on PATH and adds
+    an rpath only for a runtime that actually resolves to a real file."""
+    dirs = []
+    for lib in ('libomp.so', 'libgomp.so'):
+        try:
+            out = subprocess.run([cc, f'-print-file-name={lib}'], capture_output=True, text=True,
+                                 timeout=10).stdout.strip()
+        except Exception:
+            continue
+        if out and out != lib and os.path.isfile(out):
+            d = os.path.dirname(os.path.realpath(out))
+            if d not in dirs:
+                dirs.append(d)
+    return [f'-Wl,-rpath,{d}' for d in dirs]
 
 _CTYPE = {'double': ctypes.c_double, 'float': ctypes.c_float, 'int': ctypes.c_int, 'int64': ctypes.c_int64}
 
@@ -82,6 +135,32 @@ def _gcc_install_dir_flag(cc):
     return [f'--gcc-install-dir={gcc_dir}'] if gcc_dir else []
 
 
+def _perf_phase_cxx():
+    """The compiler for THIS phase -- DACE_PERF_CXX, set by run_perf from ``--cxx``. Both the
+    DaCe codegen AND the native experiment lanes (compiler-seq, compiler-autopar) use it, so a
+    phase is FULLY-LLVM or FULLY-GCC, never mixed. Falls back to clang++ else g++."""
+    cxx = os.environ.get('DACE_PERF_CXX')
+    if cxx and shutil.which(cxx):
+        return shutil.which(cxx)
+    return find_compiler('clang++') or find_compiler('g++')
+
+
+def _is_clang(cc):
+    return cc is not None and 'clang' in os.path.basename(cc).lower()
+
+
+def _autopar_flags(cc):
+    """Auto-parallelization flags matching the compiler family (user: cxx=clang -> clang+Polly,
+    cxx=gcc -> gcc+Graphite). clang uses Polly (``-mllvm -polly -polly-parallel``); gcc uses the
+    tree parallelizer + Graphite ``-floop-parallelize-all`` (needs a gcc built with isl)."""
+    if _is_clang(cc):
+        return _gcc_install_dir_flag(cc) + [
+            '-mllvm', '-polly', '-mllvm', '-polly-parallel', '-mllvm', '-polly-parallel-force', '-mllvm',
+            '-polly-process-unprofitable', '-lgomp'
+        ]
+    return [f'-ftree-parallelize-loops={_autopar_threads()}', '-floop-parallelize-all', '-fopenmp']
+
+
 #: lane -> (finder() -> compiler path or None, cc -> extra flags beyond
 #: '-O3 ... -shared -fPIC <src> -o <so>').
 _LANE_SPEC = {
@@ -91,6 +170,17 @@ _LANE_SPEC = {
         '-mllvm', '-polly', '-mllvm', '-polly-parallel', '-mllvm', '-polly-parallel-force', '-mllvm',
         '-polly-process-unprofitable', '-lgomp'
     ]),
+    'native-gcc-autopar':
+    (lambda: find_compiler('g++'), lambda cc: [
+        f'-ftree-parallelize-loops={_autopar_threads()}', '-floop-parallelize-all', '-fopenmp'
+    ]),
+    # -- experiment-facing lanes (run_perf.py). Both follow the PHASE compiler
+    #    (_perf_phase_cxx == DACE_PERF_CXX == run_perf --cxx) so a phase is fully
+    #    LLVM or fully GCC, never mixed: 'seq' is a single-core autovectorized build
+    #    (OPT_FLAGS: -O3 -march=native -ffast-math) and 'autopar' adds the matching
+    #    auto-parallelizer (clang -> Polly, gcc -> Graphite; see _autopar_flags).
+    'compiler-seq': (_perf_phase_cxx, _gcc_install_dir_flag),
+    'compiler-autopar': (_perf_phase_cxx, _autopar_flags),
 }
 
 
@@ -103,7 +193,7 @@ _IGNORED_FLAG_RE = re.compile(
     r'unrecognized option|ignoring unknown option|unsupported option', re.IGNORECASE)
 
 
-def compile_lane(cpp_path, so_path, lane, timeout=180):
+def compile_lane(cpp_path, so_path, lane, timeout=1200):
     """Compile one lane's shared library. Returns (ok, error_message).
     Every lane finds its own vendor's compiler (see _LANE_SPEC) -- no
     cross-lane override, so a lane always measures its named vendor."""
@@ -115,7 +205,9 @@ def compile_lane(cpp_path, so_path, lane, timeout=180):
     if not cc:
         return False, f'{lane}: compiler not found'
 
-    cmd = [cc, *OPT_FLAGS] + extra_flags(cc) + ['-shared', '-fPIC', cpp_path, '-o', so_path]
+    cmd = [cc, *OPT_FLAGS] + extra_flags(cc) + openmp_rpath_flags(cc) + [
+        '-shared', '-fPIC', cpp_path, '-o', so_path
+    ]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:

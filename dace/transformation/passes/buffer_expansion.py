@@ -134,32 +134,51 @@ class BufferExpansion(ppl.Pass):
     # -- core ---------------------------------------------------------------------------
 
     def _expand_sdfg(self, sdfg: SDFG) -> Dict[str, List[str]]:
-        """Expand beneficial buffers for the loops of a single SDFG (speculate, then verify)."""
-        loops = [r for r in sdfg.all_control_flow_regions() if isinstance(r, LoopRegion) and r.loop_variable]
+        """Expand beneficial buffers for the loops of a single SDFG (speculate, then verify).
 
-        # Cheap structural pre-filter first: collect the analyzable loops that actually have a
-        # privatizable buffer. Only if some do is the (expensive) LoopToMap match worth running.
-        candidates: Dict[LoopRegion, Tuple[Any, List[str]]] = {}
+        A loop ``LoopToMap`` already accepts needs no privatization; a loop it *refuses* is the
+        only place a buffer expansion can help. So the (expensive, ``arrays x states``) buffer
+        analysis runs only on the refused loops -- probing mappability separates the two.
+
+        That mappability probe (``LoopToMap.can_be_applied_to``) is itself the pass's whole cost:
+        it topological-sorts the loop and computes its dominators/branch-merges, ~0.3s per loop, so
+        on a kernel with a few hundred post-MapToForLoop loops (channel_flow: 159) it dominates
+        everything else by orders of magnitude. It is therefore gated behind a *cheap* candidate
+        test (:meth:`_has_candidate_buffer`, pure set lookups against per-SDFG indices): a loop with
+        no transient buffer that is both written inside it and confined to it has nothing to
+        privatize and is never expanded, whatever ``LoopToMap`` would say -- so probing it only to
+        throw the answer away is wasted. Skipping the probe on those loops leaves the expanded set
+        identical while cutting almost all of the probe cost (channel_flow: 159 probes -> 1).
+        """
+        loops = [r for r in sdfg.all_control_flow_regions() if isinstance(r, LoopRegion) and r.loop_variable]
+        if not loops:
+            return {}
+
+        # Per-SDFG indices, built once from the pristine SDFG (the candidate gate consults all three
+        # on every loop). Expansion never moves an access between states nor touches an interstate
+        # edge, so the indices -- and the ambient storage order -- stay valid across the expansions
+        # applied below.
+        access_states = self._access_state_index(sdfg)
+        interstate_syms = self._interstate_symbols(sdfg)
+        write_index = self._write_state_index(sdfg)
+        order: Optional[str] = None  # ambient storage order: built lazily, only when actually expanding
+
+        kept: Dict[str, List[str]] = {}
         for loop in loops:
             ix = self._loop_index(loop)
             if ix is None:
                 continue
-            buffers = self._privatizable_buffers(sdfg, loop)
-            if buffers:
-                candidates[loop] = (ix, buffers)
-        if not candidates:
-            return {}
-
-        order = self._ambient_order(sdfg)
-
-        # Decide each candidate loop on its own: its buffers are loop-local (verified in
-        # ``_privatizable_buffers``), so one loop's expansion never changes another loop's
-        # mappability. Probe ``LoopToMap`` on THAT loop only -- a whole-SDFG re-match here is
-        # quadratic on a big kernel (channel_flow: 158 post-MapToForLoop loops -> minutes).
-        kept: Dict[str, List[str]] = {}
-        for loop, ((index, size), buffers) in candidates.items():
+            loop_states = set(loop.all_states())
+            if not self._has_candidate_buffer(loop_states, write_index, access_states, interstate_syms):
+                continue  # no privatizable-buffer candidate -> never expanded, so skip the probe
             if self._loop_mappable(sdfg, loop):
                 continue  # already parallelizable -> expanding would only grow the SDFG
+            buffers = self._privatizable_buffers(sdfg, loop, access_states, interstate_syms, loop_states)
+            if not buffers:
+                continue
+            if order is None:
+                order = self._ambient_order(sdfg)
+            index, size = ix
             applied = [self._expand(sdfg, loop, arr, index, size, order) for arr in buffers]
             if self._loop_mappable(sdfg, loop):
                 kept[loop.label] = list(buffers)
@@ -167,6 +186,73 @@ class BufferExpansion(ppl.Pass):
                 for exp in applied:
                     exp.undo()
         return kept
+
+    @staticmethod
+    def _write_state_index(sdfg: SDFG) -> Dict[str, Set[SDFGState]]:
+        """Map each *privatizable-kind* transient array to the states that WRITE it (one pass).
+
+        A key is a transient, non-view, reindexable-lifetime Array of rank >= 1 -- exactly the
+        descriptor-level filters :meth:`_privatizable_buffers` applies -- with at least one
+        AccessNode fed by an incoming edge (a write). Read-only and never-accessed transients are
+        omitted so the candidate gate iterates a small key set. The plain "has an incoming edge"
+        test is a broad, sound stand-in for ``_defined_before_read``'s per-edge write check (it can
+        only over-include), keeping the gate a necessary precondition for privatizability.
+        """
+        reindexable = {
+            name
+            for name, desc in sdfg.arrays.items() if isinstance(desc, data.Array) and not isinstance(desc, data.View)
+            and desc.transient and desc.lifetime in _REINDEXABLE_LIFETIMES and len(desc.shape) >= 1
+        }
+        index: Dict[str, Set[SDFGState]] = {}
+        if not reindexable:
+            return index
+        for state in sdfg.all_states():
+            for n in state.nodes():
+                if isinstance(n, nodes.AccessNode) and n.data in reindexable and state.in_edges(n):
+                    index.setdefault(n.data, set()).add(state)
+        return index
+
+    @staticmethod
+    def _has_candidate_buffer(loop_states: Set[SDFGState], write_index: Dict[str, Set[SDFGState]],
+                              access_states: Dict[str, Set[SDFGState]], interstate_syms: Set[str]) -> bool:
+        """Whether ``loop_states`` could hold a privatizable buffer -- the cheap gate on the probe.
+
+        True iff some reindexable transient is written inside the loop *and* used only inside it: the
+        two conditions a privatizable buffer must meet that need no dominator or ``LoopToMap``
+        analysis, so this is a pure set-lookup test against the precomputed indices.
+        :meth:`_privatizable_buffers` additionally verifies define-before-read (dominators) and the
+        library-node guard, but those run behind the mappability probe. Since every privatizable
+        buffer is a written, loop-local, reindexable transient, this is a *necessary* precondition
+        for a non-empty ``_privatizable_buffers`` -- a loop it rejects is never expanded, so gating
+        the probe on it changes only which loops are probed, never which are expanded.
+        """
+        for name, write_states in write_index.items():
+            if not write_states.isdisjoint(loop_states) \
+                    and BufferExpansion._is_loop_local(loop_states, name, access_states, interstate_syms):
+                return True
+        return False
+
+    @staticmethod
+    def _access_state_index(sdfg: SDFG) -> Dict[str, Set[SDFGState]]:
+        """Map every data name to the set of states holding an AccessNode for it (one pass).
+
+        Built once per SDFG so ``_is_loop_local`` is a set lookup instead of an
+        ``all_states x nodes`` rescan for every (loop, array) pair.
+        """
+        index: Dict[str, Set[SDFGState]] = {}
+        for state in sdfg.all_states():
+            for n in state.nodes():
+                if isinstance(n, nodes.AccessNode):
+                    index.setdefault(n.data, set()).add(state)
+        return index
+
+    @staticmethod
+    def _interstate_symbols(sdfg: SDFG) -> Set[str]:
+        """Names appearing free on any interstate edge (a buffer used there is not loop-local)."""
+        syms: Set[str] = set()
+        for edge in sdfg.all_interstate_edges():
+            syms |= {str(s) for s in edge.data.free_symbols}
+        return syms
 
     @staticmethod
     def _loop_mappable(sdfg: SDFG, loop: LoopRegion) -> bool:
@@ -192,19 +278,35 @@ class BufferExpansion(ppl.Pass):
         if step != 1:  # only unit-step loops: the new dimension is indexed by ``loop_var - start``
             return None
         var = symbolic.pystr_to_symbolic(loop.loop_variable)
-        # ``end`` is the exclusive bound (condition ``i < end``); the loop runs i in [start, end).
-        return var - start, end - start
+        # ``get_loop_end`` returns the INCLUSIVE last value (condition ``i < N`` -> ``end = N - 1``),
+        # so the loop runs i in [start, end] and the private dimension -- indexed by the 0-based
+        # ``i - start`` -- needs ``end - start + 1`` slots. (Dropping the +1 under-sizes the axis by
+        # one and the final iteration's slice writes/reads out of bounds.)
+        return var - start, end - start + 1
 
     # -- buffer detection ---------------------------------------------------------------
 
-    def _privatizable_buffers(self, sdfg: SDFG, loop: LoopRegion) -> List[str]:
+    def _privatizable_buffers(self,
+                              sdfg: SDFG,
+                              loop: LoopRegion,
+                              access_states: Optional[Dict[str, Set[SDFGState]]] = None,
+                              interstate_syms: Optional[Set[str]] = None,
+                              loop_states: Optional[Set[SDFGState]] = None) -> List[str]:
         """Transient arrays in ``loop`` that are safe to privatize by expansion.
 
         A buffer qualifies when it is a transient array used only inside ``loop``, has no
         write-conflict (reduction) edge, and is *defined before read* on every iteration --
-        i.e. never carries a value across iterations.
+        i.e. never carries a value across iterations. ``access_states`` / ``interstate_syms``
+        are the per-SDFG indices from :meth:`_access_state_index` / :meth:`_interstate_symbols`
+        and ``loop_states`` is ``set(loop.all_states())``; each is built here when not supplied
+        (so the helper is usable standalone).
         """
-        loop_states = set(loop.all_states())
+        if access_states is None:
+            access_states = self._access_state_index(sdfg)
+        if interstate_syms is None:
+            interstate_syms = self._interstate_symbols(sdfg)
+        if loop_states is None:
+            loop_states = set(loop.all_states())
         candidates: List[str] = []
         for name, desc in sdfg.arrays.items():
             if not isinstance(desc, data.Array) or not desc.transient:
@@ -231,7 +333,8 @@ class BufferExpansion(ppl.Pass):
                 continue
             if len(desc.shape) < 1:
                 continue
-            if self._is_loop_local(sdfg, loop_states, name) and self._defined_before_read(loop, name):
+            if self._is_loop_local(loop_states, name, access_states, interstate_syms) \
+                    and self._defined_before_read(loop, name):
                 candidates.append(name)
         return candidates
 
@@ -253,18 +356,17 @@ class BufferExpansion(ppl.Pass):
         return False
 
     @staticmethod
-    def _is_loop_local(sdfg: SDFG, loop_states: Set[SDFGState], name: str) -> bool:
-        """True if ``name`` is accessed only within ``loop_states`` (not live in/out of the loop)."""
-        for state in sdfg.all_states():
-            if state in loop_states:
-                continue
-            if any(isinstance(n, nodes.AccessNode) and n.data == name for n in state.nodes()):
-                return False
+    def _is_loop_local(loop_states: Set[SDFGState], name: str, access_states: Dict[str, Set[SDFGState]],
+                       interstate_syms: Set[str]) -> bool:
+        """True if ``name`` is accessed only within ``loop_states`` (not live in/out of the loop).
+
+        Uses the precomputed per-SDFG indices: ``name`` is loop-local iff every state that
+        accesses it is inside ``loop_states`` and it is not carried on any interstate edge.
+        """
+        if any(state not in loop_states for state in access_states.get(name, ())):
+            return False
         # A buffer carried on an interstate edge (e.g. a lifted index symbol) is not loop-local.
-        for edge in sdfg.all_interstate_edges():
-            if name in edge.data.free_symbols:
-                return False
-        return True
+        return name not in interstate_syms
 
     @staticmethod
     def _defined_before_read(loop: LoopRegion, name: str) -> bool:
@@ -283,7 +385,8 @@ class BufferExpansion(ppl.Pass):
         from dace.sdfg.analysis import cfg as cfg_analysis  # avoid an import cycle
 
         saw_read = saw_write = False
-        exposed_reads: List[Tuple[Any, Any]] = []  # (reading_block, read_subset) needing a dominator
+        # (reading_block, read_subset, node_local_write_subsets) triples needing a dominator.
+        exposed_reads: List[Tuple[Any, Any, List[Any]]] = []
         write_blocks: Dict[Any, List[Any]] = {}  # unconditional state -> covering write subsets
         for state in loop.all_states():
             block = BufferExpansion._top_block(loop, state)
@@ -305,21 +408,102 @@ class BufferExpansion(ppl.Pass):
                     read = BufferExpansion._arr_subset(e, name)
                     if read is None:
                         continue
-                    if any(w.covers(read) for w in in_subsets):
-                        continue  # written then read at this node -> defined this iteration
-                    exposed_reads.append((block, read))
+                    # Written then read at this node -> defined this iteration. A single covering
+                    # write, or several node-local writes that together tile the read region
+                    # (multi-edge fill), both qualify.
+                    if BufferExpansion._union_covers(in_subsets, read):
+                        continue
+                    exposed_reads.append((block, read, in_subsets))
         if not (saw_read and saw_write):
             return False  # a reused buffer is both written and read inside the loop
         if not exposed_reads:
             return True
 
         doms = cfg_analysis.all_dominators(loop)
-        for block, read in exposed_reads:
+        for block, read, node_writes in exposed_reads:
             dominators = doms.get(block, set())
-            if not any(wb is not block and wb in dominators and any(w.covers(read) for w in subs)
-                       for wb, subs in write_blocks.items()):
+            # A read is defined-this-iteration when the writes that provably precede it -- the ones
+            # feeding its own access node plus every unconditional write block that dominates it --
+            # TOGETHER cover the read region. Crediting the union (not just one write) lets a buffer
+            # filled across several statements (``buf[0:M] = ...; buf[M:2*M] = ...``) still qualify,
+            # while a read no such writes cover is a genuine loop-carried value and is refused.
+            covering = list(node_writes)
+            for wb, subs in write_blocks.items():
+                if wb is not block and wb in dominators:
+                    covering.extend(subs)
+            if not BufferExpansion._union_covers(covering, read):
                 return False  # read reaches the loop entry without a covering write -> carried
         return True
+
+    @staticmethod
+    def _union_covers(writes: List[Any], read) -> bool:
+        """True iff the ``writes`` TOGETHER cover ``read`` (sound; conservative when unsure).
+
+        Accepts either a single write that already covers ``read``, or several unit-step writes
+        that tile ``read`` as exactly-adjacent contiguous chunks along a single axis -- the classic
+        multi-statement scratch fill ``buf[0:M] = ...; buf[M:2*M] = ...`` read back as
+        ``buf[0:2*M]``. Only exact (gap-free, overlap-free) tilings are credited: every chunk
+        boundary is matched by symbolic EQUALITY, never by an inequality that could silently
+        over-approximate a hole and mistake a partially-written (carried) buffer for a full fill.
+        """
+        if not isinstance(read, subsets.Range):
+            return False
+        dims = read.dims()
+        # ``Subset.covers`` returns a (truthy) ValueError on a dimensionality mismatch instead of
+        # raising, so gate the fast path on matching dims -- every subset here is for the same
+        # buffer, so this only rejects malformed input, never a real cover.
+        if any(w is not None and w.dims() == dims and w.covers(read) for w in writes):
+            return True
+        chunks = [w for w in writes if isinstance(w, subsets.Range) and w.dims() == dims]
+        if len(chunks) < 2:
+            return False
+        read_ranges = list(read.ranges)
+        # Exactly one axis may vary between the chunks; on every other axis each chunk must match
+        # the read's range, so stacking the chunks along the one axis reconstructs the read box.
+        varying = None
+        for ax in range(dims):
+            if all(BufferExpansion._axis_eq(c.ranges[ax], read_ranges[ax]) for c in chunks):
+                continue
+            if varying is not None:
+                return False  # chunks differ on more than one axis -> not a clean 1-axis tiling
+            varying = ax
+        if varying is None:
+            return False
+        rb, re_, rs = read_ranges[varying]
+        if rs != 1:
+            return False
+        intervals = []
+        for c in chunks:
+            b, e, s = c.ranges[varying]
+            if s != 1:
+                return False
+            intervals.append((b, e))
+        # Greedy exact chain from the read's start: each step consumes a chunk whose start is
+        # exactly the current frontier; the read is covered iff the frontier reaches its end + 1.
+        frontier = rb
+        progressed = True
+        while progressed:
+            progressed = False
+            for i, (b, e) in enumerate(intervals):
+                if BufferExpansion._sym_eq(b, frontier):
+                    frontier = e + 1
+                    intervals.pop(i)
+                    progressed = True
+                    break
+        return BufferExpansion._sym_eq(frontier, re_ + 1)
+
+    @staticmethod
+    def _axis_eq(a, b) -> bool:
+        """True if two ``(begin, end, step)`` axis ranges are provably identical."""
+        return all(BufferExpansion._sym_eq(x, y) for x, y in zip(a, b))
+
+    @staticmethod
+    def _sym_eq(a, b) -> bool:
+        """True only when ``a`` and ``b`` are provably equal (symbolic difference simplifies to 0)."""
+        try:
+            return bool(symbolic.simplify(a - b) == 0)
+        except (TypeError, AttributeError):
+            return False
 
     @staticmethod
     def _top_block(loop: LoopRegion, block):

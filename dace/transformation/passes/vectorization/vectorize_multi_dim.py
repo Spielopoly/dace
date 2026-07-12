@@ -17,6 +17,8 @@ Locked knobs (constructor has full semantics):
 
 Every other combo → ``NotImplementedError``.
 """
+import copy
+import warnings
 from typing import Literal, Optional, Tuple
 
 import sympy
@@ -24,6 +26,9 @@ import sympy
 import dace
 from dace import properties, symbolic
 from dace.dtypes import DeviceType
+import dataclasses
+from dace.transformation.passes.vectorization.config import VectorizeConfig
+from dace.transformation.passes.vectorization.enums import ISA
 from dace.transformation import pass_pipeline as ppl
 from dace.transformation.passes.length_one_array_scalar_conversion import (
     ConvertLengthOneArraysToScalars, )
@@ -31,7 +36,7 @@ from dace.transformation.passes.symbol_propagation import SymbolPropagation
 from dace.transformation.passes.prune_symbols import RemoveUnusedSymbols
 from dace.transformation.passes.vectorization.propagate_index_subsets import PropagateIndexSubsets
 from dace.transformation.passes.vectorization.bypass_trivial_assign_tasklets import BypassTrivialAssignTasklets
-from dace.transformation.passes.vectorization.utils.pass_invariants import (assert_invariant, no_wcr_in_map_body,
+from dace.transformation.passes.vectorization.utils.pass_invariants import (no_wcr_in_map_body,
                                                                             no_wcr_inside_nested_sdfgs)
 from dace.transformation.passes.vectorization.remove_unused_per_lane_symbols import RemoveUnusedPerLaneSymbols
 from dace.transformation.passes.vectorization.convert_tasklets_to_tile_ops import ConvertTaskletsToTileOps
@@ -45,6 +50,7 @@ from dace.transformation.passes.vectorization.same_write_set_if_else_to_ite_cfg 
 from dace.transformation.passes.vectorization.branch_normalization import BranchNormalization
 from dace.transformation.passes.vectorization.flatten_branches import FlattenBranches
 from dace.transformation.passes.split_tasklets import SplitTasklets
+from dace.transformation.passes.vectorization.resolve_mixed_dtype_binops import ResolveMixedDtypeBinops
 from dace.transformation.passes.eliminate_branches import EliminateBranches
 from dace.transformation.passes.vectorization.lower_ite_to_fp_factor import LowerITEToFpFactor
 from dace.transformation.passes.vectorization.lower_interstate_conditional_assignments_to_tasklets import (
@@ -62,7 +68,10 @@ from dace.transformation.passes.vectorization.tasklet_preprocessing_passes impor
     StripPowerExponentCast,
 )
 from dace.transformation.passes.relax_integer_powers import RelaxIntegerPowers
-from dace.transformation.passes.canonicalize.assume_symbols_nonnegative import SetSymbolNonnegativeAssumptions
+from dace.transformation.passes.remove_views import RemoveViews
+from dace.transformation.passes.vectorization.utils.arrays import demote_connector_views
+from dace.transformation.passes.canonicalize.assume_symbols_nonnegative import (SetSymbolNonnegativeAssumptions,
+                                                                                insert_assumption_guards)
 from dace.transformation.passes.vectorization.remove_empty_states import RemoveEmptyStates
 from dace.transformation.passes.vectorization.stride_map_by_tile_widths import (
     StrideMapByTileWidths, )
@@ -72,18 +81,17 @@ try:
 except ImportError:  # transition: canonicalize's shared reduction-normalize still lives in normalize_nested_reduction
     from dace.transformation.passes.normalize_nested_reduction import NormalizeWCR
 from dace.transformation.passes.canonicalize.normalize_loops_and_maps import NormalizeStridedMaps
+from dace.transformation.passes.vectorization.predicate_masked_reduction import PredicateMaskedReduction
+from dace.transformation.passes.vectorization.reduction_scalar_local_prep import PrepareReductionForWidening
 from dace.transformation.passes.vectorization.split_map_for_tile_remainder import SplitMapForTileRemainder
-# Walker-primary pipeline -- no legacy descent / emit_tile_ops imports. The walker
-# (InsertTileLoadStore + PreparePerLaneIndices) replaces both PromoteNSDFGBodyToTiles and the legacy
-# EmitTileOps boundary emission. Tasklet-to-TileBinop / TileITE / TileReduce conversion is
-# pending; for now the SDFG returns with raw tasklets between staged tile transients and lib-node
-# expansion handles only TileLoad / TileStore / TileMaskGen.
+# Walker-primary pipeline. The walker (InsertTileLoadStore + PreparePerLaneIndices) stages tile
+# transients and emits the TileLoad / TileStore / TileMaskGen boundary; ConvertTaskletsToTileOps
+# then rewrites the raw tasklets between staged tiles into TileBinop / TileITE / TileReduce.
 from dace.transformation.dataflow import MapCollapse, MapFission, WCRToAugAssign
 from dace.transformation.dataflow.lift_einsum import LiftEinsum
-# NOTE: interstate transforms (InlineSDFG, InlineMultistateSDFG, LoopToMap,
-# RefineNestedAccess, ExpandNestedSDFGInputs) are imported function-locally at their
-# use sites — a module-level import re-enters the partially-initialized
-# ``dace.transformation.interstate`` package (circular import) on some import orders.
+from dace.transformation.interstate import (InlineMultistateSDFG, InlineSDFG, LoopToMap, RefineNestedAccess,
+                                            StateFusionExtended)
+from dace.transformation.interstate.expand_nested_sdfg_inputs import ExpandNestedSDFGInputs
 from dace.transformation.passes.pattern_matching import PatternMatchAndApplyRepeated
 from dace.transformation.passes.vectorization.split_multi_output_tasklets import SplitMultiOutputTasklets
 from dace.transformation.passes.vectorization.normalize_masked_write_tasklets import NormalizeMaskedWriteTasklets
@@ -94,17 +102,67 @@ from dace.libraries.tileops._dispatch import select_tile_implementation
 _TILE_NODE_TYPES = (TileBinop, TileLoad, TileMaskGen, TileITE, TileReduce, TileStore, TileUnop)
 
 
-def _expandable_during_vectorization(node) -> bool:
-    """Library nodes the vectorizer's ``expand_library_nodes`` may lower.
+class VectorizeUnsupported(Exception):
+    """A kernel the K-dim tile pipeline cannot soundly vectorize.
 
-    Tile-op nodes + vectorizer-lifted ``Reduce``/``Einsum`` expand now (own lowering). Scatter
-    guard's opaque primitives (``ScatterConflictCheck``, ``IntegerSort``) DEFERRED to codegen: sort
-    stays opaque until after vectorization (user 2026-07-08), so ``compile()``'s later
-    ``expand_library_nodes`` lowers them.
+    Raised by the pre-tiling soundness gates when the kernel carries a shape the tile widener would
+    mis-lower -- a loop-carried / nested-reduction body WCR that would race the lanes (the
+    ``no_wcr_in_map_body`` / ``no_wcr_inside_nested_sdfgs`` invariants), or a prep pass that could
+    not lower the kernel to a valid tileable form. :meth:`VectorizeMultiDim.apply_pass` catches it,
+    restores the pre-vectorization SDFG, and returns without tiling, leaving the kernel as its
+    correct, un-tiled input dataflow.
+
+    This turns a genuine capability limit into a clean *refusal to vectorize* rather than a hard
+    crash (or a silently mis-tiled, wrong-numeric result). The underlying invariant CHECK is kept
+    intact -- it is the detector -- per the maintainer direction: keep the soundness guard, but let
+    it decline the kernel instead of aborting the whole run. Only the safe (e.g. perfectly-nested,
+    lane-disjoint) reductions the widener DOES lower pass the guard and tile; every unsound shape is
+    declined here.
     """
-    from dace.libraries.sort.nodes.integer_sort import IntegerSort
-    from dace.libraries.sort.nodes.scatter_conflict_check import ScatterConflictCheck
-    return not isinstance(node, (ScatterConflictCheck, IntegerSort))
+
+
+def restore_sdfg_in_place(target: dace.SDFG, source: dace.SDFG) -> None:
+    """Overwrite ``target``'s graph contents with ``source``'s while preserving ``target``'s Python
+    identity (the caller still holds a reference to ``target``).
+
+    Used to roll a caller-owned SDFG back to a pre-vectorization snapshot after a
+    :class:`VectorizeUnsupported` refusal, so the caller's reference keeps pointing at a valid,
+    correct SDFG. ``source`` is consumed (its blocks are re-parented onto ``target``); pass a
+    throwaway deep copy. Mirrors the parent-pointer fix-up :meth:`dace.SDFG.__deepcopy__` performs
+    (``reset_cfg_list`` + ``FixNestedSDFGReferences``) so nested-SDFG parent references stay coherent.
+
+    :param target: The caller-owned SDFG to overwrite in place.
+    :param source: A standalone (throwaway) SDFG whose contents ``target`` adopts.
+    """
+    from dace.transformation.passes.fusion_inline import FixNestedSDFGReferences
+    for key, value in list(source.__dict__.items()):
+        if key in ('_parent', '_parent_sdfg', '_parent_nsdfg_node', '_cfg_list', 'guid'):
+            continue
+        setattr(target, key, value)
+    target._parent = None
+    target._parent_sdfg = None
+    target._parent_nsdfg_node = None
+    target._cfg_list = []
+    for block in target.nodes():
+        block._sdfg = target
+        block._parent_graph = target
+    target.reset_cfg_list()
+    FixNestedSDFGReferences().apply_pass(target, {})
+
+
+def _expandable_during_vectorization(node) -> bool:
+    """Library nodes the vectorizer's ``expand_library_nodes`` may lower: ONLY its own tile-op
+    nodes (:data:`_TILE_NODE_TYPES`), nothing else (user 2026-07-09).
+
+    Every non-tile library node -- frontend ``Reduce`` / ``Einsum`` / ``MatMul`` / ``Transpose``
+    (including the ones the vectorizer itself lifts) and the scatter-guard opaque primitives
+    (``ScatterConflictCheck``, ``IntegerSort``) -- is left for ``compile()`` / codegen to expand on
+    the final SDFG. Expanding a frontend library node mid-pipeline re-enters the Python frontend on a
+    partially-lowered SDFG (fragile: the conv/newaxis-View broadcast ``IndexError``) and is
+    unnecessary -- codegen expands them anyway. ``_finalize_lifted_library_nodes`` still stamps the
+    lifted ``Reduce``/``Einsum`` implementation before returning so the deferred expansion is correct.
+    """
+    return isinstance(node, _TILE_NODE_TYPES)
 
 
 class _MultiOutputReductionMapFission(MapFission):
@@ -133,7 +191,19 @@ class _MultiOutputReductionMapFission(MapFission):
             for e in graph.out_edges(map_exit)
             if e.data is not None and e.data.data is not None and e.data.wcr is not None
         }
-        return len(wcr_arrays) >= 2
+        if len(wcr_arrays) < 2:
+            return False
+        # Do NOT fission a map whose multiple WCR outputs are all independent pure-scalar
+        # reductions (azimint ``s += a[j]; cnt += 1``): ``LiftMapReductionToReduce`` lifts
+        # each in place, and codegen emits one ``reduction(op:var)`` clause / thread-block
+        # fold per accumulator. Fissioning them would have to duplicate a shared body read
+        # (the mask) and can hoist it out of the map-param scope. Fission stays for the
+        # CONTRACTION case (gesummv ``tmp[i] += A[i,j]*x[j]``: param-dependent write, not a
+        # pure scalar reduction) that ``LiftEinsum`` needs separated.
+        from dace.transformation.passes.vectorization.lift_map_reduction import _recognize_pure_wcr_reductions
+        if len(_recognize_pure_wcr_reductions(graph, self.map_entry)) >= 2:
+            return False
+        return True
 
 
 #: "AUTO" resolves to the host's best ISA at expansion time
@@ -170,7 +240,52 @@ class _RunExpandNestedSDFGInputs(ppl.Pass):
     def apply_pass(self, sdfg: dace.SDFG, pipeline_results) -> Optional[int]:
         from dace.transformation.interstate.expand_nested_sdfg_inputs import ExpandNestedSDFGInputs
         applied = sdfg.apply_transformations_repeated(ExpandNestedSDFGInputs, permissive=False, validate=False)
+        # ``ExpandNestedSDFGInputs`` re-derives each widened connector descriptor by deep-copying
+        # the outer array inward (``_replace_desc_and_uncollapse_dims``) and only clearing
+        # ``transient`` -- so a frontend reshape/flatten ``View`` parent (e.g. ``C_0`` viewing
+        # ``C``) re-introduces an invalid inner ``View`` connector (no viewing edge in the body).
+        # Re-demote every connector ``View`` to a plain array so the widened bodies validate.
+        for node, _parent in sdfg.all_nodes_recursive():
+            if isinstance(node, dace.nodes.NestedSDFG):
+                demote_connector_views(node)
+        self._bind_missing_free_symbols(sdfg)
         return applied or None
+
+    @staticmethod
+    def _bind_missing_free_symbols(sdfg: dace.SDFG) -> None:
+        """Identity-bind every body-NSDFG free symbol still absent from its ``symbol_mapping``.
+
+        ``ExpandNestedSDFGInputs`` widens a per-iteration boundary memlet (``a[i]`` →
+        ``a[i*n3 + n1_minus_1]``), pulling the index's free symbols into the inner memlets. It
+        propagates those into ``symbol_mapping`` EXCEPT any whose name also names a parent data
+        descriptor: a scalar loop parameter (``n3: dace.int64`` → a ``Scalar`` in
+        ``sdfg.arrays``) used purely symbolically is filtered out by the array-name guard and
+        left unbound, so ``validate`` reports "Missing symbols on nested SDFG". Bind each such
+        symbol identity (outer ``n3`` → inner ``n3``); the parent scope already resolves it (the
+        strided map range references it), and the type comes from the parent symbol / scalar
+        descriptor (default ``int64``).
+
+        :param sdfg: The SDFG whose body NSDFGs to repair in place.
+        """
+        for node, parent in sdfg.all_nodes_recursive():
+            if not isinstance(node, dace.nodes.NestedSDFG) or node.sdfg is None:
+                continue
+            inner = node.sdfg
+            parent_sdfg = parent.sdfg
+            connectors = set(node.in_connectors) | set(node.out_connectors)
+            for sym in inner.free_symbols:
+                sym_name = str(sym)
+                if sym_name in connectors or sym_name in node.symbol_mapping:
+                    continue
+                if sym_name in parent_sdfg.symbols:
+                    sym_type = parent_sdfg.symbols[sym_name]
+                elif sym_name in parent_sdfg.arrays:
+                    sym_type = parent_sdfg.arrays[sym_name].dtype
+                else:
+                    sym_type = dace.dtypes.int64
+                if sym_name not in inner.symbols:
+                    inner.add_symbol(sym_name, sym_type)
+                node.symbol_mapping[sym_name] = symbolic.pystr_to_symbolic(sym_name)
 
 
 class _RunWCRToAugAssign(ppl.Pass):
@@ -201,19 +316,29 @@ class _RunWCRToAugAssign(ppl.Pass):
         applied = sdfg.apply_transformations_repeated(WCRToAugAssign, permissive=False, validate=False)
         # Post/pre-condition: no WCR survives inside any body NSDFG (the tile emitters would
         # silently drop it). The allowed scalar-reduction-out form is on the NSDFG → MapExit
-        # edge in the PARENT state, outside the nested SDFG, so it is not flagged.
-        assert_invariant(no_wcr_inside_nested_sdfgs(sdfg), "VectorizeMultiDim",
-                         "no WCR inside the body NSDFG before tiling")
+        # edge in the PARENT state, outside the nested SDFG, so it is not flagged. A WCR that
+        # ``WCRToAugAssign`` could NOT convert (an in-place RMW whose write is not provably
+        # lane-injective) is an un-tileable shape -> refuse this kernel cleanly (the orchestrator
+        # restores it un-tiled) rather than crash.
+        violation = no_wcr_inside_nested_sdfgs(sdfg)
+        if violation is not None:
+            raise VectorizeUnsupported(f"unresolved WCR inside the body NSDFG before tiling: {violation}")
         return applied or None
 
 
 class _AssertNoBodyWCR(ppl.Pass):
     """Vectorizer-entry precondition: NO loose WCR survives in the region about to be
-    tiled. Asserts BOTH checkers — ``no_wcr_in_map_body`` (loose WCR in the flat map body)
+    tiled. Checks BOTH invariants — ``no_wcr_in_map_body`` (loose WCR in the flat map body)
     and ``no_wcr_inside_nested_sdfgs`` (self-contained WCR inside the body NSDFG). The only
     WCR allowed past here is a lifted reduction (TileReduce / the scalar-reduction-out
     ``NSDFG → MapExit`` edge), which neither flags; every in-place RMW must already be an
-    explicit aug-assign. Read-only.
+    explicit aug-assign.
+
+    A surviving loose WCR is a reduction shape the widener cannot lower without racing the lanes
+    (e.g. a nested-reduction ``_wcr_priv -[wcr]-> inner MapExit -[wcr]-> outer MapExit -> array``
+    the split left in a scalar tail). Rather than abort the whole run, raise
+    :class:`VectorizeUnsupported` so the orchestrator refuses this one kernel and leaves it
+    correct + un-tiled. Read-only (the CHECK is preserved as the soundness guard/detector).
     """
 
     CATEGORY: str = "Vectorization Preparation"
@@ -228,10 +353,93 @@ class _AssertNoBodyWCR(ppl.Pass):
         return set()
 
     def apply_pass(self, sdfg: dace.SDFG, pipeline_results) -> Optional[int]:
-        assert_invariant(no_wcr_in_map_body(sdfg), "VectorizeMultiDim", "no loose WCR in the map body before tiling")
-        assert_invariant(no_wcr_inside_nested_sdfgs(sdfg), "VectorizeMultiDim",
-                         "no loose WCR inside the body NSDFG before tiling")
+        for violation in (no_wcr_in_map_body(sdfg), no_wcr_inside_nested_sdfgs(sdfg)):
+            if violation is not None:
+                raise VectorizeUnsupported(f"loose WCR in the region to be tiled: {violation}")
         return None
+
+
+def _promote_read_output_connectors_to_inout(sdfg: dace.SDFG) -> None:
+    """Promote a single-state NestedSDFG output connector also read internally to a full inout.
+
+    Branch lowering rewrites a same-write-set masked write ``if cond: arr[s] = f(...)`` into
+    ``arr[s] = ITE(cond, f(...), arr[s])`` (merge) / ``cond*f(...) + (1-cond)*arr[s]``
+    (fp_factor). The else-operand is the PRE-conditional value of the write target ``arr``.
+    When the rewrite happens inside the frontend's per-``if`` body NestedSDFG — whose only
+    external wiring for ``arr`` is an OUTPUT connector — that else-operand read reads the
+    output-connector array directly. Such a connector (declared output, read internally, not
+    declared input) is malformed: it relies on in-place aliasing of the output buffer,
+    ``InlineSDFG`` refuses it (``sdfg_nesting`` output-read-in-scope guard), and left nested
+    it escapes the tiler (the walker does not descend into a body-internal NestedSDFG, so the
+    masked compute would run once at the tile base — lane 0 only, 7/8 lanes unwritten).
+
+    Add ``arr`` as an INPUT connector reading the pre-conditional value from the write
+    target's own outer source at the write subset — the in-place ``arr = f(arr)`` read of
+    ``arr`` for its RHS, an in-edge already boundary-routed through the scope entry. A masked
+    write whose fused output name/subset diverges from any live input (no in-place read; e.g.
+    a per-lane rename) has no such source and is left nested — correct where its result feeds
+    the checked output, else numerically stale (lane 0 only) until a general re-route lands.
+    """
+    for node, parent in list(sdfg.all_nodes_recursive()):
+        if not isinstance(node, dace.nodes.NestedSDFG) or not isinstance(parent, dace.SDFGState):
+            continue
+        if len(node.sdfg.nodes()) != 1:
+            continue
+        istate = node.sdfg.nodes()[0]
+        for oc in list(node.out_connectors):
+            if oc in node.in_connectors:
+                continue
+            read_internally = any(
+                isinstance(n, dace.nodes.AccessNode) and n.data == oc and istate.out_degree(n) > 0
+                for n in istate.nodes())
+            if not read_internally:
+                continue
+            out_edge = next((e for e in parent.out_edges(node) if e.src_conn == oc), None)
+            if out_edge is None or out_edge.data.data is None:
+                continue
+            template = next((e for e in parent.in_edges(node)
+                             if e.data.data == out_edge.data.data and str(e.data.subset) == str(out_edge.data.subset)),
+                            None)
+            if template is None:
+                continue
+            node.add_in_connector(oc)
+            parent.add_edge(template.src, template.src_conn, node, oc, copy.deepcopy(out_edge.data))
+
+
+class _RunInlineBranchLoweredNSDFGs(ppl.Pass):
+    """Fuse the branch-lowered states, promote masked-write out-connectors to inout, then
+    inline the now-straight-line body NestedSDFGs into their map bodies.
+
+    ``NormalizeStridedMaps`` / ``normalize_loop_nests`` inlined the loop-nest wrapper
+    NestedSDFGs up front, but the frontend's per-``if`` body NestedSDFG still held a
+    ``ConditionalBlock`` (control flow) then, so it was left nested. After the branch front
+    lowers that control flow to straight-line dataflow, this pass gives those NestedSDFGs the
+    same inline treatment so the tiler reaches the (now unconditional) masked compute — else,
+    left nested, it runs once at the tile base (lane 0 only) and 7/8 lanes go unwritten.
+
+    ``StateFusionExtended`` collapses the compute-then / compute-else / apply-ITE arms into a
+    single state (the shape ``InlineSDFG`` requires); the inout promotion makes the write
+    target well-formed so the inline is accepted.
+    """
+
+    CATEGORY: str = "Vectorization Preparation"
+
+    def modifies(self) -> ppl.Modifies:
+        return ppl.Modifies.CFG | ppl.Modifies.States | ppl.Modifies.Nodes | ppl.Modifies.Edges
+
+    def should_reapply(self, modified: ppl.Modifies) -> bool:
+        return False
+
+    def depends_on(self):
+        return set()
+
+    def apply_pass(self, sdfg: dace.SDFG, pipeline_results) -> Optional[int]:
+        sdfg.apply_transformations_repeated(StateFusionExtended, permissive=False, validate=False)
+        _promote_read_output_connectors_to_inout(sdfg)
+        applied = sdfg.apply_transformations_repeated([InlineSDFG, InlineMultistateSDFG],
+                                                      permissive=False,
+                                                      validate=False)
+        return applied or None
 
 
 def _is_power_of_two(n: int) -> bool:
@@ -354,60 +562,30 @@ class VectorizeMultiDim(ppl.Pipeline):
 
     CATEGORY: str = "Vectorization"
 
-    def __init__(self,
-                 widths: Tuple[int, ...],
-                 target_isa: Literal["AUTO", "AVX512", "AVX2", "ARM_SVE", "ARM_NEON", "SCALAR", "CUDA", "CUTILE"] = "AUTO",
-                 remainder_strategy: Literal["full_mask", "masked_tail", "scalar_postamble"] = "masked_tail",
-                 branch_mode: Literal["merge", "fp_factor"] = "merge",
-                 loop_to_map_permissive: bool = False,
-                 nest_map_bodies: bool = False,
-                 scalar_remainder_emit: Literal["scalar", "tile_k1"] = "scalar",
-                 expand_tile_nodes: bool = True,
-                 validate_all: bool = False,
-                 assume_even: bool = False,
-                 device: DeviceType = DeviceType.CPU):
-        """Build the orchestrator.
+    def __init__(self, config: VectorizeConfig):
+        """Build the orchestrator from a :class:`VectorizeConfig`.
 
-        :param widths: Per-dim tile widths, innermost-last (1..3 entries).
-        :param target_isa: K=1 backend for tile ops. ``"AUTO"`` (default) resolves to the
-            host's best ISA at expansion; ``"AVX512"`` / ``"AVX2"`` / ``"ARM_SVE"`` /
-            ``"ARM_NEON"`` pin one; ``"SCALAR"`` is the portable reference. K≥2 uses ``pure``.
-        :param remainder_strategy: Tile remainder handling. ``"masked_tail"`` (default):
-            provably-divisible interior (``has_mask=False`` fast path) + masked boundary
-            remainder. ``"full_mask"``: single W-strided map, ``_tile_iter_mask`` on every
-            tile (masked expansions short-circuit OOB lanes; the SVE always-masked analogue).
-            ``"scalar_postamble"`` (K=1 only): divisible interior + a step-1 scalar tail.
-            ``scalar_postamble`` and ``branch_mode="fp_factor"`` are K=1-only (raise at K≥2).
-        :param branch_mode: Branch lowering. ``"merge"`` (default) lowers a
-            same-write-set if/else to a per-lane :class:`TileITE` select;
-            ``"fp_factor"`` (K=1 only, requires ``scalar_postamble``) lowers it
-            to ``c*x + (1-c)*y`` tile-binop arithmetic.
-        :param nest_map_bodies: Unused; kept for harness parity with the legacy 1D path
-            (every innermost map body is always nested now — the walker is the single emit
-            path).
-        :param scalar_remainder_emit: How the ``scalar_postamble`` tail is emitted.
-            ``"scalar"`` (default) keeps the legacy step-1 scalar loop on the original body,
-            untouched by tile prep. ``"tile_k1"`` routes the tail through the tile pipeline
-            at ``widths=(1,)`` (single-lane tile), reusing the interior's TileBinop /
-            TileLoad / TileStore shape. Only valid with ``remainder_strategy="scalar_postamble"``.
-        :param expand_tile_nodes: When ``True`` (default), call ``sdfg.expand_library_nodes()``
-            after the pipeline so every tile lib node lowers to its per-ISA body (SDFG ready
-            to compile). When ``False``, return with the tile lib nodes present for the caller
-            to inspect / save / transform (expansion + the post-expansion laneid audit are
-            then the caller's responsibility).
-        :param validate_all: Forwarded to the up-front ``sdfg.simplify(...)``
-            in :meth:`apply_pass` (``validate_all=True`` runs the deep
-            per-transformation validation). Off by default so callers pay the
-            heavier check only when they ask; the corpus harness turns it on.
-        :param device: Target device (``DeviceType.CPU`` default /
-            ``DeviceType.GPU``). Selects the reduction-lift form (CPU
-            horizontal SIMD fold vs. GPU-placed ``Reduce``) and the
-            lifted-library-node finalize target. ``target_isa='CUDA'`` implies
-            ``device=GPU`` regardless of this argument (the innermost tile op
-            then lowers to the CUDA half2 header).
-        :raises NotImplementedError: On any disallowed combination (e.g. a
-            K=1-only knob at K>=2, or fp_factor with a masked remainder).
+        :param config: Every vectorizer knob bundled into one dataclass -- tile ``widths``,
+            ``target_isa`` (:class:`ISA`), ``remainder_strategy`` (:class:`RemainderStrategy`),
+            ``branch_mode`` (:class:`BranchMode`), ``device``, and the behavioural flags
+            (``scalar_remainder_emit``, ``loop_to_map_permissive``,
+            ``expand_tile_nodes``, ``validate``, ``validate_all``, ``assume_even``). See
+            :class:`VectorizeConfig` for the per-field documentation.
+        :raises NotImplementedError: On any disallowed knob combination (a K=1-only knob at
+            K>=2, or fp_factor with a masked remainder).
         """
+        self._config = config
+        widths = config.widths
+        target_isa = config.target_isa
+        remainder_strategy = config.remainder_strategy
+        branch_mode = config.branch_mode
+        loop_to_map_permissive = config.loop_to_map_permissive
+        scalar_remainder_emit = config.scalar_remainder_emit
+        expand_tile_nodes = config.expand_tile_nodes
+        validate = config.validate
+        validate_all = config.validate_all
+        assume_even = config.assume_even
+        device = config.device
         _validate_knobs(widths, target_isa, remainder_strategy, branch_mode, scalar_remainder_emit)
         # K-dependent knob support: K=1 and K≥2 both support every (branch, remainder)
         # combo — the iter_mask only gates stores, and fp_factor lowering reduces to
@@ -445,20 +623,21 @@ class VectorizeMultiDim(ppl.Pipeline):
             # into single-op binops → ``TileBinop`` (no TileITE). ``EliminateBranches`` runs
             # LAST as a safety net for residual disjoint-write / single-arm shapes.
             #
-            # ``permissive=True`` is REQUIRED: the default ``can_be_applied`` refuses any
-            # conditional referencing a map parameter (guarding against synthetic OOB reads).
-            # At vectorisation time we accept that — the kernels we tile (TSVC, cloudsc, icon)
-            # use map-param-indexed access bounded by the map range, and the downstream walker
-            # EXPECTS every conditional lifted to straight-line arithmetic. Without it, every
-            # map-param-conditional kernel (``s273``, ``if a[i] < 0`` ...) is refused loudly.
-            _eb = EliminateBranches()
-            _eb.permissive = True
+            # NON-permissive (default): ``BranchElimination.condition_has_map_param`` refuses ONLY
+            # a condition that uses a map param DIRECTLY (``if i < N`` -- an iteration guard whose
+            # elimination to straight-line arithmetic would fabricate OOB reads); a DATA
+            # conditional ``if a[i] < 0`` is allowed, because ``get_free_syms_outside_calls``
+            # excludes symbols that appear only inside an array subscript. So permissive is NOT
+            # needed for the data-conditional kernels (``s273`` ...) -- they lower here regardless;
+            # a genuine ``i < N`` iteration guard is left for the later full-mask pass instead of
+            # being unsoundly force-eliminated (user directive: no permissive in the vectorizer
+            # beyond the LoopToMap scatter knob).
             passes += [
                 FlattenBranches(),
                 SameWriteSetIfElseToITECFG(),
                 BranchNormalization(),
                 LowerITEToFpFactor(),
-                _eb,
+                EliminateBranches(),
                 LowerInterstateConditionalAssignmentsToTasklets(),
             ]
         else:
@@ -470,8 +649,19 @@ class VectorizeMultiDim(ppl.Pipeline):
             # same-write-set if/else; BranchNormalization flattens any residual single-arm /
             # disjoint-write two-arm ConditionalBlocks (recursing through nested ones).
             passes += [FlattenBranches(), SameWriteSetIfElseToITECFG(), BranchNormalization()]
-        # Full prep before tiling (mirrors the legacy 1D pipeline so the tile path handles
-        # the same kernels):
+        # Branch lowering (both modes) rewrote each same-write-set ``if arr[s] = f(...)`` into
+        # ``arr[s] = ITE(cond, f(...), arr[s])`` (merge) / ``cond*f + (1-cond)*arr[s]`` (fp_factor)
+        # INSIDE the frontend's per-``if`` body NestedSDFG, whose only external wiring for the
+        # write target ``arr`` is an OUTPUT connector. The else-operand read of the pre-conditional
+        # value then reads that output-connector array directly — a form that both blocks
+        # ``InlineSDFG`` (an out-connector read internally but not declared an input) AND, left
+        # nested, escapes the tiler (the walker does not descend into a body-internal NestedSDFG,
+        # so the masked compute would run once at the tile base — lane 0 only). Promote the read
+        # to a proper inout connector, then inline the now-straight-line NestedSDFG into the map
+        # body so its compute tiles alongside its siblings. Mode-agnostic (same NestedSDFG shape
+        # under both branch modes).
+        passes.append(_RunInlineBranchLoweredNSDFGs())
+        # Full prep before tiling (so the tile path handles every kernel the frontend emits):
         #   * RemoveEmptyStates — tidy the CFG after branch lowering.
         #   * PowerOperatorExpansion — ``x**2`` → ``x*x``; ``x**c`` → ``exp(c*log(x))``.
         #   * SplitTasklets — one op per tasklet (also splits expanded power / fp_factor
@@ -500,6 +690,11 @@ class VectorizeMultiDim(ppl.Pipeline):
             # ``pow`` vs ``ipow`` per operand at emission time from the exponent.
             StripPowerExponentCast(),
             SplitTasklets(),
+            # After splitting each body into a single primitive op, unify any mixed-dtype
+            # binop by inserting cast tasklets (NumPy promotion). The tile pipeline locks
+            # one dtype per lib node (design 6.2), so no ``TileBinop`` may see operands of
+            # differing dtype -- resolve it here rather than refusing at conversion.
+            ResolveMixedDtypeBinops(),
             RemoveMathCall(),
             # Clean empty states from branch lowering + body rewrites so the tiling passes
             # see a tidy CFG. (``ppl.Pipeline`` forbids duplicate pass types, so this single
@@ -538,7 +733,6 @@ class VectorizeMultiDim(ppl.Pipeline):
         # traverse. A flat body without an NSDFG wrapper would leave the walker idle: the map
         # step strides to W but no per-tile body is produced → silently wrong numerics.
         # ``nest_provably_divisible=True`` disables the legacy single-dim divisibility skip.
-        # ``nest_map_bodies`` is kept for harness parity but unused.
         passes.append(NestInnermostMapBodyIntoNSDFG(nest_provably_divisible=True))
         # Nesting a flat ``acc = sum(A)`` body pulls the accumulator WCR inside the body
         # NSDFG. ``NormalizeWCR`` (canonicalize's shared reduction-normalize, reused since the
@@ -614,9 +808,9 @@ class VectorizeMultiDim(ppl.Pipeline):
         self._device = DeviceType.GPU if (device == DeviceType.GPU or target_isa == "CUDA") else DeviceType.CPU
         self._remainder_strategy = remainder_strategy
         self._branch_mode = branch_mode
-        self._nest_map_bodies = nest_map_bodies
         self._loop_to_map_permissive = loop_to_map_permissive
         self._expand_tile_nodes = expand_tile_nodes
+        self._validate = validate
         self._validate_all = validate_all
         self._assume_even = assume_even
 
@@ -636,11 +830,39 @@ class VectorizeMultiDim(ppl.Pipeline):
         :param pipeline_results: Carry-in from any enclosing pipeline.
         :returns: Whatever the inner pipeline returned (count of rewrites).
         """
+        # Snapshot the caller's SDFG BEFORE any mutation so a later ``VectorizeUnsupported``
+        # refusal (an un-tileable body-WCR reduction, or a prep pass that could not lower the
+        # kernel to a valid tileable form) can roll the caller-owned object back to this pristine,
+        # correct input and leave it un-tiled -- a clean refusal instead of a crash or a
+        # half-transformed SDFG. Cheap relative to the compile that follows; taken once per call.
+        snapshot = copy.deepcopy(sdfg)
         # Always simplify first (user direction): callers may hand us an un-simplified SDFG
         # (``to_sdfg(simplify=False)``) with FunctionCallRegions / redundant states / un-inlined
         # wrappers. Up-front simplify gives every downstream pass a canonical flat-state body;
         # already-simplified inputs are a near no-op.
-        sdfg.simplify(validate_all=self._validate_all)
+        # Skip ``ArrayElimination`` (mirrors canonicalize's terminal SimplifyPass): it eliminates
+        # an anti-dependence SNAPSHOT copy (``a_split_snap = a``, read as ``a_split_snap[i+1]`` while
+        # ``a`` is updated in place) as a "redundant" array, redirecting the read back to ``a`` --
+        # which destroys the anti-dep break and miscompiles (e.g. s212 ``b[i]+=a[i+1]*d[i]``). The
+        # only cost of skipping it is a dead transient left uncleaned, which the tiler ignores.
+        sdfg.simplify(validate_all=self._validate_all, skip={'ArrayElimination'})
+        # Infer connector types + assign default schedules/storage at the START of vectorization
+        # (user 2026-07-10). This gives every map a concrete schedule -- ``Sequential`` vs
+        # ``CPU_Multicore`` vs ``GPU_Device`` -- BEFORE the tile pipeline, so a downstream pass that
+        # must distinguish a sequential (loop-carried) reduction from a parallel one
+        # (``PrivatizeSequentialMapReductionAccumulator``) sees the real schedule, and so the tiler
+        # can tile ANY schedule (CPU_Multicore / GPU_Device / Sequential) uniformly. Idempotent and
+        # re-run after the reduction lifts mint new library nodes (see ``_finalize_lifted_library_nodes``).
+        self._assign_default_schedules(sdfg)
+        # Fold every frontend reshape / flatten ``View`` (e.g. ``C_0`` viewing ``C[0:XN, 0:YN]``
+        # as flat ``C[0:XN*YN]``) into a direct access. Runs UNCONDITIONALLY -- the multi-dim
+        # corpus enters via ``base_pipeline`` (simplify + LoopToMap + MapFusion), NOT canonicalize,
+        # so no earlier ``RemoveViews`` ran; and even a canonicalized input is re-cleaned cheaply.
+        # A surviving ``View`` gets deep-copied inward as a NestedSDFG connector descriptor by
+        # ``NestInnermostMapBodyIntoNSDFG`` / ``ExpandNestedSDFGInputs`` -- a connector ``View`` has
+        # no viewing edge in the body, so ``validate()`` rejects it ("Ambiguous or invalid edge
+        # to/from a View access node"). Removing views here dissolves that at the root.
+        RemoveViews().apply_pass(sdfg, {})
         # Fold any non-unit map step into the index (``a[i]`` under ``0:N:2`` → ``a[2*k]``
         # under ``0:int_floor(N-1,2)+1:1``) so the tiler — which requires unit-step maps
         # (``MarkTileDims`` / ``LiftMapReductionToReduce`` bail on ``step != 1``) — sees a
@@ -648,6 +870,22 @@ class VectorizeMultiDim(ppl.Pipeline):
         # Before the reduction lifts below (they need a unit-step map to size the product
         # buffer). Value-preserving; no-op on unit-step maps.
         NormalizeStridedMaps().apply_pass(sdfg, {})
+        # Scalar-localize an array-slot WCR reduction (``s[3] += a[i]*b[i]`` -- a map-exit WCR into
+        # one element of a multi-element array) into a private scalar accumulator + init + writeback
+        # so the widener folds it to per-lane partials + a ``TileReduce``. Without this the array
+        # slot has no scalar VARIABLE to give K per-lane copies of, the ``no loose WCR in the map
+        # body`` precondition fires, and the vectorizer bails. Runs after NormalizeStridedMaps
+        # (needs unit-step maps) and BEFORE PredicateMaskedReduction / NormalizeWCR (so it sees the
+        # clean top-level ``tasklet -[wcr]-> MapExit -> arr[c]`` shape). No-op on scalar / length-1
+        # accumulators (already widenable), non-associative WCRs, and non-reduction shapes.
+        PrepareReductionForWidening().apply_pass(sdfg, {})
+        # Predicate a masked reduction (``if mask: acc op= f``) into an unconditional
+        # select-addend reduction (``acc op= ITE(mask, f, identity)``) while the mask is
+        # still a ConditionalBlock in the CFG. Must run BEFORE NormalizeWCR (which buries
+        # the reduction across the nsdfg boundary) and before WCRToAugAssign / the reduction
+        # lifts (which refuse or cannot fold a WCR trapped inside a conditional). Bit-exact:
+        # the false lanes contribute the op identity. No-op on unmasked kernels.
+        PredicateMaskedReduction().apply_pass(sdfg, {})
         # Normalize masked in-nsdfg write-only WCR reductions FIRST, on the frontend shape,
         # before any WCR-consuming lift below. The frontend emits ``if mask: acc += x`` (in a
         # ``dc.map``) as a WCR edge INSIDE a body NestedSDFG writing a write-only connector;
@@ -661,10 +899,23 @@ class VectorizeMultiDim(ppl.Pipeline):
         # The pure-WCR boundary reduction (``acc = sum(A)`` — scalar ``CR:op`` at MapExit, no
         # carry-in read) is kept as a map-exit WCR (not lifted to a buffer + ``Reduce``) so
         # codegen lowers it directly (CPU ``reduction(op:var)``; GPU block-reduce + one atomic
-        # per block); ``LiftWCRMapToBufferAndReduce`` is the opt-in buffer form.
+        # per block); ``LiftMapReductionToReduce(pure_wcr_only=True)`` is the opt-in buffer form.
         # ``vectorized`` selects the CPU horizontal-SIMD fold for the RMW lift below; the GPU
         # path lifts UN-vectorized so a lifted RMW ``Reduce`` stays device-selectable.
         reduce_vectorized = self._device != DeviceType.GPU
+        # Materialise nested pure-WCR reductions NOW, while the WCR is intact -- before
+        # ``WCRToAugAssign`` (866) rewrites/mangles the boundary edge the pure-WCR recogniser
+        # needs, and before the fission/einsum prep. A body-NSDFG map may fold SEVERAL
+        # independent scalar accumulators (azimint ``s += a[j]; cnt += 1``); each is lifted in
+        # place to a product buffer + WCR-free ``Reduce``, so no in-NSDFG WCR survives and no
+        # fission (which would duplicate a shared body read out of map-param scope) is needed.
+        # The later ``nested_only`` call (below) catches reductions whose map the vectorizer's
+        # own ``LoopToMap`` mints after this point.
+        from dace.transformation.passes.vectorization.lift_map_reduction import LiftMapReductionToReduce
+        LiftMapReductionToReduce(vectorized=reduce_vectorized,
+                                 pure_wcr_only=True,
+                                 nested_only=True,
+                                 wcr_free_output=True).apply_pass(sdfg, {})
         # Prep for the einsum / reduction lifts: fission fused compute so each contraction /
         # reduction is a single-output map the lifts can match. A fused multi-output tasklet
         # (gesummv's ``ot = A[i,j]*x[j]; oy = B[i,j]*x[j]``) blocks MapFission (one component)
@@ -693,6 +944,12 @@ class VectorizeMultiDim(ppl.Pipeline):
         # Inline wrapper NSDFGs + collapse adjacent perfectly-nested single-param maps so the K-dim
         # tile spans K genuine map dims.
         normalize_loop_nests(sdfg)
+        # Re-infer schedules: the maps LoopToMap just minted (e.g. atax ``tmp[i] = sum_j``, gesummv)
+        # were created with ``ScheduleType.Default``; the start-of-pass inference could not see them.
+        # A downstream schedule-dependent pass (``PrivatizeSequentialMapReductionAccumulator``) must
+        # distinguish a sequential from a parallel reduction on THESE maps, so re-assign concrete
+        # schedules here rather than leaving Default until finalize. Idempotent on already-set maps.
+        self._assign_default_schedules(sdfg)
         # Lift a loop-carried scalar reduction over an innermost map (acc threaded through
         # entry/exit via an associative op) to a product-fill map + a ``Reduce`` node with the
         # "vectorized" implementation (ExpandReduceVectorized: horizontal_reduce_<op> + scalar
@@ -701,9 +958,37 @@ class VectorizeMultiDim(ppl.Pipeline):
         # non-reductions.
         from dace.transformation.passes.vectorization.lift_map_reduction import LiftMapReductionToReduce
         LiftMapReductionToReduce(vectorized=reduce_vectorized, rmw_only=True).apply_pass(sdfg, {})
+        # A pure-WCR reduction (``acc = sum_j ...``, no carry-in) trapped INSIDE a body NSDFG
+        # -- the outer loop was parallelised by ``LoopToMap`` (atax ``tmp[i] = sum_j A[i,j]*x[j]``
+        # consumed in-body; trmm/symm/gramschmidt scalar folds) -- cannot keep its map-exit WCR:
+        # that boundary lands inside the nested SDFG, and the multi-dim invariant forbids any loose
+        # in-NSDFG WCR (the tile emitter silently drops it). The top-level ``rmw_only`` call above
+        # deliberately leaves such reductions as a boundary WCR, correct ONLY when the boundary is
+        # at top level. So materialise every remaining nested pure-WCR reduction to a product-fill
+        # map + ``Reduce`` with a WCR-FREE explicit ``acc = acc <op> fold`` read-back: no WCR
+        # survives, the product-fill map is ordinary elementwise dataflow the tiler strides, and
+        # the read-back reproduces the original ``acc (op)= ...`` for any prior ``acc``. No-op at
+        # top level (``nested_only``) and on non-reductions.
+        LiftMapReductionToReduce(vectorized=reduce_vectorized,
+                                 pure_wcr_only=True,
+                                 nested_only=True,
+                                 wcr_free_output=True).apply_pass(sdfg, {})
         # ExpandNestedSDFGInputs runs as an embedded Pass (see ``_RunExpandNestedSDFGInputs``);
         # it fires after Nest and before MarkTileDims / the walker.
-        result = super().apply_pass(sdfg, pipeline_results)
+        #
+        # A pre-tiling soundness gate (or a prep pass that cannot produce a valid tileable form)
+        # raises ``VectorizeUnsupported`` for a kernel the tile widener would mis-lower -- e.g. a
+        # nested-reduction body WCR the remainder split leaves in a scalar tail. Rather than abort
+        # the whole run, refuse THIS kernel: restore the pristine input (so the caller keeps a
+        # valid, correct SDFG) and return without tiling. Warned, not silent, so a refusal is
+        # visible in the log and never mistaken for a successful vectorization.
+        try:
+            result = super().apply_pass(sdfg, pipeline_results)
+        except VectorizeUnsupported as unsupported:
+            warnings.warn(f"VectorizeMultiDim: refusing to vectorize {sdfg.name!r}; leaving it "
+                          f"un-tiled (correct, un-optimized): {unsupported}")
+            restore_sdfg_in_place(sdfg, copy.deepcopy(snapshot))
+            return None
         # Stamp ``target_isa`` + the concrete implementation on every tile lib node
         # UNCONDITIONALLY, even when expansion is deferred: a deferred SDFG
         # (``expand_tile_nodes=False``) is expanded later by the caller / ``compile()``, so its
@@ -726,11 +1011,24 @@ class VectorizeMultiDim(ppl.Pipeline):
             # intentional in the gather lowering (user 2026-06-10), and the survivors are
             # populate-tasklet references the audit can't tell from accidental leaks.
             RemoveUnusedPerLaneSymbols().apply_pass(sdfg, {})
-        # Final validate (user 2026-06-14): the core passes (WidenAccesses + tile-lib
-        # insertion) leave the SDFG transiently invalid, so the per-subpass gate skips them;
-        # by here they've all completed (and, on the expand path, lowered to tasklets), so the
-        # SDFG must be valid again. Bookends the structural-pass gate.
-        sdfg.validate()
+        # Runtime nonnegativity guard (Piece 3 of the symbol-canonicalization contract, mirrors
+        # canonicalize's terminal ``AssumeSymbolConstraints``): ``SetSymbolNonnegativeAssumptions``
+        # (line ~493) made every signed-integer free symbol ``nonnegative=True`` at COMPILE time so
+        # the tile emitter's offset/size reasoning (``x ** N`` -> ipow, full-tile store size
+        # ``end - begin + W``) is sound; that assumption is only valid if the caller actually passes
+        # ``s >= 0``. Prepend one dominating start state whose per-symbol ``__builtin_trap`` aborts
+        # on a negative value so the contract is CHECKED at the boundary, not silently assumed. Emit
+        # LAST -- after expansion + the per-lane audit -- so nothing reshapes the start block after
+        # (the same "runs last" rule the canonicalize guard follows to avoid orphaning its state).
+        # No-op when the SDFG has no signed-integer free symbols (fixed-size kernels).
+        insert_assumption_guards(sdfg)
+        # Final validate (gated on the ``validate`` knob, default on): the core passes
+        # (WidenAccesses + tile-lib insertion) leave the SDFG transiently invalid, so the
+        # per-subpass gate skips them; by here they've all completed (and, on the expand path,
+        # lowered to tasklets), so the SDFG must be valid again. This is the whole-pipeline
+        # validity check; ``validate_all`` additionally checks between subpasses.
+        if self._validate:
+            sdfg.validate()
         return result
 
     #: Passes after which the SDFG is intentionally TRANSIENTLY invalid (a later pass in the
@@ -753,13 +1051,26 @@ class VectorizeMultiDim(ppl.Pipeline):
         :meth:`apply_pass` re-checks the end state.
         """
         r = super().apply_subpass(sdfg, p, state)
-        if not isinstance(p, self._SKIP_VALIDATE_AFTER):
+        if self._validate_all and not isinstance(p, self._SKIP_VALIDATE_AFTER):
             try:
                 sdfg.validate()
-            except Exception as ex:  # noqa: BLE001 - re-raise with the culprit pass named
-                raise RuntimeError(f"VectorizeMultiDim: SDFG invalid after preprocessing pass "
-                                   f"{type(p).__name__!r} -- it left the SDFG malformed: {ex}") from ex
+            except Exception as ex:  # noqa: BLE001 - a prep pass left the SDFG un-tileable
+                # A prep pass that cannot lower this kernel to a VALID form (e.g. the branch front
+                # leaving a nested-if body NSDFG with an unbound staged-read symbol) is a capability
+                # limit for this kernel, not a run-ending fault. Signal ``VectorizeUnsupported`` so
+                # ``apply_pass`` refuses this one kernel -- restoring the pristine input un-tiled and
+                # warning -- instead of aborting the sweep. The pass name rides along for the log.
+                raise VectorizeUnsupported(f"preprocessing pass {type(p).__name__!r} left the SDFG in a form "
+                                           f"that cannot be tiled: {ex}") from ex
         return r
+
+    @staticmethod
+    def _assign_default_schedules(sdfg: dace.SDFG) -> None:
+        """Give every map a concrete schedule (Sequential / CPU_Multicore / GPU_Device), replacing
+        ``ScheduleType.Default``. Idempotent -- already-set maps are untouched -- so it is safe to
+        re-run after a pass mints new maps (LoopToMap) or library nodes."""
+        from dace.sdfg import infer_types
+        infer_types.set_default_schedule_and_storage_types(sdfg, None)
 
     def _refine_loop_to_map_bodies(self, sdfg: dace.SDFG, loop_to_map, refine_nested_access) -> None:
         """Parallelise data-parallel loops with ``LoopToMap``.
@@ -773,9 +1084,15 @@ class VectorizeMultiDim(ppl.Pipeline):
         :param refine_nested_access: The ``RefineNestedAccess`` transformation class (unused).
         """
         pre = {id(n) for n, _ in sdfg.all_nodes_recursive() if isinstance(n, dace.nodes.NestedSDFG)}
-        # ``loop_to_map_permissive`` (scatter benchmarks) lets LoopToMap parallelise a scatter
-        # loop (``a[idx[i]] = ...`` — a write not uniquely indexed by the iter var, which
-        # non-permissive LoopToMap refuses) so the tile path can vectorise it. Default off.
+        # DEFAULT non-permissive (``_loop_to_map_permissive`` defaults False): permissive
+        # ``LoopToMap`` would parallelise a scatter FOR-loop (``a[idx[i]] = ...`` -- a write the
+        # iter var does not provably index uniquely) on an unchecked assumption the index is
+        # injective, an unsound auto-parallelisation. In production a genuine data-parallel
+        # scatter must arrive already a ``Map`` (the frontend ``dace.map``, where the author
+        # asserts injectivity); the tile path then lowers it via gather/scatter tile ops (see
+        # ``kernels/test_forced_scatter_gather_scatter.py``). The knob stays honored so a
+        # dedicated scatter/gather tile-lowering test can opt in (``loop_to_map_permissive=True``)
+        # to force its for-loop scatter into a Map and exercise the tile path directly.
         sdfg.apply_transformations_repeated(loop_to_map, permissive=self._loop_to_map_permissive, validate=False)
         # ``RefineNestedAccess`` is skipped on the K-dim path (user 2026-06-10 audit): under
         # the staging-first design it is redundant and harmful:
@@ -878,9 +1195,8 @@ class VectorizeCPUMultiDim(VectorizeMultiDim):
     corpus harness and tests use.
     """
 
-    def __init__(self, *args, **kwargs):
-        kwargs.setdefault("device", DeviceType.CPU)
-        super().__init__(*args, **kwargs)
+    def __init__(self, config: VectorizeConfig):
+        super().__init__(dataclasses.replace(config, device=DeviceType.CPU))
 
 
 class VectorizeGPUMultiDim(VectorizeMultiDim):
@@ -904,30 +1220,21 @@ class VectorizeGPUMultiDim(VectorizeMultiDim):
     runs ``apply_gpu_transformations`` first when the input SDFG has no GPU map yet.
     """
 
-    def __init__(self, widths: Tuple[int, ...] = (2, ), gpu_schedule_if_needed: bool = True, **kwargs):
-        """Build the GPU orchestrator.
+    def __init__(self, config: VectorizeConfig, gpu_schedule_if_needed: bool = True):
+        """Build the GPU orchestrator from a :class:`VectorizeConfig`.
 
-        :param widths: Per-dim tile widths, innermost-last; the innermost must be even
-            (a half2 is 2 fp16 lanes). Defaults to ``(2,)``.
+        The GPU row is pinned regardless of the config: ``device=GPU``, ``target_isa=CUDA``,
+        ``assume_even=True`` (a half2 kernel emits no remainder loop). ``widths`` (innermost
+        must be even) and the remaining flags come from ``config`` -- GPU callers typically
+        pass ``VectorizeConfig(widths=(2,), expand_tile_nodes=False)``.
+
+        :param config: The vectorizer configuration; its ``device`` / ``target_isa`` /
+            ``assume_even`` are overridden with the GPU values.
         :param gpu_schedule_if_needed: When ``True`` (default), run
             ``apply_gpu_transformations`` in :meth:`apply_pass` if the SDFG has no
             ``GPU_Device`` map yet. Set ``False`` when the caller has already scheduled.
-        :param kwargs: Forwarded to :class:`VectorizeMultiDim`. ``target_isa`` and
-            ``assume_even`` are pinned to the GPU values and must not be overridden.
-            ``expand_tile_nodes`` defaults to ``False``: the pipeline returns with the
-            ``cuda``-stamped tile lib nodes in place (the vectorized form), and the
-            caller lowers them with ``sdfg.expand_library_nodes()`` (or ``compile()``).
         """
-        kwargs.setdefault("target_isa", "CUDA")
-        kwargs.setdefault("assume_even", True)
-        kwargs.setdefault("expand_tile_nodes", False)
-        kwargs["device"] = DeviceType.GPU
-        if kwargs["target_isa"] != "CUDA":
-            raise NotImplementedError(
-                f"VectorizeGPUMultiDim only targets CUDA; got target_isa={kwargs['target_isa']!r}")
-        if not kwargs["assume_even"]:
-            raise NotImplementedError("VectorizeGPUMultiDim emits no remainder loop; assume_even must stay True")
-        super().__init__(widths=widths, **kwargs)
+        super().__init__(dataclasses.replace(config, device=DeviceType.GPU, target_isa=ISA.CUDA, assume_even=True))
         self._gpu_schedule_if_needed = gpu_schedule_if_needed
 
     def apply_pass(self, sdfg: dace.SDFG, pipeline_results) -> Optional[int]:
@@ -939,5 +1246,5 @@ class VectorizeGPUMultiDim(VectorizeMultiDim):
         """
         if self._gpu_schedule_if_needed and not _has_gpu_device_map(sdfg):
             sdfg.apply_gpu_transformations()
-            sdfg.simplify()
+            sdfg.simplify(skip={'ArrayElimination'})  # preserve anti-dep snapshots (see apply_pass)
         return super().apply_pass(sdfg, pipeline_results)

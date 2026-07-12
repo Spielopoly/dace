@@ -49,8 +49,9 @@ def test_rewrites_simple_ite_tasklet():
     # The rewrite should preserve the three operands.
     for op in ("_c", "_t", "_e"):
         assert op in body
-    # And introduce the (1 - _c) factor.
-    assert "1 - _c" in body.replace(" ", "").replace("1-_c", "1 - _c")
+    # And introduce the (1 - c) complement factor, with the bool cond promoted to
+    # the float64 arm dtype (uniform-dtype tile binop; see the pass docstring).
+    assert "1 - dace.float64(_c)" in body
 
 
 def test_no_match_when_no_ite_call():
@@ -68,9 +69,10 @@ def test_handles_multiple_ites_in_one_tasklet():
 
 
 def test_handles_symbol_cond_in_ite_call():
-    """When M3.1b/M3.2 cannot resolve the cond to an array they emit the
-    cond as inline text inside the ITE call, e.g. ``ITE(c0 == 1, ...)``.
-    The pass should rewrite this just like the in-connector form."""
+    """When the upstream branch-normalization passes cannot resolve the cond
+    to an array they emit the cond as inline text inside the ITE call, e.g.
+    ``ITE(c0 == 1, ...)``. The pass should rewrite this just like the
+    in-connector form."""
     sdfg = dace.SDFG("lower_ite_sym_cond")
     sdfg.add_array("A", shape=(1, ), dtype=dace.float64)
     sdfg.add_array("T", shape=(1, ), dtype=dace.float64)

@@ -491,7 +491,13 @@ def nest_state_subgraph(sdfg: SDFG,
     for original_edge, new_edge in edges_to_offset:
         for edge in nstate.memlet_tree(new_edge):
             edge.data.data = new_edge.data.data
-            if not full_data:
+            # A whole-array / scalar access carries ``subset is None`` (a legal memlet
+            # representation, e.g. a bare scalar accumulator ``Memlet('delta')``). There is
+            # nothing to re-base into the nested SDFG's coordinate space in that case -- the
+            # nested descriptor is the whole array too -- so skip the offset instead of
+            # dereferencing ``None`` (the ``subset is not None`` guard is the idiom used for
+            # the same case throughout ``propagation.py`` / the memlet helpers below).
+            if not full_data and edge.data.subset is not None:
                 edge.data.subset.offset(global_subsets[original_edge.data.data][1], True)
                 edge.data.subset.offset(nsdfg.arrays[edge.data.data].offset, True)
 
@@ -1020,6 +1026,11 @@ def unsqueeze_memlet(internal_memlet: Memlet,
         :param external_offset: The external memlet's data descriptor offset.
         :return: Offset Memlet to set on the resulting graph.
     """
+    # A dependency edge (empty memlet) carries no subset to reindex -- the nested->outer
+    # semantics are identity. Guarding here covers every caller (e.g. InlineSDFG's
+    # _modify_memlet_path / _modify_access_to_access) with one fresh-copy return.
+    if internal_memlet.is_empty():
+        return Memlet.from_memlet(internal_memlet)
     internal_subset = _get_internal_subset(internal_memlet, external_memlet, use_src_subset, use_dst_subset)
     internal_offset = internal_offset or [0] * len(internal_subset)
     external_offset = external_offset or [0] * len(external_memlet.subset)

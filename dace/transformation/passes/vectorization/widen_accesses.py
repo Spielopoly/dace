@@ -383,13 +383,32 @@ class WidenAccesses(ppl.Pass):
                     dst_name = edge.dst.data
                     if src_name not in nt_lane_dep and src_name not in lane_dep_transients:
                         continue
+                    # A CONSTANT (loop-invariant) read from a lane-dep source -- ``a[0]`` (or
+                    # ``a[j]`` with ``j`` an outer loop var) copied into a bridge, where ``a`` is
+                    # lane-dep only because ``a[i]`` is written elsewhere -- yields a value that is
+                    # identical across lanes. It must stay a Scalar broadcast operand (design 6.5),
+                    # NOT a per-lane tile: widening it leaves lanes 1..W-1 filled from a 1-element
+                    # copy (uninitialised) instead of broadcasting. Propagate lane-dep only when
+                    # THIS edge's source-side subset is itself lane-dependent -- EXCEPT when the
+                    # source is a scalar-like (widenable) lane-dep transient: it holds ONE per-lane
+                    # value, so a FULL copy of it is per-lane, never a fixed-element broadcast. Its
+                    # sole-element subset ``[0,...]`` only LOOKS constant; once the source is widened
+                    # to a tile the copy must widen too, else the copy's ``other_subset`` keeps the
+                    # stale pre-widen rank and ``validate`` rejects it ("other_subset does not match
+                    # node dimension").
+                    src_desc = inner_sdfg.arrays.get(src_name)
+                    src_is_scalar_like = (src_desc is not None and src_desc.transient
+                                          and self._is_widenable(src_desc))
+                    if (not src_is_scalar_like
+                            and not self._edge_reads_lane_dependent(edge, state, inner_sdfg, iter_vars)):
+                        continue
                     desc = inner_sdfg.arrays.get(dst_name)
                     if desc is None or not desc.transient:
                         continue
-                    if not self._is_widenable(desc):
-                        continue
                     if dst_name in index_symbols:
                         continue  # index/address symbol -> stays scalar
+                    if not self._is_widenable(desc):
+                        raise self._unwidenable_lane_dep_error(dst_name, desc)
                     if dst_name not in lane_dep_transients:
                         lane_dep_transients.add(dst_name)
                         changed = True
@@ -413,14 +432,40 @@ class WidenAccesses(ppl.Pass):
                             desc = inner_sdfg.arrays.get(nm)
                             if desc is None or not desc.transient:
                                 continue
-                            if not self._is_widenable(desc):
-                                continue
                             if nm in index_symbols:
                                 continue  # index/address symbol -> stays scalar
+                            if not self._is_widenable(desc):
+                                raise self._unwidenable_lane_dep_error(nm, desc)
                             if nm not in lane_dep_transients:
                                 lane_dep_transients.add(nm)
                                 changed = True
         return lane_dep_transients
+
+    def _edge_reads_lane_dependent(self, edge, state: SDFGState, inner_sdfg: SDFG, iter_vars: Tuple[str, ...]) -> bool:
+        """True if the copy edge's SOURCE-side subset has >=1 non-CONSTANT (lane-dependent) dim.
+
+        A fully-CONSTANT read (``a[0]``, or ``a[j]`` with ``j`` loop-invariant w.r.t. the tiled
+        iter-vars) produces a value identical across lanes, so the destination stays a Scalar
+        broadcast. Mirrors the CONSTANT test in :meth:`_classify_non_transients`; conservatively
+        returns ``True`` when the subset cannot be classified (matches that method's fallback).
+
+        :param edge: The AN -> AN copy edge.
+        :param state: The state holding the edge.
+        :param inner_sdfg: The body NSDFG.
+        :param iter_vars: The tiled iter-var names.
+        :returns: ``True`` if the read is lane-dependent (dest must widen), else ``False``.
+        """
+        try:
+            sub = an_side_subset(edge, edge.src, inner_sdfg)
+        except Exception:  # noqa: BLE001 -- helper may refuse exotic edges
+            return True
+        try:
+            record = classify_tile_access(sub, iter_vars=iter_vars, inner_sdfg=inner_sdfg, state=state)
+        except Exception:  # noqa: BLE001
+            return True
+        if not record.per_dim_kind:
+            return True
+        return not all(k == PerDimKind.CONSTANT for k in record.per_dim_kind)
 
     # --- Step 4: widen lane-dep transient descriptors -----------------------
     @staticmethod
@@ -442,6 +487,23 @@ class WidenAccesses(ppl.Pass):
             except Exception:  # noqa: BLE001 -- symbolic simplification may refuse
                 return False
         return False
+
+    @staticmethod
+    def _unwidenable_lane_dep_error(name: str, desc) -> NotImplementedError:
+        """Build the refusal for a lane-dependent transient we cannot widen.
+
+        A lane-dependent transient must become a per-lane tile of shape ``widths``,
+        which only ``Scalar``/length-1 buffers support. A genuine multi-element
+        per-lane buffer (e.g. a 2-element sliding window ``tmp[0:2] = a[i:i+2]``)
+        would need a ``(W, ...)`` widening the descent does not implement. Refuse
+        loudly with ``NotImplementedError`` rather than silently leaving it
+        under-widened (which the post-widen invariant would later flag as a broken
+        invariant instead of an honest unsupported-pattern refusal).
+        """
+        return NotImplementedError(
+            f"WidenAccesses: lane-dependent transient '{name}' has non-scalar shape "
+            f"{tuple(desc.shape)}; widening a multi-element per-lane buffer to (W, ...) is "
+            f"unsupported. Refusing rather than emitting an under-widened tile.")
 
     # --- Step 5: seed per-lane symbols for Bypass-form gathers --------------
     def _seed_per_lane_symbols(self,

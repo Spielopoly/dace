@@ -4,12 +4,14 @@
     returns the corresponding CompiledSDFG object. """
 
 import collections
+import contextlib
 import io
 import os
 import pathlib
 import re
 import shutil
 import shlex
+import signal
 import subprocess
 from typing import Callable, List, Literal, Set, Tuple, TypeVar, Union, Optional, overload
 import warnings
@@ -162,6 +164,70 @@ def generate_program_folder(
     return out_path
 
 
+#: Environment-variable prefixes an MPI/PMI launcher (srun, mpirun) exports to mark a
+#: process as a rank of its job. A child that inherits these and links a PMI/PMIx client
+#: (directly, or transitively through an MPI-wrapper compiler) treats itself as that rank
+#: and blocks in MPI_Init/PMIx_Init awaiting a rendezvous that never comes.
+_MPI_RANK_ENV_PREFIXES = (
+    'PMI_',  # MPICH / Cray / Slurm PMI: PMI_RANK, PMI_SIZE, PMI_FD, PMI_JOBID, ...
+    'PMIX_',  # PMIx (OpenMPI 4+): PMIX_RANK, PMIX_NAMESPACE, PMIX_SERVER_URI*, ...
+    'OMPI_COMM_WORLD_',  # OpenMPI: OMPI_COMM_WORLD_RANK/SIZE/LOCAL_RANK, ...
+    'OMPI_UNIVERSE_',
+    'MV2_COMM_WORLD_',  # MVAPICH2
+    'MPI_LOCALRANKID',
+    'MPI_LOCALNRANKS',
+    'SLURM_PROCID',  # Slurm's PMI plugins derive rank from these
+    'SLURM_LOCALID',
+)
+
+
+def _build_subprocess_env():
+    """`os.environ` with this process's MPI-rank identity stripped, for the CMake
+    configure/build subprocesses.
+
+    When DaCe compiles from inside a process launched by an MPI/PMI launcher, CMake --
+    and the try_compile test binaries, make/ninja, and the compiler driver it spawns --
+    inherit the launcher's rank-identity variables (``_MPI_RANK_ENV_PREFIXES``). Any of
+    those children that touches a PMI/PMIx client library then hangs in its init call
+    forever (leaving defunct/zombie children), which manifests as a stuck ``cmake``.
+    Compilation never needs an MPI identity, so drop those variables from the build
+    environment; everything else (PATH, compiler flags, MCA tuning, ...) is preserved."""
+    return {k: v for k, v in os.environ.items() if not k.startswith(_MPI_RANK_ENV_PREFIXES)}
+
+
+@contextlib.contextmanager
+def _build_subprocess_sigmask():
+    """Temporarily unblock ``SIGCHLD`` on the calling thread so a subprocess forked
+    inside this context inherits an unblocked ``SIGCHLD``.
+
+    MPI/Slurm launchers (``srun``, ``mpirun``) start their tasks with ``SIGCHLD`` *blocked*
+    in the signal mask, and every child inherits that mask. CMake (KWSys) learns that the
+    helper processes it spawns during *configure* -- ``uname`` for system introspection,
+    the compiler-id / ABI test binaries, ``make``/``ninja`` -- have finished by receiving
+    ``SIGCHLD``; with ``SIGCHLD`` blocked it is never woken to reap them, so ``cmake`` spins
+    forever in ``select()`` leaving ``<defunct>`` children. That is the daint compile hang:
+    it looks like a stuck ``cmake`` even though nothing is compiling. (Confirmed under srun:
+    every task's ``/proc/self/status`` shows ``SigBlk`` with the ``SIGCHLD`` bit set, and a
+    trivial ``project()`` configure hangs until the child mask is cleared.)
+
+    A child inherits the *forking thread's* mask, and ``subprocess.Popen`` forks from the
+    calling thread without resetting it, so unblocking here -- immediately around the
+    ``Popen`` -- is enough. ``pthread_sigmask`` is per-thread, so this never disturbs other
+    threads or the process's steady-state mask, and it is restored right after the fork.
+    No-op where ``pthread_sigmask``/``SIGCHLD`` are unavailable (e.g. Windows)."""
+    if not hasattr(signal, 'pthread_sigmask') or not hasattr(signal, 'SIGCHLD'):
+        yield
+        return
+    if signal.SIGCHLD not in signal.pthread_sigmask(signal.SIG_BLOCK, []):
+        yield  # SIGCHLD already deliverable -- nothing to do (the common, non-launcher case)
+        return
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGCHLD})
+    try:
+        yield
+    finally:
+        signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGCHLD})
+
+
 def configure_and_compile(
     program_folder,
     program_name=None,
@@ -285,11 +351,15 @@ def configure_and_compile(
 
     cmake_filename = os.path.join(build_folder, 'cmake_configure.sh')
 
+    # Strip this process's MPI-rank identity from the build subprocesses so CMake and the
+    # children it spawns never hang joining the outer MPI/PMI job (see _build_subprocess_env).
+    build_env = _build_subprocess_env()
+
     ##############################################
     # Configure
     try:
         if not identical_file_exists(cmake_filename, cmake_command):
-            _run_liveoutput(cmake_command, shell=True, cwd=build_folder, output_stream=output_stream)
+            _run_liveoutput(cmake_command, shell=True, cwd=build_folder, output_stream=output_stream, env=build_env)
     except subprocess.CalledProcessError as ex:
         # Clean CMake directory and try once more
         if Config.get_bool('debugprint'):
@@ -297,7 +367,7 @@ def configure_and_compile(
         shutil.rmtree(build_folder, ignore_errors=True)
         os.makedirs(build_folder)
         try:
-            _run_liveoutput(cmake_command, shell=True, cwd=build_folder, output_stream=output_stream)
+            _run_liveoutput(cmake_command, shell=True, cwd=build_folder, output_stream=output_stream, env=build_env)
         except subprocess.CalledProcessError as ex:
             # If still unsuccessful, print results
             if Config.get_bool('debugprint'):
@@ -313,7 +383,8 @@ def configure_and_compile(
         _run_liveoutput("cmake --build . --config %s" % (Config.get('compiler', 'build_type')),
                         shell=True,
                         cwd=build_folder,
-                        output_stream=output_stream)
+                        output_stream=output_stream,
+                        env=build_env)
     except subprocess.CalledProcessError as ex:
         # If unsuccessful, print results
         if Config.get_bool('debugprint'):
@@ -652,7 +723,12 @@ def identical_file_exists(filename: str, file_contents: str):
 
 
 def _run_liveoutput(command, output_stream=None, **kwargs):
-    process = subprocess.Popen(command, stderr=subprocess.STDOUT, stdout=subprocess.PIPE, **kwargs)
+    # Fork the build subprocess (CMake) with SIGCHLD unblocked so it can reap the helper
+    # processes it spawns during configure; an MPI/Slurm launcher blocks SIGCHLD in the
+    # inherited mask, which otherwise deadlocks cmake in select() (see
+    # _build_subprocess_sigmask). Only the fork needs to happen inside the context.
+    with _build_subprocess_sigmask():
+        process = subprocess.Popen(command, stderr=subprocess.STDOUT, stdout=subprocess.PIPE, **kwargs)
     output = io.StringIO()
     while True:
         line = process.stdout.readline().rstrip()

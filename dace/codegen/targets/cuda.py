@@ -2197,8 +2197,9 @@ gpuError_t __err = {backend}LaunchKernel((void*){kname}, dim3({gdims}), dim3({bd
         one atomic/thread: correct but heavily contended). Narrow guard: single-element
         accumulator, register-resident per-thread partial (shared/global source races →
         refuse), built-in op with known identity, constant block size (cub's template thread
-        count), loop-invariant target. At most one descriptor/map (CPU single-target limit);
-        anything else keeps the per-thread atomic fallback.
+        count), loop-invariant target. Every qualifying accumulator is folded -- one
+        ``cub::BlockReduce`` per target (emitted with a distinct id); anything not matching
+        the guard keeps the per-thread atomic fallback.
         """
         out: List[dict] = []
         try:
@@ -2212,26 +2213,32 @@ gpuError_t __err = {backend}LaunchKernel((void*){kname}, dim3({gdims}), dim3({bd
         for b in block_dims:
             num_threads *= int(b)
         map_params = set(kernel_entry.map.params)
+        # ``cub::BlockReduce`` folds each thread's OWN partial value, so the WCR source must be
+        # thread-private. Any per-thread storage works (``Register``, kernel-local ``Default``,
+        # ...); only the two kinds shared across the folding threads are refused -- ``GPU_Shared``
+        # (one slot per block) and ``GPU_Global`` (one per grid): a single such slot is read
+        # identically by every thread, so the fold would count it N times and race the writes.
+        cross_thread_storage = (dtypes.StorageType.GPU_Shared, dtypes.StorageType.GPU_Global)
         for iedge in state.in_edges(map_exit):
             if iedge.data is None or iedge.data.wcr is None:
                 continue
-            # Per-thread partial: WCR source must be a register AccessNode of a single element
-            # (the interposed _nmr_out partial; AddThreadBlockMap keeps partial → tb-exit WCR,
-            # device exit only forwards it). Shared/global source races across threads → refuse.
+            # ``wcr -> MapExit -> wcr`` boundary: the WCR source is each thread's partial and
+            # the memlet target is the accumulator (named through any intervening threadblock
+            # map exit, so read it from the memlet -- following a single OUT_ edge misses the
+            # nested device+threadblock exits). Detected by structure, not by partial name.
             src = iedge.src
             if not isinstance(src, nodes.AccessNode):
                 continue
             part_desc = sdfg.arrays.get(src.data)
-            if part_desc is None or part_desc.storage != dtypes.StorageType.Register:
+            if part_desc is None or part_desc.storage in cross_thread_storage:
                 continue
             try:
                 if int(part_desc.total_size) != 1:
                     continue
             except (TypeError, ValueError):
                 continue
-            # Accumulator = WCR memlet's target container (acc), one element at a time. Its
-            # AccessNode sits past the device exit, but the memlet names the global target →
-            # codegen addresses it by pointer.
+            # Accumulator = the WCR memlet's target container, one element per write. A GPU
+            # atomic takes a pointer, so a scalar OR a length-1 Array slot is a valid target.
             acc_desc = sdfg.arrays.get(iedge.data.data)
             if acc_desc is None:
                 continue
@@ -2258,8 +2265,6 @@ gpuError_t __err = {backend}LaunchKernel((void*){kname}, dim3({gdims}), dim3({bd
                 'num_threads': num_threads,
                 'data': iedge.data.data,
             })
-        if len(out) > 1:  # single folded reduction per map (mirror CPU limit)
-            return []
         return out
 
     def _emit_gpu_block_reduction(self, red: dict, idstr: str, cfg: ControlFlowRegion, state_id: int,
@@ -2389,8 +2394,11 @@ gpuError_t __err = {backend}LaunchKernel((void*){kname}, dim3({gdims}), dim3({bd
         # Default path only (no explicit tb map). Partial register identity-inited BEFORE the
         # bounds guard (out-of-range threads still join the fold); per-thread atomic suppressed;
         # block fold emitted once the guard closes below.
+        # Gated by compiler.tree_reduction: OFF skips the block fold so the WCR falls back to
+        # a per-thread atomicAdd (correct but contended) instead of cub::BlockReduce.
         self._gpu_block_reductions = []
-        if (not has_tbmap and not has_dtbmap and node.map.schedule != dtypes.ScheduleType.GPU_Persistent):
+        if (not has_tbmap and not has_dtbmap and node.map.schedule != dtypes.ScheduleType.GPU_Persistent
+                and Config.get_bool('compiler', 'tree_reduction')):
             self._gpu_block_reductions = self._collect_gpu_reductions(sdfg, cfg.node(state_id), node, block_dims)
         for red in self._gpu_block_reductions:
             kernel_stream.write('%s = %s;' % (red['partial'], red['identity']), cfg, state_id, node)
@@ -2829,7 +2837,11 @@ gpuError_t __err = {backend}LaunchKernel((void*){kname}, dim3({gdims}), dim3({bd
             # threads still join the fold); per-thread atomic suppressed; fold emitted once the
             # guard closes at the thread-block MapExit. Detected on the enclosing device map,
             # whose exit carries the reduction WCR.
-            self._gpu_block_reductions = self._collect_gpu_reductions(sdfg, dfg, scope_entry, self._block_dims)
+            # Gated by compiler.tree_reduction: OFF skips the block fold so the WCR falls back
+            # to a per-thread atomicAdd (correct but contended) instead of cub::BlockReduce.
+            self._gpu_block_reductions = []
+            if Config.get_bool('compiler', 'tree_reduction'):
+                self._gpu_block_reductions = self._collect_gpu_reductions(sdfg, dfg, scope_entry, self._block_dims)
             for red in self._gpu_block_reductions:
                 callsite_stream.write('%s = %s;' % (red['partial'], red['identity']), cfg, state_id, scope_entry)
                 self._cpu_codegen._gpu_block_reduction_covered.add(red['data'])
