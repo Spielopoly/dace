@@ -51,7 +51,10 @@ def _fma5d(x: dace.float32[_N, _A, _B, _C, _D], y: dace.float32[_N, _A, _B, _C, 
 def _lower(prog, widths):
     """Canonicalize + apply the cuTile pipeline, returning the Python-backend SDFG."""
     sdfg = prog.to_sdfg(simplify=True)
-    canonicalize(sdfg)
+    # ``assumption_guard=False`` mirrors ``canonicalize_for_cutile``: the guard-on
+    # canonicalize injects a CPP ``__builtin_trap`` tasklet the Python backend
+    # cannot codegen.
+    canonicalize(sdfg, assumption_guard=False)
     VectorizeCuTile(widths=widths).apply_pass(sdfg, {})
     sdfg.backend = dtypes.BackendLanguage.Python
     return sdfg

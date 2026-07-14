@@ -15,7 +15,9 @@ import numpy as np
 import pytest
 
 import dace
-from dace import dtypes
+from dace import data, dtypes, subsets
+from dace.codegen.py.framecode import DaCePythonCodeGenerator
+from dace.codegen.py.python_target import PythonCodeGen
 from dace.memlet import Memlet
 
 
@@ -286,6 +288,8 @@ def test_column_view_gpu_global():
     assert np.allclose(Y[:, 1], 2 * X[:, 1])
     Y[:, 1] = 0
     assert np.all(Y == 0)
+
+
 def test_rendered_column_slice_needs_no_reshape():
     """A strided column slice whose RENDERED shape matches the connector
     (correlation regression).
@@ -353,17 +357,151 @@ def test_writeback_through_collapsed_dim():
     assert np.allclose(Y[:, 1], 0.0)
 
 
+def _build_inout_full_in_window_out_sdfg(name: str, use_wcr: bool) -> dace.SDFG:
+    """An in/out connector ``_y`` with an explicit-FULL IN subset and a
+    zero-based WINDOW OUT subset (the ``ExpandNestedSDFGInputs`` WCR-skip
+    shape: widened IN edge, deliberately narrow OUT edge).
+
+    The inner map covers rows ``0:3`` of the ``(4, 6)`` arrays; inner
+    subscripts are outer-origin coordinates, so both edges are semantically
+    the whole array.
+
+    :param name: SDFG name.
+    :param use_wcr: Put a sum WCR on the inner write and the OUT boundary edge
+        (accumulate) instead of a plain assignment.
+    :returns: The configured (Python-backend) SDFG.
+    """
+    sdfg = dace.SDFG(name)
+    state = sdfg.add_state()
+    sdfg.add_array('X', (4, 6), dace.float64)
+    sdfg.add_array('Y', (4, 6), dace.float64)
+
+    nsdfg = dace.SDFG(name + '_inner')
+    nstate = nsdfg.add_state()
+    nsdfg.add_array('_x', (4, 6), dace.float64)
+    nsdfg.add_array('_y', (4, 6), dace.float64)
+    me, mx = nstate.add_map('rows', dict(i='0:3', j='0:6'))
+    if use_wcr:
+        t = nstate.add_tasklet('acc', {'__i'}, {'__o'}, '__o = 2 * __i')
+        nstate.add_memlet_path(nstate.add_read('_x'), me, t, dst_conn='__i', memlet=Memlet('_x[i, j]'))
+        nstate.add_memlet_path(t,
+                               mx,
+                               nstate.add_write('_y'),
+                               src_conn='__o',
+                               memlet=Memlet('_y[i, j]', wcr='lambda a, b: a + b'))
+        # The IN edge exists because the connector is in/out (widened boundary).
+        read_y = nstate.add_read('_y')
+        t2 = nstate.add_tasklet('touch', {'__c'}, {'__u'}, '__u = __c')
+        nsdfg.add_scalar('_unused', dace.float64, transient=True)
+        nstate.add_edge(read_y, None, t2, '__c', Memlet('_y[3, 0]'))
+        nstate.add_edge(t2, '__u', nstate.add_write('_unused'), None, Memlet('_unused[0]'))
+    else:
+        t = nstate.add_tasklet('axpy', {'__i', '__c'}, {'__o'}, '__o = 2 * __i + __c')
+        nstate.add_memlet_path(nstate.add_read('_x'), me, t, dst_conn='__i', memlet=Memlet('_x[i, j]'))
+        nstate.add_memlet_path(nstate.add_read('_y'), me, t, dst_conn='__c', memlet=Memlet('_y[i, j]'))
+        nstate.add_memlet_path(t, mx, nstate.add_write('_y'), src_conn='__o', memlet=Memlet('_y[i, j]'))
+
+    node = state.add_nested_sdfg(nsdfg, {'_x', '_y'}, {'_y'})
+    state.add_edge(state.add_read('X'), None, node, '_x', Memlet('X[0:4, 0:6]'))
+    # Explicit-full IN subset: shapes match, so pre-fix the predicate was never
+    # consulted and the edge rendered as a full view expression ...
+    state.add_edge(state.add_read('Y'), None, node, '_y', Memlet('Y[0:4, 0:6]'))
+    # ... while the zero-based WINDOW OUT subset rendered the bare name ->
+    # "bound inconsistently".
+    out_memlet = Memlet('Y[0:3, 0:6]', wcr='lambda a, b: a + b') if use_wcr else Memlet('Y[0:3, 0:6]')
+    state.add_edge(node, '_y', state.add_write('Y'), None, out_memlet)
+    sdfg.backend = dtypes.BackendLanguage.Python
+    return sdfg
+
+
+def test_inout_full_in_window_out_binds_consistently():
+    """Explicit-full IN + zero-based-window OUT on an in/out connector.
+
+    Both edges are semantically the whole array; before consulting the
+    whole-array predicate also on shape matches this raised
+    ``NotImplementedError: ... bound inconsistently``.
+    """
+    sdfg = _build_inout_full_in_window_out_sdfg('nested_inout_full_window', use_wcr=False)
+    X = np.random.rand(4, 6)
+    Y0 = np.random.rand(4, 6)
+    Y = Y0.copy()
+    sdfg(X=X, Y=Y)
+    ref = Y0.copy()
+    ref[0:3] = 2 * X[0:3] + Y0[0:3]
+    assert np.allclose(Y, ref), f"max diff = {np.max(np.abs(Y - ref))}"
+
+
+def test_inout_full_in_window_out_wcr():
+    """The same mixed-edge shape with a sum WCR OUT edge (the realistic
+    ``ExpandNestedSDFGInputs`` producer: widened IN, WCR-skipped narrow OUT).
+    Accumulation is realized at the inner write site; boundary WCR is
+    metadata."""
+    sdfg = _build_inout_full_in_window_out_sdfg('nested_inout_full_window_wcr', use_wcr=True)
+    X = np.random.rand(4, 6)
+    Y0 = np.random.rand(4, 6)
+    Y = Y0.copy()
+    sdfg(X=X, Y=Y)
+    ref = Y0.copy()
+    ref[0:3] += 2 * X[0:3]
+    assert np.allclose(Y, ref), f"max diff = {np.max(np.abs(Y - ref))}"
+
+
+class TestNestedDescSpansFullOuter:
+    """Unit tests for ``PythonCodeGen._nested_desc_spans_full_outer``.
+
+    The whole-outer-array shortcut must only fire for a connector declared
+    over the entire outer array with a zero-based, step-1 window subset and
+    no inner-side (``other_subset``) remapping.
+    """
+
+    @staticmethod
+    def _codegen() -> PythonCodeGen:
+        sdfg = dace.SDFG('spans_full_outer_unit')
+        sdfg.backend = dtypes.BackendLanguage.Python
+        return PythonCodeGen(DaCePythonCodeGenerator(sdfg), sdfg)
+
+    @staticmethod
+    def _descs(inner_dtype=dace.float64, outer_dtype=dace.float64, inner_shape=(4, 5), outer_shape=(4, 5)):
+        return data.Array(inner_dtype, inner_shape), data.Array(outer_dtype, outer_shape)
+
+    def test_accepts_zero_based_step1_window(self):
+        inner, outer = self._descs()
+        assert self._codegen()._nested_desc_spans_full_outer(Memlet('A[0:3, 0:5]'), inner, outer)
+
+    def test_rejects_dtype_mismatch(self):
+        inner, outer = self._descs(outer_dtype=dace.float32)
+        assert not self._codegen()._nested_desc_spans_full_outer(Memlet('A[0:3, 0:5]'), inner, outer)
+
+    def test_rejects_ndim_mismatch(self):
+        inner, outer = self._descs(outer_shape=(4, 5, 6))
+        assert not self._codegen()._nested_desc_spans_full_outer(Memlet('A[0:3, 0:5, 0:6]'), inner, outer)
+
+    def test_rejects_nonzero_start(self):
+        inner, outer = self._descs()
+        assert not self._codegen()._nested_desc_spans_full_outer(Memlet('A[1:4, 0:5]'), inner, outer)
+
+    def test_rejects_non_unit_step(self):
+        inner, outer = self._descs()
+        assert not self._codegen()._nested_desc_spans_full_outer(Memlet('A[0:4:2, 0:5]'), inner, outer)
+
+    def test_rejects_indices_subset(self):
+        inner, outer = self._descs()
+        memlet = Memlet(data='A', subset=subsets.Indices([2, 3]))
+        assert not self._codegen()._nested_desc_spans_full_outer(memlet, inner, outer)
+
+    def test_rejects_other_subset(self):
+        inner, outer = self._descs()
+        memlet = Memlet('A[0:3, 0:5]')
+        memlet.other_subset = subsets.Range.from_string('0:3, 0:5')
+        assert not self._codegen()._nested_desc_spans_full_outer(memlet, inner, outer)
+
+    def test_rejects_view_outer_desc(self):
+        """A View outer descriptor is not the array itself; the shortcut must
+        stay sound even if ``preprocess``'s ``RemoveViews`` did not run."""
+        inner, _ = self._descs()
+        outer_view = data.ArrayView(dace.float64, (4, 5))
+        assert not self._codegen()._nested_desc_spans_full_outer(Memlet('A[0:3, 0:5]'), inner, outer_view)
+
+
 if __name__ == '__main__':
-    test_output_side_flat_reshape()
-    test_input_permutation_mismatch_raises()
-    test_output_permutation_mismatch_raises()
-    test_element_count_mismatch_raises()
-    test_matching_shapes_unchanged()
-    test_inout_connector_flat_reshape()
-    test_column_view_input_output()
-    test_column_view_symbolic_length()
-    test_strided_output_writeback()
-    test_transpose_view_supported()
-    test_inconsistent_stride_raises()
-    test_rendered_column_slice_needs_no_reshape()
-    test_writeback_through_collapsed_dim()
+    pytest.main(['-q', __file__])

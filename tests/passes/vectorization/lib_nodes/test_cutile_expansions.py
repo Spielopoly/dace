@@ -340,26 +340,29 @@ def test_tile_binop_cutile_uses_ct_minimum_for_min():
 
 
 def test_tile_mask_gen_cutile_1d_uses_arange_and_bid():
-    """K=1 mask: ``__offsets0 = ct.arange(W)`` + ``__mask0 = ... < ub``;
-    output is the single per-dim mask (no ``&`` combinator)."""
+    """K=1 mask: ``__offsets0 = ct.arange(W)`` + ``__mask0 = offsets + iter_var < ub``;
+    output is the single per-dim mask (no ``&`` combinator). The mask base is the
+    iter var itself (bound to ``start + __pid*step`` by the cuTile codegen), NOT a
+    reconstructed ``__pid0 * W`` — the latter miscomputes for nonzero-begin ranges."""
     body, _ = _expand_cutile(TileMaskGen(name="M", widths=(8, ), iter_vars=("i", ), global_ubs=("N_ub", )))
     _assert_parses_as_python(body)
     assert "__pid0 = ct.bid(0)" in body
     assert "ct.arange(8, dtype=ct.int32)" in body
-    assert "__pid0 * 8" in body
-    assert "N_ub" in body
+    assert "(__offsets0 + i) < N_ub" in body
+    assert "__pid0 *" not in body
     assert "_o = __mask0" in body
     assert "&" not in body
 
 
 def test_tile_mask_gen_cutile_K2_combines_per_dim_via_broadcast_and_amp():
-    """K=2 mask combines two per-dim masks via ``broadcast_to`` and ``&``."""
+    """K=2 mask combines two per-dim masks via ``broadcast_to`` and ``&``;
+    each per-dim mask is based on its iter var (see the K=1 test)."""
     body, _ = _expand_cutile(TileMaskGen(name="M", widths=(4, 8), iter_vars=("i", "j"), global_ubs=("M_ub", "N_ub")))
     _assert_parses_as_python(body)
     assert "ct.arange(4" in body
     assert "ct.arange(8" in body
-    assert "__pid0 * 4" in body
-    assert "__pid1 * 8" in body
+    assert "(__offsets0 + i) < M_ub" in body
+    assert "(__offsets1 + j) < N_ub" in body
     assert "ct.broadcast_to(__mask0[:, None], (4, 8))" in body
     assert "ct.broadcast_to(__mask1[None, :], (4, 8))" in body
     assert " & " in body

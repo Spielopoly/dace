@@ -269,6 +269,20 @@ class TestCuTileArgumentMarshalling:
         ref = np.minimum(np.maximum(a1, 2), 10) * a + a2 * b + c
         np.testing.assert_array_equal(np.asarray(out), ref)
 
+    def test_int_scalar_above_int32_range_reaches_ct_launch(self):
+        """int64 Scalar args >= 2**31: the by-value path raised OverflowError
+        (cuda.tile types Python ints as int32); scalars now travel as
+        1-element device arrays."""
+        csdfg = _cutile_compile(_compute_like)
+        rng = np.random.default_rng(43)
+        m, n = 32, 40
+        a1 = rng.integers(0, 1000, size=(m, n)).astype(np.int64)
+        a2 = rng.integers(0, 1000, size=(m, n)).astype(np.int64)
+        a, b, c = np.int64(2**33), np.int64(3), np.int64(2**31)
+        out = csdfg(array_1=a1, array_2=a2, a=a, b=b, c=c, M=np.int64(m), N=np.int64(n))
+        ref = np.minimum(np.maximum(a1, 2), 10) * a + a2 * b + c
+        np.testing.assert_array_equal(np.asarray(out), ref)
+
     def test_gpu_element_to_host_scalar_copy(self):
         """Host scalars fed from GPU elements + scalar launch args (syrk)."""
         csdfg = _cutile_compile(_syrk_like)
@@ -284,11 +298,11 @@ class TestCuTileArgumentMarshalling:
                 ref[i, :i + 1] += alpha * A[i, k] * A[:i + 1, k]
 
         csdfg(alpha=alpha, beta=beta, C=C, A=A, N=n, M=m)
-        # rtol matches the NPBench harness: the cuda.tile runtime packs float
-        # kernel scalars as float32 (a runtime limitation that predates the
-        # marshalling fix -- np.float64 subclasses float and was truncated
-        # the same way), so float64 scalar paths carry ~1e-8 relative error.
-        np.testing.assert_allclose(C, ref, rtol=1e-5)
+        # Float scalars now travel to kernels as 1-element float64 device
+        # arrays (full precision; the old by-value path was truncated to
+        # float32 by the cuda.tile boundary). rtol only allows for
+        # reduction-order slack.
+        np.testing.assert_allclose(C, ref, rtol=1e-12)
 
     def test_tail_tile_column_assignment_and_gather_load(self):
         """Single-column tail writes + column gather loads (adi/cavity_flow)."""

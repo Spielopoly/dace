@@ -9,8 +9,8 @@ target. Thin subclasses: :class:`VectorizeCPUMultiDim` (device=CPU), :class:`Vec
 
 Locked knobs (constructor has full semantics):
 
-* ``target_isa`` ∈ ``{AUTO, AVX512, AVX2, ARM_SVE, ARM_NEON, SCALAR, CUDA}`` (K=1 backend; AUTO
-  detects host ISA at expansion).
+* ``target_isa`` ∈ ``{AUTO, AVX512, AVX2, ARM_SVE, ARM_NEON, SCALAR, CUDA, CUTILE}`` (K=1 backend;
+  AUTO detects host ISA at expansion).
 * ``widths`` — innermost-last, len ∈ ``{1,2,3}``, powers of 2.
 * ``remainder_strategy`` — ``masked_tail`` (default), ``full_mask``, ``scalar_postamble``.
 * ``branch_mode`` — ``merge`` (default) or ``fp_factor``.
@@ -568,8 +568,8 @@ class VectorizeMultiDim(ppl.Pipeline):
         :param config: Every vectorizer knob bundled into one dataclass -- tile ``widths``,
             ``target_isa`` (:class:`ISA`), ``remainder_strategy`` (:class:`RemainderStrategy`),
             ``branch_mode`` (:class:`BranchMode`), ``device``, and the behavioural flags
-            (``scalar_remainder_emit``, ``loop_to_map_permissive``,
-            ``expand_tile_nodes``, ``validate``, ``validate_all``, ``assume_even``). See
+            (``scalar_remainder_emit``, ``loop_to_map_permissive``, ``expand_tile_nodes``,
+            ``validate``, ``validate_all``, ``assume_even``, ``assumption_guard``). See
             :class:`VectorizeConfig` for the per-field documentation.
         :raises NotImplementedError: On any disallowed knob combination (a K=1-only knob at
             K>=2, or fp_factor with a masked remainder).
@@ -813,6 +813,7 @@ class VectorizeMultiDim(ppl.Pipeline):
         self._validate = validate
         self._validate_all = validate_all
         self._assume_even = assume_even
+        self._assumption_guard = config.assumption_guard
 
     def apply_pass(self, sdfg: dace.SDFG, pipeline_results) -> Optional[int]:
         """Run the prep + emit pipeline, then expand lib nodes + audit.
@@ -1021,7 +1022,10 @@ class VectorizeMultiDim(ppl.Pipeline):
         # LAST -- after expansion + the per-lane audit -- so nothing reshapes the start block after
         # (the same "runs last" rule the canonicalize guard follows to avoid orphaning its state).
         # No-op when the SDFG has no signed-integer free symbols (fixed-size kernels).
-        insert_assumption_guards(sdfg)
+        # Gated on ``assumption_guard``: the guard is a CPP ``__builtin_trap`` tasklet the
+        # Python/cuTile backend cannot codegen, so that track disables it.
+        if self._assumption_guard:
+            insert_assumption_guards(sdfg)
         # Final validate (gated on the ``validate`` knob, default on): the core passes
         # (WidenAccesses + tile-lib insertion) leave the SDFG transiently invalid, so the
         # per-subpass gate skips them; by here they've all completed (and, on the expand path,

@@ -17,6 +17,7 @@ import dace
 from dace import dtypes
 from dace.transformation.passes.vectorization.vectorize_cutile import VectorizeCuTile
 from dace.transformation.passes.vectorization.vectorize_cpu_multi_dim import VectorizeCPUMultiDim
+from dace.transformation.passes.vectorization.config import VectorizeConfig
 
 N = dace.symbol("N")
 
@@ -87,7 +88,7 @@ def test_fmod_decomposes_and_drops_cpp_mod():
 
 def test_fmod_cpu_matches_numpy():
     sdfg = _fmod.to_sdfg(simplify=False)
-    VectorizeCPUMultiDim(widths=(8, )).apply_pass(sdfg, {})
+    VectorizeCPUMultiDim(VectorizeConfig(widths=(8, ))).apply_pass(sdfg, {})
     csdfg = sdfg.compile()
     a, b = _inputs()
     out = np.zeros_like(a)

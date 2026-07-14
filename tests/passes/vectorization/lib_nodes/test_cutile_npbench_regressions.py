@@ -35,6 +35,7 @@ from dace.sdfg import nodes as nd
 from dace.transformation.passes.vectorization.cutile_lowering import (CuTileSetLibraryImplementations,
                                                                       _demote_residual_gpu_device_maps)
 from dace.transformation.passes.vectorization.vectorize_cpu_multi_dim import VectorizeCPUMultiDim
+from dace.transformation.passes.vectorization.config import VectorizeConfig
 from dace.transformation.passes.vectorization.vectorize_cutile import VectorizeCuTile
 
 N = dace.symbol("N")
@@ -172,7 +173,8 @@ def test_lane_id_materializes_tile_iota_not_cpp_tasklet():
     """The lane-id path places a TileIota lib node (Python-compatible for
     cuTile), not a raw CPP tasklet."""
     sdfg = _build_lane_id_kernel(16)
-    VectorizeCPUMultiDim(widths=(8, ), target_isa="CUTILE", expand_tile_nodes=False).apply_pass(sdfg, {})
+    VectorizeCPUMultiDim(VectorizeConfig(widths=(8, ), target_isa="CUTILE",
+                                         expand_tile_nodes=False)).apply_pass(sdfg, {})
     iotas = [n for n, _ in sdfg.all_nodes_recursive() if isinstance(n, TileIota)]
     assert iotas, "lane-id symbol should be materialized via a TileIota lib node"
     cpp_tasklets = [t for t in _all_tasklets(sdfg) if t.language != dtypes.Language.Python]
@@ -191,7 +193,7 @@ def test_lane_id_pure_path_numerics_unchanged():
     ref.name = "lane_id_reg_ref"
     vec = _build_lane_id_kernel(n)
     vec.name = "lane_id_reg_vec"
-    VectorizeCPUMultiDim(widths=(8, ), target_isa="SCALAR").apply_pass(vec, {})
+    VectorizeCPUMultiDim(VectorizeConfig(widths=(8, ), target_isa="SCALAR")).apply_pass(vec, {})
     ref.compile()(A=a.copy(), B=b_ref)
     vec.compile()(A=a.copy(), B=b_vec)
     np.testing.assert_allclose(b_vec, b_ref, rtol=1e-12, atol=1e-12)

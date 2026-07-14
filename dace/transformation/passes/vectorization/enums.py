@@ -11,7 +11,11 @@ from typing import Union
 
 
 class ISA(str, enum.Enum):
-    """Target instruction set for the K=1 tile-op backend."""
+    """Target instruction set for the tile-op backend.
+
+    Per-ISA intrinsic expansions (AVX512/AVX2/ARM_SVE/ARM_NEON/CUDA) exist for
+    K=1 only; CUTILE and the ``pure`` fallback cover K<=3.
+    """
     AUTO = "AUTO"            #: resolve to the host's best ISA at expansion
     AVX512 = "AVX512"
     AVX2 = "AVX2"
@@ -19,6 +23,7 @@ class ISA(str, enum.Enum):
     ARM_NEON = "ARM_NEON"
     SCALAR = "SCALAR"        #: portable scalar reference
     CUDA = "CUDA"           #: GPU half2 (implies device=GPU)
+    CUTILE = "CUTILE"       #: cuTile ``cuda.tile`` CuTile Python-backend
 
 
 class RemainderStrategy(str, enum.Enum):

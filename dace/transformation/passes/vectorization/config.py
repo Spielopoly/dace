@@ -39,6 +39,9 @@ class VectorizeConfig:
     :param validate: Validate the SDFG once after the whole pipeline.
     :param validate_all: Also validate between every subpass.
     :param assume_even: Assume every tiled extent is divisible (skip the remainder).
+    :param assumption_guard: Insert the runtime symbol-nonnegativity guard state after the
+        pipeline. Set ``False`` for backends that cannot codegen its CPP trap tasklet
+        (e.g. the Python/cuTile backend).
     :param device: Target device (CPU / GPU).
     """
     widths: Tuple[int, ...]
@@ -51,6 +54,7 @@ class VectorizeConfig:
     validate: bool = True
     validate_all: bool = False
     assume_even: bool = False
+    assumption_guard: bool = True
     device: DeviceType = DeviceType.CPU
 
     def __post_init__(self) -> None:

@@ -2,44 +2,6 @@
 """cuTile lowering passes: tileops-anchored schedule, storage, and
 implementation stamping for the Python/cuTile backend.
 
-The passes in this module lower a tile-op SDFG — produced by
-``VectorizeCPUMultiDim(target_isa="CUTILE", expand_tile_nodes=False)`` —
-into the form the cuTile code generator (``dace/codegen/py/cutile_target.py``)
-consumes.  GPU scheduling, storage stamping, and host/device data copies are
-delegated to ``sdfg.apply_gpu_transformations()``; the passes here handle the
-tileops-specific concerns that the generic GPU transform does not cover.
-
-Required order::
-
-    CuTileValidateTiles           # tile-op anchors exist; widths are powers of 2
-    mark_tile_op_memlets_allow_oob  # 2b: allow_oob on tileops-adjacent memlet trees
-    sdfg.apply_gpu_transformations(...)  # GPU scheduling, storage, data copies
-    clamp_propagated_oob_memlets  # 3b: re-clamp propagated tileops OOB subsets
-    sdfg.simplify()               # 3c: simplify + validate
-    GPUDeviceToCuTile             # re-stamp tileops-anchored maps GPU_Device -> CuTile
-    CuTileSetTileStorage          # Register tile transients -> CuTile_Tile
-    CuTileSetLibraryImplementations  # non-tileops lib nodes (BLAS MatMul) -> CuPy, expand
-    CuTileSetImplementations      # tileops lib nodes -> target_isa="CUTILE", implementation="cutile"
-
-followed by ``sdfg.expand_library_nodes()`` and
-``sdfg.backend = dtypes.BackendLanguage.Python`` (single core-API calls,
-performed by the ``VectorizeCuTile`` orchestrator or two explicit lines in a
-manual recipe).
-
-Out-of-order behavior (every pass cheaply validates its preconditions and
-warns by default; ``strict=True`` raises instead):
-
-- A pass run before the vectorizer finds no tile-op anchors -> warn/no-op.
-- A storage/adapter pass run before ``apply_gpu_transformations()`` finds no
-  GPU_Device-scheduled map -> warn/no-op.
-- ``CuTileSetImplementations`` run after ``expand_library_nodes()`` finds no
-  library nodes -> warn/no-op.
-- Every pass is idempotent: re-running the whole sequence changes nothing.
-
-Exception: non-power-of-2 tile widths raise ``ValueError`` unconditionally
-(a hard ``cuda.tile`` runtime requirement, not gated by ``strict``), as does
-a tile-op node type that lacks a ``'cutile'`` implementation (loud failure
-instead of a silent ``'pure'`` fallback).
 """
 import warnings
 from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, Type
@@ -67,12 +29,10 @@ def _tile_node_types() -> Tuple[Type[nodes.LibraryNode], ...]:
     Imported lazily to keep the transformation package importable without
     pulling in the tileops library at module-import time.
 
-    :returns: All tile-op ``LibraryNode`` classes exported by
-        :mod:`dace.libraries.tileops.nodes` (including :class:`TileIota`).
+    :returns: :data:`dace.libraries.tileops.nodes.TILEOPS_NODE_TYPES`.
     """
-    from dace.libraries.tileops.nodes import (TileBinop, TileIota, TileITE, TileLoad, TileMaskGen, TileMMA, TileReduce,
-                                              TileStore, TileUnop)
-    return (TileBinop, TileIota, TileITE, TileLoad, TileMaskGen, TileMMA, TileReduce, TileStore, TileUnop)
+    from dace.libraries.tileops.nodes import TILEOPS_NODE_TYPES
+    return TILEOPS_NODE_TYPES
 
 
 def _collect_tile_nodes(sdfg: SDFG) -> List[Tuple[nodes.LibraryNode, SDFGState]]:
@@ -108,7 +68,7 @@ def _collect_tileops_adjacent_edges(sdfg: SDFG) -> Tuple[Set[int], Set[int]]:
 
     Walks the memlet tree of each tileops-incident edge and follows
     non-transient (connector) arrays across NestedSDFG boundaries up to the
-    top-level SDFG, covering the ``nest_map_bodies=True`` descent where the
+    top-level SDFG, covering the always-on NestedSDFG body descent where the
     tileops nodes live inside a NestedSDFG body.
 
     :param sdfg: SDFG to search (NestedSDFGs included).
@@ -206,9 +166,9 @@ def clamp_propagated_oob_memlets(sdfg: SDFG) -> int:
     * Edges incident to library nodes: tile-op expansions require their own
       memlet subsets to match ``widths`` exactly (full-tile write contract).
     * NestedSDFG boundary edges whose connector feeds a tileops node
-      (``nest_map_bodies=True`` descent): the inner connector array is a full
-      ``W``-wide window, so the boundary subset must stay ``W`` wide. When
-      provably OOB they are marked ``allow_oob`` instead of clamped.
+      (the always-on NestedSDFG body descent): the inner connector array is a
+      full ``W``-wide window, so the boundary subset must stay ``W`` wide.
+      When provably OOB they are marked ``allow_oob`` instead of clamped.
 
     :param sdfg: SDFG to fix up in place (NestedSDFGs included).
     :returns: Number of clamped memlet dimensions.
@@ -421,8 +381,51 @@ def _demote_residual_gpu_device_maps(sdfg: SDFG, strict: bool, pass_name: str) -
                 "(one device round-trip per element), which is pathological for "
                 "anything but tiny scalar-control maps", strict)
         map_node.map.schedule = dtypes.ScheduleType.Sequential
+        _promote_demoted_scope_transients(graph, map_node)
         demoted += 1
     return demoted
+
+
+def _promote_demoted_scope_transients(state: SDFGState, map_entry: nodes.MapEntry) -> int:
+    """Move ``Register`` transient Arrays inside a just-demoted map scope to ``GPU_Global``.
+
+    ``apply_gpu_transformations(register_transients=True)`` stamps transients inside a
+    GPU_Device map ``Register`` on the assumption they stay kernel-internal. After the map
+    is demoted to a host driver loop, such a transient becomes a host (numpy) array
+    bridging ``GPU_Global`` (cupy) operands — e.g. doitgen's matmul result buffer — and
+    the generated ``cupy_slice[...] = numpy_array`` copy raises at runtime. Re-stamp them
+    ``GPU_Global`` so the whole demoted body stays device-resident. Views and Scalars are
+    left alone (a View follows its viewed array; Scalars feed host control flow).
+    Descends into NestedSDFGs within the scope: their ``Register`` Array transients bridge
+    the same ``GPU_Global`` operands and fail the same way on whole-array copies.
+
+    The re-stamp is descriptor-level (``sdfg.arrays``), not scope-level: a transient whose
+    descriptor is also accessed OUTSIDE the demoted scope changes storage at every use site,
+    not just inside this scope.
+
+    :param state: State containing the demoted map.
+    :param map_entry: Entry node of the map that was just demoted to Sequential.
+    :returns: Number of descriptors re-stamped.
+    """
+    promoted = 0
+    scope = state.scope_subgraph(map_entry, include_entry=False, include_exit=False)
+    # (state, nodes) pairs: the scope itself plus every NestedSDFG under it, recursively.
+    frontier = [(state, scope.nodes())]
+    while frontier:
+        st, nds = frontier.pop()
+        for node in nds:
+            if isinstance(node, nodes.NestedSDFG):
+                frontier.extend((ns, ns.nodes()) for ns in node.sdfg.all_states())
+                continue
+            if not isinstance(node, nodes.AccessNode):
+                continue
+            desc = st.sdfg.arrays.get(node.data)
+            if (desc is None or not desc.transient or not isinstance(desc, data.Array) or isinstance(desc, data.View)
+                    or desc.storage != dtypes.StorageType.Register):
+                continue
+            desc.storage = dtypes.StorageType.GPU_Global
+            promoted += 1
+    return promoted
 
 
 def _diagnose_no_anchors(pass_name: str, sdfg: SDFG, strict: bool) -> None:
@@ -453,8 +456,9 @@ def _diagnose_no_anchors(pass_name: str, sdfg: SDFG, strict: bool) -> None:
     else:
         _warn_or_raise(
             f"{pass_name}: no tileops library nodes found and no other library nodes present; "
-            "the SDFG appears not to have been vectorized -- run "
-            "VectorizeCPUMultiDim(target_isa='CUTILE', expand_tile_nodes=False) first", strict)
+            "the SDFG appears not to have been vectorized -- run VectorizeCuTile (or "
+            "VectorizeMultiDim with a target_isa=ISA.CUTILE, expand_tile_nodes=False config) "
+            "first", strict)
 
 
 @properties.make_properties

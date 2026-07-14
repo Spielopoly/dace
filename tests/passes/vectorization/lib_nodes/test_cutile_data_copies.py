@@ -34,6 +34,7 @@ from dace.transformation.passes.vectorization.cutile_lowering import (
 from dace.transformation.passes.vectorization.vectorize_cpu_multi_dim import (
     VectorizeCPUMultiDim,
 )
+from dace.transformation.passes.vectorization.config import VectorizeConfig
 
 
 # ============================================================
@@ -130,10 +131,11 @@ def _lower_full_pipeline(sdfg: SDFG, widths: Tuple[int, ...] = (8,)) -> None:
     :param widths: Per-dim tile widths (innermost-last).
     """
     vec = VectorizeCPUMultiDim(
-        widths=widths,
-        target_isa="CUTILE",
-        expand_tile_nodes=False,
-    )
+        VectorizeConfig(
+            widths=widths,
+            target_isa="CUTILE",
+            expand_tile_nodes=False,
+        ))
     vec.apply_pass(sdfg, {})
     CuTileValidateTiles().apply_pass(sdfg, {})
     sdfg.apply_gpu_transformations(

@@ -414,19 +414,23 @@ class TestGPUSameStorageRuntime:
 # ============================================================
 
 
-def _build_vadd_with_tile_copy(name: str, width: int = 8) -> SDFG:
+def _build_vadd_with_tile_copy(name: str, width: int = 8) -> Tuple[SDFG, str]:
     """Lower a vadd kernel via ``VectorizeCuTile``, then splice a tile copy.
 
-    After lowering, the result tile ``C_tile_out`` (produced by the binop)
-    flows straight into the ``TileStore``.  We insert a new ``CuTile_Tile``
-    transient ``C_tile_copy`` between them, so the store reads from the copy.
-    The cuTile AccessNode-centric codegen emits ``C_tile_copy = C_tile_out``
-    -- the ``CuTile_Tile -> CuTile_Tile`` tile-rename path -- and the result
-    must be unchanged (``C == A + B``).
+    After lowering, the result tile (produced by the binop) flows straight
+    into the ``TileStore``.  We insert a new ``CuTile_Tile`` transient
+    ``C_tile_copy`` between them, so the store reads from the copy.  The cuTile
+    AccessNode-centric codegen emits ``C_tile_copy = <out tile>`` -- the
+    ``CuTile_Tile -> CuTile_Tile`` tile-rename path -- and the result must be
+    unchanged (``C == A + B``).
+
+    The result tile's name is ``C_tile_out`` under the legacy order and
+    ``gpu_C_tile_out`` under the GPU-first order (arrays are renamed with a
+    ``gpu_`` prefix by the GPU transform); it is resolved by suffix match.
 
     :param name: Unique SDFG name.
     :param width: Tile width (power of two).
-    :returns: The lowered + spliced SDFG, ready to compile.
+    :returns: The lowered + spliced SDFG and the resolved out-tile name.
     """
     N = dace.symbol("N")
     sdfg = dace.SDFG(name)
@@ -445,20 +449,26 @@ def _build_vadd_with_tile_copy(name: str, width: int = 8) -> SDFG:
     VectorizeCuTile(widths=(width, )).apply_pass(sdfg, {})
 
     # Locate the kernel state, the result-tile AccessNode, and the store edge.
-    kstate = next(s for s in sdfg.all_states()
-                  if any(getattr(n, "data", None) == "C_tile_out" for n in s.nodes()))
-    c_out = next(n for n in kstate.nodes() if getattr(n, "data", None) == "C_tile_out")
+    # The tile transient is named ``C_tile_out`` (legacy) or ``gpu_C_tile_out``
+    # (GPU-first) -- match by suffix.
+    def _is_out_tile(n) -> bool:
+        data = getattr(n, "data", None)
+        return isinstance(data, str) and data.endswith("C_tile_out")
+
+    kstate = next(s for s in sdfg.all_states() if any(_is_out_tile(n) for n in s.nodes()))
+    c_out = next(n for n in kstate.nodes() if _is_out_tile(n))
+    out_name = c_out.data
     store_edge = next(e for e in kstate.out_edges(c_out) if isinstance(e.dst, nodes.LibraryNode))
     store = store_edge.dst
 
-    # Splice a CuTile_Tile copy: C_tile_out -> C_tile_copy -> TileStore.
-    sdfg.add_array("C_tile_copy", sdfg.arrays["C_tile_out"].shape, dace.float64,
+    # Splice a CuTile_Tile copy: <out tile> -> C_tile_copy -> TileStore.
+    sdfg.add_array("C_tile_copy", sdfg.arrays[out_name].shape, dace.float64,
                    storage=ST.CuTile_Tile, transient=True)
     c_copy = kstate.add_access("C_tile_copy")
     kstate.remove_edge(store_edge)
-    kstate.add_edge(c_out, None, c_copy, None, dace.Memlet(data="C_tile_out"))
+    kstate.add_edge(c_out, None, c_copy, None, dace.Memlet(data=out_name))
     kstate.add_edge(c_copy, None, store, store_edge.dst_conn, dace.Memlet(data="C_tile_copy"))
-    return sdfg
+    return sdfg, out_name
 
 
 @pytest.mark.gpu
@@ -467,8 +477,8 @@ class TestCuTileTileSameStorageRuntime:
 
     def test_tile_to_tile_copy_matches_numpy(self):
         """A spliced tile-to-tile copy keeps ``C == A + B`` (aligned size)."""
-        sdfg = _build_vadd_with_tile_copy("cutile_tile2tile_aligned")
-        assert "C_tile_copy = C_tile_out" in _full_code(sdfg)
+        sdfg, out_name = _build_vadd_with_tile_copy("cutile_tile2tile_aligned")
+        assert f"C_tile_copy = {out_name}" in _full_code(sdfg)
 
         n = 64
         rng = np.random.default_rng(7)
@@ -480,7 +490,7 @@ class TestCuTileTileSameStorageRuntime:
 
     def test_tile_to_tile_copy_unaligned(self):
         """Tile-to-tile copy with a non-divisible size (masking + rename)."""
-        sdfg = _build_vadd_with_tile_copy("cutile_tile2tile_unaligned")
+        sdfg, _ = _build_vadd_with_tile_copy("cutile_tile2tile_unaligned")
 
         n = 17  # not a multiple of the tile width
         rng = np.random.default_rng(8)

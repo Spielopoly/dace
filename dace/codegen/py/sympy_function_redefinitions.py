@@ -4,16 +4,14 @@ Min = min
 Max = max
 Abs = abs
 
-
-# Integer-exact ceil/floor division: NO float cast (cuTile cannot int() tiles;
-# see commit a18642205).
-def int_ceil(x, y=1):
+def int_ceil(x, y):
     return -(-x // y)
 
-
-def int_floor(x, y=1):
+def int_floor(x, y):
     return x // y
 
+def py_mod(x, y):
+    return x % y
 
 # Sympy boolean if-then-else (emitted verbatim by boundary-ITE tasklets, e.g.
 # ``_o = ITE(cond, _new, _old)``). A plain-bool condition branches directly
@@ -101,7 +99,6 @@ _NUMPY_EQUIVALENTS = {
     'pow': 'power',
     'ceiling': 'ceil',
     # DaCe runtime helper names (dace/runtime/include/dace/math.h).
-    'py_mod': 'mod',  # Python-sign modulo
     'cpp_mod': 'fmod',  # C-sign modulo
     'py_floor': 'floor_divide',  # floor division
     'np_float_pow': 'float_power',

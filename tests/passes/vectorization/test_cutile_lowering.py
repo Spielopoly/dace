@@ -3,7 +3,7 @@
 
 Each pass in :mod:`dace.transformation.passes.vectorization.cutile_lowering`
 is tested in isolation on SDFGs produced by
-``VectorizeCPUMultiDim(target_isa="CUTILE", expand_tile_nodes=False)``, plus
+``VectorizeMultiDim(VectorizeConfig(target_isa=ISA.CUTILE, expand_tile_nodes=False))``, plus
 hand-built SDFGs for the anchor-construction corner cases. Ordering /
 out-of-order precondition behavior and the full documented sequence through
 code generation (text assertions only -- no compilation, no kernel launches)
@@ -42,23 +42,33 @@ from dace.transformation.passes.vectorization.cutile_lowering import (
     _tile_node_types,
     clamp_propagated_oob_memlets,
 )
-from dace.transformation.passes.vectorization.vectorize_cpu_multi_dim import (
-    VectorizeCPUMultiDim, )
+from dace.transformation.passes.vectorization.vectorize_multi_dim import (
+    VectorizeMultiDim, )
+from dace.transformation.passes.vectorization.config import VectorizeConfig
+from dace.transformation.passes.vectorization.enums import ISA
+from dace.dtypes import DeviceType
 
 # ============================================================
 # Fixture builders
 # ============================================================
 
 
-def _vectorize_cutile(sdfg: SDFG, widths: Tuple[int, ...], **kwargs) -> None:
+def _vectorize_cutile(sdfg: SDFG, widths: Tuple[int, ...]) -> None:
     """Run the building-block vectorizer config for the cuTile lowering.
+
+    Uses ``device=CPU`` (host maps) so the individual lowering passes can be
+    exercised in isolation; the passes are order-tolerant by design.
 
     :param sdfg: The SDFG to vectorize in place.
     :param widths: Per-dim tile widths, innermost-last.
-    :param kwargs: Extra ``VectorizeCPUMultiDim`` knobs (e.g.
-        ``nest_map_bodies=True``).
     """
-    VectorizeCPUMultiDim(widths=widths, target_isa="CUTILE", expand_tile_nodes=False, **kwargs).apply_pass(sdfg, {})
+    VectorizeMultiDim(
+        VectorizeConfig(widths=widths,
+                        target_isa=ISA.CUTILE,
+                        expand_tile_nodes=False,
+                        validate=False,
+                        assumption_guard=False,
+                        device=DeviceType.CPU)).apply_pass(sdfg, {})
 
 
 def _build_unvectorized_vadd_sdfg() -> SDFG:
@@ -73,10 +83,10 @@ def _build_unvectorized_vadd_sdfg() -> SDFG:
     return cutile_lowering_vadd_plain.to_sdfg()
 
 
-def _build_vadd_k1_sdfg(**vectorizer_kwargs) -> SDFG:
+def _build_vadd_k1_sdfg() -> SDFG:
     """Symbolic-size K=1 vadd, vectorized with ``widths=(8,)``."""
     sdfg = _build_unvectorized_vadd_sdfg()
-    _vectorize_cutile(sdfg, (8, ), **vectorizer_kwargs)
+    _vectorize_cutile(sdfg, (8, ))
     return sdfg
 
 
@@ -814,8 +824,8 @@ class TestClampPropagatedOOBMemlets:
         assert kept.allow_oob
 
     @pytest.mark.gpu
-    def test_nest_map_bodies_boundary_tail_gpu(self):
-        """``nest_map_bodies=True`` descent with a non-divisible concrete
+    def test_boundary_tail_nested_body_gpu(self):
+        """Always-on NestedSDFG body descent with a non-divisible concrete
         size: the boundary-tail window survives the clamp gate and the
         kernel matches NumPy end-to-end."""
         from dace.transformation.passes.vectorization import VectorizeCuTile
@@ -826,7 +836,7 @@ class TestClampPropagatedOOBMemlets:
                 C[i] = A[i] + B[i]
 
         sdfg = clamp_nest_boundary_vadd.to_sdfg()
-        VectorizeCuTile(widths=(8, ), nest_map_bodies=True).apply_pass(sdfg, {})
+        VectorizeCuTile(widths=(8, )).apply_pass(sdfg, {})
         rng = np.random.default_rng(0)
         A = rng.random(100)
         B = rng.random(100)

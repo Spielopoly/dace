@@ -393,15 +393,16 @@ class TestOrchestratorCodegen:
         ast.parse(code)
         assert "@ct.kernel" in code
 
-    def test_nest_map_bodies_codegen(self):
-        """nest_map_bodies=True drives the map body through a NestedSDFG.
+    def test_nested_body_codegen(self):
+        """The always-on NestedSDFG body descent drives the map body through
+        a NestedSDFG.
 
         The cuTile codegen emits NSDFGs as module-level functions, so this
         exercises the NSDFG-body path through the full orchestrator. The
         result must still be valid Python with cuTile primitives.
         """
         sdfg = _build_vadd_sdfg("vcutile_code_nest")
-        VectorizeCuTile(widths=(8, ), nest_map_bodies=True).apply_pass(sdfg, {})
+        VectorizeCuTile(widths=(8, )).apply_pass(sdfg, {})
         code = _generate_code(sdfg)
         ast.parse(code)
         assert "import cuda.tile as ct" in code
@@ -433,8 +434,13 @@ class TestAPISurface:
             VectorizeCuTile(widths=(6, ))
 
     def test_bad_remainder_strategy_raises_eagerly(self):
-        """An unknown remainder_strategy is rejected at construction."""
-        with pytest.raises(NotImplementedError):
+        """An unknown remainder_strategy is rejected at construction.
+
+        The inner ``VectorizeConfig`` coerces the string to a
+        ``RemainderStrategy`` enum, raising ``ValueError`` for an unknown
+        value.
+        """
+        with pytest.raises(ValueError, match="RemainderStrategy"):
             VectorizeCuTile(widths=(8, ), remainder_strategy="bogus")
 
     def test_zero_anchor_warns_and_returns_none(self):

@@ -154,12 +154,10 @@ def map_body_has_library_node(state: SDFGState, map_entry: dace.nodes.MapEntry) 
     ...) are EXCLUDED: they are inserted into the body DURING tiling, so treating them as
     opaque would make a half-tiled map refuse its own remaining tile passes.
     """
-    from dace.libraries.tileops.nodes import (TileBinop, TileITE, TileLoad, TileMaskGen, TileReduce, TileStore,
-                                              TileUnop)
-    tile_ops = (TileBinop, TileITE, TileLoad, TileMaskGen, TileReduce, TileStore, TileUnop)
+    from dace.libraries.tileops.nodes import TILEOPS_NODE_TYPES
 
     def _opaque(n) -> bool:
-        return isinstance(n, dace.nodes.LibraryNode) and not isinstance(n, tile_ops)
+        return isinstance(n, dace.nodes.LibraryNode) and not isinstance(n, TILEOPS_NODE_TYPES)
 
     for node in state.all_nodes_between(map_entry, state.exit_node(map_entry)):
         if _opaque(node):

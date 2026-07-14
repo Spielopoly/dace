@@ -241,34 +241,58 @@ def _rewrite_cutile_tasklet_code(code: str, tile_conn_dtypes: Dict[str, str]) ->
     return ast.unparse(tree)
 
 
-def _is_float_scalar(desc: object) -> bool:
-    """Whether *desc* is a floating-point ``data.Scalar``.
+def _is_device_scalar(desc: object) -> bool:
+    """Whether *desc* is a numeric ``data.Scalar`` that must reach a cuTile
+    kernel through device memory.
 
-    Float scalars need the device-memory path into a cuTile kernel: the
-    ``cuda.tile`` frontend types every by-value Python/numpy float argument as
-    ``float32`` (``typeof_pyval`` -> ``default_float_type``), silently losing
-    float64 precision. They are therefore passed as 1-element device arrays
-    and bound as 0-d tiles via ``ct.load(name, (0,), shape=())`` in-kernel.
+    The ``cuda.tile`` launch boundary (1.5.0) cannot pass numeric scalars by
+    value faithfully: every by-value Python/numpy float is typed ``float32``
+    (silent float64 precision loss), a Python int >= 2**31 raises
+    ``OverflowError`` (int32 typing), and numpy int/float scalar types are
+    rejected outright. All float/int/uint Scalars are therefore passed as
+    1-element device arrays and bound as scalar tiles via
+    ``ct.load(name, (0,), shape=()).item()`` in-kernel (bit-exact for f64 and
+    int64/uint64). Bool scalars stay by value: the boundary types them
+    exactly (``ScalarConstraint(bool_)``).
 
     :param desc: A data descriptor (or ``None``).
-    :returns: ``True`` for floating-point ``data.Scalar`` descriptors.
+    :returns: ``True`` for float/int/uint ``data.Scalar`` descriptors.
     """
-    return isinstance(desc, data.Scalar) and desc.dtype.as_numpy_dtype().kind == "f"
+    return isinstance(desc, data.Scalar) and desc.dtype.as_numpy_dtype().kind in "fiu"
 
 
 def _scalar_tile_load(name: str) -> str:
-    """The 0-d tile load binding a float-scalar kernel parameter.
+    """The 0-d tile load binding a device-scalar kernel parameter.
+
+    The trailing ``.item()`` (``cuda.tile``'s ``Tile.item``, equivalent to
+    ``reshape(())``) is a device-side scalar extraction -- NOT the host
+    ``numpy``/``cupy`` ``.item()`` -- that normalizes the load to a canonical
+    scalar tile. It stays on device (no host copy) and yields the scalar form
+    contexts like load indices and ``range`` bounds expect.
 
     :param name: The 1-element device-array parameter name.
-    :returns: The ``ct.load`` expression producing a 0-d tile.
+    :returns: The ``ct.load(...).item()`` expression producing a scalar tile.
     """
-    return f"ct.load({name}, (0,), shape=())"
+    return f"ct.load({name}, (0,), shape=()).item()"
 
 
-def _is_device_float_scalar(desc: object) -> bool:
-    """Whether *desc* is a float ``data.Scalar`` materialized as a 1-element
+def _scalar_element_load(name: str, index_exprs: str) -> str:
+    """The scalar load of a single addressed element of an in-kernel array.
+
+    Like :func:`_scalar_tile_load`, the trailing device-side ``.item()``
+    normalizes the load to a scalar tile (no host copy).
+
+    :param name: The in-kernel array name.
+    :param index_exprs: Comma-joined per-dim index expressions.
+    :returns: The ``ct.load(...).item()`` expression producing a scalar tile.
+    """
+    return f"ct.load({name}, ({index_exprs},), shape=()).item()"
+
+
+def _is_device_staged_scalar(desc: object) -> bool:
+    """Whether *desc* is a numeric ``data.Scalar`` materialized as a 1-element
     DEVICE array at kernel entry — either a non-transient kernel parameter
-    (launch-site normalization, see :func:`_is_float_scalar`) or a transient
+    (launch-site normalization, see :func:`_is_device_scalar`) or a transient
     staged in ``GPU_Global`` storage by the data-copy insertion. Both need the
     0-d ``ct.load`` binding; a transient in Register/Default storage is a plain
     in-kernel Python variable and must be bound by rename instead.
@@ -276,26 +300,29 @@ def _is_device_float_scalar(desc: object) -> bool:
     :param desc: A data descriptor (or ``None``).
     :returns: ``True`` when the in-kernel binding must be a 0-d tile load.
     """
-    if not _is_float_scalar(desc):
+    if not _is_device_scalar(desc):
         return False
     return (not desc.transient) or desc.storage == dtypes.StorageType.GPU_Global
 
 
-def _element_index_exprs(subset: object) -> Optional[str]:
-    """Comma-joined index expressions when ``subset`` addresses exactly one
-    element; ``None`` when it spans more than one element (or size cannot be
-    proven 1 symbolically).
+def _element_index_exprs(subset: object, allow_multi_element: bool = False) -> Optional[str]:
+    """Comma-joined kernel-safe index expressions when ``subset`` addresses
+    exactly one element; ``None`` when it spans more than one element (or size
+    cannot be proven 1 symbolically).
 
     :param subset: A memlet subset (``Indices`` or ``Range``).
+    :param allow_multi_element: Render the per-dim begin expressions even for
+        a (possibly) multi-element ``Range`` instead of returning ``None``.
     :returns: ``"i, j"``-style index string, or ``None``.
     """
     if isinstance(subset, subsets.Indices):
         return ", ".join(symstr(i) for i in subset.indices)
-    try:
-        if any(sp.simplify(sp.sympify(r[1] - r[0])) != 0 for r in subset):
+    if not allow_multi_element:
+        try:
+            if any(sp.simplify(sp.sympify(r[1] - r[0])) != 0 for r in subset):
+                return None
+        except Exception:  # noqa: BLE001 -- unprovable extent: treat as non-element.
             return None
-    except Exception:  # noqa: BLE001 -- unprovable extent: treat as non-element.
-        return None
     return ", ".join(symstr(r[0]) for r in subset)
 
 
@@ -1350,8 +1377,9 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
     @staticmethod
     def _kernel_input_names(state: "SDFGState", entry: nodes.MapEntry) -> set:
         """Data names passed into the kernel (in-edges of the map entry) —
-        exactly the ``input_arrays`` the launch site normalizes (a float Scalar
-        param always becomes a 1-element device array; see ``generate_scope``).
+        exactly the ``input_arrays`` the launch site normalizes (a numeric
+        Scalar param always becomes a 1-element device array; see
+        ``generate_scope``).
 
         :param state: The state containing the map scope.
         :param entry: The CuTile-scheduled MapEntry of the kernel scope.
@@ -1363,31 +1391,32 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
             if e.data is not None and e.data.data is not None and isinstance(e.src, nodes.AccessNode)
         }
 
-    def _float_scalar_needs_tile_load(self, state: "SDFGState", entry: Optional[nodes.MapEntry], name: str,
-                                      desc: object) -> bool:
-        """Whether a float-Scalar read must be bound as a 0-d tile load.
+    def _scalar_needs_tile_load(self, state: "SDFGState", entry: Optional[nodes.MapEntry], name: str,
+                                desc: object) -> bool:
+        """Whether a numeric-Scalar read must be bound as a 0-d tile load.
 
         Mirrors the launch site exactly when the kernel entry is at hand: every
-        float Scalar in the kernel's INPUT list is a 1-element device array
-        (regardless of transience/storage — covariance's host-created transient
-        prefactor is still a param), while kernel-written scalars and scalars
-        defined inside the kernel are plain values. Without an entry (a nested
-        SDFG inside the kernel), fall back to the descriptor heuristic
-        (:func:`_is_device_float_scalar`).
+        numeric (float/int/uint) Scalar in the kernel's INPUT list is a
+        1-element device array (regardless of transience/storage —
+        covariance's host-created transient prefactor is still a param), while
+        kernel-written scalars, bool scalars, and scalars defined inside the
+        kernel are plain values. Without an entry (a nested SDFG inside the
+        kernel), fall back to the descriptor heuristic
+        (:func:`_is_device_staged_scalar`).
 
         :param state: The state owning the read.
         :param entry: The enclosing CuTile MapEntry, or ``None`` inside a
             nested SDFG.
         :param name: The data name being bound.
         :param desc: Its data descriptor.
-        :returns: ``True`` when the binding must be ``ct.load(name, (0,), shape=())``.
+        :returns: ``True`` when the binding must be ``ct.load(name, (0,), shape=()).item()``.
         """
-        if not _is_float_scalar(desc):
+        if not _is_device_scalar(desc):
             return False
         if entry is not None:
             return (name in self._kernel_input_names(state, entry)
                     and name not in self._kernel_output_names(state, entry))
-        return _is_device_float_scalar(desc)
+        return _is_device_staged_scalar(desc)
 
     def _emit_scalar_bridge_binding(self, sdfg: "SDFG", state: "SDFGState", node: nodes.AccessNode, cfg: object,
                                     state_id: int, callsite_stream: PythonCodeIOStream) -> None:
@@ -1409,7 +1438,7 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
         map range (a non-constant slice the ``cuda.tile`` compiler rejects),
         so the element is read with a scalar tile load using the *inner*
         memlet's subset, which is expressed in kernel-bound map parameters:
-        ``aa_const = ct.load(aa, (0, j), shape=())``.
+        ``aa_const = ct.load(aa, (0, j), shape=()).item()``.
 
         :param sdfg: The SDFG.
         :param state: The state holding ``node``.
@@ -1440,22 +1469,24 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
             src_name = outer_edge.data.data if outer_edge.data else outer_edge.src.data
             src_desc = sdfg.arrays.get(src_name)
             # Mirror the launch-site convention (``_launch_arg_expr``): only
-            # *input-only* float Scalars in DEVICE memory (kernel params, or
+            # *input-only* numeric Scalars in DEVICE memory (kernel params, or
             # GPU_Global-staged transients like gramschmidt's ``R_index``) are
             # 1-element device arrays bound as 0-d tiles; a kernel-written
-            # scalar is passed raw (and float input+output scalars are
-            # rejected in generate_scope). A Register/Default TRANSIENT float
+            # scalar is passed raw (and numeric input+output scalars are
+            # rejected in generate_scope). A Register/Default TRANSIENT
             # scalar is bound in-kernel as a plain Python variable (e.g.
             # syrk's ``alpha_times_A_slice``), so a ``ct.load`` on it would be
             # invalid -- it takes the rename path.
-            if self._float_scalar_needs_tile_load(state, kernel_entry, src_name, src_desc):
-                # Float scalar: the kernel parameter is a 1-element device
-                # array (launch-site normalization, full f64 precision); bind
-                # it as a 0-d tile.
+            if self._scalar_needs_tile_load(state, kernel_entry, src_name, src_desc):
+                # Numeric scalar: the kernel parameter is a 1-element device
+                # array (launch-site normalization, full f64/int64 precision);
+                # bind it as a 0-d tile.
                 source_expr = _scalar_tile_load(src_name)
             elif src_desc is None or isinstance(src_desc, data.Scalar):
-                # Integer/bool scalar: the kernel parameter carries the plain
-                # value (launch-site ``.item()``), so the bridge is a rename.
+                # Non-numeric scalar (bool -- complex is rejected at the
+                # launch boundary) or unknown descriptor: the kernel parameter
+                # carries the plain value (launch-site ``.item()``), so the
+                # bridge is a rename.
                 source_expr = src_name
             else:
                 # Array source: scalar tile load of the staged element. The
@@ -1471,14 +1502,12 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
                     warnings.warn(f"cuTile codegen: scalar bridge {node.data!r} stages array "
                                   f"{src_name!r} without a usable subset; no binding emitted.")
                     continue
-                if isinstance(subset, subsets.Indices):
-                    index_exprs = ", ".join(symstr(i) for i in subset.indices)
-                else:
-                    if any(sp.simplify(sp.sympify(r[1] - r[0])) != 0 for r in subset):
-                        warnings.warn(f"cuTile codegen: scalar bridge {node.data!r} stages a non-element "
-                                      f"subset {subset} of {src_name!r}; using the per-dim begins.")
-                    index_exprs = ", ".join(symstr(r[0]) for r in subset)
-                source_expr = f"ct.load({src_name}, ({index_exprs},), shape=())"
+                index_exprs = _element_index_exprs(subset)
+                if index_exprs is None:
+                    warnings.warn(f"cuTile codegen: scalar bridge {node.data!r} stages a non-element "
+                                  f"subset {subset} of {src_name!r}; using the per-dim begins.")
+                    index_exprs = _element_index_exprs(subset, allow_multi_element=True)
+                source_expr = _scalar_element_load(src_name, index_exprs)
             if source_expr != node.data:
                 callsite_stream.write(f"{node.data} = {source_expr}", cfg, state_id)
 
@@ -1694,15 +1723,15 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
                 if isinstance(edge.src, nodes.AccessNode):
                     rhs = edge.src.data
                     src_desc = sdfg.arrays.get(rhs)
-                    if (src_desc is not None and src_desc.storage not in
-                        (dtypes.StorageType.CuTile_Tile, dtypes.StorageType.Register)):
+                    if (src_desc is not None
+                            and src_desc.storage not in (dtypes.StorageType.CuTile_Tile, dtypes.StorageType.Register)):
                         # Non-tile source at kernel scope. Binding the bare name
                         # hands the tasklet the WHOLE ct array, dropping the
                         # memlet subset (syrk's ``alpha * A[i, k]`` became
                         # ``alpha * A`` -- a mixed-rank TileTypeError at
                         # runtime). Bind the addressed element instead.
-                        if self._float_scalar_needs_tile_load(state, entry, rhs, src_desc):
-                            # Float-scalar kernel param: 1-element device
+                        if self._scalar_needs_tile_load(state, entry, rhs, src_desc):
+                            # Numeric-scalar kernel param: 1-element device
                             # array (launch-site convention) -> 0-d tile.
                             rhs = _scalar_tile_load(rhs)
                         elif (isinstance(src_desc, data.Array) and not isinstance(src_desc, data.View)
@@ -1712,9 +1741,9 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
                             # sources) keep the raw array binding.
                             idx = _element_index_exprs(edge.data.subset)
                             if idx is not None:
-                                rhs = f"ct.load({rhs}, ({idx},), shape=())"
+                                rhs = _scalar_element_load(rhs, idx)
                         # Transient scalars are plain in-kernel Python variables
-                        # (bound by rename); integer scalar params carry the
+                        # (bound by rename); bool scalar params carry the
                         # plain value -- both keep the bare-name binding.
                 elif isinstance(edge.src, (nodes.MapEntry, nodes.ConsumeEntry)):
                     # Trace through the scope entries to the root AccessNode.
@@ -1725,21 +1754,20 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
                     root = state.memlet_path(edge)[0].src
                     if isinstance(root, nodes.AccessNode):
                         rhs = root.data
-                        # An *input-only* float scalar in device memory (kernel
-                        # param or GPU_Global-staged transient) is a 1-element
-                        # device array; bind as 0-d tile. Mirrors the
+                        # An *input-only* numeric scalar in device memory
+                        # (kernel param or GPU_Global-staged transient) is a
+                        # 1-element device array; bind as 0-d tile. Mirrors the
                         # launch-site condition in ``_launch_arg_expr``
-                        # (kernel-written scalars are passed raw; float
+                        # (kernel-written scalars are passed raw; numeric
                         # input+output scalars are rejected in
                         # ``generate_scope``; Register/Default transient
                         # scalars are plain in-kernel variables -- rename
                         # only).
                         root_desc = sdfg.arrays.get(rhs)
-                        if self._float_scalar_needs_tile_load(state, entry, rhs, root_desc):
+                        if self._scalar_needs_tile_load(state, entry, rhs, root_desc):
                             rhs = _scalar_tile_load(rhs)
                         elif (isinstance(root_desc, data.Array) and not isinstance(root_desc, data.View)
-                              and root_desc.storage not in
-                              (dtypes.StorageType.CuTile_Tile, dtypes.StorageType.Register)
+                              and root_desc.storage not in (dtypes.StorageType.CuTile_Tile, dtypes.StorageType.Register)
                               and edge.data is not None and edge.data.data == rhs):
                             # Global-array element read through the scope
                             # entry (symm's ``alpha * B[i, j]``): binding the
@@ -1750,7 +1778,7 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
                             # (tile loads, gathers) keep the raw binding.
                             idx = _element_index_exprs(edge.data.subset)
                             if idx is not None:
-                                rhs = f"ct.load({rhs}, ({idx},), shape=())"
+                                rhs = _scalar_element_load(rhs, idx)
                     elif edge.data is not None and edge.data.data is not None:
                         rhs = edge.data.data
                     elif edge.src_conn is not None:
@@ -2052,21 +2080,30 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
         :param name: The data name.
         :param is_output: Whether the kernel writes to this data.
         :returns: The Python expression string for the launch argument.
+        :raises NotImplementedError: For complex Scalar inputs (no cuTile
+            launch convention exists for them).
         """
         expr = _array_runtime_name(sdfg, name)
         desc = sdfg.arrays.get(name)
         if isinstance(desc, data.Scalar) and not is_output:
-            if _is_float_scalar(desc):
-                # Float scalars go through device memory as 1-element arrays
-                # (``cupy.asarray(x).reshape(1)`` -- a no-copy view for
-                # device-resident values) and are bound as 0-d tiles
-                # in-kernel: by-value floats are typed float32 by cuda.tile,
-                # silently losing float64 precision.
+            if _is_device_scalar(desc):
+                # Numeric scalars (float/int/uint) go through device memory
+                # as 1-element arrays (``cupy.asarray(x).reshape(1)`` -- a
+                # no-copy view for device-resident values) and are bound as
+                # 0-d tiles in-kernel: by-value floats are typed float32 by
+                # cuda.tile (silent f64 precision loss), by-value Python ints
+                # >= 2**31 raise OverflowError, and numpy int scalars are
+                # rejected outright. The declared dtype is preserved (int64
+                # stays int64, uint64 stays uint64).
                 np_name = desc.dtype.as_numpy_dtype().name
                 return f"cupy.asarray({expr}, dtype=numpy.{np_name}).reshape(1)"
-            # Integer/bool scalars are passed by value; ``.item()`` covers
-            # cupy 0-d arrays, numpy scalars, and 0-d numpy buffers; plain
-            # Python numbers pass through.
+            if desc.dtype.as_numpy_dtype().kind == 'c':
+                raise NotImplementedError(f"cuTile codegen: complex Scalar {name!r} is not supported as a "
+                                          f"kernel argument (no by-value or device-memory convention).")
+            # Bool scalars (the only remaining kind) are passed by value
+            # (typed exactly at the launch boundary); ``.item()`` covers cupy
+            # 0-d arrays, numpy scalars, and 0-d numpy buffers; plain Python
+            # bools pass through.
             return f"({expr}.item() if hasattr({expr}, 'item') else {expr})"
         return expr
 
@@ -2084,8 +2121,8 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
         :param function_stream: Stream for function-level code.
         :param callsite_stream: Stream for call-site code.
         :raises ValueError: If the scope source is not a MapEntry.
-        :raises NotImplementedError: If a floating-point Scalar is both a
-            kernel input and a kernel output.
+        :raises NotImplementedError: If a Scalar is both a kernel input and a
+            kernel output, or a complex Scalar is a kernel argument.
         """
         entry = dfg_scope.source_nodes()[0]
         if not isinstance(entry, nodes.MapEntry):
@@ -2102,28 +2139,45 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
         free_syms = _collect_free_symbols(entry, dfg_scope, sdfg)
         kernel_params = list(dict.fromkeys(input_arrays + output_arrays + free_syms))
 
-        # A float Scalar that is BOTH input and output cannot satisfy the two
-        # scalar conventions at once: the launch site passes kernel-written
-        # scalars raw, while in-kernel reads bind input float scalars as 0-d
-        # tiles from a 1-element device array. The current lowering pipeline
-        # never produces this shape; fail loudly if it ever does.
+        # A Scalar that is BOTH input and output cannot be launched: numeric
+        # scalars cannot satisfy the two conventions at once (the launch site
+        # passes kernel-written scalars raw, while in-kernel reads bind input
+        # numeric scalars as 0-d tiles from a 1-element device array), and a
+        # raw bool/complex in/out scalar is a 0-d host buffer that ct.launch
+        # rejects at runtime (probed: ``RuntimeError: NumPy only supports
+        # stream=None``) with no writeback path either. The current lowering
+        # pipeline never produces this shape; fail loudly if it ever does.
         for name in set(input_arrays) & set(output_arrays):
-            if _is_float_scalar(sdfg.arrays.get(name)):
-                raise NotImplementedError(f"cuTile codegen: float Scalar {name!r} is both a kernel input and a "
-                                          f"kernel output; the float-scalar device-memory convention does not "
+            if isinstance(sdfg.arrays.get(name), data.Scalar):
+                raise NotImplementedError(f"cuTile codegen: Scalar {name!r} is both a kernel input and a "
+                                          f"kernel output; the scalar launch conventions do not "
                                           f"support in/out scalars. Stage the scalar through a 1-element array "
                                           f"instead.")
 
-        # Floating-point SYMBOLS would otherwise ride the by-value path, where
-        # the cuda.tile frontend types every Python/numpy float as float32
-        # (silent f64 precision loss -- same issue as float Scalars). Stage
-        # them as 1-element device arrays at the launch site and rebind them
-        # as 0-d tiles at kernel entry (symbols are read-only, so the rebind
-        # is safe for every downstream use).
-        float_syms = {
-            s: sdfg.symbols[s].as_numpy_dtype().name
-            for s in free_syms if s in sdfg.symbols and sdfg.symbols[s].as_numpy_dtype().kind == 'f'
-        }
+        # Numeric SYMBOLS would otherwise ride the by-value path, where the
+        # cuda.tile frontend types every Python/numpy float as float32 (silent
+        # f64 precision loss) and every int as int32 (OverflowError >= 2**31
+        # -- same issues as numeric Scalars). Stage them as 1-element device
+        # arrays at the launch site and rebind them as 0-d tiles at kernel
+        # entry (symbols are read-only, so the rebind is safe for every
+        # downstream use: binop broadcasting, tile indices, range() bounds,
+        # and branch conditions all accept 0-d tiles). Grid-dimension
+        # computations at the call site keep the raw host values.
+        # Maps sym name -> declared numpy dtype name, or None for a
+        # runtime-defined name (loop induction variable / interstate-
+        # assignment key, absent from ``sdfg.symbols``): those are staged with
+        # the runtime value's own dtype (``cupy.asarray`` types a Python float
+        # float64 and an int int64 -- exact; a bool becomes a 0-d bool tile,
+        # probe-verified as a branch condition). Declared bool symbols stay by
+        # value (typed exactly at the launch boundary).
+        device_syms: Dict[str, Optional[str]] = {}
+        for s in free_syms:
+            if s in sdfg.symbols:
+                np_dtype = sdfg.symbols[s].as_numpy_dtype()
+                if np_dtype.kind in 'fiu':
+                    device_syms[s] = np_dtype.name
+            else:
+                device_syms[s] = None
 
         kernel_name = (f"__dace_cutile_{sdfg.name}_{cfg.cfg_id}_"
                        f"{state.block_id}_{state.node_id(entry)}")
@@ -2132,7 +2186,7 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
         kernel_stream.write("@ct.kernel")
         kernel_stream.write(f"def {kernel_name}({', '.join(kernel_params)}):")
         with kernel_stream.indented():
-            for sym_name in float_syms:
+            for sym_name in device_syms:
                 kernel_stream.write(f"{sym_name} = {_scalar_tile_load(sym_name)}")
             # Emit MapEntry (pid setup) ourselves; the dispatcher's
             # topological walk treats MapEntry specially (dispatch_scope), so
@@ -2166,13 +2220,17 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
         # host tasklets from ``gpu_arr[i]``), which the cuda.tile kernel cannot
         # use as an arithmetic operand. Note: passing a 0-d ARRAY as a kernel
         # argument crashes the tile compiler; ``shape=()`` loads of 1-element
-        # arrays are fine and are exactly how float scalars are bound. See
+        # arrays are fine and are exactly how numeric scalars are bound. See
         # ``_launch_arg_expr`` for the per-dtype normalization.
         launch_args = [self._launch_arg_expr(sdfg, n, is_output=n in output_arrays) for n in deduped_arrays]
         for s in free_syms:
-            if s in float_syms:
-                # Float symbols travel through device memory (see above).
-                launch_args.append(f"cupy.asarray({s}, dtype=numpy.{float_syms[s]}).reshape(1)")
+            if s in device_syms:
+                # Numeric symbols travel through device memory (see above):
+                # declared symbols preserve the declared dtype, runtime-defined
+                # names use the runtime value's own dtype.
+                np_name = device_syms[s]
+                dtype_arg = f", dtype=numpy.{np_name}" if np_name is not None else ""
+                launch_args.append(f"cupy.asarray({s}{dtype_arg}).reshape(1)")
             else:
                 launch_args.append(s)
         args_tuple = (f"({', '.join(launch_args)},)" if len(launch_args) == 1 else f"({', '.join(launch_args)})")

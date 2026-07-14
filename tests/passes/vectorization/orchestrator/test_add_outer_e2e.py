@@ -28,6 +28,7 @@ import pytest
 
 import dace
 from dace.transformation.passes.vectorization.vectorize_cpu_multi_dim import VectorizeCPUMultiDim
+from dace.transformation.passes.vectorization.config import VectorizeConfig
 
 N = dace.symbol("N")
 P = dace.symbol("P")
@@ -50,7 +51,7 @@ def _vectorized(program, widths, isa):
     from dace.transformation.passes.canonicalize import canonicalize
     sdfg = program.to_sdfg(simplify=False)
     canonicalize(sdfg)
-    VectorizeCPUMultiDim(widths=widths, target_isa=isa).apply_pass(sdfg, {})
+    VectorizeCPUMultiDim(VectorizeConfig(widths=widths, target_isa=isa)).apply_pass(sdfg, {})
     return sdfg.compile()
 
 

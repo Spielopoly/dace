@@ -120,6 +120,23 @@ def _sdfg_uses_cutile(sdfg: SDFG) -> bool:
     return found
 
 
+def _sdfg_needs_cupy(sdfg: SDFG) -> bool:
+    """True if the generated module touches GPU (cupy) arrays.
+
+    Mirrors the allocation rule in :meth:`PythonCodeGen.allocate_array`: a
+    ``GPU_Global`` Array (or any non-Register Array transient of a cuTile
+    SDFG) allocates with ``cupy.empty``, so the frame needs ``import cupy``
+    even when the cuTile target itself is never dispatched (e.g. an SDFG with
+    ``GPU_Global`` transients but no host<->device copies and no CuTile map).
+    Scalars never allocate with cupy, so only Array descriptors are scanned.
+    """
+    if _sdfg_uses_cutile(sdfg):
+        return True
+    return any(
+        isinstance(desc, data.Array) and desc.storage == dtypes.StorageType.GPU_Global
+        for _, _, desc in sdfg.arrays_recursive())
+
+
 def _defined_ptype_for(desc: data.Data) -> str:
     if isinstance(desc, data.Scalar):
         return _python_type(desc.dtype)
@@ -139,6 +156,7 @@ class PythonCodeGen(PythonTargetCodeGenerator):
     def __init__(self, frame_codegen: 'DaCePythonCodeGenerator', sdfg: SDFG):
         self._frame = frame_codegen
         self._dispatcher: 'TargetDispatcher' = frame_codegen.dispatcher
+        self._sdfg = sdfg
         self.calling_codegen = self
         self._toplevel_schedule = None
         self._generated_nodes = set()
@@ -193,13 +211,16 @@ class PythonCodeGen(PythonTargetCodeGenerator):
         return [code]
 
     def get_includes(self) -> dict[str, list[str]]:
-        return {
-            'frame': [
-                'import numpy',
-                'from dataclasses import dataclass',
-                "from sympy_function_redefinitions import *",
-            ]
-        }
+        includes = [
+            'import numpy',
+            'from dataclasses import dataclass',
+            "from sympy_function_redefinitions import *",
+        ]
+        if _sdfg_needs_cupy(self._sdfg):
+            # GPU_Global allocations emit cupy.empty; do not rely on the cuTile
+            # target being dispatch-'used' to provide the import.
+            includes.insert(1, 'import cupy')
+        return {'frame': includes}
 
     def preprocess(self, sdfg: SDFG) -> None:
         """Strip remaining View access nodes before Python backend codegen.
@@ -490,6 +511,45 @@ class PythonCodeGen(PythonTargetCodeGenerator):
             inserts = ', '.join('None' if symbolic.equal_valued(1, size) else ':' for size in desc.shape)
             expr = f'{expr}[{inserts}]'
         return expr
+
+    def _nested_desc_spans_full_outer(self, memlet: mmlt.Memlet, desc: data.Array, outer_desc: data.Data) -> bool:
+        """Whether the nested connector is declared over the WHOLE outer array
+        while the memlet subset is only the (zero-based, step-1) accessed window.
+
+        This is the widened-boundary shape (``ExpandNestedSDFGInputs``) and the
+        unsimplified-frontend shape (``to_sdfg(simplify=False)`` with a
+        loop-dependent window such as ``A[0:i+1, 0:M]`` into a connector declared
+        ``(N, M)``): inner subscripts are outer-origin coordinates, so the whole
+        outer array is the exact argument — no reshape or copy is involved.
+
+        :param memlet: The connector's memlet (subset = accessed window).
+        :param desc: The nested connector's array descriptor.
+        :param outer_desc: The outer array descriptor.
+        :returns: True when the whole outer array can be passed directly.
+        """
+        if not isinstance(outer_desc, data.Array) or isinstance(outer_desc, data.View):
+            # A View is not the array itself; self-contained even though
+            # ``preprocess`` normally strips Views beforehand.
+            return False
+        if outer_desc.dtype != desc.dtype:
+            return False
+        if memlet.other_subset is not None:
+            # An explicit inner-side subset means inner subscripts are NOT
+            # outer-origin coordinates; the whole-array shortcut is unsound.
+            return False
+        conn_shape = list(desc.shape)
+        outer_shape = list(outer_desc.shape)
+        if len(conn_shape) != len(outer_shape):
+            return False
+        if not all(self._provably_equal(a, b) for a, b in zip(conn_shape, outer_shape)):
+            return False
+        subset = self._normalize_subset(memlet.subset)
+        if subset is None:
+            return True  # Whole-array memlet.
+        if not isinstance(subset, subsets.Range):
+            return False
+        return all(
+            self._provably_equal(start, 0) and symbolic.equal_valued(1, step) for start, _end, step in subset.ranges)
 
     def _nested_arg_needs_flat_reshape(self, connector_name: str, memlet: mmlt.Memlet, desc: data.Array) -> bool:
         """Whether a nested-SDFG array connector needs (and safely admits) a
@@ -1087,22 +1147,31 @@ class PythonCodeGen(PythonTargetCodeGenerator):
             elif self._is_singleton_buffer_desc(desc) and isinstance(outer_desc, data.Scalar):
                 arg_expr = _bind_bridge(connector_name, memlet, desc, is_input)
             elif isinstance(desc, data.Array):
-                arg_expr = self._nested_view_expr(sdfg, memlet.data, memlet.subset)
-                if not self._nested_shapes_match(memlet, desc):
-                    # Prefer a genuine strided view (exact layout, valid for
-                    # reads and writes); otherwise fall back to a flat reshape,
-                    # which raises when not provably order-preserving.
-                    strided_expr = self._nested_strided_view_expr(sdfg, memlet, desc)
-                    if strided_expr is not None:
-                        arg_expr = strided_expr
-                    elif self._nested_arg_needs_flat_reshape(connector_name, memlet, desc):
-                        if connector_name in output_connector_names:
-                            # Writes must land in the outer array: go through a
-                            # contiguous bridge with an explicit copy-back.
-                            arg_expr = _bind_reshape_bridge(connector_name, memlet, desc, arg_expr, is_input)
-                        else:
-                            # Read-only: a flat reshape view (or copy) suffices.
-                            arg_expr = f'({arg_expr}).reshape({self._shape_expression(desc.shape)})'
+                # A connector declared over the whole outer array takes the array
+                # itself (inner subscripts are outer-origin coordinates), whether
+                # the subset is the explicit full array or a zero-based accessed
+                # window. Consulted BEFORE the shapes-match shortcut so an in/out
+                # connector with an explicit-full IN subset and a window OUT
+                # subset canonicalizes to the same (bare-name) binding instead of
+                # raising the inconsistent-binding error.
+                if self._nested_desc_spans_full_outer(memlet, desc, outer_desc):
+                    arg_expr = self._runtime_data_name(sdfg, memlet.data)
+                else:
+                    arg_expr = self._nested_view_expr(sdfg, memlet.data, memlet.subset)
+                    if not self._nested_shapes_match(memlet, desc):
+                        # Otherwise prefer a genuine strided view (exact layout,
+                        # valid for reads and writes); otherwise fall back to a flat
+                        # reshape, which raises when not provably order-preserving.
+                        if (strided_expr := self._nested_strided_view_expr(sdfg, memlet, desc)) is not None:
+                            arg_expr = strided_expr
+                        elif self._nested_arg_needs_flat_reshape(connector_name, memlet, desc):
+                            if connector_name in output_connector_names:
+                                # Writes must land in the outer array: go through a
+                                # contiguous bridge with an explicit copy-back.
+                                arg_expr = _bind_reshape_bridge(connector_name, memlet, desc, arg_expr, is_input)
+                            else:
+                                # Read-only: a flat reshape view (or copy) suffices.
+                                arg_expr = f'({arg_expr}).reshape({self._shape_expression(desc.shape)})'
             else:
                 arg_expr = self._runtime_data_name(sdfg, memlet.data)
 

@@ -84,16 +84,16 @@ def test_orchestrator_rejects_avx512_innermost_not_8_aligned():
 
 
 def test_orchestrator_rejects_unknown_target_isa():
-    """An ISA outside ``_VALID_ISAS`` is rejected at construction."""
-    with pytest.raises(NotImplementedError, match="target_isa"):
-        VectorizeCPUMultiDim(widths=(8,), target_isa="FOO")
+    """An ISA outside the :class:`ISA` enum is rejected when the config coerces it."""
+    with pytest.raises(ValueError, match="not a valid ISA"):
+        VectorizeCPUMultiDim(VectorizeConfig(widths=(8, ), target_isa="FOO"))
 
 
 def test_orchestrator_accepts_cutile_target_isa():
-    """``CUTILE`` is deliberately in ``_VALID_ISAS``: it is the building-block
-    config (``expand_tile_nodes=False``) consumed by the cuTile lowering
-    pipeline, so the constructor must accept it without raising."""
-    VectorizeCPUMultiDim(widths=(8,), target_isa="CUTILE")
+    """``CUTILE`` is a valid :class:`ISA`: it is the building-block config
+    (``expand_tile_nodes=False``) consumed by the cuTile lowering pipeline,
+    so the constructor must accept it without raising."""
+    VectorizeCPUMultiDim(VectorizeConfig(widths=(8, ), target_isa="CUTILE"))
 
 
 def test_orchestrator_k1_axpy_runs_and_validates():

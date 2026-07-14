@@ -16,6 +16,7 @@ import pytest
 import dace
 from dace.transformation.passes.vectorization.utils.name_schemes import sanitize_transient_name_hint
 from dace.transformation.passes.vectorization.vectorize_cpu_multi_dim import VectorizeCPUMultiDim
+from dace.transformation.passes.vectorization.config import VectorizeConfig
 
 #: Reserved return-array names: exactly ``__return`` or ``__return_<int>``.
 _RETURN_ARRAY_RE = re.compile(r'^__return(_[0-9]+)?$')
@@ -56,7 +57,7 @@ def test_vectorized_return_program_compiles_and_runs():
         return X + Y
 
     sdfg = vec_return_add.to_sdfg()
-    VectorizeCPUMultiDim(widths=(8, )).apply_pass(sdfg, {})
+    VectorizeCPUMultiDim(VectorizeConfig(widths=(8, ))).apply_pass(sdfg, {})
     sdfg.simplify()
 
     _assert_no_reserved_transients(sdfg)
