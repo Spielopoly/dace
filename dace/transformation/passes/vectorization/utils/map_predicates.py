@@ -127,6 +127,16 @@ def map_body_has_param_dependent_loop(state: SDFGState, map_entry: dace.nodes.Ma
 def is_tile_eligible(state: SDFGState, map_entry: dace.nodes.MapEntry) -> bool:
     """True if an (assumed innermost) ``map_entry`` can be safely tiled/vectorized.
 
+    Refuses a trivial wrapper map (EVERY dim provably 1 trip AND step 1): there is nothing to
+    tile -- e.g. the ``0:1`` ``*_gmap`` wrappers ``GPUTransformSDFG`` mints around free tasklets.
+    Refused here, in the shared gate, so every tile pass skips such a map consistently (a
+    MarkTileDims-only check would desync with ``StrideMapByTileWidths``, which re-scans
+    independently); the map stays a correct scalar step. A single-trip map with step > 1 is NOT
+    refused: it is a legitimate W-strided tile map (e.g. a masked remainder tail ``16:20:8`` --
+    one iteration whose tile covers the masked lanes; ``StrideMapByTileWidths`` produces such
+    maps and downstream passes re-consult this gate). Symbolic ranges are NOT refused either
+    (masking handles short trips).
+
     Refuses a body with a self-referential loop-carried recurrence (``k = f(k)``, e.g. TSVC
     s141's ``k = (k + i) + 1`` feeding ``flat_2d_array[k]``): per-iteration recurrence → map
     stays scalar, refused REGARDLESS of use. Also refuses a body whose nested loop bound depends
@@ -134,6 +144,17 @@ def is_tile_eligible(state: SDFGState, map_entry: dace.nodes.MapEntry) -> bool:
     trip counts a single tiled loop cannot honour. Graceful-refuse gate: ineligible map left as
     correct scalar rather than tiled incorrectly.
     """
+
+    def _provably_one(expr) -> bool:
+        try:
+            return int(expr) == 1
+        except (TypeError, ValueError):
+            return False  # Symbolic: not provably 1.
+
+    if all(
+            _provably_one(size) and _provably_one(rng[2])
+            for size, rng in zip(map_entry.map.range.size(), map_entry.map.range.ranges)):
+        return False
     for node in state.all_nodes_between(map_entry, state.exit_node(map_entry)):
         if isinstance(node, dace.nodes.NestedSDFG) and _sdfg_has_self_recurrent_assign(node.sdfg):
             return False

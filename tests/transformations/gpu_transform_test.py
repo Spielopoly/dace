@@ -146,6 +146,34 @@ def test_free_tasklet(transient, scalar):
     sdfg.validate()
 
 
+def test_free_tasklet_with_dependency_edge():
+    """A free tasklet with a connector-less (ordering) in-edge -- e.g. a
+    write-after-write dependency on the same array -- must wrap into the
+    trivial GPU map without minting an invalid ``IN_None`` connector."""
+    sdfg = dace.SDFG("assign_waw")
+    sdfg.add_array("A", (4, ), dace.float32)
+    state = sdfg.add_state("main")
+
+    first = state.add_access("A")
+    t0 = state.add_tasklet("seed", {}, {"_out"}, "_out = 1.0")
+    state.add_edge(t0, "_out", first, None, dace.memlet.Memlet("A[1]"))
+
+    second = state.add_access("A")
+    t1 = state.add_tasklet("assign", {}, {"_out"}, "_out = 2.0")
+    # Ordering-only edge: no connector, empty memlet.
+    state.add_nedge(first, t1, dace.memlet.Memlet())
+    state.add_edge(t1, "_out", second, None, dace.memlet.Memlet("A[0]"))
+    sdfg.validate()
+
+    sdfg.apply_gpu_transformations(validate=True,
+                                   validate_all=True,
+                                   permissive=True,
+                                   sequential_innermaps=True,
+                                   register_transients=False,
+                                   simplify=False)
+    sdfg.validate()
+
+
 if __name__ == '__main__':
     test_toplevel_transient_lifetime()
     test_scalar_to_symbol_in_nested_sdfg()
@@ -155,3 +183,4 @@ if __name__ == '__main__':
     for scalar in [False, True]:
         for transient in [False, True]:
             test_free_tasklet(transient, scalar)
+    test_free_tasklet_with_dependency_edge()

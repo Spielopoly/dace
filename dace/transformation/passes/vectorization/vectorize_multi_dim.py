@@ -131,21 +131,36 @@ def restore_sdfg_in_place(target: dace.SDFG, source: dace.SDFG) -> None:
     throwaway deep copy. Mirrors the parent-pointer fix-up :meth:`dace.SDFG.__deepcopy__` performs
     (``reset_cfg_list`` + ``FixNestedSDFGReferences``) so nested-SDFG parent references stay coherent.
 
-    :param target: The caller-owned SDFG to overwrite in place.
+    :param target: The caller-owned SDFG to overwrite in place. Must be a ROOT SDFG: the
+        restore nulls the parent pointers, so restoring into a nested SDFG would orphan it
+        (the enclosing SDFG then fails validation).
     :param source: A standalone (throwaway) SDFG whose contents ``target`` adopts.
+    :raises ValueError: If ``target`` is a nested (non-root) SDFG.
     """
     from dace.transformation.passes.fusion_inline import FixNestedSDFGReferences
+    if target.parent_sdfg is not None:
+        raise ValueError(f"restore_sdfg_in_place: target {target.name!r} is a nested SDFG; "
+                         "restoring in place would orphan it from its parent (root SDFGs only)")
     for key, value in list(source.__dict__.items()):
-        if key in ('_parent', '_parent_sdfg', '_parent_nsdfg_node', '_cfg_list', 'guid'):
+        if key in ('_parent', '_parent_sdfg', '_parent_nsdfg_node', '_cfg_list', 'guid', '_sdfg'):
             continue
         setattr(target, key, value)
     target._parent = None
     target._parent_sdfg = None
     target._parent_nsdfg_node = None
     target._cfg_list = []
-    for block in target.nodes():
-        block._sdfg = target
-        block._parent_graph = target
+    target._sdfg = target
+    # The adopted structure is internally consistent with SOURCE as its root; the only stale
+    # pointers are the ones aimed at ``source`` itself. Swap every such reference to ``target``
+    # -- across ALL control flow regions, not just the top level: blocks nested inside
+    # LoopRegions / ConditionalBlocks (and directly nested SDFGs) otherwise keep pointing at the
+    # discarded source, which breaks ``parent_graph`` walks downstream (e.g. the reachability
+    # analysis inside ``propagate_memlets_sdfg`` crashing with ``NoneType has no cfg_id``).
+    for region in target.all_control_flow_regions(recursive=True):
+        for obj in (region, *region.nodes()):
+            for attr in ('_sdfg', '_parent_graph', '_parent_sdfg', '_parent'):
+                if getattr(obj, attr, None) is source:
+                    setattr(obj, attr, target)
     target.reset_cfg_list()
     FixNestedSDFGReferences().apply_pass(target, {})
 

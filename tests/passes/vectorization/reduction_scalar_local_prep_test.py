@@ -8,9 +8,10 @@ writeback, so the tile/SIMD widener folds it to per-lane partial sums + one hori
 
 Coverage:
 
-* POSITIVE e2e: a dot product / a sum whose accumulator is a genuine array slot -- BAILS through the
-  vectorize pipeline with the prep disabled (proven via a no-op patch), widens + is numerically
-  correct with the prep on.
+* POSITIVE e2e: a dot product / a sum whose accumulator is a genuine array slot -- with the prep
+  disabled (proven via a no-op patch) the vectorizer REFUSES cleanly (``VectorizeUnsupported`` ->
+  warn + restore the pristine, still-correct SDFG); widens + is numerically correct with the
+  prep on.
 * POSITIVE structural: the array-slot WCR target becomes a transient ``Scalar`` after the pass.
 * NEGATIVE: a plain scalar / length-1 accumulator (already widenable), a ``min`` RMW (not a WCR),
   and a cross-iteration recurrence are all left untouched -- value-preserving.
@@ -175,23 +176,42 @@ def _vectorize(prog, name):
     return sdfg
 
 
-def test_array_slot_dot_bails_without_prep_and_widens_with_it():
-    """The dot-into-slot reduction BAILS through the vectorizer with the prep disabled, and widens
-    to a correct result with it on -- the "no-widen before, correct after" case."""
-    # BEFORE: with the prep patched to a no-op, the array-slot WCR reaches the tiler as a loose
-    # in-body WCR and the pipeline's precondition fires.
-    with mock.patch.object(PrepareReductionForWidening, "apply_pass", lambda self, sdfg, res: None):
-        with pytest.raises((AssertionError, dace.sdfg.validation.InvalidSDFGError)):
-            _vectorize(dot_into_slot, "dot_into_slot_noprep")
+def _tileops_nodes(sdfg: dace.SDFG):
+    """All tileops library nodes in the SDFG tree (evidence the widener fired)."""
+    found = []
+    for sd in sdfg.all_sdfgs_recursive():
+        for st in sd.all_states():
+            for node in st.nodes():
+                if isinstance(node, nodes.LibraryNode) and type(node).__module__.startswith("dace.libraries.tileops"):
+                    found.append(node)
+    return found
 
-    # AFTER: the wired-in prep scalar-localizes it and the widened result matches numpy.
+
+def test_array_slot_dot_bails_without_prep_and_widens_with_it():
+    """With the prep disabled the array-slot WCR reaches the tiler as a loose in-body WCR and the
+    vectorizer REFUSES cleanly (``VectorizeUnsupported`` -> warn + restore the pristine SDFG,
+    which stays numerically correct); with the prep on it widens to a correct result."""
     n = 60
     a = np.random.random(n)
     b = np.random.random(n)
-    s = np.zeros(8)
     ref = np.zeros(8)
     ref[3] = float((a * b).sum())
+
+    # BEFORE: prep patched to a no-op -> clean refusal (warn + restore), NOT a widened SDFG
+    # and NOT a hard crash. The restored, un-tiled SDFG must still compute correctly.
+    with mock.patch.object(PrepareReductionForWidening, "apply_pass", lambda self, sdfg, res: None):
+        with pytest.warns(UserWarning, match="refusing to vectorize"):
+            sdfg_noprep = _vectorize(dot_into_slot, "dot_into_slot_noprep")
+    assert not _tileops_nodes(sdfg_noprep), "refusal must restore the un-tiled SDFG"
+    s = np.zeros(8)
+    sdfg_noprep.compile()(a=a.copy(), b=b.copy(), s=s, N=n)
+    assert np.allclose(s, ref, rtol=1e-9, atol=1e-12), f"restored SDFG wrong: got {s}, ref {ref}"
+
+    # AFTER: the wired-in prep scalar-localizes it; the SDFG actually widens (tile lib nodes
+    # present pre-expansion) and the widened result matches numpy.
     sdfg = _vectorize(dot_into_slot, "dot_into_slot_prep")
+    assert _tileops_nodes(sdfg), "prep-enabled pipeline must widen (tile lib nodes expected)"
+    s = np.zeros(8)
     sdfg.compile()(a=a.copy(), b=b.copy(), s=s, N=n)
     assert np.allclose(s, ref, rtol=1e-9, atol=1e-12), f"got {s}, ref {ref}"
 

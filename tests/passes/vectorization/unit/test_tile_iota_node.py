@@ -89,7 +89,7 @@ def test_tile_iota_cutile_expansion_smoke():
     sdfg.add_array("_tile", [8], dace.int64, storage=dace.dtypes.StorageType.Register, transient=True)
     state = sdfg.add_state()
     me, mx = state.add_map("m", {"i": "0:1"})
-    iota = TileIota("iota_x", widths=(8,), expr="i + __l0")
+    iota = TileIota("iota_x", widths=(8, ), expr="i + __l0")
     iota.implementation = "cutile"
     state.add_node(iota)
     state.add_nedge(me, iota, dace.Memlet())
@@ -154,7 +154,7 @@ def test_tile_iota_cutile_expansion_single_lane():
     sdfg.add_array("_tile", [1], dace.int64, storage=dace.dtypes.StorageType.Register, transient=True)
     state = sdfg.add_state()
     me, mx = state.add_map("m", {"i": "0:1"})
-    iota = TileIota("iota_x", widths=(1,), expr="i + __l0")
+    iota = TileIota("iota_x", widths=(1, ), expr="i + __l0")
     iota.implementation = "cutile"
     state.add_node(iota)
     state.add_nedge(me, iota, dace.Memlet())
@@ -189,7 +189,7 @@ def test_tile_iota_cutile_expansion_with_extra_input():
     sdfg.add_array("_tile", [8], dace.int64, storage=dace.dtypes.StorageType.Register, transient=True)
     state = sdfg.add_state()
     me, mx = state.add_map("m", {"i": "0:1"})
-    iota = TileIota("iota_idx", widths=(8,), expr="_idx[__l0]", extra_inputs=("_idx",))
+    iota = TileIota("iota_idx", widths=(8, ), expr="_idx[__l0]", extra_inputs=("_idx", ))
     iota.implementation = "cutile"
     state.add_node(iota)
     state.add_nedge(me, iota, dace.Memlet())
@@ -212,6 +212,24 @@ def test_tile_iota_cutile_expansion_with_extra_input():
             assert "_idx" in n.in_connectors
             assert "ct.arange" in n.code.as_string
             assert "_idx[__l0]" in n.code.as_string
+
+
+def test_render_expr_cpp_python_ternary():
+    """A Python-dialect ternary renders to a C++ ``?:`` expression."""
+    from dace.libraries.tileops.nodes.tile_iota import _render_expr_cpp
+    cpp = _render_expr_cpp("0 if __l0 > 4 else __l0")
+    assert "?" in cpp and ":" in cpp
+    assert "__l0 > 4" in cpp
+
+
+def test_render_expr_cpp_cpp_ternary_falls_back_verbatim():
+    """An expr already carrying a C++ ternary splices verbatim (with a
+    warning): ``pystr_to_symbolic`` would silently collapse it to the
+    degenerate symbol ``?``."""
+    from dace.libraries.tileops.nodes.tile_iota import _render_expr_cpp
+    expr = "(__l0 > 4) ? 0 : __l0"
+    with pytest.warns(UserWarning, match="C\\+\\+ ternary"):
+        assert _render_expr_cpp(expr) == expr
 
 
 if __name__ == "__main__":

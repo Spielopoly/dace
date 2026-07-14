@@ -2,20 +2,21 @@
 """``TileIota`` — fill an integer (or scalar-numeric) tile with a per-lane
 expression in the lane placeholders ``__l0..__l{K-1}``.
 
-Used by the K-dim emitter / NSDFG-body promoter to materialize the
-integer index tiles that feed :class:`TileLoad` / :class:`TileStore`,
-plus any other per-lane affine fill (constant arange, diagonal index,
-strided base). The expression may also reference additional input tiles
-/ arrays declared via ``extra_inputs`` — the lane body reads them by
-their connector names so callers can compose ``_src``- or ``_idx``-style
-lookups without inventing new lib nodes.
+Used by ``materialise_lane_id_index_tile`` (the only production
+constructor) to materialize the integer index tiles that feed
+:class:`TileLoad` / :class:`TileStore`, plus any other per-lane affine
+fill (constant arange, diagonal index, strided base). The expression may
+also reference additional input tiles / arrays declared via
+``extra_inputs`` — the lane body reads them by their connector names so
+callers can compose ``_src``- or ``_idx``-style lookups without
+inventing new lib nodes.
 
-The pure expansion lowers to a CPP tasklet with a K-fold nested scalar
-loop body ``_dst[offset] = <expr>``. The K-dim contract (per the user
-directive: "K-dim path can only emit tile ops or python single-element")
-is satisfied at the IR level — the emitter / promoter places a
-``TileIota`` lib node, not a raw CPP tasklet.
+``expr`` is stored canonically as Python source (``dace.symbolic``-
+parseable); each expansion renders it for its own target: ``'pure'``
+re-renders to C++ at expansion time, ``'cutile'`` splices it into the
+``cuda.tile`` Python kernel verbatim.
 """
+import warnings
 from typing import Optional, Sequence, Tuple
 
 import dace
@@ -26,9 +27,63 @@ from dace.transformation.transformation import ExpandTransformation
 from .._pure_codegen import nested_loops, tile_offset
 
 
+def _render_expr_cpp(expr: str) -> str:
+    """Render the canonical Python-dialect ``expr`` to C++.
+
+    ``sym2cpp(pystr_to_symbolic(expr))`` turns ``**`` into multiplication /
+    ``dace::math::pow``, ``//`` into ``int_floor`` etc.; ``py_mod`` and
+    subscripts (``_idx[__l0]``) roundtrip unchanged. Python ternaries
+    (``a if c else b``) render as C++ ``?:``. Unparseable exprs (hand-built
+    nodes) are spliced verbatim with a warning, preserving the historical
+    lax behavior.
+
+    Caveat: an expr that ALREADY contains a C++ ternary (``c ? a : b``) does
+    not raise in ``pystr_to_symbolic`` -- it silently collapses to the
+    degenerate symbol ``?`` -- so any ``?`` in the input is guarded and
+    spliced verbatim (it is already C++).
+
+    :param expr: The node's per-lane expression (Python dialect).
+    :returns: The equivalent C++ expression string.
+    """
+    from dace import symbolic
+    from dace.codegen.common import sym2cpp
+    if "?" in expr:
+        warnings.warn(f"TileIota: expr {expr!r} contains a C++ ternary; splicing verbatim into C++", stacklevel=2)
+        return expr
+    try:
+        return sym2cpp(symbolic.pystr_to_symbolic(expr))
+    except Exception:  # noqa: BLE001
+        warnings.warn(f"TileIota: expr {expr!r} is not dace.symbolic-parseable; splicing verbatim into C++",
+                      stacklevel=2)
+        return expr
+
+
+def _dst_dtype(node: "TileIota", parent_state: dace.SDFGState,
+               parent_sdfg: dace.SDFG) -> Optional[dace.dtypes.typeclass]:
+    """Dtype of the ``_dst`` descriptor, or ``None`` when unknown.
+
+    Shared by both expansions: the pure expansion casts the lane store to it,
+    the cutile expansion types its ``ct.arange`` lane arrays with it.
+
+    :param node: The ``TileIota`` lib node being expanded.
+    :param parent_state: State that owns the lib node.
+    :param parent_sdfg: SDFG that owns ``parent_state``.
+    :returns: The destination tile's dtype, or ``None``.
+    """
+    for out_edge in parent_state.out_edges(node):
+        if out_edge.src_conn != "_dst" or out_edge.data is None or out_edge.data.data is None:
+            continue
+        dst_desc = parent_sdfg.arrays.get(out_edge.data.data)
+        if dst_desc is not None:
+            return dst_desc.dtype
+        break
+    return None
+
+
 @library.expansion
 class ExpandTileIotaPure(ExpandTransformation):
-    """CPP tasklet emitting ``_dst[off] = <expr>`` over the K-fold lane loop."""
+    """CPP tasklet emitting ``_dst[off] = (<dtype>)(<expr>);`` over the
+    ``constexpr``-bounded ``DACE_UNROLL`` K-fold lane loop."""
 
     environments = []
 
@@ -36,26 +91,33 @@ class ExpandTileIotaPure(ExpandTransformation):
     def expansion(node: "TileIota", parent_state: dace.SDFGState, parent_sdfg: dace.SDFG) -> nodes.Tasklet:
         """Return a CPP tasklet that fills the tile lane by lane.
 
+        The stored Python-dialect ``expr`` is re-rendered to C++ here
+        (see :func:`_render_expr_cpp`); the store is cast to the ``_dst``
+        descriptor's dtype and the lane loops carry ``DACE_UNROLL`` with
+        ``constexpr`` bounds so the compiler unrolls / SIMD-lowers them.
+
         K=0 / W=1 single-lane postamble: DaCe collapses ``Register
         Array(shape=(1,))`` transients to plain scalars, so the standard
         ``_dst[__l0] = expr`` body (with ``__l0 = 0``) would index into
         ``int64_t _dst;`` — a compile error. Detect the all-ones width
         case and emit the body WITHOUT the indexing wrappers: substitute
-        each lane var ``__l<p>`` with ``0`` directly in ``expr``, and
-        rewrite trailing ``_idx[0]`` / ``_src[0]`` extra-input reads to
-        the bare connector name (the connector is also a scalar in this
-        case). The result is a single CPP statement
-        ``_dst = <expr_substituted>;``.
+        each lane var ``__l<p>`` with ``0`` directly in the rendered
+        expr, and rewrite trailing ``_idx[0]`` / ``_src[0]`` extra-input
+        reads to the bare connector name (the connector is also a scalar
+        in this case). The result is a single CPP statement
+        ``_dst = (<dtype>)(<expr_substituted>);``.
 
         :param node: The ``TileIota`` lib node being expanded.
-        :param parent_state: State that owns the lib node (unused).
-        :param parent_sdfg: SDFG that owns ``parent_state`` (unused).
+        :param parent_state: State that owns the lib node.
+        :param parent_sdfg: SDFG that owns ``parent_state``.
         :returns: A CPP tasklet replacing the lib node in place.
         """
         widths = list(node.widths)
         inputs = {c: None for c in node.extra_inputs}
+        # int64 fallback: the lane-id tiles' declared dtype.
+        ctype = (_dst_dtype(node, parent_state, parent_sdfg) or dace.int64).ctype
+        expr = _render_expr_cpp(node.expr)
         if all(w == 1 for w in widths):
-            expr = node.expr
             # Substitute lane vars with 0 (single lane).
             for p in range(len(widths)):
                 expr = expr.replace(f"__l{p}", "0")
@@ -63,7 +125,7 @@ class ExpandTileIotaPure(ExpandTransformation):
             # scalar connector becomes the bare connector name.
             for conn in node.extra_inputs:
                 expr = expr.replace(f"{conn}[0]", conn)
-            body = f"_dst = {expr};"
+            body = f"_dst = ({ctype})({expr});"
             return nodes.Tasklet(
                 label=f"{node.label}_pure",
                 inputs=inputs,
@@ -72,8 +134,8 @@ class ExpandTileIotaPure(ExpandTransformation):
                 language=dace.dtypes.Language.CPP,
             )
         off = tile_offset(widths)
-        body = f"_dst[{off}] = {node.expr};"
-        code = nested_loops(widths, body)
+        body = f"_dst[{off}] = ({ctype})({expr});"
+        code = nested_loops(widths, body, unroll=True)
         return nodes.Tasklet(
             label=f"{node.label}_pure",
             inputs=inputs,
@@ -113,14 +175,8 @@ class ExpandTileIotaCutile(ExpandTransformation):
         # declared descriptor dtype and the runtime tile dtype agree (the
         # lane-id tiles are declared int64; ct.arange defaults would yield
         # int32 tiles). Falls back to int32 when the descriptor is unknown.
-        ct_dtype = "ct.int32"
-        for out_edge in parent_state.out_edges(node):
-            if out_edge.src_conn != "_dst" or out_edge.data is None or out_edge.data.data is None:
-                continue
-            dst_desc = parent_sdfg.arrays.get(out_edge.data.data)
-            if dst_desc is not None:
-                ct_dtype = f"ct.{dst_desc.dtype.to_string()}"
-            break
+        dst_dtype = _dst_dtype(node, parent_state, parent_sdfg)
+        ct_dtype = f"ct.{dst_dtype.to_string()}" if dst_dtype is not None else "ct.int32"
 
         # Degenerate single-lane case: all widths are 1.
         if all(w == 1 for w in widths):
@@ -184,8 +240,9 @@ class TileIota(nodes.LibraryNode):
       ``expr = "_src[<flat_offset(__l<p>)>]"``.
 
     The K-fold nested loop is CPP inside the pure expansion. The IR
-    level above is a tile op — ``EmitTileOps`` / ``PromoteNSDFGBodyToTiles``
-    never emit a raw CPP tasklet for these fills.
+    level above is a tile op — ``materialise_lane_id_index_tile`` (the
+    only production constructor) never emits a raw CPP tasklet for
+    these fills.
 
     :cvar implementations: Per-target expansions; ``"pure"`` is the
         CPP-loop correctness fallback. ``"cutile"`` emits the
@@ -201,9 +258,10 @@ class TileIota(nodes.LibraryNode):
         dtype=str,
         allow_none=False,
         default="SCALAR",
-        desc="CPU target ISA the Auto-dispatch lowers to for K==1 "
-        "(SCALAR | AVX512 | AVX2 | ARM_SVE | ARM_NEON | CUTILE); K>=2 is pure. "
-        "Stamped by the VectorizeCPUMultiDim orchestrator before expansion.",
+        desc="CPU target ISA stamp (SCALAR | AVX512 | AVX2 | ARM_SVE | ARM_NEON | CUTILE), "
+        "carried for tile-op interface parity: TileIota has no per-ISA expansions, so CPU "
+        "dispatch resolves 'pure' for every K; the cuTile pipeline stamps "
+        "implementation='cutile' directly. Set by the tile pipeline before expansion.",
     )
 
     widths = properties.ListProperty(
@@ -214,7 +272,9 @@ class TileIota(nodes.LibraryNode):
     expr = properties.Property(
         dtype=str,
         default="",
-        desc="Per-lane body expression assigned to ``_dst[<offset>]``. "
+        desc="Per-lane body expression assigned to ``_dst[<offset>]``, stored "
+        "canonically as Python source (``dace.symbolic``-parseable); each "
+        "expansion renders it for its own target language. "
         "Uses ``__l0..__l{K-1}`` for the lane indices and any "
         "name from ``extra_inputs`` for extra-input reads.",
     )

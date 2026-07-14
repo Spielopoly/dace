@@ -13,7 +13,10 @@ from dace.memlet import Memlet
 from dace import typeclass
 
 
-def materialise_lane_id_index_tile(inner_state, expr: str, iter_vars: Tuple[str, ...], widths: Tuple[int, ...],
+def materialise_lane_id_index_tile(inner_state,
+                                   expr: str,
+                                   iter_vars: Tuple[str, ...],
+                                   widths: Tuple[int, ...],
                                    name_hint: str = "_sym_tile") -> "dace.nodes.AccessNode":
     """Mint a per-lane int64 tile = ``expr`` evaluated at ``(iter_var_k -> iter_var_k + __l_k)``
     for each tile dim ``k`` -- i.e. the function is EXPANDED INSIDE per lane, not widened as if
@@ -23,56 +26,40 @@ def materialise_lane_id_index_tile(inner_state, expr: str, iter_vars: Tuple[str,
     K=1, expr ``"py_mod(ii,K)"`` -> ``_tile[l] = py_mod((ii + l), K)``  (cyclic per-lane index).
     K=2, expr ``"2 * ii + jj"`` -> ``_tile[l0, l1] = 2*(ii+l0) + (jj+l1)``.
 
-    The lane loop is a ``constexpr``-bounded ``DACE_UNROLL`` (compiler lowers to SIMD), NOT a
-    data-dependent CPP gather loop -- the sanctioned tile-op index materialisation. Shared by
+    The fill is always placed as a
+    :class:`~dace.libraries.tileops.nodes.tile_iota.TileIota` lib node whose ``expr`` holds the
+    substituted expression in canonical Python dialect (``symstr(..., cpp_mode=False)``). Each
+    expansion renders it for its own target: ``'pure'`` re-renders to C++ (``constexpr``-bounded
+    ``DACE_UNROLL`` lane loop) at expansion time; ``'cutile'`` splices it into Python. Shared by
     :meth:`ConvertTaskletsToTileOps._materialise_lane_id_tile` (lane-id symbol operands) and
     :meth:`InsertTileLoadStore._stage_index_via_tileops` (modular / non-affine gather indices).
 
-    :returns: the ``AccessNode`` (wired as the fill tasklet's output) holding the
+    :returns: the ``AccessNode`` (wired as the fill node's output) holding the
         ``(W_0, .., W_{K-1})`` index tile. Consumers MUST read THIS node so the scheduler orders
         the fill before the gather -- a fresh ``add_access`` of the same array is an unproduced
         orphan the gather may read before it is populated (uninitialised index -> OOB).
     """
     from dace import dtypes, symbolic
-    from dace.codegen.common import sym2cpp
+    from dace.libraries.tileops.nodes import TileIota
     sdfg = inner_state.sdfg
     widths = tuple(int(w) for w in widths)
-    K = len(widths)
     # Substitute each tile iter-var ``v -> (v + __l<k>)`` INSIDE the (possibly non-affine)
-    # expression, then render to C++ via ``sym2cpp`` so ``**`` becomes multiplication, ``py_mod``
-    # stays ``py_mod`` etc. -- a raw string keeps Python ``**`` which is invalid C++.
+    # expression, then store it Python-style: valid for the cutile expansion as-is, and the
+    # pure expansion re-renders it to C++ (``**`` -> multiplication, ``//`` -> int_floor, ...).
     parsed = symbolic.pystr_to_symbolic(expr)
     subs = {symbolic.symbol(v): symbolic.symbol(v) + symbolic.symbol(f"__l{k}") for k, v in enumerate(iter_vars)}
-    body_expr = sym2cpp(parsed.subs(subs))
+    substituted = parsed.subs(subs)
     arr_name, _ = sdfg.add_array(name_hint,
                                  shape=widths,
                                  dtype=dace.int64,
                                  transient=True,
                                  storage=dtypes.StorageType.Register,
                                  find_new_name=True)
-    parts = []
-    for i in range(K):
-        inner = 1
-        for q in range(i + 1, K):
-            inner *= widths[q]
-        parts.append(f"__l{i}" if inner == 1 else f"(__l{i} * {inner})")
-    flat = " + ".join(parts) if parts else "0"
-    code_lines = []
-    for d in range(K):
-        code_lines.append(f"{'    ' * d}constexpr std::size_t __W{d} = {widths[d]};")
-        code_lines.append(f"{'    ' * d}DACE_UNROLL")
-        code_lines.append(f"{'    ' * d}for (std::size_t __l{d} = 0; __l{d} < __W{d}; ++__l{d}) {{")
-    code_lines.append(f"{'    ' * K}_out[{flat}] = (int64_t)({body_expr});")
-    for d in reversed(range(K)):
-        code_lines.append(f"{'    ' * d}}}")
-    tasklet = inner_state.add_tasklet(name=f"lane_id_mat_{arr_name}",
-                                      inputs=set(),
-                                      outputs={"_out"},
-                                      code="\n".join(code_lines),
-                                      language=dtypes.Language.CPP)
+    iota = TileIota(name=f"lane_id_mat_{arr_name}", widths=widths, expr=symbolic.symstr(substituted, cpp_mode=False))
+    inner_state.add_node(iota)
     out_an = inner_state.add_access(arr_name)
     out_subset = ", ".join(f"0:{w}" for w in widths)
-    inner_state.add_edge(tasklet, "_out", out_an, None, Memlet(f"{arr_name}[{out_subset}]"))
+    inner_state.add_edge(iota, "_dst", out_an, None, Memlet(f"{arr_name}[{out_subset}]"))
     return out_an
 
 
