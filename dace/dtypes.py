@@ -207,7 +207,7 @@ SCOPEDEFAULT_STORAGE = {
     ScheduleType.GPU_ThreadBlock_Dynamic: StorageType.Register,
     ScheduleType.SVE_Map: StorageType.CPU_Heap,
     ScheduleType.Snitch: StorageType.Snitch_TCDM,
-    ScheduleType.GPU_Warp: StorageType.Register,,
+    ScheduleType.GPU_Warp: StorageType.Register,
     ScheduleType.CuTile: StorageType.CuTile_Tile,
 }
 
@@ -226,7 +226,7 @@ SCOPEDEFAULT_SCHEDULE = {
     ScheduleType.SVE_Map: ScheduleType.Sequential,
     ScheduleType.Snitch: ScheduleType.Snitch,
     ScheduleType.Snitch_Multicore: ScheduleType.Snitch_Multicore,
-    ScheduleType.GPU_Warp: ScheduleType.Sequential,,
+    ScheduleType.GPU_Warp: ScheduleType.Sequential,
     ScheduleType.CuTile: ScheduleType.Sequential,
 }
 
