@@ -19,7 +19,8 @@ def is_device_resident(storage: dtypes.StorageType) -> bool:
     :returns: ``True`` when the storage is GPU-resident (no host conversion
         needed), ``False`` otherwise.
     """
-    return storage in dtypes.GPU_RESIDENT_STORAGES
+    from dace.libraries.standard.helper import GPU_RESIDENT_STORAGES
+    return storage in GPU_RESIDENT_STORAGES
 
 
 def cupy_in_wrap(name: str, storage: dtypes.StorageType) -> str:
