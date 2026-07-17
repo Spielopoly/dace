@@ -7,26 +7,12 @@ from dace.sdfg import SDFG
 from dace.properties import CodeBlock
 from dace.codegen import cppunparse
 from dace.codegen.tools import gpu_runtime
+from functools import lru_cache
 from io import StringIO
-import functools
 import os
 import subprocess
 from typing import List, Optional, Set, Union
 import warnings
-
-_NO_SYNC_ENV = "__DACE_NO_SYNC"
-
-
-def no_sync_emission() -> bool:
-    """True when ``__DACE_NO_SYNC`` is set (to any truthy value) in the
-    environment at codegen time. When set, ``*Synchronize`` calls on
-    streams, events and the device are elided from the generated CUDA
-    code. Default is False (sync calls are emitted). Use as an escape
-    hatch while the codegen's sync emission has known issues; the
-    caller is then responsible for any host-side synchronization that
-    would otherwise have been implicit."""
-    v = os.environ.get(_NO_SYNC_ENV, "")
-    return v.lower() not in ("", "0", "false", "no", "off")
 
 
 def find_incoming_edges(node, dfg):
@@ -51,7 +37,7 @@ def find_outgoing_edges(node, dfg):
         return list(dfg.out_edges(node))
 
 
-@functools.lru_cache(maxsize=16384)
+@lru_cache(maxsize=16384, typed=True)
 def _sym2cpp(s, arrayexprs):
     return cppunparse.pyexpr2cpp(symbolic.symstr(s, arrayexprs, cpp_mode=True))
 
@@ -128,12 +114,10 @@ def get_gpu_backend() -> str:
     return _probing_for_gpu_backend()
 
 
-@functools.cache
+@lru_cache(maxsize=None, typed=True)
 def _probing_for_gpu_backend() -> str:
-    # Inspects the system to figuring out which GPU backend to be used.
-    #  This function should not be called directly by the user, instead it is called
-    #  by `get_gpu_backend()` is the backend is not set. Note that the return value
-    #  of this function is cached and will never change.
+    # Probe the system for the GPU backend. Called by ``get_gpu_backend()`` when
+    # the backend is unset, not directly; the cached result never changes.
     def _try_execute(cmd: str) -> bool:
         process = subprocess.Popen(cmd.split(' '), stderr=subprocess.STDOUT, stdout=subprocess.PIPE, shell=True)
         errcode = process.wait()
@@ -177,11 +161,10 @@ def get_gpu_runtime() -> gpu_runtime.GPURuntime:
     return _look_for_runtime_file(backend)
 
 
-@functools.cache
+@lru_cache(maxsize=None, typed=True)
 def _look_for_runtime_file(backend: str) -> gpu_runtime.GPURuntime:
-    # Look for the runtime information of a GPU backend.
-    #  The user should never call this function directly, instead it is called
-    #  indirectly by ``get_gpu_runtime()``.
+    # Locate a GPU backend's runtime. Called indirectly by ``get_gpu_runtime()``,
+    # not directly.
 
     if backend == 'cuda':
         libpath = ctypes.util.find_library('cudart')

@@ -135,6 +135,25 @@ def validate_control_flow_region(sdfg: 'SDFG',
                     f'variables {also_assigned}, which are also modified in the same '
                     'edge.', sdfg, eid)
 
+        # A LoopRegion's iterator is mutated by the LoopRegion itself
+        # (init_expr / update_expr); writing to it from an arbitrary
+        # interstate edge inside the body would race with the loop
+        # machinery and break the SSA invariant the SSA pass relies on.
+        # Reject any assignment whose LHS is the enclosing LoopRegion's
+        # loop variable.  Use the generic ``InvalidSDFGError`` rather
+        # than ``InvalidSDFGInterstateEdgeError`` so the message renders
+        # cleanly -- the latter looks the edge up via
+        # ``sdfg.edges()[edge_id]`` which can't find region-internal
+        # edges.
+        if isinstance(region, LoopRegion) and region.loop_variable:
+            if region.loop_variable in edge.data.assignments:
+                raise InvalidSDFGError(
+                    f'Loop iterator "{region.loop_variable}" must not appear on '
+                    f'the LHS of an interstate-edge assignment inside its own '
+                    f'LoopRegion "{region.label}".  The LoopRegion already '
+                    'owns the iterator update via init_expr / update_expr; '
+                    'mutating it elsewhere races with that machinery.', sdfg, None)
+
         # Add edge symbols into defined symbols
         symbols.update(issyms)
 
@@ -211,7 +230,7 @@ def validate_control_flow_region(sdfg: 'SDFG',
                         f'(Storage: {sdfg.arrays[container].storage}) in host code interstate edge', sdfg, eid)
 
     # Check for interstate edges that write to scalars or arrays
-    _no_writes_to_scalars_or_arrays_on_interstate_edges(sdfg)
+    _no_writes_to_scalars_or_arrays_on_interstate_edges(region)
 
 
 def validate_sdfg(sdfg: 'dace.sdfg.SDFG', references: Set[int] = None, **context: bool):
@@ -914,9 +933,14 @@ def validate_state(state: 'dace.sdfg.SDFGState',
                          for oe in state.out_edges(dst_node)}):
                         pass
                 else:
-                    raise InvalidSDFGEdgeError(
-                        f"Memlet creates an invalid path (sink node {dst_node}"
-                        " should be a data node)", sdfg, state_id, eid)
+                    if isinstance(dst_node, nd.Tasklet) and len(dst_node.in_connectors) == 0 and len(
+                            dst_node.out_connectors) == 0:
+                        # Tasklets with no input or output connector -> sync tasklet -> OK
+                        pass
+                    else:
+                        raise InvalidSDFGEdgeError(
+                            f"Memlet creates an invalid path (sink node {dst_node}"
+                            " should be a data node)", sdfg, state_id, eid)
         # If scope(dst) is disjoint from scope(src), it's an illegal memlet
         else:
             raise InvalidSDFGEdgeError("Illegal memlet between disjoint scopes", sdfg, state_id, eid)
@@ -932,18 +956,15 @@ def validate_state(state: 'dace.sdfg.SDFGState',
                     eid,
                 )
 
-        # Verify that source and destination subsets contain the same
-        # number of elements. Only AccessNode endpoints expose a ``.data``
-        # descriptor whose ``veclen`` participates in this check; scope
-        # nodes (NestedSDFG, MapEntry/Exit, ConsumeEntry/Exit) route data
-        # through connectors and contribute ``veclen = 1`` to the count.
-        if not e.data.allow_oob and e.data.other_subset is not None and not (
-            (isinstance(src_node, nd.AccessNode) and isinstance(sdfg.arrays[src_node.data], dt.Stream)) or
-            (isinstance(dst_node, nd.AccessNode) and isinstance(sdfg.arrays[dst_node.data], dt.Stream))):
-            src_veclen = sdfg.arrays[src_node.data].veclen if isinstance(src_node, nd.AccessNode) else 1
-            dst_veclen = sdfg.arrays[dst_node.data].veclen if isinstance(dst_node, nd.AccessNode) else 1
-            src_expr = e.data.src_subset.num_elements() * src_veclen
-            dst_expr = e.data.dst_subset.num_elements() * dst_veclen
+        # Verify that source and destination subsets contain the same number of
+        # elements. The check only applies when BOTH endpoints are ``AccessNode``s
+        # backed by arrays (so ``.data`` and ``.veclen`` are meaningful); if either
+        # side is a ``Stream`` access node the volumes legitimately differ.
+        if (not e.data.allow_oob and e.data.other_subset is not None and isinstance(src_node, nd.AccessNode)
+                and isinstance(dst_node, nd.AccessNode) and not isinstance(sdfg.arrays[src_node.data], dt.Stream)
+                and not isinstance(sdfg.arrays[dst_node.data], dt.Stream)):
+            src_expr = (e.data.src_subset.num_elements() * sdfg.arrays[src_node.data].veclen)
+            dst_expr = (e.data.dst_subset.num_elements() * sdfg.arrays[dst_node.data].veclen)
             if symbolic.inequal_symbols(src_expr, dst_expr):
                 error = InvalidSDFGEdgeError('Dimensionality mismatch between src/dst subsets', sdfg, state_id, eid)
                 # NOTE: Make an exception for Views and reference sets

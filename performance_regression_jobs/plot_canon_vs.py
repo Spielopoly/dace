@@ -31,23 +31,36 @@ CORPORA = ('npbench', 'polybench', 'tsvc2', 'tsvc2_5')
 
 #: (lane, colour) shown per panel -- the baseline lane is dropped per corpus.
 #: Categorical hues from the dataviz skill's validated default palette.
-LANE_COLORS = [('dace-canon', '#1baf7a'), ('dace-parallel', '#2a78d6'), ('compiler-autopar', '#eda100'),
-               ('compiler-seq', '#d9534f')]
+LANE_COLORS = [('dace-canon', '#1baf7a'), ('dace-parallel', '#2a78d6'), ('dace-autoopt', '#e07a2b'),
+               ('compiler-autopar', '#eda100'), ('compiler-seq', '#d9534f')]
 
 
 def baseline_lane(corpus):
     return 'numpy' if corpus in ('npbench', 'polybench') else 'compiler-seq'
 
 
+def _rank(entry):
+    """Sort key for picking the representative of a lane across tags: a
+    correct+timed run beats an untimed/failed one, and among correct+timed the
+    smaller min_ms wins (best-of-N over the compiler x node tags)."""
+    good = bool(entry.get('correct') and entry.get('min_ms') is not None)
+    return (good, -(entry['min_ms'] if good else float('inf')))
+
+
 def merge_kernel(kernel_dir):
     """All lanes for one kernel merged across its tag folders (dace-tag +
-    native-tag). Lane names never collide across the two, so one flat dict
-    is unambiguous."""
+    native-tag). A lane CAN appear in several tags (e.g. compiler-seq shows up
+    both in a compiler-prefixed tag where it was built and in a bare-node tag
+    where it was not), so a blind last-tag-wins update lets an untimed/failed
+    copy clobber a good one -- keep the best-ranked entry per lane instead."""
     merged = {}
     for tag in sorted(os.listdir(kernel_dir)):
         p = os.path.join(kernel_dir, tag)
-        if os.path.isdir(p):
-            merged.update(engine._read_kernel(p))
+        if not os.path.isdir(p):
+            continue
+        for lane, entry in engine._read_kernel(p).items():
+            if lane not in merged or _rank(entry) > _rank(merged[lane]):
+                merged[lane] = entry
     return merged
 
 

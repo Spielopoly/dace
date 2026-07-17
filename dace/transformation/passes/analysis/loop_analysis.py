@@ -100,6 +100,44 @@ def get_loop_stride(loop: LoopRegion) -> Optional[symbolic.SymbolicType]:
     return None
 
 
+def _provably_le(a: symbolic.SymbolicType, b: symbolic.SymbolicType) -> bool:
+    """Prove ``a <= b`` SOUNDLY, returning ``False`` when it cannot be decided (never a guess).
+
+    Beyond a concrete numeric verdict and sympy's own non-positivity engine (which respects the
+    codebase's non-negative symbols), this proves the ``Min`` / ``Max`` clamp shape a range split
+    leaves behind: ``Min(..., t) <= t`` for any of its own args ``t``, ``t <= Max(..., t)``, and the
+    combined ``Min(..., t) <= t <= Max(..., t)`` sharing a term ``t``.
+    """
+    diff = symbolic.simplify(a - b)
+    if diff.is_number:
+        return bool(diff <= 0)
+    if diff.is_nonpositive:  # sympy assumption engine; None (undecided) is falsy -> not proven
+        return True
+    a_min = a.args if isinstance(a, sympy.Min) else ()
+    b_max = b.args if isinstance(b, sympy.Max) else ()
+    if b in a_min:  # a = Min(..., b, ...) <= b
+        return True
+    if a in b_max:  # a <= Max(..., a, ...) = b
+        return True
+    return bool(a_min and b_max and (set(a_min) & set(b_max)))  # a <= shared t <= b
+
+
+def loop_provably_at_most_one_iteration(loop: LoopRegion) -> bool:
+    """Whether ``loop`` provably runs at most once (zero or one iterations).
+
+    Such a loop carries no cross-iteration dependence by construction, so it is trivially DOALL --
+    a ``LoopToMap`` can map it without any dependence analysis. Restricted to the unit ascending
+    stride so the inclusive trip count is exactly ``end - start + 1``; the loop runs at most once iff
+    ``end <= start``. Conservative: returns ``False`` whenever the bound cannot be proven.
+    """
+    start = get_init_assignment(loop)
+    end = get_loop_end(loop)  # inclusive
+    step = get_loop_stride(loop)
+    if start is None or end is None or step is None or symbolic.simplify(step) != 1:
+        return False
+    return _provably_le(symbolic.simplify(end), symbolic.simplify(start))
+
+
 @dataclass(frozen=True)
 class InductionVariable:
     """
@@ -148,7 +186,7 @@ def affine_in_iv(
     """
     if expr is None:
         return None
-    e = sympy.sympify(expr)
+    e = symbolic.pystr_to_symbolic(expr)
     iv_names = set(ivs)
     # DaCe uses its own ``symbolic.symbol`` subclass; sympy treats it as a
     # distinct Symbol from ``sympy.Symbol(name)``, so match by name string.
@@ -159,19 +197,19 @@ def affine_in_iv(
     if not referenced:
         if invariant_syms is not None and not (free <= invariant_syms):
             return None
-        return (None, sympy.Integer(0), e)
+        return (None, symbolic.pystr_to_symbolic(0), e)
 
     for iv_name in referenced:
         iv_sym = sym_by_name[iv_name]
         try:
-            scale = sympy.simplify(sympy.diff(e, iv_sym))
+            scale = symbolic.simplify(sympy.diff(e, iv_sym))
         except Exception:
             continue
         scale_free = {str(s) for s in scale.free_symbols}
         if scale_free & iv_names:
             continue
         try:
-            offset = sympy.simplify(e - scale * iv_sym)
+            offset = symbolic.simplify(e - scale * iv_sym)
         except Exception:
             continue
         offset_free = {str(s) for s in offset.free_symbols}
@@ -267,7 +305,7 @@ def detect_induction_variables(loop: LoopRegion) -> Dict[str, InductionVariable]
     step = get_loop_stride(loop)
     if start is None or step is None:
         return ivs
-    if loop.loop_variable in {str(s) for s in sympy.sympify(step).free_symbols}:
+    if loop.loop_variable in {str(s) for s in symbolic.pystr_to_symbolic(step).free_symbols}:
         return ivs
 
     ivs[loop.loop_variable] = InductionVariable(
@@ -308,7 +346,7 @@ def detect_induction_variables(loop: LoopRegion) -> Dict[str, InductionVariable]
                 continue
             # Reject self-referential assignments like ``j = j + i``: the RHS
             # must not mention the name being classified.
-            if name in {str(s) for s in sympy.sympify(rhs_sym).free_symbols}:
+            if name in {str(s) for s in symbolic.pystr_to_symbolic(rhs_sym).free_symbols}:
                 pending.pop(name)
                 continue
             result = affine_in_iv(rhs_sym, ivs)

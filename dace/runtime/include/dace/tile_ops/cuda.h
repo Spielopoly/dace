@@ -207,6 +207,14 @@ template <char Op>
 DACE_DFI constexpr bool _is_half2_reduce() {
   return Op == '+' || Op == '*' || Op == 'm' || Op == 'M';
 }
+
+// Aligned 32-bit pair load/store for the FP16x2 fast paths. The tile buffers the
+// vectorizer stages are DACE_ALIGN(64) and every non-broadcast half2 access starts
+// at an even lane, so ``&p[i]`` is 4-byte aligned. A single LD.U32 / ST.U32 then
+// replaces the two-element ``__halves2half2`` pack (two 16-bit loads + a pack) and
+// the ``__low2half`` / ``__high2half`` unpack (two extracts + two 16-bit stores).
+DACE_DFI __half2 _load_half2(const __half* __restrict__ p) { return *reinterpret_cast<const __half2*>(p); }
+DACE_DFI void _store_half2(__half* __restrict__ p, __half2 v) { *reinterpret_cast<__half2*>(p) = v; }
 #endif
 
 // ----------------------------- tile_binop -----------------------------
@@ -219,11 +227,10 @@ DACE_DFI void tile_binop(T* __restrict__ out, const T* __restrict__ a, const T* 
   if constexpr (__is_same(T, __half) && (VLEN % 2 == 0) && !Masked && _is_half2_binop<Op>()) {
 #pragma unroll
     for (int i = 0; i < VLEN; i += 2) {
-      const __half2 av = BroadcastA ? __half2half2(a[0]) : __halves2half2(a[i], a[i + 1]);
-      const __half2 bv = BroadcastB ? __half2half2(b[0]) : __halves2half2(b[i], b[i + 1]);
+      const __half2 av = BroadcastA ? __half2half2(a[0]) : _load_half2(&a[i]);
+      const __half2 bv = BroadcastB ? __half2half2(b[0]) : _load_half2(&b[i]);
       const __half2 rv = _half2_apply<Op>(av, bv);
-      out[i] = __low2half(rv);
-      out[i + 1] = __high2half(rv);
+      _store_half2(&out[i], rv);
     }
     return;
   }
@@ -239,6 +246,44 @@ DACE_DFI void tile_binop(T* __restrict__ out, const T* __restrict__ a, const T* 
   }
 }
 
+// ----------------------------- tile_fma -------------------------------
+// out[i] = fma(a, b, c) = a*b + c (single rounding). A ``__half`` tile at even
+// width uses the native FP16x2 fused multiply-add ``__hfma2(av, bv, cv)`` (=
+// av*bv + cv, single-rounded per lane); every other element type computes
+// through ``float`` with ``fmaf`` (matching the sibling ``tile_binop`` compute
+// path -- a double tile degrades through float exactly as tile_binop does).
+// ``fmaf`` / ``__hfma2`` are fused single-rounded, so the GPU and the CPU pure
+// lowerings agree.
+template <typename T, int VLEN, bool BroadcastA, bool BroadcastB, bool BroadcastC, bool Masked>
+DACE_DFI void tile_fma(T* __restrict__ out, const T* __restrict__ a, const T* __restrict__ b, const T* __restrict__ c,
+                       const bool* __restrict__ mask) {
+#if defined(__CUDACC__)
+  // FP16x2 path: __half tile, even width, unmasked. Two lanes per __hfma2.
+  if constexpr (__is_same(T, __half) && (VLEN % 2 == 0) && !Masked) {
+#pragma unroll
+    for (int i = 0; i < VLEN; i += 2) {
+      const __half2 av = BroadcastA ? __half2half2(a[0]) : _load_half2(&a[i]);
+      const __half2 bv = BroadcastB ? __half2half2(b[0]) : _load_half2(&b[i]);
+      const __half2 cv = BroadcastC ? __half2half2(c[0]) : _load_half2(&c[i]);
+      const __half2 rv = __hfma2(av, bv, cv);  // av*bv + cv
+      _store_half2(&out[i], rv);
+    }
+    return;
+  }
+#endif
+#pragma unroll
+  for (int i = 0; i < VLEN; ++i) {
+    const float af = _cuda_to_compute<T>(BroadcastA ? a[0] : a[i]);
+    const float bf = _cuda_to_compute<T>(BroadcastB ? b[0] : b[i]);
+    const float cf = _cuda_to_compute<T>(BroadcastC ? c[0] : c[i]);
+    const T rv = _cuda_from_compute<T>(fmaf(af, bf, cf));  // single-rounded a*b + c
+    if constexpr (Masked)
+      out[i] = mask[i] ? rv : T(0);
+    else
+      out[i] = rv;
+  }
+}
+
 // ----------------------------- tile_unop ------------------------------
 template <typename T, int VLEN, char Op, bool Broadcast, bool Masked>
 DACE_DFI void tile_unop(T* __restrict__ out, const T* __restrict__ a, const bool* __restrict__ mask) {
@@ -248,10 +293,9 @@ DACE_DFI void tile_unop(T* __restrict__ out, const T* __restrict__ a, const bool
   if constexpr (__is_same(T, __half) && (VLEN % 2 == 0) && !Masked && _is_half2_unop<Op>()) {
 #pragma unroll
     for (int i = 0; i < VLEN; i += 2) {
-      const __half2 av = Broadcast ? __half2half2(a[0]) : __halves2half2(a[i], a[i + 1]);
+      const __half2 av = Broadcast ? __half2half2(a[0]) : _load_half2(&a[i]);
       const __half2 rv = _half2_unop_apply<Op>(av);
-      out[i] = __low2half(rv);
-      out[i + 1] = __high2half(rv);
+      _store_half2(&out[i], rv);
     }
     return;
   }
@@ -347,21 +391,36 @@ DACE_DFI void tile_mask_gen(bool* __restrict__ out, IdxT base, IdxT ub) {
 // ('+' sum, '*' prod, 'm' min, 'M' max). Returns the reduced ELEMENT (a ``__half`` for
 // an fp16 tile), not a vector.
 //
-// CUDA has NO single "reduce half2 -> half" intrinsic, so for an fp16 tile we compose
-// one: accumulate the lanes pairwise with the half2 arithmetic intrinsic (``__hadd2`` /
-// ... two lanes per op), then fold the surviving half2's two lanes into one ``__half``
-// with the scalar combine (``__hadd`` / ...). The generic template keeps the portable
-// per-lane scalar fold for every other element type.
+// An fp16 tile folds as a balanced tree of half2 ops (consecutive pairs (0,1)(2,3)...;
+// an odd trailing element forwards unchanged). CUDA has NO single "reduce half2 -> half"
+// intrinsic, so we compose one: pack the VLEN lanes into VLEN/2 ``half2`` values and fold
+// that array as a balanced tree of the half2 intrinsic (``__hadd2`` / ..., two lanes per op
+// -- a sequence of half2 trees), then combine the surviving half2's two lanes into one
+// ``__half`` with the scalar combine (``__hadd`` / ...). The O(log VLEN) critical path lets
+// the compiler re-vectorise the partials. Every other element type (fp32 / fp64) folds
+// through the plain per-lane scalar accumulate. Over a compile-time-constant ``VLEN`` every
+// loop unrolls.
 template <typename T, int VLEN, char Op>
 DACE_DFI T tile_reduce(const T* __restrict__ src) {
 #if defined(__CUDACC__)
   if constexpr (__is_same(T, __half) && VLEN >= 2 && (VLEN % 2 == 0) && _is_half2_reduce<Op>()) {
-    __half2 acc = __halves2half2(src[0], src[1]);
+    constexpr int H = VLEN / 2;
+    __half2 buf[H];
 #pragma unroll
-    for (int i = 2; i < VLEN; i += 2) acc = _half2_apply<Op>(acc, __halves2half2(src[i], src[i + 1]));
-    return _half_combine<Op>(__low2half(acc), __high2half(acc));
+    for (int i = 0; i < H; ++i) buf[i] = _load_half2(&src[2 * i]);
+    int n = H;
+    while (n > 1) {
+      int half = n / 2;
+#pragma unroll
+      for (int i = 0; i < half; ++i) buf[i] = _half2_apply<Op>(buf[2 * i], buf[2 * i + 1]);
+      if (n & 1) buf[half] = buf[n - 1];
+      n = half + (n & 1);
+    }
+    return _half_combine<Op>(__low2half(buf[0]), __high2half(buf[0]));
   }
 #endif
+  // Every other element type (fp32 / fp64) folds through the plain per-lane scalar
+  // accumulate (unrolled over the compile-time-constant VLEN).
   T acc = src[0];
 #pragma unroll
   for (int i = 1; i < VLEN; ++i) acc = tile_apply<T, Op>(acc, src[i]);
@@ -405,6 +464,20 @@ DACE_DFI typename std::enable_if<VLEN == 1, void>::type tile_binop(Out&& out, A&
   const T av = tile_load_value<T>(a);
   const T bv = tile_load_value<T>(b);
   T rv = tile_apply<T, Op>(av, bv);
+  if constexpr (Masked)
+    tile_store_value<T>(out, mask[0] ? rv : T(0));
+  else
+    tile_store_value<T>(out, rv);
+}
+
+template <typename T, int VLEN, bool BroadcastA, bool BroadcastB, bool BroadcastC, bool Masked, typename Out,
+          typename A, typename B, typename C>
+DACE_DFI typename std::enable_if<VLEN == 1, void>::type tile_fma(Out&& out, A&& a, B&& b, C&& c,
+                                                                const bool* __restrict__ mask) {
+  const float af = _cuda_to_compute<T>(tile_load_value<T>(a));
+  const float bf = _cuda_to_compute<T>(tile_load_value<T>(b));
+  const float cf = _cuda_to_compute<T>(tile_load_value<T>(c));
+  T rv = _cuda_from_compute<T>(fmaf(af, bf, cf));
   if constexpr (Masked)
     tile_store_value<T>(out, mask[0] ? rv : T(0));
   else

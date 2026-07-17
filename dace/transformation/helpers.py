@@ -1612,6 +1612,40 @@ def get_parent_map(state: SDFGState, node: Optional[nodes.Node] = None) -> Optio
     return None
 
 
+def is_within_schedule_types(state: SDFGState, node: nodes.Node, schedules: Set[dtypes.ScheduleType]) -> bool:
+    """
+    Checks if the given node is enclosed within a Map whose schedule type
+    matches any in the ``schedules`` set.
+
+    Parameters
+    ----------
+    state : SDFGState
+        The State where the node resides
+    node : nodes.Node
+        The node to check.
+    schedules : set[dtypes.ScheduleType]
+        A set of schedule types to match (e.g., {dtypes.ScheduleType.GPU_Device}).
+
+    Returns
+    ----------
+    bool
+        True if the node is enclosed by a Map with a schedule type in ``schedules``, False otherwise.
+    """
+    current = node
+
+    while current is not None:
+        if isinstance(current, nodes.MapEntry):
+            if current.map.schedule in schedules:
+                return True
+
+        parent = get_parent_map(state, current)
+        if parent is None:
+            return False
+        current, state = parent
+
+    return False
+
+
 def redirect_edge(state: SDFGState,
                   edge: graph.MultiConnectorEdge[Memlet],
                   new_src: Optional[nodes.Node] = None,
@@ -2188,7 +2222,12 @@ def get_parent_map_and_loop_scopes(root_sdfg: SDFG, node: Union[nodes.MapEntry, 
     cur_node = node
     parent_scopes = list()
 
-    if isinstance(cur_node, (nodes.MapEntry, nodes.Tasklet)):
+    if isinstance(cur_node, (nodes.MapEntry, nodes.Tasklet, nodes.LibraryNode)):
+        # A LibraryNode is a scope child like a Tasklet (a "special tasklet"): its enclosing
+        # MapEntry scopes are read from the same ``scope_dict``. Without it, a caller asking for
+        # the parent maps of a library node (e.g. the SharedMemoryCollective GPU_ThreadBlock
+        # rejection, or the libnode-schedule decision in canonicalize's finalize) would miss every
+        # map in the node's own state.
         while scope_dict[cur_node] is not None:
             if isinstance(scope_dict[cur_node], nodes.MapEntry):
                 parent_scopes.append(scope_dict[cur_node])

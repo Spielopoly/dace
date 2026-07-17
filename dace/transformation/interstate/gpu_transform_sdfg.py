@@ -523,20 +523,40 @@ class GPUTransformSDFG(transformation.MultiStateTransformation):
                 # Store in/out edges in lists so that they don't get corrupted when they are removed from the graph.
                 in_edges = list(state.in_edges(gcode))
                 out_edges = list(state.out_edges(gcode))
-                me.in_connectors = {('IN_' + e.dst_conn): None for e in in_edges}
-                me.out_connectors = {('OUT_' + e.dst_conn): None for e in in_edges}
-                mx.in_connectors = {('IN_' + e.src_conn): None for e in out_edges}
-                mx.out_connectors = {('OUT_' + e.src_conn): None for e in out_edges}
+                # A connector-less edge (``dst_conn`` / ``src_conn`` is None -- an
+                # empty-memlet dependency edge, e.g. sequencing a reduction-init
+                # tasklet) passes through the wrapping map as a dependency edge with
+                # no connector; only named edges get IN_/OUT_ connectors (``'IN_' +
+                # None`` would crash).
+                me.in_connectors = {('IN_' + e.dst_conn): None for e in in_edges if e.dst_conn is not None}
+                me.out_connectors = {('OUT_' + e.dst_conn): None for e in in_edges if e.dst_conn is not None}
+                mx.in_connectors = {('IN_' + e.src_conn): None for e in out_edges if e.src_conn is not None}
+                mx.out_connectors = {('OUT_' + e.src_conn): None for e in out_edges if e.src_conn is not None}
 
-                # Create memlets through map
+                # Create memlets through map. A connector-less edge must be an empty-memlet
+                # dependency edge -- a data edge to/from the wrapped tasklet/nested SDFG always
+                # carries a named connector, so routing a non-empty memlet with no IN_/OUT_
+                # connector would silently drop its data path; assert the invariant to fail loud.
                 for e in in_edges:
                     state.remove_edge(e)
-                    state.add_edge(e.src, e.src_conn, me, 'IN_' + e.dst_conn, e.data)
-                    state.add_edge(me, 'OUT_' + e.dst_conn, e.dst, e.dst_conn, dc(e.data))
+                    if e.dst_conn is None:
+                        assert e.data is None or e.data.is_empty(), \
+                            f'connector-less in-edge into {gcode.label} carries a non-empty memlet {e.data}'
+                        state.add_edge(e.src, e.src_conn, me, None, e.data)
+                        state.add_edge(me, None, e.dst, e.dst_conn, dc(e.data))
+                    else:
+                        state.add_edge(e.src, e.src_conn, me, 'IN_' + e.dst_conn, e.data)
+                        state.add_edge(me, 'OUT_' + e.dst_conn, e.dst, e.dst_conn, dc(e.data))
                 for e in out_edges:
                     state.remove_edge(e)
-                    state.add_edge(e.src, e.src_conn, mx, 'IN_' + e.src_conn, e.data)
-                    state.add_edge(mx, 'OUT_' + e.src_conn, e.dst, e.dst_conn, dc(e.data))
+                    if e.src_conn is None:
+                        assert e.data is None or e.data.is_empty(), \
+                            f'connector-less out-edge from {gcode.label} carries a non-empty memlet {e.data}'
+                        state.add_edge(e.src, e.src_conn, mx, None, e.data)
+                        state.add_edge(mx, None, e.dst, e.dst_conn, dc(e.data))
+                    else:
+                        state.add_edge(e.src, e.src_conn, mx, 'IN_' + e.src_conn, e.data)
+                        state.add_edge(mx, 'OUT_' + e.src_conn, e.dst, e.dst_conn, dc(e.data))
 
                 # Map without inputs
                 if len(in_edges) == 0:
@@ -618,7 +638,69 @@ class GPUTransformSDFG(transformation.MultiStateTransformation):
                     block.replace_meta_accesses({devicename: hostname})
 
         # Step 9: Simplify
-        if not self.simplify:
+        if self.simplify:
+            sdfg.simplify()
+
+        # When the ExperimentalCUDACodeGen is selected, handle in-kernel transient
+        # GPU_Global arrays here for backwards compatibility. Imports are local: this
+        # block only runs under the experimental codegen, and importing the pass at
+        # module scope would create a transformation <-> pass import cycle.
+        from dace.config import Config
+        if not Config.get('compiler', 'cuda', 'implementation') == 'experimental':
             return
 
-        sdfg.simplify()
+        from dace.transformation.passes.move_array_out_of_kernel import MoveArrayOutOfKernel
+        import warnings
+
+        # Detect transient GPU_Global arrays inside GPU_Device-scheduled maps
+        transients_in_kernels: Set[Tuple[str, data.Array, nodes.MapEntry]] = set()
+        transient_outside_kernels: Set[Tuple[str, data.Array]] = set()
+
+        for node, parent in sdfg.all_nodes_recursive():
+            # Consider only transient GPU_Global arrays.
+            if not isinstance(node, nodes.AccessNode):
+                continue
+
+            desc = node.desc(parent)
+            if not isinstance(desc, data.Array):
+                continue
+            if not desc.transient:
+                continue
+            if desc.storage != dtypes.StorageType.GPU_Global:
+                continue
+
+            # Check whether the transient/access node occurs within a kernel.
+            in_kernel = False
+            parent_map_info = xfh.get_parent_map(state=parent, node=node)
+            while parent_map_info is not None:
+                map_entry, map_state = parent_map_info
+                if (isinstance(map_entry, nodes.MapEntry) and map_entry.map.schedule == dtypes.ScheduleType.GPU_Device):
+                    in_kernel = True
+                    break
+                parent_map_info = xfh.get_parent_map(map_state, map_entry)
+
+            if in_kernel:
+                transients_in_kernels.add((node.data, desc, map_entry))
+            else:
+                transient_outside_kernels.add((node.data, desc))
+
+        # Skip transients that are used outside of GPU kernels, unless a separate, strictly kernel-local
+        # transient with the same name exists inside a kernel. In such cases, 'MoveArrayOutOfKernel' is
+        # still applied to the local one, and naming conflicts are handled automatically.
+        transient_defined_inside_kernel: Set[Tuple[str, nodes.MapEntry]] = set()
+        for data_name, array_desc, kernel_entry in transients_in_kernels:
+            if (data_name, array_desc) in transient_outside_kernels:
+                continue
+            else:
+                transient_defined_inside_kernel.add((data_name, kernel_entry))
+
+        # Apply the pass and warn the user of its use
+        for data_name, kernel_entry in transient_defined_inside_kernel:
+            warnings.warn(
+                f"Transient array '{data_name}' with storage type GPU_Global detected inside kernel {kernel_entry}. "
+                "GPU_Global memory cannot be allocated within GPU kernels, so this usage is semantically invalid. "
+                "As a best-effort fix, the array will be lifted outside the kernel as a non-transient GPU_Global array. "
+                "Any naming conflicts are resolved automatically. "
+                "Please avoid this pattern, as it is strongly discouraged and may lead to undefined behavior. "
+                "Note that this fix provides no guarantees, especially for unusual or complex use cases.")
+            MoveArrayOutOfKernel().apply_pass(sdfg, kernel_entry, data_name)

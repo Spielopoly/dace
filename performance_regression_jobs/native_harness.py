@@ -79,6 +79,52 @@ def openmp_rpath_flags(cc):
                 dirs.append(d)
     return [f'-Wl,-rpath,{d}' for d in dirs]
 
+
+def library_discovery_flags():
+    """``-isystem`` / ``-L`` / ``-rpath`` flags so a kernel that expands a DaCe library node
+    (BLAS/LAPACK via ``cblas.h`` / ``lapacke.h``, MKL, ...) finds its headers and libraries in
+    the common install layouts the bare compiler does not search on its own.
+
+    The compiler already honors ``CPATH`` / ``C_INCLUDE_PATH`` / ``CPLUS_INCLUDE_PATH`` and
+    ``LIBRARY_PATH`` from the inherited environment, so this ADDS only the prefix layouts those
+    miss: the ``include`` / ``lib`` / ``lib64`` siblings of every ``PATH`` entry (the standard
+    ``bin/ include/ lib/`` prefix used by conda / spack / venv), the common prefix variables,
+    every ``CMAKE_PREFIX_PATH`` entry, and the Debian multiarch cblas/openblas header subdirs.
+    Purely additive: a nonexistent dir is dropped and re-adding a default dir is a no-op, so a
+    build that already resolved is unchanged."""
+    inc, lib = [], []
+
+    def add_prefix(pfx):
+        inc.append(os.path.join(pfx, 'include'))
+        lib.extend((os.path.join(pfx, 'lib'), os.path.join(pfx, 'lib64')))
+
+    for entry in os.environ.get('PATH', '').split(os.pathsep):
+        if entry:
+            add_prefix(os.path.dirname(entry.rstrip(os.sep)))
+    for var in ('CONDA_PREFIX', 'VIRTUAL_ENV', 'OPENBLAS_ROOT', 'BLAS_ROOT', 'LAPACK_ROOT', 'MKLROOT', 'CUDA_HOME',
+                'CUDA_PATH'):
+        if os.environ.get(var):
+            add_prefix(os.environ[var])
+    for pfx in os.environ.get('CMAKE_PREFIX_PATH', '').split(os.pathsep):
+        if pfx:
+            add_prefix(pfx)
+    for base in ('/usr/include', '/usr/include/x86_64-linux-gnu'):
+        for sub in ('openblas', 'openblas-pthread', 'openblas-openmp', 'openblas-serial', 'cblas', 'lapacke', 'mkl'):
+            inc.append(os.path.join(base, sub))
+
+    flags, seen = [], set()
+    for d in inc:
+        if d and d not in seen and os.path.isdir(d):
+            seen.add(d)
+            flags.extend(('-isystem', d))
+    seen = set()
+    for d in lib:
+        if d and d not in seen and os.path.isdir(d):
+            seen.add(d)
+            flags.extend(('-L', d, f'-Wl,-rpath,{d}'))
+    return flags
+
+
 _CTYPE = {'double': ctypes.c_double, 'float': ctypes.c_float, 'int': ctypes.c_int, 'int64': ctypes.c_int64}
 
 
@@ -98,17 +144,40 @@ def find_best_cpp_compiler():
     return find_compiler('clang++') or find_compiler('g++')
 
 
-def find_gcc_install_dir():
-    """Clang needs an explicit --gcc-install-dir to find libstdc++ headers.
+def _gxx_version(gxx):
+    """(major, minor) of a g++ binary, or (0, 0) if it can't be queried."""
+    try:
+        dump = subprocess.run([gxx, '-dumpversion'], capture_output=True, text=True, timeout=10).stdout.strip()
+        parts = dump.split('.')
+        return (int(parts[0]), int(parts[1]) if len(parts) > 1 else 0)
+    except Exception:
+        return (0, 0)
 
-    Uses find_compiler('g++') -- the C++ compiler, not 'gcc' the C compiler --
-    since the two can be different versions with only one of them having a
-    matching libstdc++-dev headers package installed (observed concretely:
-    a gcc present as a C-only compiler with no matching libstdc++-dev, while
-    a different g++ on the same PATH was the actual complete C++ toolchain)."""
-    gxx = find_compiler('g++')
-    if not gxx:
-        return None
+
+def newest_gxx():
+    """Path to the HIGHEST-version g++ on PATH, across the bare ``g++`` (a spack-loaded gcc
+    puts its own here) and versioned ``g++-NN`` names. Distros ship a stale ``/usr/bin/g++``
+    (e.g. gcc 7) alongside newer ``g++-14``/``g++-13``; the newest is the one that both
+    compiles DaCe's C++23 (clang's libstdc++ source, see find_gcc_install_dir) AND supports
+    the Graphite loop optimizer (``-floop-parallelize-all``, needs a gcc built with isl --
+    the ancient default g++ predates it). Returns None if no g++ is found at all."""
+    best, best_ver, seen = None, (-1, -1), set()
+    for name in ['g++'] + [f'g++-{m}' for m in range(30, 6, -1)]:
+        gxx = find_compiler(name)
+        if not gxx:
+            continue
+        real = os.path.realpath(gxx)
+        if real in seen:
+            continue
+        seen.add(real)
+        ver = _gxx_version(gxx)
+        if ver > best_ver:
+            best, best_ver = gxx, ver
+    return best
+
+
+def _gcc_install_dir_of(gxx):
+    """The libstdc++ 'install:' dir clang's --gcc-install-dir wants, for a given g++."""
     try:
         out = subprocess.run([gxx, '-print-search-dirs'], capture_output=True, text=True, timeout=10).stdout
     except Exception:
@@ -119,6 +188,24 @@ def find_gcc_install_dir():
             if os.path.isdir(path):
                 return path
     return None
+
+
+def find_gcc_install_dir():
+    """Clang needs an explicit --gcc-install-dir to find libstdc++ headers.
+
+    Uses g++ -- the C++ compiler, not 'gcc' the C compiler -- since the two can be
+    different versions with only one having matching libstdc++-dev headers (observed:
+    a C-only gcc with no libstdc++-dev, while a different g++ on PATH was the complete
+    toolchain).
+
+    Resolved from :func:`newest_gxx` (the highest-version g++ on PATH): DaCe codegen emits
+    C++23, and clang resolves its libstdc++ from THIS directory -- a stale one (a distro's
+    ``/usr/bin/g++`` fixed at gcc 7, whose libstdc++ lacks ``std::ranges::fold_left`` and
+    other C++23 features) makes clang fail to compile the generated code even though clang
+    itself is modern. A spack-loaded modern gcc wins; failing that a system ``g++-14`` beats
+    the ancient default ``g++``."""
+    gxx = newest_gxx()
+    return _gcc_install_dir_of(gxx) if gxx else None
 
 
 def needs_gcc_install_dir(cc):
@@ -170,8 +257,12 @@ _LANE_SPEC = {
         '-mllvm', '-polly', '-mllvm', '-polly-parallel', '-mllvm', '-polly-parallel-force', '-mllvm',
         '-polly-process-unprofitable', '-lgomp'
     ]),
+    # newest_gxx (not bare 'g++'): the Graphite loop optimizer '-floop-parallelize-all' needs a
+    # gcc built with isl, which the ancient distro-default '/usr/bin/g++' (gcc 7) lacks -- a
+    # newer system g++-14/13/12 has it. Picking the newest g++ makes this lane a real Graphite
+    # auto-parallelizer instead of silently failing to compile.
     'native-gcc-autopar':
-    (lambda: find_compiler('g++'), lambda cc: [
+    (newest_gxx, lambda cc: [
         f'-ftree-parallelize-loops={_autopar_threads()}', '-floop-parallelize-all', '-fopenmp'
     ]),
     # -- experiment-facing lanes (run_perf.py). Both follow the PHASE compiler
@@ -205,7 +296,7 @@ def compile_lane(cpp_path, so_path, lane, timeout=1200):
     if not cc:
         return False, f'{lane}: compiler not found'
 
-    cmd = [cc, *OPT_FLAGS] + extra_flags(cc) + openmp_rpath_flags(cc) + [
+    cmd = [cc, *OPT_FLAGS] + extra_flags(cc) + openmp_rpath_flags(cc) + library_discovery_flags() + [
         '-shared', '-fPIC', cpp_path, '-o', so_path
     ]
     try:

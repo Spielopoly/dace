@@ -94,7 +94,22 @@ class SplitMapForTileRemainder(ppl.Pass):
         "GPU path, which emits no remainder loop; the caller guarantees the even extent.",
     )
 
-    def __init__(self, widths: Tuple[int, ...] = (8, ), tail_mode: str = "masked", assume_even: bool = False):
+    range_check = properties.Property(
+        dtype=bool,
+        default=True,
+        desc="Under ``assume_even``, guard the even-extent assumption at runtime: for every tiled "
+        "dim whose extent is not PROVABLY a multiple of its width, emit a host-side side-effect "
+        "tasklet that checks ``extent % W == 0`` before the kernel and, on violation, writes to "
+        "stderr and traps (``abort``) rather than silently reading/writing out of bounds. A "
+        "provably-divisible extent needs no check. Ignored when ``assume_even`` is False (the "
+        "remainder is peeled, so no assumption to guard).",
+    )
+
+    def __init__(self,
+                 widths: Tuple[int, ...] = (8, ),
+                 tail_mode: str = "masked",
+                 assume_even: bool = False,
+                 range_check: bool = True):
         """Build the pass.
 
         :param widths: Per-dim tile widths, innermost-last (1..3 entries).
@@ -104,6 +119,9 @@ class SplitMapForTileRemainder(ppl.Pass):
             :data:`TILE_K1_TAIL_MARKER`, the single-lane tile-op variant).
         :param assume_even: ``True`` -> mark every eligible map ``__tile_main``
             without splitting (whole extent assumed divisible, no remainder).
+        :param range_check: Under ``assume_even``, emit a host-side runtime
+            ``extent % W == 0`` guard (stderr + ``abort`` on violation) for every
+            not-provably-divisible tiled dim. No effect when ``assume_even`` is False.
         :raises ValueError: If ``widths`` length not in ``{1, 2, 3}`` or
             ``tail_mode`` invalid.
         """
@@ -116,6 +134,7 @@ class SplitMapForTileRemainder(ppl.Pass):
         self.widths = list(widths)
         self.tail_mode = tail_mode
         self.assume_even = assume_even
+        self.range_check = range_check
 
     def modifies(self) -> ppl.Modifies:
         """Pass replicates scopes and retightens ranges.
@@ -152,6 +171,33 @@ class SplitMapForTileRemainder(ppl.Pass):
         except Exception:  # noqa: BLE001 - non-decidable symbolic trip -> split
             return False
 
+    def _trip_class(self, lb, ub, W: int) -> str:
+        """Classify a tiled dim's extent against width ``W`` for the ``assume_even`` path.
+
+        ``'divisible'``   -- provably a whole number of tiles (constant OR symbolic like ``4*M``).
+        ``'below'``       -- provably ``< W``: too small to tile, keep the map scalar.
+        ``'nondivisible'``-- provably not a whole multiple of ``W`` (a constant ``>= W``, or a
+                             symbolic extent whose remainder reduces to a nonzero constant, e.g.
+                             ``4*M + 1``): a provable ``assume_even`` violation (rerun with
+                             ``assume_even=False``).
+        ``'symbolic'``    -- non-decidable extent: guard the assumption at runtime.
+        """
+        if self._provably_divisible(lb, ub, W):  # constant or symbolic (``4*M % 4 == 0``)
+            return 'divisible'
+        trip = symbolic.simplify(ub - lb + 1)
+        try:
+            t = int(trip)
+        except (TypeError, ValueError):
+            # Symbolic, not provably divisible: a remainder that reduces to a nonzero CONSTANT is a
+            # provable violation; an undecidable remainder falls through to a runtime guard.
+            try:
+                if int((trip % W).simplify()) != 0:
+                    return 'nondivisible'
+            except (TypeError, ValueError):
+                pass
+            return 'symbolic'
+        return 'below' if t < W else 'nondivisible'
+
     def _split(self, state: dace.SDFGState, map_entry: MapEntry, K: int) -> bool:
         """Peel ``map_entry``'s K innermost dims into interior + K slabs.
 
@@ -173,6 +219,27 @@ class SplitMapForTileRemainder(ppl.Pass):
         # ``assume_even``: caller guarantees every tiled extent is a multiple of W,
         # so no boundary -> skip peel, mark whole map ``__tile_main`` (mask-free).
         if self.assume_even:
+            classes = []
+            for d, W in zip(tiled_dims, self.widths):
+                lb, ub, _ = map_entry.map.range[d]
+                classes.append((self._trip_class(lb, ub, W), d, W, lb, ub))
+            # A provably-too-small dim (extent < W) cannot be tiled -> keep the WHOLE map scalar.
+            # MarkTileDims refuses the same dim, so the two passes agree (no strided-map/scalar-body
+            # desync). Takes precedence over a nondivisible sibling dim: an untiled map is never wrong.
+            if any(c == 'below' for c, *_ in classes):
+                return False
+            for c, d, W, lb, ub in classes:
+                if c == 'nondivisible':
+                    # Provable violation of the caller's even-extent guarantee: fail loudly at
+                    # transform time (a runtime guard would only abort once the kernel launches).
+                    raise ValueError(f"SplitMapForTileRemainder: map {map_entry.map.label!r} dim {d} has extent "
+                                     f"{symbolic.simplify(ub - lb + 1)}, which is provably not a multiple of tile "
+                                     f"width {W} that assume_even requires. Rerun with assume_even=False to peel a "
+                                     f"masked remainder.")
+                # Non-decidable extent: record a host-side runtime guard (extent % W == 0 and
+                # extent >= W). A provably-divisible extent needs no check.
+                if c == 'symbolic' and self.range_check:
+                    self._range_checks.append((state.sdfg, symbolic.simplify(ub - lb + 1), int(W)))
             if not map_entry.map.label.endswith(TILE_MAIN_MARKER):
                 map_entry.map.label = map_entry.map.label + TILE_MAIN_MARKER
             return True
@@ -213,15 +280,19 @@ class SplitMapForTileRemainder(ppl.Pass):
         """
         K = len(self.widths)
         applied = 0
+        # Collector for assume_even runtime guards, filled by ``_split`` and drained below.
+        self._range_checks = []
         # Snapshot up front: splitting mutates the graph; must not re-split a
         # freshly replicated remainder map.
         eligible = [(n, g) for n, g in sdfg.all_nodes_recursive()
-                    if isinstance(n, MapEntry) and isinstance(g, dace.SDFGState) and is_vectorizable_map(g, n)
+                    if isinstance(n, MapEntry) and isinstance(g, dace.SDFGState) and is_vectorizable_map(g, n, len(self.widths))
                     and len(n.map.params) >= K and not n.map.label.endswith(TILE_MAIN_MARKER)
                     and not n.map.label.endswith(SCALAR_TAIL_MARKER) and not n.map.label.endswith(TILE_K1_TAIL_MARKER)]
         for n, g in eligible:
             if self._split(g, n, K):
                 applied += 1
+        if self.assume_even and self.range_check and self._range_checks:
+            self._emit_range_checks()
         if applied:
             # ``replicate_scope`` deep-copies body NestedSDFGs without registering
             # the clone in ``cfg_list``; rebuild so later passes (and
@@ -230,3 +301,35 @@ class SplitMapForTileRemainder(ppl.Pass):
         assert_invariant(no_memlet_dim_mismatch(sdfg), "SplitMapForTileRemainder",
                          "memlet subset and other_subset have matching dimensionality")
         return applied or None
+
+    def _emit_range_checks(self) -> None:
+        """Emit the host-side even-extent guards recorded during ``assume_even`` splitting.
+
+        One guard state is prepended (as the new start block) to each SDFG that owns a checked
+        map, so the check runs before that SDFG's kernels. Every distinct ``(extent, width)``
+        pair becomes a side-effect CPP tasklet that writes to stderr and ``abort``\\ s when the
+        even-extent assumption is violated at runtime -- ``extent`` is not a whole multiple of
+        ``width`` OR ``extent < width`` (a symbolic extent that turns out shorter than one tile) --
+        turning a silent out-of-bounds tile access into a loud, deterministic failure that names
+        the fix (rerun with ``assume_even=False``). Host-side, so it guards CPU and GPU alike.
+        ``side_effects=True`` keeps the guard from being fused into a neighbour or eliminated as
+        dead code.
+        """
+        by_sdfg = {}
+        for owner, extent, width in self._range_checks:
+            by_sdfg.setdefault(owner, set()).add((symbolic.symstr(extent, cpp_mode=True), width))
+        for owner, checks in by_sdfg.items():
+            guard = owner.add_state_before(owner.start_block, label="tile_even_range_check", is_start_block=True)
+            for extent_c, width in sorted(checks):
+                code = (f'if ((long long)({extent_c}) % {width} != 0 || (long long)({extent_c}) < {width}) {{\n'
+                        f'    fprintf(stderr, "DaCe tile vectorization: extent %lld violates assume_even '
+                        f'(must be a multiple of tile width {width} and >= {width}); rerun with '
+                        f'assume_even=False.\\n", (long long)({extent_c}));\n'
+                        f'    abort();\n'
+                        f'}}')
+                tasklet = guard.add_tasklet(name="tile_range_check",
+                                            inputs={},
+                                            outputs={},
+                                            code=code,
+                                            language=dace.dtypes.Language.CPP)
+                tasklet.side_effects = True

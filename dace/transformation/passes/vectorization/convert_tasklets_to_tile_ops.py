@@ -98,6 +98,72 @@ def _cast_call_inner(rhs: str) -> Optional[Tuple[str, str]]:
     return (name, inner) if inner else None
 
 
+def numeric_constant_domain(rhs: str) -> Optional[str]:
+    """Numeric domain of a bare compile-time literal ``rhs``: ``"int"`` for an integer
+    literal, ``"float"`` for a floating-point literal, ``None`` when ``rhs`` is not a pure
+    numeric constant (a symbol, an expression with free symbols, or unparseable).
+
+    Drives the "constant stays a single-element broadcast" decision: a scalar produced by
+    a pure ``out = <literal>`` (or a same-domain ``out = TYPE(<literal>)`` cast) is a
+    narrowed compile-time constant that the consuming tile op splats across lanes, so it
+    must NOT be materialised as a per-lane fill tile. Domain is read off the sympy literal
+    type (``Integer`` vs ``Float``), never a hardcoded dtype.
+    """
+    try:
+        expr = dace.symbolic.pystr_to_symbolic(rhs)
+    except Exception:  # noqa: BLE001 -- unparseable RHS is not a numeric constant
+        return None
+    if expr is None or expr.free_symbols or not bool(expr.is_number):
+        return None
+    if expr.is_Integer:
+        return "int"
+    if expr.is_Float:
+        return "float"
+    return None  # bare Rational / complex / unrecognised literal -- treat as non-simple
+
+
+def dtype_numeric_domain(dtype) -> Optional[str]:
+    """Numeric domain of a DaCe descriptor ``dtype``: ``"int"`` (signed/unsigned integer),
+    ``"float"`` (floating point), else ``None`` (bool / complex / no numpy mapping).
+
+    Inferred from the numpy dtype kind so no specific dtype is hardcoded; the classifier
+    only ever compares the *kind* (int vs fp) of a constant against its target descriptor.
+    """
+    if dtype is None:
+        return None
+    try:
+        npdt = np.dtype(dtype.as_numpy_dtype())
+    except Exception:  # noqa: BLE001 -- exotic dtype without a numpy mapping
+        return None
+    if np.issubdtype(npdt, np.integer):
+        return "int"
+    if np.issubdtype(npdt, np.floating):
+        return "float"
+    return None
+
+
+def is_same_domain_constant(rhs: str, target_dtype) -> bool:
+    """True iff ``rhs`` is a pure compile-time numeric constant whose domain matches
+    ``target_dtype``'s domain -- an integer literal into an integer dtype, or a
+    floating-point literal into a floating-point dtype. Sees THROUGH one dtype-cast layer,
+    so both a bare literal (``0.125``) and a cast-of-literal (``dace.float16(0.125)``) are
+    matched against the target descriptor's domain.
+
+    Such a constant is a same-domain narrowing (``dace.float16(0.125)`` into a float16
+    tile): value-preserving in kind, so it stays a single-element broadcast operand fed
+    straight to the tile intrinsic. A CROSS-domain literal (fp -> int, int -> fp) is a
+    genuine numeric conversion (truncation / promotion) and is deliberately excluded --
+    those keep the real, materialised lowering, matching the frontend's conversion
+    semantics. Symbols / free-symbol expressions are not constants and return False.
+    """
+    lit = rhs.strip()
+    hit = _cast_call_inner(lit)
+    if hit is not None:
+        lit = hit[1]  # peel one dtype-cast layer: TYPE(<literal>) -> <literal>
+    lit_domain = numeric_constant_domain(lit)
+    return lit_domain is not None and lit_domain == dtype_numeric_domain(target_dtype)
+
+
 def _normalize_python_tasklet_body(body: str) -> Optional[str]:
     """Rewrite Python boolean syntax (``or`` / ``and``) to the C forms (``||`` / ``&&``)
     the binop detectors match. Returns ``None`` for bodies containing ``@`` (matmul is
@@ -306,7 +372,7 @@ class ConvertTaskletsToTileOps(ppl.Pass):
             if not isinstance(parent, SDFGState):
                 continue
             try:
-                if not is_vectorizable_map(parent, node):
+                if not is_vectorizable_map(parent, node, len(self.widths)):
                     continue
             except (StopIteration, ValueError):
                 continue
@@ -372,6 +438,29 @@ class ConvertTaskletsToTileOps(ppl.Pass):
                 if body in forms:
                     return out_conn, a, b, op
         return None
+
+    def _detect_fma(self, tasklet: Tasklet) -> Optional[Tuple[str, str, str, str]]:
+        """If ``tasklet`` is a fused multiply-add ``__out = fma(__a, __b, __c)`` over three data
+        connectors, return ``(out_conn, a_conn, b_conn, c_conn)`` (``a*b + c``); else ``None``.
+
+        :class:`~dace.transformation.passes.vectorization.fuse_multiply_add.FuseMultiplyAdd` mints
+        this shape -- all three operands are data connectors -- so it lowers to a :class:`TileFMA`.
+        """
+        if len(tasklet.out_connectors) != 1 or len(tasklet.in_connectors) != 3:
+            return None
+        if tasklet.language is not dace.dtypes.Language.Python:
+            return None
+        body = _normalize_python_tasklet_body(tasklet.code.as_string.strip().rstrip(";").strip())
+        if body is None:
+            return None
+        out_conn = next(iter(tasklet.out_connectors))
+        m = re.match(r'^(\w+)\s*=\s*\(?\s*fma\(\s*(\w+)\s*,\s*(\w+)\s*,\s*(\w+)\s*\)\s*\)?$', body)
+        if m is None:
+            return None
+        o, a, b, c = m.groups()
+        if o != out_conn or {a, b, c} != set(tasklet.in_connectors):
+            return None
+        return out_conn, a, b, c
 
     def _detect_binop_with_symbol(self, tasklet: Tasklet) -> Optional[Tuple[str, str, str, str, str]]:
         """Detect a binop with ONE Tile/Scalar operand and ONE Symbol operand.
@@ -497,6 +586,27 @@ class ConvertTaskletsToTileOps(ppl.Pass):
             return None
         return out_conn, rhs
 
+    def _reads_scalar_operand_inline(self, node) -> bool:
+        """True if ``node`` is a compute tasklet that reads a Scalar operand as an INLINE
+        broadcast when converted -- a plain binop (``_o = _a <op> _b``), a binop with an
+        inline symbol operand, a unary op / dtype cast, or a trivial assign. Those lower a
+        single-element operand to a ``_bc[1]`` splat / scalar-in ``TileUnop`` /
+        ``TileLoad(src_kind='Scalar')`` without a per-lane fill, so a same-domain constant
+        feeding them can stay a Scalar broadcast.
+
+        A ``TileITE`` arm / masked-write / reduction consumer materialises a scalar arm
+        through a per-lane fill instead, so it returns ``False`` (the constant keeps the
+        widened ``TileLoad(src_kind='Symbol')`` broadcast). Non-tasklet consumers (a tile
+        lib node, an AccessNode copy) likewise return ``False``.
+        """
+        if not isinstance(node, Tasklet):
+            return False
+        # An ITE / masked-write consumer must NOT keep a scalar arm (it would fill per lane).
+        if self._detect_ite(node) is not None or self._detect_conditional_write(node) is not None:
+            return False
+        return (self._detect_binop(node) is not None or self._detect_binop_with_symbol(node) is not None
+                or self._detect_unop(node) is not None or self._detect_assign(node) is not None)
+
     def _convert_const_assign(self, inner_state: SDFGState, tasklet: Tasklet, detected, iter_vars: Tuple[str,
                                                                                                          ...]) -> bool:
         """Replace ``_o = <const_expr>`` (loop-invariant literal / symbol store) with a
@@ -510,6 +620,40 @@ class ConvertTaskletsToTileOps(ppl.Pass):
         if not out_edges:
             return False
         out_edge = out_edges[0]
+        # A pure SAME-DOMAIN compile-time constant (fp literal into an fp scalar, int into an
+        # int scalar) is a narrowed constant, not a produced per-lane value: keep it a Scalar
+        # so the consuming compute op splats it (a single-element broadcast operand), instead
+        # of widening it to a tile materialised by a preceding per-lane fill loop. This makes
+        # ``k = 0.125; ... A[i] * dace.float16(k)`` lower to the same broadcast shape as the
+        # inline literal ``0.125 * A[i]``. A cross-domain literal (fp -> int / int -> fp) is a
+        # real conversion and keeps the materialised lowering below. Domain is inferred from
+        # the output descriptor dtype (never hardcoded). The dtype-cast constant form
+        # ``dace.float16(0.125)`` is caught earlier by ``_convert_unop_with_symbol`` (a Symbol
+        # operand), so this only sees bare literals / symbol exprs.
+        #
+        # Gate on the consumer: only a plain binop / unop / assign reads a Scalar operand as an
+        # INLINE broadcast (``_bc[1] = {(T)(scalar)}`` on the TileBinop, a scalar-in TileUnop,
+        # or a ``TileLoad(src_kind='Scalar')`` copy) -- so a constant feeding one of those stays
+        # a Scalar. A ``TileITE`` arm / masked-write / reduction consumer instead materialises a
+        # scalar through a per-lane fill, and a ``TileStore`` ``_src`` / other lib node / AN
+        # copy needs the tile outright; for those the ``TileLoad(src_kind='Symbol')`` broadcast
+        # below is the clean lowering, so keep the widened form. Require EVERY consumer to be an
+        # inline-broadcasting compute tasklet before keeping the scalar.
+        const_dst = out_edge.dst
+        if (out_edge.data is not None and isinstance(const_dst, dace.nodes.AccessNode)):
+            const_desc = inner_state.sdfg.arrays.get(const_dst.data)
+            # The keep-scalar shortcut only applies when the output is STILL single-element. A
+            # reduction SEED (``_nnr_priv = <identity>``) whose accumulator ``WidenAccesses``
+            # already widened to a ``(W,)`` tile is no longer a scalar: assigning a scalar into
+            # the tile pointer will not compile, and lanes 1..W-1 would be uninitialised. Skip
+            # the shortcut for an already-widened tile output and fall through to the
+            # ``TileLoad(src_kind='Symbol')`` broadcast fill below (which splats the identity
+            # across every lane).
+            out_is_tile = (isinstance(const_desc, dace.data.Array) and tuple(const_desc.shape) == tuple(self.widths))
+            consumers = [e.dst for e in inner_state.out_edges(const_dst)]
+            if (const_desc is not None and not out_is_tile and is_same_domain_constant(str(expr), const_desc.dtype)
+                    and consumers and all(self._reads_scalar_operand_inline(c) for c in consumers)):
+                return False  # same-domain constant -> stays a scalar broadcast operand
         # Widen the output transient to tile shape when widenable; a genuinely
         # scalar (non-widenable) output stays the python scalar assign.
         self._ensure_output_widened(inner_state, out_edge)
@@ -1089,6 +1233,11 @@ class ConvertTaskletsToTileOps(ppl.Pass):
         affine_sym = self._detect_affine_unit_with_symbol(tasklet)
         if affine_sym is not None:
             return self._convert_binop_with_symbol(inner_state, tasklet, affine_sym, iter_vars)
+        # Fused multiply-add ``_o = fma(_a, _b, _c)`` (minted by FuseMultiplyAdd). Detect before
+        # ITE (also 3-in-conn) -- the ``fma(`` head is unambiguous vs every other op shape.
+        fma_detected = self._detect_fma(tasklet)
+        if fma_detected is not None:
+            return self._convert_fma(inner_state, tasklet, fma_detected)
         # ITE (``if..else`` or ``ITE(...)``) — detect before binop/reduction so the
         # 2-in-conn ``ITE(_cond, _t, <symbol>)`` isn't miscaptured. Precise body match
         # keeps binop fall-through safe.
@@ -1538,6 +1687,56 @@ class ConvertTaskletsToTileOps(ppl.Pass):
             _out_memlet = dace.Memlet.from_memlet(out_edge.data)
 
         inner_state.add_edge(binop, "_c", out_edge.dst, out_edge.dst_conn, _out_memlet)
+        for edge in list(in_edges.values()) + out_edges:
+            inner_state.remove_edge(edge)
+        inner_state.remove_node(tasklet)
+        return True
+
+    def _convert_fma(self, inner_state: SDFGState, tasklet: Tasklet, detected) -> bool:
+        """Replace a ``__out = fma(__a, __b, __c)`` tasklet with a :class:`TileFMA` node
+        (``a*b + c``). Mirror of :meth:`_convert_binop` with a third data operand (``_c``) and
+        the ``_o`` output connector."""
+        from dace.libraries.tileops import TileFMA
+        out_conn, a_conn, b_conn, c_conn = detected
+        in_edges = {e.dst_conn: e for e in inner_state.in_edges(tasklet)}
+        out_edges = list(inner_state.out_edges(tasklet))
+        if a_conn not in in_edges or b_conn not in in_edges or c_conn not in in_edges or not out_edges:
+            return False
+        out_edge = out_edges[0]
+        a_edge, b_edge, c_edge = in_edges[a_conn], in_edges[b_conn], in_edges[c_conn]
+        # One dtype per lib node (design 6.2): refuse a mixed-dtype fma so callers cast upstream.
+        sdfg = inner_state.sdfg
+        dtypes_seen = {
+            sdfg.arrays[e.data.data].dtype
+            for e in (a_edge, b_edge, c_edge, out_edge) if e.data is not None and e.data.data is not None
+        }
+        if len(dtypes_seen) > 1:
+            raise NotImplementedError(
+                f"vec(K-dim): mixed-dtype fma NOT supported. Tasklet {tasklet.label!r} body "
+                f"{tasklet.code.as_string!r} mixes dtypes {dtypes_seen}. Add an explicit cast tasklet "
+                f"upstream OR widen the destination dtype.")
+        kind_a = self._operand_kind(inner_state, a_edge)
+        kind_b = self._operand_kind(inner_state, b_edge)
+        kind_c = self._operand_kind(inner_state, c_edge)
+        mask_an = self._find_mask_an(inner_state)
+        fma = TileFMA(name=f"{tasklet.label}_fma",
+                      widths=tuple(self.widths),
+                      kind_a=kind_a,
+                      kind_b=kind_b,
+                      kind_c=kind_c,
+                      has_mask=mask_an is not None)
+        inner_state.add_node(fma)
+        self._wire_mask(inner_state, fma, mask_an)
+        inner_state.add_edge(a_edge.src, a_edge.src_conn, fma, "_a", dace.Memlet.from_memlet(a_edge.data))
+        inner_state.add_edge(b_edge.src, b_edge.src_conn, fma, "_b", dace.Memlet.from_memlet(b_edge.data))
+        inner_state.add_edge(c_edge.src, c_edge.src_conn, fma, "_c", dace.Memlet.from_memlet(c_edge.data))
+        _was_widened = self._ensure_output_widened(inner_state, out_edge, fma)
+        if _was_widened:
+            _subset_str = ", ".join(f"0:{w}" for w in self.widths)
+            _out_memlet = dace.Memlet(f"{out_edge.dst.data}[{_subset_str}]")
+        else:
+            _out_memlet = dace.Memlet.from_memlet(out_edge.data)
+        inner_state.add_edge(fma, "_o", out_edge.dst, out_edge.dst_conn, _out_memlet)
         for edge in list(in_edges.values()) + out_edges:
             inner_state.remove_edge(edge)
         inner_state.remove_node(tasklet)

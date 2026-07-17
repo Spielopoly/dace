@@ -6,7 +6,7 @@ import copy
 import os
 import sympy
 import sys
-from typing import Any, Callable, Dict, List, Optional, Set, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Set, Sequence, Tuple, Union, TYPE_CHECKING
 from typing import get_origin, get_args
 import warnings
 
@@ -15,6 +15,9 @@ from dace.config import Config
 from dace.frontend.python import (newast, common as pycommon, cached_program, preprocessing)
 from dace.sdfg import SDFG, utils as sdutils
 from dace.data import create_datadescriptor, Data
+
+if TYPE_CHECKING:
+    from dace.codegen.compiled_sdfg import CompiledSDFG
 
 try:
     import mpi4py
@@ -125,14 +128,19 @@ def infer_symbols_from_datadescriptor(sdfg: SDFG,
                         exclude.add(sym)
                     repldict[sym] = newsym
 
+                # ``ipow`` is a codegen-only spelling of ``Pow``; restore ``Pow`` so ``solve`` can
+                # invert the shape. A Function-head rewrite can't ride in ``repldict`` (symbol
+                # rename), so do it here.
+                if isinstance(sym_dim, sympy.Basic):
+                    sym_dim = sym_dim.replace(symbolic.ipow, lambda b, e: b**e)
+
                 # Replace symbols with __SOLVE_ symbols so as to allow
                 # the same symbol in the called SDFG
                 if repldict:
                     sym_dim = sym_dim.subs(repldict)
 
                 if symbolic.issymbolic(sym_dim - real_dim):
-                    # ipow is semantically Pow; restore it so the solver can invert the shape.
-                    equations.append((sym_dim - real_dim).replace(symbolic.ipow, lambda b, e: b**e))
+                    equations.append(sym_dim - real_dim)
 
     if len(symbols) == 0:
         return {}
@@ -794,7 +802,8 @@ class DaceProgram(pycommon.SDFGConvertible):
 
         return sdfg, cachekey
 
-    def load_precompiled_sdfg(self, path: str, *args, **kwargs) -> None:
+    def load_precompiled_sdfg(self, path: str, *args,
+                              **kwargs) -> tuple['CompiledSDFG', cached_program.ProgramCacheKey]:
         """
         Loads an external compiled SDFG object that will be invoked when the
         function is called.

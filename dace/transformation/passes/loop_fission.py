@@ -11,6 +11,7 @@ import copy
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from dace import SDFG
+from dace import symbolic
 from dace.sdfg import nodes
 from dace.sdfg.state import ControlFlowBlock, LoopRegion, SDFGState
 from dace.sdfg.sdfg import InterstateEdge
@@ -34,9 +35,8 @@ def _is_per_iter_subset(subset, loop_var: Optional[str]) -> bool:
     """
     if loop_var is None or subset is None:
         return False
-    import sympy as sp
     try:
-        loop_sym = sp.Symbol(loop_var)
+        loop_sym = symbolic.pystr_to_symbolic(loop_var)
     except Exception:
         return False
     saw_loop_var = False
@@ -44,11 +44,11 @@ def _is_per_iter_subset(subset, loop_var: Optional[str]) -> bool:
         if rb != re_:
             return False
         try:
-            expr = sp.sympify(str(rb))
+            expr = symbolic.pystr_to_symbolic(str(rb))
         except Exception:
             return False
         if loop_sym in expr.free_symbols:
-            offset = sp.simplify(expr - loop_sym)
+            offset = symbolic.simplify(expr - loop_sym)
             if not (getattr(offset, 'is_number', False) and offset == 0):
                 return False
             saw_loop_var = True
@@ -61,6 +61,23 @@ def _is_per_iter_subset(subset, loop_var: Optional[str]) -> bool:
     # ``a[i] = aa[j,i] - a[i-1]; aa[j,i] = a[i] + bb[j,i]`` inside the
     # inner ``j`` loop is the canonical regression.
     return saw_loop_var
+
+
+def _fissions_after_bridge_rewrite(loop: LoopRegion, sdfg: SDFG) -> bool:
+    """Whether ``loop``'s body splits into >= 2 independent groups once its per-iter bridges are rewritten.
+
+    Decided on a DEEPCOPY. The rewrite has to happen before the grouping -- severing a bridge is what makes
+    a producer and its consumer look independent (TSVC s221 goes 1 -> 2 groups only because of it) -- but it
+    is only SOUND once the fission puts them in separate loops. Answering the question on a throwaway copy
+    keeps that conditional mutation off the real graph entirely: a loop that does not fission is never
+    touched, so the pass reporting "nothing applied" is the truth.
+    """
+    probe = copy.deepcopy(loop)  # detached: its states carry no .sdfg, hence the explicit one below
+    probe_compute = _single_compute_state(probe)
+    if probe_compute is None:
+        return False
+    _rewrite_per_iter_bridges(probe_compute, probe.loop_variable, sdfg)
+    return len(_independent_groups(probe_compute, probe.loop_variable, sdfg)) >= 2
 
 
 def _container_per_iter_only(state: SDFGState, data: str, loop_var: Optional[str]) -> bool:
@@ -77,7 +94,7 @@ def _container_per_iter_only(state: SDFGState, data: str, loop_var: Optional[str
     return True
 
 
-def _rewrite_per_iter_bridges(state: SDFGState, loop_var: Optional[str]):
+def _rewrite_per_iter_bridges(state: SDFGState, loop_var: Optional[str], sdfg: SDFG):
     """In-place: replace writer-side AccessNodes whose out-edges feed
     downstream consumers (the textbook fission bridge) with a fresh reader
     AccessNode for the same data.
@@ -90,14 +107,27 @@ def _rewrite_per_iter_bridges(state: SDFGState, loop_var: Optional[str]):
     the producer's loop finish before the consumer's loop starts, so each
     reader genuinely sees the just-written value.
 
+    That last sentence is a PRECONDITION, not a description: the reader only
+    sees the written value once the fission has actually put producer and
+    consumer in separate loops. Until then the rewrite has merely deleted the
+    edge that ordered the write before the read *within one iteration*, and the
+    state says nothing about which runs first -- so the value would depend on
+    the order codegen happens to pick. CALL THIS ONLY WHEN THE FISSION IS GOING
+    TO BE APPLIED; to ask whether it would, use
+    :func:`_fissions_after_bridge_rewrite`, which decides on a copy.
+
     Has no effect if ``loop_var`` is ``None`` or if no per-iter shared
     container exists.
+
+    :param sdfg: The SDFG owning ``state``'s data descriptors, passed in rather
+        than read off ``state``: a detached copy of a loop (what the fission
+        probe reasons about) has no ``.sdfg``.
     """
     if loop_var is None:
         return
     written = {n.data for n in state.nodes() if isinstance(n, nodes.AccessNode) and state.in_degree(n) > 0}
     for data in list(written):
-        desc = state.sdfg.arrays.get(data)
+        desc = sdfg.arrays.get(data)
         if desc is None or getattr(desc, 'transient', False):
             continue
         if not _container_per_iter_only(state, data, loop_var):
@@ -116,7 +146,7 @@ def _rewrite_per_iter_bridges(state: SDFGState, loop_var: Optional[str]):
                 state.remove_edge(oe)
 
 
-def _independent_groups(state: SDFGState, loop_var: Optional[str] = None) -> List[List[nodes.Node]]:
+def _independent_groups(state: SDFGState, loop_var: Optional[str], sdfg: SDFG) -> List[List[nodes.Node]]:
     """Partition ``state``'s nodes into data-independent groups.
 
     A *pure input* is an AccessNode with no in-edges whose data is never
@@ -137,6 +167,9 @@ def _independent_groups(state: SDFGState, loop_var: Optional[str] = None) -> Lis
     :param state: The loop body state.
     :param loop_var: The enclosing loop's iteration variable. ``None`` keeps
         the legacy strict-merge behaviour.
+    :param sdfg: The SDFG owning ``state``'s data descriptors, passed in rather
+        than read off ``state``: a detached copy of a loop (what the fission
+        probe reasons about) has no ``.sdfg``.
     :returns: A list of node lists, one per independent group, deterministic.
     """
     order = {n: i for i, n in enumerate(state.nodes())}
@@ -175,7 +208,7 @@ def _independent_groups(state: SDFGState, loop_var: Optional[str] = None) -> Lis
         # finishes all writes before the consumer reads). The bridges are
         # rewritten in :func:`_fission` to give each clone its own reader.
         if loop_var is not None:
-            desc = state.sdfg.arrays.get(data)
+            desc = sdfg.arrays.get(data)
             if (desc is not None and not getattr(desc, 'transient', False)
                     and _container_per_iter_only(state, data, loop_var)):
                 continue
@@ -370,10 +403,13 @@ class LoopFission(ppl.Pass):
                     continue
                 compute = _single_compute_state(loop)
                 if compute is not None:
-                    _rewrite_per_iter_bridges(compute, loop.loop_variable)
-                    if len(_independent_groups(compute, loop.loop_variable)) < 2:
+                    # Decide on a copy, then mutate: the bridge rewrite is only sound once the fission
+                    # separates producer and consumer into their own loops, so a loop that turns out not to
+                    # fission must come out exactly as it went in.
+                    if not _fissions_after_bridge_rewrite(loop, sdfg):
                         continue
-                    self._fission(loop, compute)
+                    _rewrite_per_iter_bridges(compute, loop.loop_variable, sdfg)
+                    self._fission(loop, compute, sdfg)
                 else:
                     groups = _independent_block_groups(loop)
                     if groups is None:
@@ -428,7 +464,7 @@ class LoopFission(ppl.Pass):
             parent.start_block = parent.node_id(clones[0])
 
     @staticmethod
-    def _fission(loop: LoopRegion, compute: SDFGState):
+    def _fission(loop: LoopRegion, compute: SDFGState, sdfg: SDFG):
         """Replace ``loop`` with one header-replicated loop per independent
         node group of its single compute state.
 
@@ -442,7 +478,7 @@ class LoopFission(ppl.Pass):
         is_start = parent.start_block is loop
         cidx = list(loop.nodes()).index(compute)
         loop_var = loop.loop_variable
-        ngroups = len(_independent_groups(compute, loop_var))
+        ngroups = len(_independent_groups(compute, loop_var, sdfg))
 
         clones: List[LoopRegion] = []
         for gi in range(ngroups):
@@ -450,7 +486,7 @@ class LoopFission(ppl.Pass):
             clone.label = f"{loop.label}_fis{gi}"
             parent.add_node(clone, ensure_unique_name=True)  # derived label; wired by object ref
             cstate = list(clone.nodes())[cidx]
-            keep = set(_independent_groups(cstate, loop_var)[gi])
+            keep = set(_independent_groups(cstate, loop_var, sdfg)[gi])
             for n in [n for n in cstate.nodes() if n not in keep]:
                 cstate.remove_node(n)
             clones.append(clone)

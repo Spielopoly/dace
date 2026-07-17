@@ -28,12 +28,48 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 
 _RESULTS_CSV = 'results.csv'
 _STATUS_CSV = 'status.csv'
 _COMPILE_CSV = 'compile.csv'
+
+# A failing kernel stores its traceback in status.csv's `error` field; DaCe validation
+# tracebacks routinely blow past csv's 128 KB default field cap and make every later read
+# of that file raise `_csv.Error: field larger than field limit`, taking down table writing
+# for the whole corpus. Errors are truncated on write (see write_status), but the cap has to
+# be lifted too so the oversized files already on disk stay readable.
+csv.field_size_limit(min(2 ** 31 - 1, sys.maxsize))
+
+# The job's FULL cpu mask, captured at engine import -- i.e. before any DaCe-compiled
+# kernel .so is loaded. With OMP_PROC_BIND set (the job scripts export close/cores),
+# libgomp's INIT -- which runs the moment a -fopenmp .so is dlopened, no parallel
+# region needed -- binds the master thread to its single place (core 0). From then on
+# (a) every subprocess this process spawns inherits a ONE-CORE mask, so the child's
+# libgomp resolves OMP_PLACES=cores to '{0}' and its 72 "threads" time-slice core 0
+# (measured: 2048^3 DGEMM 24x SLOWER at 72 threads than at 1), and (b) any
+# affinity-derived thread-count detection (pthreads OpenBLAS, numpy's bundled BLAS)
+# sees ONE cpu and silently caps itself at a single thread -- which is why every
+# BLAS-backed kernel measured near-identical times across all thread configurations.
+# restore_cpu_affinity() undoes the master-thread bind; call it after any kernel .so
+# load and before spawning measurement children.
+try:
+    _INITIAL_CPU_AFFINITY = frozenset(os.sched_getaffinity(0))
+except (AttributeError, OSError):
+    _INITIAL_CPU_AFFINITY = None
+
+
+def restore_cpu_affinity():
+    """Restore this thread's cpu mask to the job's full mask (see the capture above)."""
+    if _INITIAL_CPU_AFFINITY:
+        try:
+            os.sched_setaffinity(0, _INITIAL_CPU_AFFINITY)
+        except OSError:
+            pass
+
+_MAX_STATUS_ERROR_CHARS = 8192
 
 
 # --------------------------------------------------------------------------
@@ -133,6 +169,10 @@ def configure_dace_process():
       become self-locating too -- otherwise, since `spack load` puts neither
       libomp nor libgomp on LD_LIBRARY_PATH, loading a -fopenmp kernel via ctypes
       fails with 'libomp.so: cannot open shared object file'."""
+    # Defensive affinity reset (see _INITIAL_CPU_AFFINITY): harmless when the mask is
+    # already full; undoes libgomp's master-thread bind when a kernel .so was loaded
+    # earlier in this process.
+    restore_cpu_affinity()
     import dace
     import native_harness as nh
     # Warm the transformation import graph before any to_sdfg() runs in this
@@ -188,6 +228,15 @@ def configure_dace_process():
                 args = f'{args} {flag}'
         dace.Config.set('compiler', 'cpu', 'args', value=args)
 
+    # NOTE: no LAPACK/BLAS link is force-injected here. Both build paths link the LAPACK/BLAS libs
+    # from the SDFG's OWN environments -- CMake via get_environment_flags, the direct compile via
+    # _environment_build_flags -- so a single-library OpenBLAS (which bundles LAPACKE, used by
+    # cholesky2 -> LAPACKE_spotrf, contour_integral -> LAPACKE_zgetrf/zgetrs) resolves LAPACKE_*
+    # exactly as it resolves cblas_*, with libopenblas found at runtime via LD_LIBRARY_PATH (the
+    # SLURM jobs set it). The old DACE_PERF_LAPACK_LIBDIR ``-llapacke -llapack`` injection was a
+    # workaround for the direct compile not collecting env libs, and force-linked names that don't
+    # exist for a single-lib OpenBLAS (`cannot find -llapacke`); it is no longer needed.
+
 
 # --------------------------------------------------------------------------
 # Crash isolation: run fn(*args) in a spawned subprocess. A segfault leaves
@@ -203,6 +252,14 @@ def _run_and_queue(fn, args, q):
     try:
         os.setsid()
     except OSError:
+        pass
+    # Unblock SIGCHLD in this worker. Under srun the inherited signal mask can leave SIGCHLD blocked,
+    # which deadlocks a CMake configure/build (it wait()s on children whose SIGCHLD never gets delivered
+    # -- the classic daint cmake/srun hang, cmake trees left with <defunct> kids). A spawned worker that
+    # shells out to the build toolchain must be able to reap its own subprocesses.
+    try:
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGCHLD})
+    except (ValueError, OSError):
         pass
     try:
         q.put(('ok', fn(*args)))
@@ -225,6 +282,11 @@ def _kill_process_group(p):
 
 def run_isolated(fn, args=(), timeout=120):
     """Returns (ok, payload_or_error). Never raises; a crash/timeout is (False, msg)."""
+    # Un-poison the mask BEFORE spawning: if this process ever dlopened a kernel .so,
+    # libgomp bound the master thread to one core and the child would inherit that
+    # single-core mask (see _INITIAL_CPU_AFFINITY) -- collapsing every threaded
+    # library inside the measurement child onto core 0.
+    restore_cpu_affinity()
     ctx = mp.get_context('spawn')
     q = ctx.Queue()
     p = ctx.Process(target=_run_and_queue, args=(fn, args, q))
@@ -258,7 +320,54 @@ def _flatten_durations(d):
     return times
 
 
-def time_sdfg(sdfg, call_kwargs, reps, warmup=1):
+def _is_array(v):
+    """True for a host (numpy) OR device (cupy) ndarray -- the buffers a kernel reads/writes."""
+    import numpy as np
+    if isinstance(v, np.ndarray):
+        return True
+    try:
+        import cupy
+        return isinstance(v, cupy.ndarray)
+    except ImportError:
+        return False
+
+
+def to_device_args(sdfg, call_kwargs, device):
+    """GPU: copy an ndarray arg to the device (cupy) ONLY when the SDFG's matching interface array is on
+    GPU storage; host-storage args (and scalars) pass through unchanged. CPU: everything unchanged.
+
+    The GPU pipelines move interface arrays to ``GPU_Global`` (``apply_gpu_storage``), so the compiled
+    program expects DEVICE pointers for those -- calling with host numpy would run but leave results on
+    the host buffers (a silent correctness failure). But ``auto_optimize`` may leave SOME interface
+    arrays on HOST (e.g. an arg only touched by host/library code); passing cupy for those trips DaCe's
+    host-array marshalling (`'ndarray' object has no attribute '__array_interface__'`). So the decision
+    is per-argument, keyed on that array's storage in the compiled SDFG -- not a blanket convert."""
+    if device != 'gpu':
+        return call_kwargs
+    import cupy as cp
+    import numpy as np
+
+    def on_device(name):
+        desc = sdfg.arrays.get(name)
+        return desc is not None and 'GPU' in str(getattr(desc, 'storage', ''))
+
+    return {k: (cp.asarray(v) if (isinstance(v, np.ndarray) and on_device(k)) else v)
+            for k, v in call_kwargs.items()}
+
+
+def args_to_host(call_kwargs, ret, device):
+    """Bring a GPU call's outputs back to host numpy for validation: device arrays in the (mutated)
+    kwargs and in the SDFG return value become numpy. No-op on CPU (already host)."""
+    if device != 'gpu':
+        return call_kwargs, ret
+    import cupy as cp
+    to_h = lambda v: cp.asnumpy(v) if isinstance(v, cp.ndarray) else v
+    host_kwargs = {k: to_h(v) for k, v in call_kwargs.items()}
+    ret = tuple(to_h(v) for v in ret) if isinstance(ret, tuple) else to_h(ret)
+    return host_kwargs, ret
+
+
+def time_sdfg(sdfg, call_kwargs, reps, warmup=1, time_budget_s=None):
     """Best-of-`reps` timing via sdfg.instrument + get_latest_report (ms per call).
 
     The SAME argument buffers are reused for every call -- never reallocated between
@@ -273,32 +382,157 @@ def time_sdfg(sdfg, call_kwargs, reps, warmup=1):
 
     The first `warmup` call(s) are executed (and instrumented, same as any
     other call -- simplest way to keep one accumulated report) but sliced off
-    before returning, so they never reach the CSV."""
+    before returning, so they never reach the CSV.
+
+    `time_budget_s` (typically ~0.8x the subprocess timeout) caps the wall-clock
+    the measured reps may consume: once cumulative measured time passes it the loop
+    stops early, so a slow kernel at a realistic dataset size (cholesky/lu/gemm at
+    paper N) yields FEWER measured reps instead of a total-loss timeout. At least
+    one rep is always measured; None means run all `reps` (the historical behavior)."""
+    import time
     import dace
     import numpy as np
+    # A previously loaded kernel .so has already libgomp-bound this master thread to
+    # one core (OMP_PROC_BIND); restore the full mask so affinity-derived thread
+    # detection (pthreads BLAS, numpy's bundled BLAS) inside the timed calls is not
+    # silently capped at a single thread.
+    restore_cpu_affinity()
     sdfg.instrument = dace.InstrumentationType.Timer
     # Instrumented codegen is different C++ than the plain correctness-check
     # build of the exact same variant -- needs its own cache-key (name) or
     # cache='name' mode would find and silently reuse the uninstrumented
     # binary, leaving get_latest_report() with nothing recorded.
     sdfg.name = f'{sdfg.name}_timed'
-    # Snapshot initial inputs once; reset each buffer IN PLACE before every call.
-    initial = {k: v.copy() for k, v in call_kwargs.items() if isinstance(v, np.ndarray)}
+    # Snapshot initial inputs once; reset each buffer IN PLACE before every call. Works for host
+    # (numpy) and device (cupy) arrays alike -- `.copy()` and `buf[...] = v0` are defined for both, so
+    # a GPU lane resets its resident device buffers between reps exactly as a CPU lane does its host ones.
+    initial = {k: v.copy() for k, v in call_kwargs.items() if _is_array(v)}
+
+    def one_call():
+        for k, v0 in initial.items():
+            call_kwargs[k][...] = v0  # in-place reset (numpy or cupy) -- no realloc between reps
+        csdfg(**call_kwargs)
+
+    measured = 0
     with dace.config.set_temporary('instrumentation', 'report_each_invocation', value=False):
         csdfg = sdfg.compile()
-        for _ in range(warmup + reps):
-            for k, v0 in initial.items():
-                np.copyto(call_kwargs[k], v0)  # reuse the same buffer -- no realloc between reps
-            csdfg(**call_kwargs)
+        for _ in range(warmup):
+            one_call()
+        start = time.perf_counter()
+        for _ in range(reps):
+            one_call()
+            measured += 1
+            if time_budget_s is not None and time.perf_counter() - start >= time_budget_s:
+                break  # keep the >=1 reps already measured rather than risk a hard timeout
         csdfg.finalize()
-    return _flatten_durations(sdfg.get_latest_report().durations)[warmup:]
+    # The report accumulates every call in order (warmup first); drop the warmups
+    # and any measured reps that never ran when the budget cut the loop short.
+    return _flatten_durations(sdfg.get_latest_report().durations)[warmup:warmup + measured]
+
+
+#: Process-level memo for :func:`_environment_build_flags`, keyed by the frozenset of environment
+#: names. The resolved flags are process-stable, so each distinct env mix is discovered once.
+_ENV_BUILD_FLAGS_CACHE = {}
+
+
+def _resolve_library_path(soname):
+    """Absolute path of a bare soname / filename (``liblapacke.so.3``) searched across the linker's
+    library dirs (``LIBRARY_PATH``, ``LD_LIBRARY_PATH``, and the standard multiarch/lib dirs), or None.
+    Used to turn a resolved soname in an environment's ``cmake_libraries`` into a linkable path when it
+    is not a plain ``-l`` name and has no dev ``.so`` symlink."""
+    base = os.path.basename(soname)
+    dirs = []
+    for var in ('LIBRARY_PATH', 'LD_LIBRARY_PATH'):
+        dirs += [d for d in os.environ.get(var, '').split(os.pathsep) if d]
+    dirs += ['/usr/lib/x86_64-linux-gnu', '/usr/lib64', '/usr/lib', '/lib/x86_64-linux-gnu', '/lib']
+    for d in dirs:
+        candidate = os.path.join(d, base)
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def _environment_build_flags(folder):
+    """``(-I include dirs, link args)`` for the SDFG's library-node environments.
+
+    Reads the program folder's ``dace_environments.csv`` -- the SAME environment list CMake
+    (:func:`dace.codegen.compiler.get_environment_flags`) and DaCe's native backend
+    (``native_compiler._resolve_environment``) resolve -- so the direct compile links exactly what
+    those do, rather than hardcoding include dirs or force-linking ``-llapacke``. Per environment:
+    ``cmake_includes`` plus the environment's own dir when it ships a header (so ``cblas.h`` and the
+    relative ``"../include/dace_blas.h"`` resolve) become ``-I``; ``cmake_libraries`` (absolute .so
+    paths such as libopenblas -- which bundles LAPACKE -- or bare sonames) and non-deferred
+    ``cmake_link_flags`` become link args. Unexpanded CMake ``${...}`` fragments (reference-BLAS
+    FindLAPACK vars) are skipped: the perf lanes force concrete OpenBLAS/cuBLAS impls that arrive as
+    real paths. Returns ``([], [])`` if the CSV is absent (no library nodes)."""
+    import dace
+    from dace.codegen.compiler import _get_or_eval
+    csv = os.path.join(folder, 'dace_environments.csv')
+    if not os.path.isfile(csv):
+        return [], []
+    with open(csv) as f:
+        names = frozenset(ln.strip() for ln in f if ln.strip())
+    # Cache by environment-name SET: the resolved include dirs (env source dirs + the OpenBLAS install
+    # include) and link libraries are folder-independent and process-stable, so a sweep compiling many
+    # kernels that share the same envs (~all use OpenBLAS/OpenMP) resolves the paths ONCE instead of
+    # re-importing environments and re-running OpenBLAS discovery (find_library / lib-dir scan) on
+    # every single compile. Keyed on the frozenset so kernels with a different env mix cache separately.
+    cached = _ENV_BUILD_FLAGS_CACHE.get(names)
+    if cached is not None:
+        return cached
+    envs = dace.library.get_environments_and_dependencies(names)
+    _live = lambda x: bool(x) and '$' not in x  # drop unexpanded CMake ${...} fragments
+    inc, link = [], []
+    for env in envs:
+        for i in _get_or_eval(env.cmake_includes):
+            if _live(i):
+                inc.append(f'-I{i}')
+        # A header stored beside the environment (e.g. blas/include/dace_blas.h, referenced from the
+        # frame as "../include/dace_blas.h") means the environment's own dir is an include root.
+        env_dir = os.path.dirname(env._dace_file_path)
+        headers = _get_or_eval(env.headers)
+        for group in (headers.values() if isinstance(headers, dict) else [headers]):
+            for h in group:
+                if os.path.isabs(h):
+                    inc.append(f'-I{os.path.dirname(h)}')
+                elif os.path.isfile(os.path.join(env_dir, h)):
+                    inc.append(f'-I{env_dir}')
+                    break
+        for lib in _get_or_eval(env.cmake_libraries):
+            lib = (lib or '').strip()
+            if not _live(lib):
+                continue
+            if os.path.isabs(lib) or lib.startswith(('-l', '-L', '-Wl')):
+                link.append(lib)
+            elif re.search(r'\.(so|a|dylib)(\.\d+)*$', lib):
+                # A resolved soname / filename (e.g. "liblapacke.so.3", as ctypes.util.find_library
+                # returns on Debian/Ubuntu) is NOT a ``-l`` link NAME -- ``-lliblapacke.so.3`` is not
+                # found. Resolve it to an absolute path against the linker's library dirs (handles a
+                # missing dev ``.so`` symlink, e.g. cblas); else fall back to ``-l<stem>`` (strip the
+                # "lib" prefix and the ".so[.N]" suffix). On daint a single-lib OpenBLAS is a clean
+                # "openblas" name and takes the plain ``-l`` path below, so this is a no-op there.
+                resolved = _resolve_library_path(lib)
+                if resolved:
+                    link.append(resolved)
+                else:
+                    stem = re.sub(r'^lib', '', re.sub(r'\.(so|a|dylib)(\.\d+)*$', '', os.path.basename(lib)))
+                    link.append(f'-l{stem}')
+            else:
+                link.append(f'-l{lib}')
+        for lf in _get_or_eval(env.cmake_link_flags):
+            if _live(lf):
+                link.append(lf)
+    result = (list(dict.fromkeys(inc)), list(dict.fromkeys(link)))  # de-dup, preserve order
+    _ENV_BUILD_FLAGS_CACHE[names] = result
+    return result
 
 
 def _direct_compile_cmd(sdfg, folder):
     """Our OWN compiler command line (not sdfg.compile() / CMake) to build the
     generated frame into a .so: the configured C++ compiler + its OPT flags,
     the generated include/ + DaCe's runtime include, -fopenmp for the parallel
-    maps, every src/cpu/*.cpp. Mirrors how nest-forge owns its build."""
+    maps, every src/cpu/*.cpp, plus the include/link flags of the SDFG's library
+    environments (:func:`_environment_build_flags`). Mirrors nest-forge's owned build."""
     import dace
     cxx = dace.Config.get('compiler', 'cpu', 'executable') or shutil.which('g++') or 'g++'
     args = (dace.Config.get('compiler', 'cpu', 'args') or '').split()
@@ -306,6 +540,12 @@ def _direct_compile_cmd(sdfg, folder):
     srcs = sorted(glob.glob(os.path.join(folder, 'src', 'cpu', '*.cpp')))
     runtime_inc = os.path.join(os.path.dirname(dace.__file__), 'runtime', 'include')
     inc = [f"-I{os.path.join(folder, 'include')}", f'-I{runtime_inc}']
+    # Include dirs + link libraries for the library nodes this SDFG uses (BLAS/LAPACK/...), collected
+    # from the SDFG's OWN environments -- the SAME list CMake and DaCe's native backend resolve. This
+    # is why a library header ("../include/dace_blas.h") and its lib (libopenblas, which bundles
+    # LAPACKE) both resolve here without hardcoding an include list or force-linking -llapacke.
+    env_inc, env_link = _environment_build_flags(folder)
+    inc += env_inc
     so = os.path.join(folder, f'lib{sdfg.name}.so')
     # Don't pin a low standard (DaCe codegen may use newer C++); assume the toolchain supports >=23.
     std = os.environ.get('DACE_PERF_CXX_STD', 'c++23')
@@ -313,7 +553,7 @@ def _direct_compile_cmd(sdfg, folder):
     # libomp/libgomp on LD_LIBRARY_PATH; see native_harness.openmp_rpath_flags).
     import native_harness as nh
     return [cxx, *args, f'-std={std}', '-fPIC', '-shared', '-fopenmp', *nh.openmp_rpath_flags(cxx),
-            *inc, *srcs, '-o', so], srcs
+            *inc, *srcs, *env_link, '-o', so], srcs
 
 
 def compile_sdfg_timed(sdfg):
@@ -400,13 +640,76 @@ def _set_tree_reduction(enabled):
     dace.Config.set('compiler', 'tree_reduction', value=bool(enabled))
 
 
+def perf_library_prio(device_type):
+    """Library-implementation priority for the perf sweep, handed to
+    ``set_fast_implementations`` as its ``find_fast_library_fn`` so the stock
+    walker -- and its GPU device-level-reduce scope guards -- is reused verbatim
+    rather than reimplemented. Two deliberate deviations from the stock
+    ``find_fast_library`` matter here:
+
+    - CPU lists ``OpenBLAS`` FIRST (ahead of any ``MKL``): MKL is x86-only and the
+      perf target is aarch64/daint, and even on an x86 box we want the OpenBLAS
+      lane actually measured, never a silent MKL substitution. It also adds
+      ``OpenMP`` so a ``Reduce`` library node lowers to the OpenMP privatized
+      reduction instead of the stock serial ``pure`` loop (``find_fast_library``'s
+      CPU list omits ``OpenMP``), and ``CPU`` so the sort / scan / scatter-conflict
+      / memset nodes take their native CPU expansion.
+    - GPU lists ``cuBLAS`` / ``cuSolverDn`` / ``cuTENSOR`` / ``CUB`` / ``GPUAuto``
+      (device BLAS + LAPACK and CUB reductions) then ``CUDA`` for the sort / scan /
+      scatter-conflict / memset nodes whose device-impl key is literally ``CUDA``.
+
+    Only impls a node actually offers are ever assigned (the walker checks
+    ``impl in node.implementations``), so listing a key a given node lacks -- e.g.
+    ``CUDA`` against a GEMM -- is a harmless no-op for that node."""
+    import dace
+    if device_type == dace.DeviceType.GPU:
+        return ['cuBLAS', 'cuSolverDn', 'cuTENSOR', 'CUB', 'GPUAuto', 'CUDA']
+    return ['OpenBLAS', 'OpenMP', 'CPU']
+
+
+def set_fastest_library_impls(sdfg, device):
+    """Force every BLAS / LAPACK / sort / reduce library node in `sdfg` onto the
+    fastest backend available for `device` and nothing slower:
+
+      CPU -> OpenBLAS for gemm/gemv AND for the LAPACK potrf/getrf/getrs/getri
+             nodes (each lists an ``OpenBLAS`` expansion that emits ``LAPACKE_*``
+             calls), OpenMP for ``Reduce``, native ``CPU`` for sort/scan/memset.
+      GPU -> cuBLAS, cuSolverDn, cuTENSOR, CUB / GPUAuto (device-level reduce),
+             ``CUDA`` (CUB) sort/scan/memset.
+
+    Delegates to ``set_fast_implementations`` with ``perf_library_prio`` so the
+    existing walker's guards are reused -- notably the GPU rule that never puts a
+    device-level reduce impl on a reduce living inside a GPU kernel scope, and the
+    "sequential-scheduled libnode on GPU -> pure" safety fallback. Idempotent and
+    consistent with canon's ``finalize`` (which already forces OpenBLAS + OpenMP on
+    CPU); the canon lane deliberately leaves selection to that main-thread-owned
+    finalize and never calls this, so finalize's tiny-matmul ``rowwise``/``pure``
+    override is preserved rather than reverted to a BLAS call."""
+    from dace.transformation.auto.auto_optimize import set_fast_implementations
+    set_fast_implementations(sdfg, _device_type(device), find_fast_library_fn=perf_library_prio)
+    return sdfg
+
+
 def pipeline_auto_opt(sdfg, device='cpu'):
     """DaCe's own auto_optimize for the target device -- the speedup baseline
     every other pipeline is reported against. Emits atomic WCR reductions (no
-    tree reduction -- that is the canonicalize lanes' distinguishing lowering)."""
+    tree reduction -- that is the canonicalize lanes' distinguishing lowering).
+
+    ``auto_optimize`` selects library-node impls AND expands them internally
+    (``set_fast_implementations`` then ``expand_library_nodes``), so a trailing
+    ``set_fastest_library_impls`` would see nothing left to re-select. The perf
+    priority (OpenBLAS over MKL, OpenMP reduce, cuBLAS/cuSolverDn/CUB on GPU) is
+    therefore threaded IN as ``find_fast_library_fn`` so it drives the selection
+    before expansion -- the same ``perf_library_prio`` the other lanes force."""
     from dace.transformation.auto.auto_optimize import auto_optimize
+    _set_cpu_codegen('legacy')  # the baseline stays on the old CPU generator
     _set_tree_reduction(False)
-    return auto_optimize(sdfg, _device_type(device))
+    # On GPU force all non-transient (I/O) arrays onto GPU_Global storage (use_gpu_storage): the whole
+    # program stays device-resident like pipeline_parallel/canon_gpu. auto_optimize defaults
+    # use_gpu_storage=False, which leaves interface arrays on host -- a mixed-storage interface the
+    # harness would then have to marshal per-arg. All-arrays-on-device is the GPU-path invariant.
+    return auto_optimize(sdfg, _device_type(device), use_gpu_storage=(device == 'gpu'),
+                         find_fast_library_fn=perf_library_prio)
 
 
 def pipeline_parallel(sdfg, device='cpu'):
@@ -430,7 +733,12 @@ def pipeline_parallel(sdfg, device='cpu'):
         apply_gpu_storage(sdfg)  # non-transient arrays -> GPU_Global (data resident on device)
         sdfg.apply_gpu_transformations()
         sdfg.simplify(validate=True)
-    return sdfg
+    # Without this, library nodes stay implementation=None and a GEMM lowers to a
+    # naive `pure` triple loop (e.g. mlp 12,443ms vs ~200ms). auto_opt/canon pick
+    # fast impls in their own finalize; this is the parallel lane's equivalent,
+    # forcing the perf priority: CPU BLAS/LAPACK->OpenBLAS + Reduce->OpenMP,
+    # GPU->cuBLAS/cuSolverDn + CUB/GPUAuto reduce + CUB sort.
+    return set_fastest_library_impls(sdfg, device)
 
 
 #: The canonicalize knobs used everywhere (mirrors the sibling gate's _CPU
@@ -441,32 +749,69 @@ _CANON_KNOBS = dict(peel_limit=4,
                     scatter_to_guarded_maps=True)
 
 
+def _set_cpu_codegen(implementation):
+    """Pin ``compiler.cpu.implementation`` for this measurement process. Called from the
+    pipeline functions, which run in the same isolated child that then compiles -- so the
+    canonicalize lanes are emitted by the NEW experimental_readable CPU codegen while the
+    auto_opt baseline stays on the legacy generator (each lane pairs its transformation
+    stack with its intended backend instead of both inheriting the process default)."""
+    import dace
+    dace.Config.set('compiler', 'cpu', 'implementation', value=implementation)
+
+
 def pipeline_canon(sdfg, device='cpu'):
     from dace.transformation.passes.canonicalize import canonicalize
     from dace.transformation.passes.canonicalize.finalize import finalize_for_target
+    _set_cpu_codegen('experimental_readable')  # canon lanes are the new-codegen lanes
     _set_tree_reduction(True)  # canon is the only lane that tree-reduces its WCR
     return finalize_for_target(canonicalize(sdfg, validate=True, target=device, **_CANON_KNOBS), device)
 
 
-def pipeline_fast_canon(sdfg, device='cpu'):
+def pipeline_canon_gpu(sdfg, device='gpu'):
+    """Canonicalize, then offload to the GPU EXPLICITLY: canonicalize(target=cpu)
+    -> apply_gpu_storage (non-transient I/O arrays -> GPU_Global, data resident)
+    -> apply_gpu_transformations (maps onto the device) -> fast impls (cub
+    reductions / device BLAS). Distinct from the `canon` lane's device='gpu' path:
+    canon's own GPU offloading inside finalize is a separate upcoming change, so
+    this lane is how canon reaches the GPU today. GPU-only -- the driver runs it
+    solely on the gpu device and gates it on gpu_supported(), so a CPU-only box
+    never touches it. `device` is accepted for a uniform pipeline signature but the
+    target is always the GPU."""
     from dace.transformation.passes.canonicalize import canonicalize
-    from dace.transformation.passes.canonicalize.finalize import finalize_for_target
-    _set_tree_reduction(True)  # canon is the only lane that tree-reduces its WCR
-    return finalize_for_target(canonicalize(sdfg, validate=True, fast=True, target=device, **_CANON_KNOBS), device)
+    from dace.transformation.auto.auto_optimize import apply_gpu_storage
+    _set_cpu_codegen('experimental_readable')  # canon lanes are the new-codegen lanes (host-side code here)
+    _set_tree_reduction(True)  # match the canon lane: tree-reduce the WCR
+    sdfg = canonicalize(sdfg, validate=True, target='cpu', **_CANON_KNOBS)
+    apply_gpu_storage(sdfg)  # non-transient arrays -> GPU_Global (data resident on device)
+    sdfg.apply_gpu_transformations()
+    sdfg.simplify(validate=True)
+    # Force the perf GPU priority on every library node: cuBLAS/cuSolverDn +
+    # CUB/GPUAuto device reduce + CUB sort (this lane offloads to GPU explicitly,
+    # so canon's CPU finalize never ran the impl selection here).
+    return set_fastest_library_impls(sdfg, 'gpu')
 
 
-#: The 4 DaCe-side comparison points. auto_opt is the BASELINE speedups are
+#: The 3 DaCe-side comparison points. auto_opt is the BASELINE speedups are
 #: reported against; parallel (light simplify+loop2map+mapfusion) and
-#: canonicalize / canonicalize(fast=True) are the candidates. The key is also
-#: the SDFG-name suffix each variant is cache-keyed on (with a _cpu/_gpu device
-#: tail), so e.g. canon->'..._canon_cpu', parallel->'..._parallel_gpu',
+#: canonicalize are the candidates. The key is also the SDFG-name suffix each
+#: variant is cache-keyed on (with a _cpu/_gpu device tail), so e.g.
+#: canon->'..._canon_cpu', parallel->'..._parallel_gpu',
 #: auto_opt->'..._auto_opt_cpu' -- distinct build folders, never colliding.
 PIPELINES = {
     'auto_opt': pipeline_auto_opt,
     'parallel': pipeline_parallel,
     'canon': pipeline_canon,
-    'fast-canon': pipeline_fast_canon,
 }
+
+#: GPU-only lanes: run solely on the gpu device (gated on gpu_supported()), never
+#: on cpu. Kept out of PIPELINES so DACE_LANES (the cpu+gpu-capable standard set)
+#: excludes them; dispatch a lane name through ALL_PIPELINES.
+GPU_ONLY_PIPELINES = {
+    'canon-gpu': pipeline_canon_gpu,
+}
+
+#: Every dispatchable pipeline (standard + gpu-only), keyed by lane name.
+ALL_PIPELINES = {**PIPELINES, **GPU_ONLY_PIPELINES}
 
 
 # --------------------------------------------------------------------------
@@ -554,6 +899,7 @@ def _apply_multidim_vectorizer(sdfg):
 def pipeline_canon_vectorize(sdfg, device='cpu'):
     """canonicalize -> VectorizeCPUMultiDim."""
     from dace.transformation.passes.canonicalize import canonicalize
+    _set_cpu_codegen('experimental_readable')  # canon lanes are the new-codegen lanes
     _set_tree_reduction(True)  # canon tree-reduces its WCR, like the plain canon lane
     canonicalize(sdfg, validate=True, **_VECTORIZE_CANON_KNOBS)
     return _apply_multidim_vectorizer(sdfg)
@@ -592,7 +938,7 @@ def _slug(s):
 
 def compiler_host_tag():
     """`<compiler>_<hostname>` -- namespace for DaCe-lane results (baseline/
-    auto-opt/canon/fast-canon): a different --cxx (or a different node's
+    auto-opt/canon): a different --cxx (or a different node's
     autodetected default) produces timings that aren't comparable, so this
     keeps them in separate result folders instead of corrupting one shared
     results.csv/status.csv. Native lanes use host_tag() instead -- they pick
@@ -722,6 +1068,11 @@ def write_status(kdir, pipeline, correct, error=''):
     if os.path.exists(path):
         with open(path, newline='') as f:
             rows = [r for r in csv.DictReader(f) if r['pipeline'] != pipeline]
+    error = str(error)
+    if len(error) > _MAX_STATUS_ERROR_CHARS:
+        # Keep the head (exception type + first frames) and the tail (the actual raise).
+        head, tail = _MAX_STATUS_ERROR_CHARS // 2, _MAX_STATUS_ERROR_CHARS // 2
+        error = f'{error[:head]}\n...[{len(error) - head - tail} chars truncated]...\n{error[-tail:]}'
     rows.append(dict(pipeline=pipeline, correct=correct, error=error))
     tmp = path + '.tmp'
     with open(tmp, 'w', newline='') as f:
@@ -946,7 +1297,7 @@ def add_common_args(ap, default_timeout=900.0):
     ap.add_argument('--kernels-file', default=None, help='file of kernel names, one per line (overrides rank slicing)')
     ap.add_argument('--force', action='store_true', help='ignore existing results, re-measure from scratch')
     ap.add_argument('--save-sdfg', action='store_true', help='save each pipeline\'s SDFG into the kernel folder')
-    ap.add_argument('--save-sdfg-only', action='store_true', help='save canon/fast-canon SDFGs, skip all timing')
+    ap.add_argument('--save-sdfg-only', action='store_true', help='save canon SDFGs, skip all timing')
     ap.add_argument('--list-kernels', action='store_true', help='print this corpus\'s kernel identifiers and exit')
     ap.add_argument('--tables-only', action='store_true', help='skip measurement, just rebuild the markdown tables')
     ap.add_argument('--timeout',

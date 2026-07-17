@@ -32,7 +32,6 @@ from dace.transformation.passes.canonicalize.fuse_chained_scalar_reductions impo
 from dace.transformation.passes.canonicalize.symbol_dedup import SymbolDedup
 from dace.transformation.passes.canonicalize.perfect_loop_nesting import PerfectLoopNesting
 from dace.transformation.passes.lift_trivial_if import LiftTrivialIf
-from dace.transformation.passes.loop_fission import LoopFission
 from dace.transformation.passes.move_if_into_loop import MoveIfIntoLoop
 from dace.transformation.passes.loop_stride_permutation import LoopStridePermutation
 from dace.transformation.passes.minimize_stride_permutation import MinimizeStridePermutation
@@ -69,16 +68,21 @@ from dace.transformation.passes.canonicalize.fuse_consecutive_loops import FuseC
 from dace.transformation.passes.normalize_wcr_source import NormalizeWCRSource
 from dace.transformation.passes.normalize_wcr import NormalizeWCR
 from dace.transformation.passes.scatter_to_guarded_maps import ScatterToGuardedMaps
+from dace.transformation.passes.privatize_scatter_reduction import PrivatizeScatterReduction
 from dace.transformation.passes.parallelize_under_constraint import ParallelizeUnderConstraint
 from dace.transformation.passes.promote_constant_index_access import PromoteConstantIndexAccess
 from dace.transformation.passes.buffer_expansion import BufferExpansion
 from dace.transformation.passes.canonicalize.wavefront_skew import WavefrontSkew
+from dace.transformation.passes.canonicalize.loop_fusion import LoopFusion
 from dace.transformation.passes.canonicalize.untile_loops import UntileLoops
 from dace.transformation.passes.canonicalize.arg_max_lift import ArgMaxLift
 from dace.transformation.passes.canonicalize.early_exit_to_find_index import EarlyExitToFindIndex
 from dace.transformation.passes.canonicalize.loop_to_conditional_reduce import LoopToConditionalReduce
 from dace.transformation.passes.canonicalize.loop_to_symmetrize import LoopToSymmetrize
 from dace.transformation.passes.canonicalize.loop_to_symm import LoopToSymm
+from dace.transformation.passes.canonicalize.loop_to_syrk import LoopToSyrk
+from dace.transformation.passes.canonicalize.loop_to_syr2k import LoopToSyr2k
+from dace.transformation.passes.canonicalize.lift_inv import LiftInv
 from dace.transformation.passes.canonicalize.loop_to_einsum import LoopToEinsum
 from dace.transformation.passes.canonicalize.distribute_producer_consumer import DistributeProducerConsumerLoop
 from dace.transformation.passes.canonicalize.assume_symbols_nonnegative import (AssumeSymbolConstraints,
@@ -176,6 +180,12 @@ class _PrivatizeScalarsStage(ppl.Pass):
         return set()
 
     def apply_pass(self, sdfg: SDFG, _pipeline_results: Dict[str, Any]) -> Optional[Any]:
+        # ``PrivatizeScalars`` resolves a ``FindAccessNodes`` analysis (keyed by
+        # ``cfg_id``) and a reachability analysis that calls ``reset_cfg_list`` mid-
+        # pipeline; a stale control-flow-region list (left by a prior stage's inliner)
+        # then lets that reset reassign ``cfg_id`` under the cached ``FindAccessNodes``
+        # result -> ``KeyError``. Refresh the list up front so both analyses agree.
+        sdfg.reset_cfg_list()
         return PrivatizeScalars().apply_pass(sdfg, {})
 
 
@@ -225,17 +235,26 @@ class _PrivatizeScalarsStage(ppl.Pass):
 #   - GPU: B (guarded) ~1.03x A. Same reasoning. On.
 # Both targets default to True; the knob exists so the AB harness can
 # measure off-vs-on without resorting to pre-canonicalize hand-wiring.
+# ``privatize_scatter_reductions`` (PrivatizeScatterReduction): surface a
+# data-dependent scatter reduction (``hist[bin[i]] (+)= w[i]``) to a whole-buffer
+# map WCR so CPU codegen privatises the accumulator with an OpenMP array-section
+# ``reduction(op:hist[0:n])`` clause instead of a contended per-element atomic
+# (azimint_hist: ~200x -> ~1x vs numpy). CPU-only: the clause path is gated on
+# ``openmp_array_reductions`` (an OpenMP feature); on GPU a scatter accumulate stays
+# an ``atomicAdd`` and this privatisation does not apply, so the knob defaults off.
 _CPU_DEFAULTS: Dict[str, Any] = {
     'interchange_carry_with_map': True,
     'peel_limit': 4,
     'break_anti_dependence': True,
     'scatter_to_guarded_maps': True,
+    'privatize_scatter_reductions': True,
 }
 _GPU_DEFAULTS: Dict[str, Any] = {
     'interchange_carry_with_map': False,
     'peel_limit': 4,
     'break_anti_dependence': True,
     'scatter_to_guarded_maps': True,
+    'privatize_scatter_reductions': False,
 }
 _TARGET_DEFAULTS: Dict[str, Dict[str, Any]] = {'cpu': _CPU_DEFAULTS, 'gpu': _GPU_DEFAULTS}
 
@@ -253,9 +272,9 @@ def _build_stages(unroll_limit: int = DEFAULT_UNROLL_LIMIT,
                   break_anti_dependence: bool = True,
                   interchange_carry_with_map: bool = True,
                   scatter_to_guarded_maps: bool = True,
+                  privatize_scatter_reductions: bool = True,
                   assume_parallel_guards: bool = False,
                   target: str = 'cpu',
-                  fast: bool = False,
                   lift: bool = True,
                   lift_copy: bool = True,
                   semantic_lifting: bool = True,
@@ -357,6 +376,33 @@ def _build_stages(unroll_limit: int = DEFAULT_UNROLL_LIMIT,
     if semantic_lifting and lift:
         s += [('loop_to_symm', LoopToSymm())]
 
+    # lift_inv (semantic lift, on the raw frontend shape, gated like loop_to_symm):
+    # recognise ``A^-1`` written as ``solve(A, eye(N))`` -- a ``Solve`` library
+    # node whose RHS operand is a freshly-built identity matrix
+    # (``numpy.eye`` / ``numpy.identity``: a square ``val = 1 if i == j else 0``
+    # mapped tasklet) -- and replace the ``Solve`` + identity-construction map
+    # with a single ``Inv`` node (getrf + getri, the direct inverse that never
+    # materialises an identity RHS). It runs BEFORE ``MapToForLoop`` lowers the
+    # identity map to a loop and before the ITE-lowering passes rewrite its
+    # ``1 if ... else 0`` body, so the identity is still its raw mapped-tasklet
+    # form. A strict no-op on any deviation (non-identity RHS, shifted diagonal,
+    # a reused identity), like the other semantic lifts.
+    if semantic_lifting and lift:
+        s += [('lift_inv', LiftInv())]
+
+    # privatize_scatter (BEFORE normalize_reduction): surface a data-dependent scatter
+    # reduction (``hist[bin[i]] (+)= w[i]`` -- the azimint histogram) onto the whole-buffer
+    # ``NestedSDFG -> MapExit -> accumulator`` WCR edge chain, so CPU codegen privatises the
+    # accumulator with an OpenMP array-section ``reduction(op:hist[0:n])`` clause (each thread
+    # a private copy, uncontended accumulate, runtime tree-merge) instead of the contended
+    # per-element atomic (~200x on azimint_hist). Must run BEFORE ``NormalizeWCR``: surfacing
+    # the WCR here makes the outer edge non-plain, so ``NormalizeWCR`` skips the scatter and
+    # its unsound drop-WCR shortcut (which turns ``oc[bin] (+)= w`` into a partial plain
+    # ``oc[bin] = w`` over a per-iteration whole-array buffer, reading the rest uninitialised)
+    # never fires. CPU-only (the clause path needs OpenMP array reductions); off for GPU.
+    if privatize_scatter_reductions:
+        s += [('privatize_scatter', PrivatizeScatterReduction())]
+
     # normalize_reduction (FIRST, on the frontend shape): a masked reduction emitted as an
     # in-nsdfg WCR into a write-only output connector (plain map-exit edge) is rewritten to
     # the seeded-local + map-exit-WCR shape the frontend already emits for the equivalent
@@ -374,6 +420,27 @@ def _build_stages(unroll_limit: int = DEFAULT_UNROLL_LIMIT,
           ('clean', SplitTasklets()), ('clean', LowerITEToFpFactor()), ('clean', ContinueToCondition()),
           ('clean', EarlyExitToFindIndex()), ('clean', SimplifyPass()),
           ('clean', PatternMatchAndApplyRepeated([StateFusionExtended()]))]
+
+    # loop_to_syrk / loop_to_syr2k (semantic lift, gated like loop_to_symm): the
+    # hand-written symmetric rank-k / rank-2k update nests (polybench syrk / syr2k) are
+    # recognised -- an outer row loop whose body beta-scales a triangular row slice of a
+    # square C and then accumulates onto that same slice in an inner k loop -- and
+    # replaced by a ``Syrk`` / ``Syr2k`` BLAS node (vendor dsyrk / dsyr2k, which compute
+    # only the referenced triangle: half the flops of the equivalent gemm, and threaded).
+    #
+    # They run HERE, right after the clean block's SimplifyPass + StateFusionExtended,
+    # because -- unlike loop_to_symm, which matches a raw frontend map+NestedSDFG
+    # boundary -- these match the *dataflow expression* of a single fused body state.
+    # The frontend spreads each slice statement over several states and staging
+    # temporaries; StateFusionExtended collapses that into the one-state-per-loop-body
+    # shape the recogniser resolves through. They must still run BEFORE 'prep'
+    # (SplitStatements) and 'lower' (MapToForLoop) rewrite the body.
+    #
+    # A strict, no-op-on-any-deviation match (gated on the semantic-lifting knobs, like
+    # LiftEinsum / LoopToSymm), so the vectorizer path (semantic_lifting=False) leaves
+    # syrk / syr2k as plain reduction nests.
+    if semantic_lifting and lift:
+        s += [('loop_to_syrk', LoopToSyrk()), ('loop_to_syr2k', LoopToSyr2k())]
 
     # prep (still maps): push guarding conditionals into maps, then split
     # statements -- replicate a conditional / gather-scatter NestedSDFG per
@@ -574,13 +641,6 @@ def _build_stages(unroll_limit: int = DEFAULT_UNROLL_LIMIT,
     # a loop into siblings that keep the same ``_loop_it_<N>`` name; re-running
     # UniqueLoopIterators disambiguates those duplicates so the later LoopToMap is
     # not blocked by a sibling appearing to read the shared iterator.
-    #
-    # FAST MODE skips the up-front broad fission: fissioning every loop (then fusing
-    # most of them back) is too costly on large programs (cloudsc / icon). Instead
-    # fast mode parallelizes first and fissions only the residual loops AFTER the
-    # first LoopToMap (see the ``fast`` block after the 'parallelize' stage) -- the
-    # already-lifted maps are no longer loops, so fission naturally touches only the
-    # loops that resisted parallelization.
     # break_antidep (before fission): a forward-read anti-dependence -- a body that
     # reads ``a[i+1]`` off the same array a sibling statement writes at ``a[i]`` (s1244
     # ``d[i] = a[i] + a[i+1]``) -- is a cross-iteration bridge LoopFission cannot sever,
@@ -592,10 +652,9 @@ def _build_stages(unroll_limit: int = DEFAULT_UNROLL_LIMIT,
     # on the now single-compute-state body, in addition to the earlier 'break_antidep'
     # stage (which sees the loop before its slice states fuse and so only breaks the
     # whole-array pure-WAR loops). Gated on the same knob as that stage.
-    if not fast:
-        if break_anti_dependence:
-            s += [('fission', BreakAntiDependence())]
-        s += [('fission', PerfectLoopNesting()), ('fission', _uniq_fis)]
+    if break_anti_dependence:
+        s += [('fission', BreakAntiDependence())]
+    s += [('fission', PerfectLoopNesting()), ('fission', _uniq_fis)]
 
     # normalize: dropped from the pipeline. ``NormalizeLoopsAndMaps`` rewrites
     # ``for i in b:e:s`` into ``for j in 0:(e-b)//s:1`` with body
@@ -628,6 +687,19 @@ def _build_stages(unroll_limit: int = DEFAULT_UNROLL_LIMIT,
     # a unit-stride single-accumulator loop, and before ``loop_to_x`` lifts it.
     s += [('fuse_consecutive_loops', FuseConsecutiveLoops())]
 
+    # lift_copy_loops (BEFORE loop_to_x / LoopToReduce): a plain contiguous copy /
+    # zero loop -- ``for i: dst[i] = src[i]`` / ``for i: dst[i] = 0`` -- is lifted to a
+    # Copy / Memset library node here, before the reduction/scan detection runs, so it is
+    # recognised as pure data movement instead of being mis-analysed as a (degenerate)
+    # reduction or left as a naive loop. The earlier structural cleanup has already folded
+    # the frontend ``AccessNode -> scalar-slice -> Tasklet`` bridge into the ``_out = _in``
+    # form the detector matches. Gated on the same ``lift_copy`` knob as the post-parallelize
+    # map lift below; the vectorizer (``semantic_lifting=False``) skips it so copy loops stay
+    # raw loops it can lower. Structural cleanup tidies the spliced-in states afterwards.
+    if semantic_lifting and lift_copy:
+        s += [('lift_copy_loops', AssignmentAndCopyKernelToMemsetAndMemcpy())]
+        s += _structural_cleanup('lift_copy_loops')
+
     # loop_to_x (moved here from the 'reduce' stage so the order is
     # LoopFission -> LoopStridePermutation -> LoopToX -> LoopToMap): lift the
     # accumulator / scan / argmax / find-index / conditional-reduce shapes that
@@ -644,6 +716,13 @@ def _build_stages(unroll_limit: int = DEFAULT_UNROLL_LIMIT,
     # (matvec / matmul / transpose) must be claimed as a single Einsum node before
     # LoopToReduce lifts its reduction axis to a Reduce. It probes on a throwaway
     # copy and is a clean no-op on any nest that does not collapse to one Einsum.
+    # LoopToConditionalReduce folds a guarded accumulator ``if cond: acc OP= x`` into an
+    # UNCONDITIONAL masked reduction -- ``masked = (x if cond else IDENTITY); acc OP= masked``
+    # -- the exact "compute then accumulate" shape an unguarded reduction (``s += a[i]*b[i]``)
+    # has -- so the later ``reduction_to_wcr_map`` stage lifts it to a parallel WCR-on-scalar
+    # Map whose codegen emits the OpenMP ``reduction(op:acc)`` clause (CPU) / block-warp
+    # tree-reduce (GPU), instead of the per-passing-thread guarded atomic the raw conditional
+    # lowers to.
     s += [('loop_to_x', LoopToEinsum()), ('loop_to_x', LoopToReduce()),
           ('loop_to_x', LoopToScan(interchange_carry_with_map=interchange_carry_with_map)), ('loop_to_x', ArgMaxLift()),
           ('loop_to_x', LoopToConditionalReduce())]
@@ -663,14 +742,10 @@ def _build_stages(unroll_limit: int = DEFAULT_UNROLL_LIMIT,
     # undo that work and ping-pong. The terminal ``hoist_guards`` stage runs it
     # once, AFTER fuse, where the fusion it would otherwise undo has happened.
 
-    # wavefront_skew (pre-parallelize): apply the ``t = i + j, p = j`` skew to
-    # 2-D perfect nests whose body has a backward dependence pattern (TSVC
-    # ``s2111`` and friends). The outer ``t`` axis stays sequential (diagonal
-    # sweep); the inner ``p`` axis becomes parallel and is then mapped by
-    # ``LoopToMap`` in the ``parallelize`` stage. The rewrite is a relabelling
-    # of the iteration space + an in-body substitution; symbolic offsets get a
-    # runtime ``__builtin_trap`` non-positivity guard planted in a pre-state.
-    s += [('wavefront_skew', WavefrontSkew())]
+    # Wavefront skewing has a single home: the ``loop_fuse`` block after
+    # ``post_l2m`` (see below). It is the final parallelization attempt, applied
+    # to the sequential residue ``LoopToMap`` refused -- so it must run after
+    # ``LoopToMap``, not before it.
 
     # loop_to_scan (late, post-fission + post-skew): a second LoopToScan pass
     # catches prefix-scan recurrences that only emerged AFTER ``LoopFission``
@@ -684,27 +759,6 @@ def _build_stages(unroll_limit: int = DEFAULT_UNROLL_LIMIT,
 
     # parallelize: the canonical (fissioned / normalized) loops -> parallel maps.
     s += [('parallelize', PatternMatchAndApplyRepeated([LoopToMap()]))]
-
-    # FAST MODE fission-on-demand: in fast mode the up-front broad fission was
-    # skipped, so the loops that survived the first LoopToX/LoopToMap above are
-    # exactly the ones that resisted parallelization (a loop carrying both a parallel
-    # and a sequential statement, etc.). Fission ONLY those now -- the loops that did
-    # become maps are no longer LoopRegions, so LoopFission cannot touch them -- then
-    # re-permute and retry the LoopToX/LoopToMap lift on the fragments. A fragment
-    # that became independent now parallelizes; the truly-sequential remainder stays a
-    # loop. This is the parallelize-first / fission-residual / retry shape: it pays
-    # the fission (+ fuse-back) cost only where it can unlock parallelism, instead of
-    # on every loop in the program.
-    if fast:
-        _uniq_fast_fis = UniqueLoopIterators(assign_loop_iterator_post_value=False)
-        _uniq_fast_ssa = UniqueLoopIterators(assign_loop_iterator_post_value=False)
-        s += [('fission', LoopFission()), ('fission', _uniq_fast_fis)]
-        s += [('loop_stride_permutation', LoopStridePermutation())]
-        s += [('loop_to_x', LoopToEinsum()), ('loop_to_x', LoopToReduce()),
-              ('loop_to_x', LoopToScan(interchange_carry_with_map=interchange_carry_with_map)),
-              ('loop_to_x', ArgMaxLift()), ('loop_to_x', LoopToConditionalReduce())]
-        s += [('cascade_iedges_up', CascadeInterstateEdgeAssignmentsUp()), ('ssa', _uniq_fast_ssa)]
-        s += [('parallelize', PatternMatchAndApplyRepeated([LoopToMap()]))]
 
     # parallelize_guarded: loops that ``LoopToMap`` refused but would accept
     # permissively, where the blocker is an algebraic side condition (TSVC s171's
@@ -777,6 +831,19 @@ def _build_stages(unroll_limit: int = DEFAULT_UNROLL_LIMIT,
     # cleanup (state fusion + inline SDFG) -- after LoopToMap.
     s += [('post_l2m', InsertAssignTaskletsAtMapBoundary())]
     s += _structural_cleanup('post_l2m')
+
+    # loop_fuse (post-parallelize recovery): every DOALL loop is now a Map, so the
+    # remaining LoopRegions are exactly the sequential residue LoopToMap refused.
+    # ``LoopFusion`` fuses consecutive same-range sequential siblings (locality; it
+    # cannot touch the already-parallel Maps, which it never matches).
+    # ``WavefrontSkew`` then makes its final parallelization attempt on those
+    # residual 2-D nests (seidel / nussinov and any nest LoopFusion merged), and a
+    # second ``LoopToMap`` maps the inner axis it exposes. This is the single home
+    # of wavefront skewing: it only ever runs on what LoopToMap could not take.
+    s += [('loop_fuse', LoopFusion())]
+    s += [('loop_fuse', WavefrontSkew())]
+    s += [('loop_fuse', PatternMatchAndApplyRepeated([LoopToMap()]))]
+    s += _structural_cleanup('loop_fuse')
 
     # lift_copy (cleaning, post-parallelize): now that loops are maps, extract pure
     # data-movement out of them -- a contiguous element-wise copy -> a Copy library
@@ -934,21 +1001,18 @@ def _build_stages(unroll_limit: int = DEFAULT_UNROLL_LIMIT,
 
     # end: the final SimplifyPass.
     #
-    # ``ArrayElimination`` is intentionally skipped: its source-merge
-    # (``merge_access_nodes`` with the ``in_degree == 0`` predicate) collapses
-    # two distinct source AccessNodes for the same data into one with
-    # ``out_degree >= 2``. When the body of a loop carries a *different*
-    # transient scalar via a read-AN-at-top / write-AN-at-bottom pair, the
-    # implicit codegen ordering between those two roots is what kept the
-    # carrier's RAW order intact -- merging the source breaks that ordering
-    # and the carrier reads the *new* value instead of the previous one.
-    # TSVC s254 / s255 (single- / two-step scalar lookback) divergence comes
-    # from this exact mechanism. The Phase 2.4a guard refuses the merge when
-    # the merged data itself has writes in the state, but s254's ``b`` is
-    # read-only -- the carrier (``x``) is the affected transient. Until the
-    # guard is widened to account for sibling carrier transients, the safer
-    # disposition is to skip the pass at end-of-canonicalize. Other Simplify
-    # sub-passes still run.
+    # ``ArrayElimination`` now runs at end-of-canonicalize. Two classes of bug
+    # that previously forced it off are fixed: (1) the ``merge_access_nodes``
+    # source-merge reorder that diverged the s254/s255 scalar-lookback carriers
+    # -- guarded by ``_state_has_read_write_sibling_carrier`` / ``_is_war_carrier``
+    # (a read-only merged container whose sibling transient is a read-then-seed
+    # carrier, or the anti-dep snapshot of s212, is left un-merged); and (2) the
+    # dead-data removal that ignored control-flow-region *condition* codeblocks --
+    # ``FindAccessStates`` now records data read by a loop/branch condition as live
+    # in the states the region governs, so a data-dependent bound is no longer
+    # dropped from under its own condition. Running it here reclaims the dead
+    # transients later canon phases strand (e.g. the wavefront's absorbed
+    # ``arr_split_snap`` snapshot copy).
     #
     # relax_powers (before the terminal simplify): freeze a provable non-negative integer
     # ``base ** exp`` to the exact integer ``ipow`` on the size / subscript / bound sites WHILE
@@ -962,7 +1026,7 @@ def _build_stages(unroll_limit: int = DEFAULT_UNROLL_LIMIT,
     # an earlier suspicion that it miscompiled gramschmidt was a misdiagnosis -- that was an
     # uninitialized WCR read whose layout the relax merely perturbed.)
     s += [('relax_powers', RelaxIntegerPowers())]
-    s += [('end', SimplifyPass(skip={'ArrayElimination'}))]
+    s += [('end', SimplifyPass())]
 
     # Final parallelize sweep: the symbolic-stride scan specialization
     # (``LoopToScan._specialize_scan_under_stride_guard``) emits its carry-free
@@ -982,6 +1046,21 @@ def _build_stages(unroll_limit: int = DEFAULT_UNROLL_LIMIT,
     s += [('end', LiftLoopCarriedReduction())]
     s += [('end', PatternMatchAndApplyRepeated([LoopToMap()]))]
 
+    # Terminal fuse: the main ``fuse`` stage runs BEFORE ``normalize_wcr`` and the
+    # terminal ``LoopToMap`` above. Two maps that were not yet fuseable at that point
+    # can become fuseable only afterwards: ``NormalizeWCRSource`` reshapes a reduction
+    # consumer's WCR from the seeded privatized-accumulator form (IN-wcr / plain
+    # copy-out -- which MapFusionVertical's ``_second_map_is_seeded_reduction`` guard
+    # rightly refuses) into a plain map-exit WCR that IS fuseable, and the terminal
+    # LoopToMap lifts residual loops into fresh maps adjacent to existing ones. With no
+    # fuse after those stages, such producer->consumer pairs stay split (polybench
+    # ``syrk``: the ``alpha*A*A`` product map + the ``C += ...`` k-reduction map, both
+    # over the same ``0:i+1`` slice, stayed as two maps == two fork/joins per k step).
+    # Re-run vertical+horizontal fusion in final map form so every fuseable pair is
+    # fused; the seeded-reduction / dependency guards still refuse the unsafe ones. The
+    # following SymbolDedup cleans up the duplicate index symbols fusion introduces.
+    s += [('end', PatternMatchAndApplyRepeated([MapFusionVertical(), MapFusionHorizontal()]))]
+
     # Terminal symbol cleanup: after fusion, a fused gather-map body carries
     # duplicate index symbols that map fusion introduced -- ``idx_index`` and
     # ``idx_index_0`` both ``idx[i]`` (``idx[i]`` computed twice). ``SymbolDedup``
@@ -990,6 +1069,16 @@ def _build_stages(unroll_limit: int = DEFAULT_UNROLL_LIMIT,
     # (the merge can expose fresh constant/symbol chains). BEFORE
     # AssumeSymbolConstraints, which must stay the terminal stage.
     s += [('end', SymbolDedup()), ('end', SymbolPropagation()), ('end', ConstantPropagation())]
+
+    # revert_nonreduction_wcr (terminal): the terminal ``LoopToMap`` + fusion above form fresh
+    # ``map_exit -> output`` WCR edges that the earlier ``revert_nonreduction_wcr`` (which ran
+    # before those maps existed) never saw -- an injective slice aug-assign such as seidel's
+    # ``A[i, 1:-1] += <neighbours>`` whose ``j``-loop only became a Map here. Its per-iteration
+    # write is a single conflict-free element and the tasklet already reads the destination back,
+    # so the map-exit WCR is a spurious atomic over a conflict-free store: WCRToAugAssign (expr 4)
+    # drops it to a plain indexed write. The injectivity gate still keeps genuine reductions (a
+    # real ``w[i] += ...`` k-reduction whose write does NOT vary with the map lane).
+    s += [('end', PatternMatchAndApplyRepeated([WCRToAugAssign()]))]
 
     # NOTE: fresh WCR accumulators are identity-seeded by ``NormalizeWCRSource`` (the
     # ``normalize_wcr`` stage above), not a separate pass -- codegen never seeds a WCR
@@ -1139,16 +1228,17 @@ class CanonicalizationPipeline(ppl.Pass):
         dtype=bool,
         default=True,
         desc='Run ScatterToGuardedMaps in the scatter stage to lift scatter loops with a sort-based guard.')
+    privatize_scatter_reductions = properties.Property(
+        dtype=bool,
+        default=True,
+        desc='Run PrivatizeScatterReduction to surface a data-dependent scatter reduction '
+        '(azimint histogram) to an OpenMP array-section reduction clause (CPU-only; off for GPU).')
     assume_parallel_guards = properties.Property(
         dtype=bool,
         default=False,
         desc='Assume every parallel-guard condition holds: ParallelizeUnderConstraint + '
         'ScatterToGuardedMaps emit only the parallel Map (no if-else fallback, no sort/trap). '
         'Unsound if a condition is violated at runtime; default keeps the sound guards.')
-    fast = properties.Property(
-        dtype=bool,
-        default=False,
-        desc='Fast mode: parallelize first and fission only the residual loops (skip the up-front broad fission).')
     lift = properties.Property(
         dtype=bool,
         default=True,
@@ -1184,9 +1274,9 @@ class CanonicalizationPipeline(ppl.Pass):
                  target: str = 'cpu',
                  interchange_carry_with_map: Optional[bool] = None,
                  scatter_to_guarded_maps: Optional[bool] = None,
+                 privatize_scatter_reductions: Optional[bool] = None,
                  assume_parallel_guards: bool = False,
                  specialize_constants: Optional[Dict[str, int]] = None,
-                 fast: bool = False,
                  lift: bool = True,
                  lift_copy: bool = True,
                  semantic_lifting: bool = True,
@@ -1212,8 +1302,11 @@ class CanonicalizationPipeline(ppl.Pass):
                                                                'scatter_to_guarded_maps',
                                                                scatter_to_guarded_maps,
                                                                fallback=True)
+        self.privatize_scatter_reductions = _resolve_target_default(target,
+                                                                    'privatize_scatter_reductions',
+                                                                    privatize_scatter_reductions,
+                                                                    fallback=(target == 'cpu'))
         self.assume_parallel_guards = assume_parallel_guards
-        self.fast = fast
         self.lift = lift
         self.lift_copy = lift_copy
         self.semantic_lifting = semantic_lifting
@@ -1250,9 +1343,9 @@ class CanonicalizationPipeline(ppl.Pass):
                                break_anti_dependence=self.break_anti_dependence,
                                interchange_carry_with_map=self.interchange_carry_with_map,
                                scatter_to_guarded_maps=self.scatter_to_guarded_maps,
+                               privatize_scatter_reductions=self.privatize_scatter_reductions,
                                assume_parallel_guards=self.assume_parallel_guards,
                                target=self.target,
-                               fast=self.fast,
                                lift=self.lift,
                                lift_copy=self.lift_copy,
                                semantic_lifting=self.semantic_lifting,
@@ -1277,9 +1370,9 @@ def canonicalize(sdfg: SDFG,
                  target: str = 'cpu',
                  interchange_carry_with_map: Optional[bool] = None,
                  scatter_to_guarded_maps: Optional[bool] = None,
+                 privatize_scatter_reductions: Optional[bool] = None,
                  assume_parallel_guards: bool = False,
                  specialize_constants: Optional[Dict[str, int]] = None,
-                 fast: bool = False,
                  lift: bool = True,
                  lift_copy: bool = True,
                  semantic_lifting: bool = True,
@@ -1307,6 +1400,12 @@ def canonicalize(sdfg: SDFG,
                    knob args override the preset.
     :param interchange_carry_with_map: ``LoopToScan`` knob; ``None`` (default) ->
                                        per-target preset (CPU=True, GPU=False).
+    :param privatize_scatter_reductions: Surface a data-dependent scatter reduction
+                                   (``hist[bin[i]] (+)= w[i]`` -- the azimint histogram)
+                                   to an OpenMP array-section ``reduction(op:hist[0:n])``
+                                   clause so the accumulator is thread-privatised instead
+                                   of hammered with a contended atomic; ``None`` (default)
+                                   -> per-target preset (CPU=True, GPU=False).
     :param assume_parallel_guards: Assume every parallel-guard condition holds --
                                    ``ParallelizeUnderConstraint`` and
                                    ``ScatterToGuardedMaps`` emit only the parallel
@@ -1319,10 +1418,6 @@ def canonicalize(sdfg: SDFG,
                              SDFGs) before canonicalization, so symbolic trip counts
                              unroll (e.g. ``{'nclv': 5}``) and concrete matmul extents
                              (e.g. ``{'Norb': 3}``) enable the small-GEMM ``'pure'`` path.
-    :param fast: Fast mode -- parallelize first and fission only the residual loops
-                 (skip the up-front broad fission). Cheaper on large programs
-                 (cloudsc / icon) where most loops are directly mappable; the few
-                 loops that resist parallelization are fissioned and re-lifted.
     :param lift: Lift tensor-contraction maps (matmul chains) to ``Einsum`` library
                  nodes for BLAS lowering (default ``True``). Set ``False`` to skip
                  that optimization and keep matmuls as plain WCR loop nests -- a
@@ -1354,9 +1449,9 @@ def canonicalize(sdfg: SDFG,
                              target=target,
                              interchange_carry_with_map=interchange_carry_with_map,
                              scatter_to_guarded_maps=scatter_to_guarded_maps,
+                             privatize_scatter_reductions=privatize_scatter_reductions,
                              assume_parallel_guards=assume_parallel_guards,
                              specialize_constants=specialize_constants,
-                             fast=fast,
                              lift=lift,
                              lift_copy=lift_copy,
                              semantic_lifting=semantic_lifting,

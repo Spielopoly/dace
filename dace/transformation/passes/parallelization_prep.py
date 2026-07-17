@@ -8,9 +8,11 @@ plain :class:`~dace.transformation.pass_pipeline.Pass` objects so the
 - :class:`ShortLoopUnroll` -- fully unroll constant-trip loops with at most
   ``unroll_limit`` iterations, turning small recurrence / reduction loops into
   inline straight-line code instead of atomically-parallelized maps.
-- :class:`BestEffortLoopPeeling` -- search front/back/both peels of 1..``peel_limit``
-  boundary iterations, keep the one that unblocks the most maps, revert if none
-  helps, and prune the now-dead boundary guard from the remainder.
+- :class:`BestEffortLoopPeeling` -- index-set-split a loop at a point DERIVED from its body
+  (an ``if i == x`` guard, a broadcast read's conflicting index), and peel a wrapping body
+  modulo to its floor-correct affine form, pruning the now-dead boundary guard from each
+  segment. ``peel_limit`` bounds the modulo peel and underwrites the large-trip-count
+  assumption the split's range proofs lean on (0 disables the pass).
 
 Transformation classes are imported lazily inside the methods: importing them at
 module load would cycle (this package is imported by the transformations those
@@ -135,17 +137,23 @@ class ShortLoopUnroll(ppl.Pass):
 
 @properties.make_properties
 class BestEffortLoopPeeling(ppl.Pass):
-    """Best-effort loop peeling that unblocks parallelization.
+    """Best-effort index-set splitting and peeling that unblocks parallelization.
 
-    For each of front / back / both and each peel count ``k`` in
-    ``1..peel_limit``, peel ``k`` boundary iterations off the loops and run a
-    cheap candidate check (scalar fission -> symbol propagation -> constant
-    propagation), then COUNT the loops ``LoopToMap`` *could* parallelize via
-    ``can_be_applied_to`` -- WITHOUT applying it (peeling is a preparation pass;
-    the actual parallelization is the pipeline's job). Keep the single peel that
-    yields the most mappable loops; if none beats the no-peel baseline, leave the
-    SDFG unpeeled. The search runs on ``copy.deepcopy`` copies (revertible by
-    construction); only the winning peel is applied to the real SDFG.
+    Split points are DERIVED from the body -- an equality guard's value, a broadcast read's
+    conflicting index -- rather than enumerated blindly, so the body nominates the few cuts
+    worth trying. Those candidates are still probed (each on a ``copy.deepcopy``, revertible
+    by construction) and only the one unblocking the most maps reaches the real SDFG. A loop
+    the body nominates nothing for is left alone: sequential and correct.
+
+    Peeling is what a split at a boundary point degenerates to (``_split_loop_at`` drops the
+    empty side), so there is no separate boundary-peel stage. The wrapping-modulo peel does
+    search a bounded ``(count, direction)`` grid, because it is a CORRECTNESS fix rather than
+    a parallelism one -- a wrap-around read maps fine but then emits C's truncated ``%`` and
+    computes the wrong boundary value -- and so deliberately runs even when ``LoopToMap``
+    already accepts the loop.
+
+    This pass is a preparation pass: it only COUNTS what ``LoopToMap`` *could* parallelize via
+    ``can_be_applied_to``, never applying it. The actual parallelization is the pipeline's job.
     """
 
     CATEGORY: str = 'Optimization Preparation'
@@ -153,8 +161,9 @@ class BestEffortLoopPeeling(ppl.Pass):
     peel_limit = properties.Property(
         dtype=int,
         default=DEFAULT_PEEL_LIMIT,
-        desc='Try peeling 1..peel_limit iterations from the front, the back, and both; keep the '
-        'peel that produces the most maps and revert if none beats the no-peel baseline (0 disables).')
+        desc='Bounds the wrapping-modulo peel to 1..peel_limit iterations (front/back/both), keeping '
+        'the smallest peel that folds the wrap away. Also underwrites the split range proofs: a loop '
+        'worth peeling by k <= peel_limit is assumed to run more than peel_limit times (0 disables).')
 
     def __init__(self, peel_limit: int = DEFAULT_PEEL_LIMIT):
         self.peel_limit = peel_limit
@@ -253,73 +262,6 @@ class BestEffortLoopPeeling(ppl.Pass):
             return mini, mini_loop
         except Exception:
             return None, None
-
-    @staticmethod
-    def _has_iter_var_guard(loop: LoopRegion) -> bool:
-        """True if any branch condition inside ``loop`` tests the iteration variable.
-
-        A best-effort BOUNDARY peel unblocks a loop only by stripping a boundary special case,
-        which always surfaces as an ``i <cmp> const`` guard on the iteration variable (the
-        equality ``i == x`` case is the split search's job; the wrapping-modulo case has its own
-        ``_has_wrapping_modulo`` gate). A loop with no iter-var-dependent branch has no boundary
-        special case a peel could remove -- a plain carried recurrence (``a[i] = a[i-1]``) is not
-        fixable by peeling and the search would only revert -- so the expensive isolate-and-search
-        (and even the ``can_be_applied`` probe) is skipped for it. On a stencil like channel_flow,
-        whose stuck loops carry array dependences with no iter-var branch at all, this turns the
-        whole peel stage from ~90s of fruitless search into a cheap syntactic scan.
-        """
-        ivar = loop.loop_variable
-        for cb in loop.all_control_flow_blocks():
-            if not isinstance(cb, ConditionalBlock):
-                continue
-            for cond, _ in cb.branches:
-                if cond is not None and ivar in cond.get_free_symbols():
-                    return True
-        return False
-
-    def _best_peel_for(self, loop: LoopRegion, sdfg: SDFG):
-        """Find the ``(count, direction)`` peel that unblocks the most maps for
-        ``loop``, experimenting on an isolated mini-SDFG; ``None`` if no peel
-        beats leaving it alone (or the loop already maps)."""
-        # Cheap structural gate FIRST: without an iter-var branch guard there is no boundary
-        # special case to peel, so neither the isolate-and-search nor the can_be_applied probe
-        # can turn up a beneficial peel -- skip both (see _has_iter_var_guard).
-        if not self._has_iter_var_guard(loop):
-            return None
-        # A loop LoopToMap can already map needs no peel either.
-        from dace.transformation.interstate.loop_to_map import LoopToMap
-        try:
-            if LoopToMap.can_be_applied_to(sdfg, loop=loop):
-                return None
-        except Exception:
-            pass
-        mini, _ = self._isolate_loop(loop, sdfg)
-        if mini is None:
-            return None
-        base = copy.deepcopy(mini)
-        try:
-            baseline = self._mappable_loop_count(base)
-        except Exception:
-            return None
-
-        best_count, best = baseline, None
-        for direction in ('front', 'back', 'both'):
-            for count in range(1, self.peel_limit + 1):
-                cand = copy.deepcopy(mini)
-                cloops = _loops(cand)
-                if not cloops:
-                    break
-                if not self._peel_one_loop(cand, cloops[0], count, direction):
-                    continue
-                self._clean_peeled_remainder(cand)
-                try:
-                    cand.validate()  # only a peel that stays valid is a working parameter
-                    n_mappable = self._mappable_loop_count(cand)
-                except Exception:
-                    continue
-                if n_mappable > best_count:
-                    best_count, best = n_mappable, (count, direction)
-        return best
 
     def _equality_guard_values(self, loop: LoopRegion):
         """Loop-invariant values ``x`` for which the body has an ``if i == x`` guard
@@ -457,7 +399,13 @@ class BestEffortLoopPeeling(ppl.Pass):
         [x, end] (``x`` joins the second half), for a band-boundary split where each
         half's wrap-around modulo folds to a different affine index -- the symbolic
         modular split ``a[(i + K) % N]`` at ``x = N - K``. A no-op ``x == start``
-        (whole loop is the second half) returns ``False`` without splitting."""
+        (whole loop is the second half) returns ``False`` without splitting.
+
+        CONTRACT: the segments regroup the SAME iterations only while ``start <= x <= end``. An
+        ``x`` outside the range would invent iterations the loop never ran (the middle at ``i = x``)
+        or run past its end (``before``'s ``i < x`` REPLACES the original bound), so a caller that
+        cannot prove the range membership must guard the split with it -- see
+        :meth:`_split_range_relations` and :meth:`_specialize_index_set_split`."""
         import copy
         from dace.properties import CodeBlock
         from dace.sdfg.sdfg import InterstateEdge
@@ -492,9 +440,13 @@ class BestEffortLoopPeeling(ppl.Pass):
             before.loop_condition = CodeBlock(f'{ivar} < ({x})')  # [start, x-1]
             chain.append(before)
         if middle_singleton:
-            at = clone_segment()  # {x}: a single iteration
-            at.init_statement = CodeBlock(f'{ivar} = ({x})')
-            at.loop_condition = CodeBlock(f'{ivar} < ({x}) + 1')
+            at = clone_segment()  # {x} intersected with [start, end]: at most a single iteration
+            # Clamped to the range, so an out-of-range ``x`` runs nothing here rather than an
+            # iteration the loop never had. Nobody maps a singleton, so the min/max costs no
+            # parallelism -- unlike the range segments, whose bounds must stay bare for
+            # ``LoopToMap`` and are guarded by :meth:`_split_range_relations` instead.
+            at.init_statement = CodeBlock(f'{ivar} = max(({x}), ({start}))')
+            at.loop_condition = CodeBlock(f'{ivar} < min(({x}), ({end})) + 1')
             chain.append(at)
             if want_after:
                 after = clone_segment()
@@ -522,6 +474,109 @@ class BestEffortLoopPeeling(ppl.Pass):
         parent.reset_cfg_list()
         return True
 
+    def _split_range_relations(self, loop: LoopRegion, x):
+        """The range-membership relations an index-set split at ``x`` needs for ``loop`` but cannot
+        prove -- the missing half of :meth:`_split_loop_at`'s contract, for
+        :meth:`_specialize_index_set_split` to emit as the ``if cond: par else: seq`` guard.
+
+        A split point is only known to be loop-INVARIANT: a free ``K`` in ``if i == K``, or a
+        ``N // 2`` broadcast point against a symbolic ``N``, says nothing about where it lands
+        relative to the bounds. Only the two RANGE segments need guarding, and only in the one
+        direction each can run away in (the middle singleton is clamped in
+        :meth:`_split_loop_at`, and either range segment is simply empty in its other direction):
+
+        - ``before`` = [start, x-1], emitted as ``i < x``, REPLACES the original end bound -- it
+          overruns only when it runs an iteration ABOVE ``end``, i.e. when ``x - 1 > end``. Safe for
+          ``x <= end + 1`` (at ``x == end + 1`` ``before`` is exactly the whole loop and the middle
+          singleton and ``after`` are empty). Proven against that true bound; the emitted fallback
+          guard stays the conservative ``x <= end`` (stricter, so always safe) when it is not proven.
+        - ``after`` = [x+1, end], entered at ``i = x + 1`` -- an ``x < start`` re-runs the
+          iterations below the start. Needs ``start <= x``.
+
+        Empty means every needed side is provable and the split applies unconditionally (the
+        boundary ``x == start`` of a front conflict emits no ``before`` at all, so nothing is left
+        to prove). ``None`` means the bounds are unreadable and the caller must not split."""
+        import sympy
+        from dace.transformation.passes.analysis import loop_analysis
+        start = loop_analysis.get_init_assignment(loop)
+        end = loop_analysis.get_loop_end(loop)
+        if start is None or end is None:
+            return None  # bounds unreadable -> membership cannot even be stated
+        relations = set()
+        if symbolic.simplify(x - start) != 0 and not self._nonneg_in_loop(loop, end + 1 - x, start, end):
+            relations.add(sympy.LessThan(x, end))  # a `before` segment exists -> it must not overrun
+        if symbolic.simplify(x - end) != 0 and not self._nonneg_in_loop(loop, x - start, start, end):
+            relations.add(sympy.LessThan(start, x))  # an `after` segment exists -> it must not underrun
+        return frozenset(relations)
+
+    def _nonneg_in_loop(self, loop: LoopRegion, expr, start, end) -> bool:
+        """Whether ``expr >= 0`` holds -- either unconditionally
+        (:meth:`_provably_nonneg`) or under the same large-trip-count assumption
+        :meth:`_nonneg_assuming_large_modulus` already encodes: a symbolic loop
+        being peeled/split by ``k <= peel_limit`` iterations presupposes it runs
+        more than ``peel_limit`` times, so its trip count ``end - start + 1``
+        exceeds ``peel_limit``.
+
+        A near-boundary split point ``x`` carving off ``c <= peel_limit`` tail
+        iterations has ``x - start = trip - 1 - c``, non-negative once
+        ``trip > peel_limit`` -- so its range-membership is statically true and
+        needs no ``if start <= x`` runtime guard (the ext_peel_multi_back back-peel
+        at ``x = LEN_1D - 2``: ``x - start = LEN_1D - 2 = trip - 2 >= 0`` for
+        ``trip = LEN_1D > peel_limit``). Applying the assumption with the trip
+        count as the modulus (and NO wrap offsets, so no offset facts are relied
+        on) proves only such affine-in-trip boundary points; a point leaning on a
+        free offset (``N - K``) is left guarded. A non-affine floor/ceil point
+        (``N // 2``) falls through to :meth:`_provably_nonneg_symbolic`, which
+        bounds it from the nonnegative-symbol contract."""
+        if self._provably_nonneg(expr):
+            return True
+        import sympy
+        trip = symbolic.simplify(end - start + 1)
+        if isinstance(trip, sympy.Symbol) and self._nonneg_assuming_large_modulus(expr, trip) is not None:
+            return True
+        # Floor/ceil-of-a-nonnegative-bound split points (``x = int_floor(N, 2)``) are not affine in
+        # the trip count, so the large-modulus path leaves them guarded; the symbolic nonnegativity
+        # prover discharges them from the canonicalization nonnegative-symbol contract + floor/ceil
+        # bounds. See :meth:`_provably_nonneg_symbolic`.
+        return self._provably_nonneg_symbolic(expr)
+
+    def _specialize_index_set_split(self, sdfg: SDFG, loop: LoopRegion, x, relations) -> None:
+        """Replace ``loop`` with ``if (start <= x <= end) { index-set split } else { original loop }``.
+
+        The split form regroups the same iterations only inside the range (see
+        :meth:`_split_loop_at`), so it is emitted as the true branch guarded by ``relations`` and
+        the untouched loop -- correct wherever ``x`` lands -- is the sequential fallback. With no
+        relation (a provably in-range ``x``) the split is applied in place, no branch. Mirrors
+        :meth:`_specialize_modulo_split`, whose far-half fold is likewise conditional."""
+        from dace.transformation.passes.loop_specialization import specialize_loop_under_condition
+        if not relations:
+            if self._split_loop_at(sdfg, loop, x):
+                self._clean_peeled_remainder(sdfg)
+            return
+        # A ``CodeBlock`` condition is PYTHON (``and``, not ``&&``), and the relation is rendered by
+        # sympy's own printer -- not ``sym2cpp``, whose C ``/`` would turn the ``N // 2`` split point
+        # into a true division. ``int_floor`` and friends round-trip through ``pystr_to_symbolic``.
+        condition = ' and '.join(f'({r})' for r in sorted(relations, key=str))
+
+        def _parallelize(par_loop, par_region, _owner):
+            if self._split_loop_at(sdfg, par_loop, x):
+                self._clean_peeled_remainder(par_region)
+
+        specialize_loop_under_condition(loop, condition, _parallelize, sdfg)
+
+    def _inner_loop_variables(self, loop: LoopRegion) -> set:
+        """Iterator names bound by a ``LoopRegion`` nested strictly inside ``loop``.
+
+        A split point that names one of these is not loop-invariant at ``loop``'s level: it is only
+        defined per-iteration deeper in the nest, so embedding it in ``loop``'s segment bounds is
+        out of scope. The reference stays hidden while the inner loop shares the name (the symbol
+        table still ``defines`` it), then leaks the instant ``UniqueLoopIterators`` gives that inner
+        loop a fresh unique name -- exactly the durbin ``_loop_it_1`` codegen failure."""
+        return {
+            r.loop_variable
+            for r in loop.all_control_flow_regions() if r is not loop and isinstance(r, LoopRegion) and r.loop_variable
+        }
+
     def _best_split_for(self, loop: LoopRegion, sdfg: SDFG):
         """The ``if i == x`` guard value whose index-set split unblocks the most maps
         for ``loop`` (probed on an isolated copy), or ``None`` if splitting does not
@@ -536,6 +591,15 @@ class BestEffortLoopPeeling(ppl.Pass):
         for x in self._broadcast_conflict_split_points(loop):
             if x not in candidates:
                 candidates.append(x)
+        # A split point is baked into ``loop``'s segment bounds (see :meth:`_split_loop_at`), so it
+        # must be in scope at ``loop``'s own level. Drop any candidate naming an iterator an INNER
+        # loop binds -- a value that varies per inner iteration is undefined where the outer segments
+        # test it (durbin's broadcast conflict ``y[k] == y[i]`` solves to ``x = i``, the inner loop
+        # variable). Splitting there embeds the inner name into the outer bounds, valid only by
+        # accident until ``UniqueLoopIterators`` renames the inner loop and the reference dangles as a
+        # free symbol (``SDFG.arglist`` -> ``KeyError``). See :meth:`_inner_loop_variables`.
+        inner = self._inner_loop_variables(loop)
+        candidates = [x for x in candidates if inner.isdisjoint(str(s) for s in x.free_symbols)]
         if not candidates:
             return None
         try:
@@ -614,6 +678,52 @@ class BestEffortLoopPeeling(ppl.Pass):
         simplified (the deciding differences of a range bound reduce to numbers)."""
         s = symbolic.simplify(x)
         return s.is_number and s >= 0
+
+    @staticmethod
+    def _provably_nonneg_symbolic(x) -> bool:
+        """Whether ``x`` is provably ``>= 0`` for EVERY value of its free symbols, given the
+        canonicalization contract that those symbols are nonnegative -- the symbolic superset of
+        :meth:`_provably_nonneg`, which only decides concrete numbers.
+
+        This discharges the range-membership relations of an index-set split whose split point is
+        a floor/ceil of a nonnegative loop bound -- the archetype being the ``a[N // 2]`` broadcast
+        conflict of ``s1113``, split at ``x = int_floor(N, 2)``. Both membership sides
+        (``0 <= int_floor(N, 2)`` and ``int_floor(N, 2) <= N``) hold for all ``N >= 0``, so the
+        guard is redundant and the split applies unconditionally.
+
+        Sound because every step only ever REPLACES a subterm by a valid bound that makes the whole
+        smaller, then asks sympy whether the weakened expression is still nonnegative:
+
+        - Free symbols are re-asserted nonnegative (the canonicalization contract, already runtime
+          guarded), and ``int_floor``/``int_ceil`` are rewritten to sympy's ``floor``/``ceiling``
+          so its own sign reasoning applies. If that alone proves it, done.
+        - Otherwise relax each rounding atom to the extreme that MINIMIZES the (affine) expression:
+          ``floor(t) in [t - 1, t]`` and ``ceiling(t) in [t, t + 1]``, so a term with a negative
+          coefficient takes the upper bound and one with a nonnegative coefficient the lower. If the
+          resulting bound is nonnegative, so is ``x``. A non-numeric coefficient (nonlinear in the
+          atom) is unprovable here -> ``False`` (conservative: the guard stays)."""
+        import sympy
+        s = symbolic.simplify(x)
+        if s.is_number:
+            return bool(s >= 0)
+        nonneg = {sym: sympy.Symbol(sym.name, nonnegative=True, integer=bool(sym.is_integer)) for sym in s.free_symbols}
+        e = s.replace(lambda t: isinstance(t, symbolic.int_floor), lambda t: sympy.floor(t.args[0] / t.args[1]))
+        e = e.replace(lambda t: isinstance(t, symbolic.int_ceil), lambda t: sympy.ceiling(t.args[0] / t.args[1]))
+        e = e.subs(nonneg)
+        if e.is_nonnegative is True:
+            return True
+        bounds = {sympy.floor: (lambda a: a - 1, lambda a: a), sympy.ceiling: (lambda a: a, lambda a: a + 1)}
+        atoms = list(e.atoms(sympy.floor, sympy.ceiling))
+        if not atoms:
+            return False
+        relaxed = {}
+        for a in atoms:
+            c = e.coeff(a, 1)
+            if not c.is_number:
+                return False  # nonlinear in the rounding atom -> cannot bound
+            low, high = bounds[a.func]
+            relaxed[a] = high(a.args[0]) if c < 0 else low(a.args[0])
+        return symbolic.simplify(e.subs(relaxed)).is_nonnegative is True
 
     def _nonneg_assuming_large_modulus(self, x, m, offsets=frozenset()):
         """Prove ``x >= 0`` given the modulus ``m`` is at least ``peel_limit + 1`` and
@@ -865,7 +975,7 @@ class BestEffortLoopPeeling(ppl.Pass):
         """The smallest ``(count, direction)`` peel that turns a genuinely-wrapping
         body modulo into an affine, floor-correct index for ``loop``, probed on an
         isolated copy; ``None`` if the loop has no such wrap or no bounded peel folds
-        it. Unlike :meth:`_best_peel_for`, this runs *even when* ``LoopToMap`` already
+        it. Unlike the index-set split above, this runs *even when* ``LoopToMap`` already
         maps the loop: a wrap-around read maps as-is but then emits C's truncated
         ``%``, computing the wrong boundary value, so the peel is for correctness, not
         to unblock a map. A peel is accepted as soon as it removes every wrapping
@@ -1004,31 +1114,43 @@ class BestEffortLoopPeeling(ppl.Pass):
         return count
 
     def apply_pass(self, sdfg: SDFG, _pipeline_results: Dict[str, Any]) -> Optional[int]:
-        """Unblock stuck loops, choosing per loop (on an isolated copy of just that
-        nest, so the search is cheap and revertible) between an index-set split at an
-        interior ``if i == x`` guard and a best-effort boundary peel, applying the
-        winner to the real SDFG. Returns the number of loops rewritten or None.
+        """Unblock stuck loops, splitting or peeling each at a point taken from its body.
+        Returns the number of loops rewritten or None.
 
-        Splitting is tried first: an interior equality guard (``if i == x`` with ``x``
-        away from the boundary) is carved out as [start, x-1] + {x} + [x+1, end], which
-        no bounded boundary peel could reach. Next a wrapping-modulo peel fixes a
-        boundary that reads/writes the wrong element under C's truncated ``%`` (a
-        correctness fix that runs even when the loop already maps). A wrap whose
-        boundary is symbolic -- unreachable by any constant-count peel -- is instead
-        *specialized* into ``if (K < N) { band-split into affine maps } else {
-        original modular loop }`` (``a[(i + K) % N]`` split at ``x = N - K``): the
-        parallel split is value-correct only below the modulus, so the untouched
-        modular loop is kept as the sequential fallback. Whatever stays stuck then
-        goes through the front/back/both peel search."""
+        An index-set split comes first. Its point ``x`` is solved for, not guessed: from an
+        interior equality guard (``if i == x``), or from a broadcast/self-conflict read
+        (``a[i] = a[c]``, solving ``f(x) == c``). The carve is [start, x-1] + {x} + [x+1, end],
+        and ``_split_loop_at`` drops whichever side is empty -- so a point ON a boundary yields
+        a peel of one, which is why there is no separate peel stage. The carve regroups the
+        loop's own iterations only while ``start <= x <= end``, and a loop-invariant ``x`` need
+        not satisfy it (a free ``K`` in ``if i == K``), so an unprovable membership is emitted
+        as ``if (start <= x <= end) { split } else { original loop }`` rather than assumed.
+
+        Next a wrapping-modulo peel fixes a boundary that reads/writes the wrong element under
+        C's truncated ``%`` -- a correctness fix, so it runs even when the loop already maps.
+        This is the only stage that searches (bounded by ``peel_limit``), and the only one that
+        produces peels in practice. A wrap whose boundary is symbolic -- unreachable by any
+        constant-count peel -- is instead *specialized* into ``if (K < N) { band-split into
+        affine maps } else { original modular loop }`` (``a[(i + K) % N]`` split at
+        ``x = N - K``): the parallel split is value-correct only below the modulus, so the
+        untouched modular loop is kept as the sequential fallback. A loop no derived point
+        reaches is left alone, sequential and correct."""
         if self.peel_limit <= 0 or not _loops(sdfg):
             return None
         applied = 0
-        # 1. Index-set splitting for interior equality guards.
+        # 1. Index-set splitting for interior equality guards. The split only regroups the loop's
+        #    own iterations while the split point lies inside the range, which a loop-invariant
+        #    point does not have to (``if i == K`` with a free ``K``), so an unprovable membership
+        #    becomes the `if in-range: split else: original loop` branch condition.
         for loop in list(_loops(sdfg)):
             x = self._best_split_for(loop, sdfg)
-            if x is not None and self._split_loop_at(sdfg, loop, x):
-                self._clean_peeled_remainder(sdfg)
-                applied += 1
+            if x is None:
+                continue
+            relations = self._split_range_relations(loop, x)
+            if relations is None:
+                continue
+            self._specialize_index_set_split(sdfg, loop, x, relations)
+            applied += 1
         # 2. Peel a genuinely-wrapping body modulo to its floor-correct affine form,
         #    even for loops LoopToMap already maps (the wrap-around access otherwise
         #    emits C's truncated ``%`` and computes the wrong boundary value).
@@ -1046,12 +1168,20 @@ class BestEffortLoopPeeling(ppl.Pass):
                 x, relations = res
                 self._specialize_modulo_split(sdfg, loop, x, relations)
                 applied += 1
-        # 3. Best-effort boundary peel for the loops splitting did not resolve.
-        for loop in list(_loops(sdfg)):
-            best = self._best_peel_for(loop, sdfg)
-            if best is not None and self._peel_one_loop(sdfg, loop, *best):
-                self._clean_peeled_remainder(sdfg)
-                applied += 1
+        # There is deliberately no separate boundary-peel stage. A boundary peel IS an index-set split
+        # at a boundary point: ``_split_loop_at`` drops the side that would be empty, so ``x == end``
+        # emits [start, end-1] + {end} -- a back-peel of one -- and stage 1 already reaches it from the
+        # guard. The old stage searched a blind 3-directions x peel_limit grid per loop (24 speculative
+        # peels, each a deepcopy + peel + validate + a full mappability recount) and, measured across
+        # 151 TSVC kernels, all of tsvc_2_5 and 6 polybench kernels, produced ZERO peels while costing
+        # 86.5% of the whole canonicalization pipeline on CloudSC (5398s of 6242s). Every peel that
+        # does fire comes from the modulo stage above; every boundary case that resolves comes from the
+        # split. Nor is an iteration-variable INEQUALITY guard promoted to a split point to compensate:
+        # it bounds the run rather than marking a boundary between a special case and the rest, so
+        # there is nothing for a split to carve out. No corpus kernel asks for one, and an attempt to
+        # add them regressed nussinov (a point derived in the ENCLOSING loop's variable; three
+        # InvalidSDFGEdgeError failures, root cause never pinned down) -- so the evidence for the
+        # feature was zero and the evidence against it was three tests.
         return applied or None
 
     def _specialize_modulo_split(self, sdfg: SDFG, loop: LoopRegion, x, relations) -> None:

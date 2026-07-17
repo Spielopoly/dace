@@ -11,7 +11,6 @@ import re
 import types
 from typing import Any, Callable, Dict, FrozenSet, Iterable, Optional, Set, Tuple, Union, TYPE_CHECKING, List
 import numpy
-import math
 import sympy.abc
 import sympy.printing.str
 
@@ -832,7 +831,7 @@ def overapproximate(expr):
     return _overapproximate(expr)
 
 
-@lru_cache(maxsize=2048)
+@lru_cache(maxsize=2048, typed=True)
 def _overapproximate(expr):
     if isinstance(expr, SymExpr):
         if expr.expr != expr.approx:
@@ -967,8 +966,8 @@ def swalk(expr, enter_functions=False):
 
 
 _builtin_userfunctions = {
-    'int_floor', 'int_ceil', 'ipow', 'abs', 'Abs', 'min', 'Min', 'max', 'Max', 'not', 'Not', 'Eq', 'NotEq', 'Ne', 'AND',
-    'OR', 'pow', 'round', 'ITE'
+    'int_floor', 'int_ceil', 'ipow', 'fma', 'abs', 'Abs', 'min', 'Min', 'max', 'Max', 'not', 'Not', 'Eq', 'NotEq', 'Ne',
+    'AND', 'OR', 'pow', 'round', 'ITE', 'merge', 'int32', 'int64', 'float32', 'float64', 'conj', 'mod', 'fortran_mod'
 }
 
 
@@ -1173,7 +1172,9 @@ class ipow(sympy.Function):
 
     @classmethod
     def eval(cls, base, exp):
-        """Fold a literal non-negative integer power; stay symbolic otherwise."""
+        # negative constant exp would wrap the C++ ``unsigned`` -> reject at construction
+        if exp.is_Number and exp.is_integer and exp.is_negative:
+            raise ValueError(f'ipow exponent must be non-negative, got {exp}')
         if base.is_Number and exp.is_Number and exp.is_integer and exp.is_nonnegative:
             return base**exp
 
@@ -1201,6 +1202,32 @@ class ipow(sympy.Function):
         # ``Function`` blocks) can ``.rewrite(sympy.Pow)`` -- without changing how ``ipow``
         # itself lowers (repeated-multiply integer ``dace::math::ipow``) at codegen.
         return sympy.Pow(base, exp)
+
+
+class fma(sympy.Function):
+    """Fused multiply-add ``a * b + c``.
+
+    Minted by the vectorizer's FMA-fusion pass from an ``a * b + c`` chain so the tile-op
+    lowering can emit a single fused multiply-add -- ``std::fma`` (scalar), ``__hfma2`` (CUDA
+    fp16), ``_mm*_fmadd`` (AVX), ``vfmaq`` (NEON), ``svmla`` (SVE) -- where the ISA supports
+    it, and multiply-then-add where it does not. A residual (non-tiled) ``fma`` tasklet lowers
+    to the C ``fma`` (``std::fma``). The argument order matches C ``fma(a, b, c) == a*b + c``."""
+
+    @classmethod
+    def eval(cls, a, b, c):
+        """Fold a fully-constant multiply-add; stay symbolic otherwise."""
+        if a.is_Number and b.is_Number and c.is_Number:
+            return a * b + c
+
+    def _eval_is_real(self):
+        if all(arg.is_real for arg in self.args):
+            return True
+
+    def _eval_rewrite_as_Add(self, a, b, c, **kwargs):
+        # ``fma(a, b, c)`` is exactly ``a*b + c`` as a value; expose it on request so a caller
+        # that needs ordinary arithmetic reasoning can ``.rewrite(sympy.Add)`` without changing
+        # how ``fma`` lowers (a single fused multiply-add) at codegen.
+        return a * b + c
 
 
 class OR(sympy.Function):
@@ -1311,6 +1338,97 @@ class ITE(sympy.Function):
 merge = ITE
 
 
+class mod(sympy.Function):
+    """Floored modulus (Fortran ``MODULO`` / Python ``%`` on negatives).
+
+    Two-arg ``mod(a, b)`` — distinct from sympy's built-in ``Mod`` (which
+    prints as ``%`` and lowers to the C ``%`` operator that *truncates*
+    on signed integers).  Used by the HLFIR frontend's ``MODULO``
+    lowering so the C++ codegen routes through ``dace::math::mod``
+    (templated; floored for both int and float)."""
+
+    @classmethod
+    def eval(cls, x, y):
+        if x.is_Number and y.is_Number:
+            return x - y * sympy.floor(x / y)
+
+    def _eval_is_integer(self):
+        return self.args[0].is_integer and self.args[1].is_integer
+
+
+class fortran_mod(sympy.Function):
+    """Floored modulus for use in symbolic expressions / memlet subsets.
+
+    Two-arg ``fortran_mod(a, b)`` -- the Fortran ``MODULO`` semantics:
+    the result has the sign of ``b`` and lies in ``[0, b)`` for ``b > 0``,
+    UNLIKE sympy's ``Mod`` which lowers to the bare C ``%`` operator
+    (truncating on signed integers, so ``(-1) % 5 == -1``).
+
+    A distinct ``Function`` subclass (not ``sympy.Mod``) so it is NOT
+    simplified back to ``Mod`` and survives to C++ codegen, where the
+    printer emits the self-contained floored form
+    ``(((a) % (b)) + (b)) % (b)`` (see ``_print_Function``).  Added for
+    sign-correct array-index wraps (e.g. CSHIFT) without touching the
+    existing ``Mod`` / ``mod`` lowering."""
+
+    @classmethod
+    def eval(cls, x, y):
+        if x.is_Number and y.is_Number:
+            return x - y * sympy.floor(x / y)
+
+    def _eval_is_integer(self):
+        return self.args[0].is_integer and self.args[1].is_integer
+
+
+class int32(sympy.Function):
+    """Explicit ``INTEGER(4)`` typecast in a symbolic expression.
+
+    The Fortran frontend emits ``dace.int{32,64}(x)`` / ``dace.float{32,
+    64}(x)`` for a kind coercion in a tasklet body, where cppunparse
+    lowers the ``dace`` attribute to ``dace::int32(x)``.  When the SAME
+    coercion lands in an INTERSTATE-EDGE / memlet expression (a float
+    index symbol ``i = dace.int32(qm) + 1``, a condition over a widened
+    int) it must be sympy-parseable -- ``dace.int32`` is an attribute
+    call sympy cannot evaluate (``'Attr' object is not callable``).
+    These first-grade typecast functions are the symbolic spelling: the
+    frontend drops the ``dace.`` prefix in symbolic contexts so the cast
+    survives, unevaluated, to C++ as ``dace::int32(x)`` (a TRUNCATING
+    cast, matching Fortran ``INT`` -- semantically exact, unlike a
+    floored / stripped approximation)."""
+    nargs = 1
+
+    def _eval_is_integer(self):
+        return True
+
+
+class int64(sympy.Function):
+    """Explicit ``INTEGER(8)`` typecast -- see :class:`int32`."""
+    nargs = 1
+
+    def _eval_is_integer(self):
+        return True
+
+
+class float32(sympy.Function):
+    """Explicit ``REAL(4)`` typecast -- see :class:`int32`."""
+    nargs = 1
+
+    def _eval_is_real(self):
+        return True
+
+
+class float64(sympy.Function):
+    """Explicit ``REAL(8)`` typecast -- see :class:`int32`."""
+    nargs = 1
+
+    def _eval_is_real(self):
+        return True
+
+
+# Symbolic-function-name -> C++ cast emitted by ``DaceSympyPrinter``.
+_TYPECAST_CPP = {'int32': 'dace::int32', 'int64': 'dace::int64', 'float32': 'dace::float32', 'float64': 'dace::float64'}
+
+
 class bitwise_and(sympy.Function):
     pass
 
@@ -1392,6 +1510,10 @@ class logical_right_shift(sympy.Function):
     def eval(cls, x, y):
         if x.is_Number and y.is_Number and x.is_nonnegative:
             return x >> y
+
+
+class conj(sympy.Function):
+    pass
 
 
 # Internal variants for the Python operators: ``a | b`` parses to ``__bitwise_or``, etc.
@@ -1841,6 +1963,29 @@ class PythonOpToSympyConverter(ast.NodeTransformer):
                             keywords=[])
         return ast.copy_location(new_node, node)
 
+    def visit_Call(self, node):
+        # ``dace.int32(x)`` / ``dace.float64(x)`` -- an explicit numeric
+        # typecast.  The frontend emits the ``dace.<type>(x)`` spelling
+        # uniformly (cppunparse lowers it to ``dace::<type>(x)`` in a
+        # tasklet body); here in a sympy-parsed context the default
+        # ``visit_Attribute`` would turn ``dace.int32`` into ``Attr(dace,
+        # int32)`` and the surrounding call into ``Attr(...)(x)`` ->
+        # ``'Attr' object is not callable``.  Rewrite to the bare
+        # first-grade typecast function ``int32(x)`` (registered in
+        # ``_PYSTR2SYM_locals``) which parses cleanly and prints back to
+        # ``dace::int32(x)`` -- so the cast keeps its exact (truncating
+        # for int) semantics in EVERY symbolic context (interstate edge,
+        # memlet subset, condition).
+        func = node.func
+        if (isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) and func.value.id == 'dace'
+                and func.attr in _TYPECAST_CPP):
+            new_node = ast.Call(func=ast.Name(id=func.attr, ctx=ast.Load),
+                                args=[self.visit(a) for a in node.args],
+                                keywords=[])
+            return ast.copy_location(new_node, node)
+        self.generic_visit(node)
+        return node
+
     def visit_Attribute(self, node):
         new_node = ast.Call(func=ast.Name(id='Attr', ctx=ast.Load),
                             args=[self.visit(node.value), ast.Name(id=node.attr, ctx=ast.Load)],
@@ -2005,8 +2150,10 @@ class _SerializedSymbolicParser(ast.NodeVisitor):
         'Le': sympy.Le,
         'int_floor': int_floor,
         'int_ceil': int_ceil,
+        'ipow': ipow,
         'IfExpr': IfExpr,
         'Mod': sympy.Mod,
+        'fortran_mod': fortran_mod,
         'Attr': Attr,
         'BitwiseAnd': bitwise_and,
         'BitwiseOr': bitwise_or,
@@ -2320,7 +2467,7 @@ def serialize_symbolic(expr):
     return _serialize_symbolic_uncached(expr)
 
 
-@lru_cache(maxsize=16384)
+@lru_cache(maxsize=16384, typed=True)
 def deserialize_symbolic(expr) -> SymbolicType:
     """Deserialize a string produced by :func:`serialize_symbolic`."""
     if isinstance(expr, (SymExpr, sympy.Basic)):
@@ -2402,11 +2549,18 @@ _PYSTR2SYM_locals = {
     'IfExpr': IfExpr,
     'ITE': ITE,
     'Mod': sympy.Mod,
+    'fortran_mod': fortran_mod,
+    'int32': int32,
+    'int64': int64,
+    'float32': float32,
+    'float64': float64,
     'Attr': Attr,
+    'conj': conj,
     'Subscript': Subscript,
     'id': sympy.Symbol('id'),
     'diag': sympy.Symbol('diag'),
     'jn': sympy.Symbol('jn'),
+    'yn': sympy.Symbol('yn'),  # spherical Bessel Y_n; shadows a common size-symbol name (mirror of 'jn')
 }
 # _clash1 enables all one-letter variables like N as symbols
 # _clash also allows pi, beta, zeta and other common greek letters
@@ -2432,7 +2586,7 @@ def pystr_to_symbolic(expr, symbol_map=None, simplify=None) -> sympy.Basic:
     return _pystr_to_symbolic_uncached(expr, symbol_map, simplify)
 
 
-@lru_cache(maxsize=16384)
+@lru_cache(maxsize=16384, typed=True)
 def _pystr_to_symbolic_cached(expr, simplify=None) -> sympy.Basic:
     return _pystr_to_symbolic_uncached(expr, None, simplify)
 
@@ -2473,12 +2627,6 @@ def _pystr_to_symbolic_uncached(expr, symbol_map=None, simplify=None) -> sympy.B
     return sympy_to_dace(result, symbol_map)
 
 
-# ``typed=True`` is required: ``lru_cache`` keys entries by ``hash``/``==``, and
-# Python conflates booleans with integers (``hash(True) == hash(1)`` and
-# ``True == sympy.Integer(1)``). Without it, a cached ``simplify(True)`` would be
-# returned for a later ``simplify(sympy.Integer(1))`` (and vice versa), poisoning
-# the cache. ``typed=True`` keeps the ``bool`` and ``sympy.Integer`` entries
-# distinct. See ``tests/symbolic/test_simplify_cache_typed.py``.
 @lru_cache(maxsize=2048, typed=True)
 def simplify(expr: SymbolicType) -> SymbolicType:
     return sympy.simplify(expr)
@@ -2519,6 +2667,35 @@ class DaceSympyPrinter(sympy.printing.str.StrPrinter):
         if str(expr.func) in self.arrays:
             indices = ", ".join(self._print(arg) for arg in expr.args)
             return f'{expr.func}[{indices}]'
+        if self.cpp_mode and str(expr.func) == 'int_floor':
+            return '((%s) / (%s))' % (self._print(expr.args[0]), self._print(expr.args[1]))
+        # ``fortran_mod(a, b)`` -- a FLOORED modulus (Fortran ``MODULO``
+        # semantics): result lies in ``[0, b)`` for ``b > 0`` for any
+        # sign of ``a`` (``fortran_mod(-1, 5) == 4``).  Distinct from
+        # sympy's ``Mod`` (printed as the bare C ``%`` operator, which
+        # TRUNCATES on signed integers: ``(-1) % 5 == -1``).  Emitted as
+        # the self-contained form ``(((a) % (b)) + (b)) % (b)`` -- pure C
+        # ``%`` (works in the memlet-subset codegen context, where
+        # ``dace::math::`` qualified CALLS don't resolve, only operators
+        # do; and robust to a value/modulus of DIFFERENT integer types,
+        # e.g. ``__i0 - 1`` vs a shape symbol ``n``).  Floored for any
+        # sign.  Added (NOT a change to the existing ``Mod`` / ``mod``
+        # lowering) for sign-correct array-index wraps, e.g. a CSHIFT
+        # source subset ``_x[fortran_mod(i + shift, n)]``.
+        if self.cpp_mode and str(expr.func) == 'fortran_mod':
+            a = self._print(expr.args[0])
+            b = self._print(expr.args[1])
+            return '((((%s) %% (%s)) + (%s)) %% (%s))' % (a, b, b, b)
+        # Explicit numeric typecasts (``int32(x)`` / ``float64(x)`` ...)
+        # -> the matching ``dace::<type>(x)`` C++ cast (the same form the
+        # tasklet-body ``dace.<type>(x)`` lowers to via cppunparse), so a
+        # kind coercion that landed in an interstate-edge / memlet
+        # expression keeps its exact (truncating for int) semantics.
+        if self.cpp_mode and str(expr.func) in _TYPECAST_CPP:
+            return '%s(%s)' % (_TYPECAST_CPP[str(expr.func)], self._print(expr.args[0]))
+        # Complex conjugate: ``conj(x)`` -> ``dace::math::conj(x)`` in C++
+        if self.cpp_mode and str(expr.func) in ('conj', 'conjugate'):
+            return 'dace::math::conj(%s)' % self._print(expr.args[0])
         if str(expr.func) == 'AND':
             return f'(({self._print(expr.args[0])}) and ({self._print(expr.args[1])}))'
         if str(expr.func) == 'OR':
@@ -2669,7 +2846,7 @@ class DaceSympyPrinter(sympy.printing.str.StrPrinter):
                 return f'({self._print(expr.args[0])}) ** ({self._print(expr.args[1])})'
 
 
-@lru_cache(maxsize=16384)
+@lru_cache(maxsize=16384, typed=True)
 def symstr(sym, arrayexprs: Optional[FrozenSet[str]] = None, cpp_mode=False) -> str:
     """
     Convert a symbolic expression to a compilable expression.
@@ -2843,7 +3020,7 @@ def safe_replace(mapping: Dict[Union[SymbolicType, str], Union[SymbolicType, str
     replace_callback(invrepl)
 
 
-@lru_cache(16384)
+@lru_cache(maxsize=16384, typed=True)
 def _spickle(obj):
     return str(obj)
 

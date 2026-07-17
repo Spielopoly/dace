@@ -41,7 +41,7 @@ mis-classified as a fold or a parallel map. The TSVC kernel ``s317``
 (``q[0] *= 0.99`` for ``LEN_1D//2`` iters) is the canonical hit.
 """
 import ast
-from typing import Optional, Tuple
+from typing import Optional, Set, Tuple
 
 from dace import SDFG, dtypes, nodes, properties, symbolic
 from dace.sdfg import SDFGState
@@ -100,6 +100,13 @@ class InductionVariableSubstitution(ppl.Pass):
         count = 0
         for _ in range(1000):
             progressed = False
+            # ``SDFG.free_symbols`` re-derives itself from the whole graph on EVERY access -- it is a
+            # property, not a cached one (~0.5s on CloudSC). The invariance checks below consult it once
+            # per candidate symbol, which made it 96% of this pass's runtime (163s of 169s over 500
+            # calls). It only changes when the SDFG does, and every mutation below restarts this round,
+            # so hoisting it here is exact. ``materialize_loop_exit_symbols`` already threads it the
+            # same way for the same reason.
+            sdfg_free_symbols = sdfg.free_symbols
             for node, parent in list(sdfg.all_nodes_recursive()):
                 if not isinstance(node, LoopRegion):
                     continue
@@ -119,9 +126,10 @@ class InductionVariableSubstitution(ppl.Pass):
                 #     (the derived symbol a primary-IV substitution just freed);
                 # (4) an IV incremented identically in every branch of a body
                 #     conditional -> hoist it out so (2) can then close it (s124).
-                if (_try_substitute(parent, node, sdfg) or _try_substitute_iedge_iv(parent, node, sdfg)
-                        or _try_substitute_derived_symbol(parent, node, sdfg)
-                        or _hoist_branch_uniform_iv(parent, node, sdfg)):
+                if (_try_substitute(parent, node, sdfg, sdfg_free_symbols)
+                        or _try_substitute_iedge_iv(parent, node, sdfg, sdfg_free_symbols)
+                        or _try_substitute_derived_symbol(parent, node, sdfg, sdfg_free_symbols)
+                        or _hoist_branch_uniform_iv(parent, node, sdfg, sdfg_free_symbols)):
                     count += 1
                     progressed = True
                     break  # SDFG mutated -> restart the scan on fresh node list
@@ -152,9 +160,9 @@ def _loop_has_break_or_continue(loop: LoopRegion) -> bool:
     return False
 
 
-def _try_substitute(parent: ControlFlowRegion, loop: LoopRegion, sdfg: SDFG) -> bool:
+def _try_substitute(parent: ControlFlowRegion, loop: LoopRegion, sdfg: SDFG, sdfg_free_symbols: Set[str]) -> bool:
     """Return True if the loop matched and was replaced; False otherwise."""
-    info = _extract_iv(loop, sdfg)
+    info = _extract_iv(loop, sdfg, sdfg_free_symbols)
     if info is None:
         return False
     accum, accum_subset, op_type, const_val, trip_count = info
@@ -168,17 +176,20 @@ def _try_substitute(parent: ControlFlowRegion, loop: LoopRegion, sdfg: SDFG) -> 
     return True
 
 
-def _is_loop_invariant_symbol(name: str, loop: LoopRegion, sdfg: SDFG) -> bool:
+def _is_loop_invariant_symbol(name: str, loop: LoopRegion, sdfg: SDFG, sdfg_free_symbols: Set[str]) -> bool:
     """Whether ``name`` refers to an SDFG symbol/constant that the loop does not
     redefine in its body (so its value is stable across iterations).
 
     Accepts: SDFG symbols and constants, with the loop variable explicitly excluded,
     and with the symbol not appearing as the LHS of any interstate-edge assignment
     inside the loop's body.
+
+    ``sdfg_free_symbols`` is ``sdfg.free_symbols`` precomputed by the caller: that property walks the
+    whole SDFG on every access, so it is passed in rather than recomputed per candidate symbol.
     """
     if name == loop.loop_variable:
         return False
-    if name not in sdfg.symbols and name not in sdfg.constants and name not in sdfg.free_symbols:
+    if name not in sdfg.symbols and name not in sdfg.constants and name not in sdfg_free_symbols:
         return False
     # The loop must not assign to ``name`` on any of its body interstate edges --
     # otherwise it would not be loop-invariant.
@@ -188,7 +199,8 @@ def _is_loop_invariant_symbol(name: str, loop: LoopRegion, sdfg: SDFG) -> bool:
     return True
 
 
-def _extract_iv(loop: LoopRegion, sdfg: SDFG) -> Optional[Tuple[str, str, type, object, object]]:
+def _extract_iv(loop: LoopRegion, sdfg: SDFG,
+                sdfg_free_symbols: Set[str]) -> Optional[Tuple[str, str, type, object, object]]:
     """Pattern-match the loop body. Returns ``(accum_name, accum_subset_str, ast.BinOp_type, const_val, trip_count)``
     or ``None``.
 
@@ -264,11 +276,11 @@ def _extract_iv(loop: LoopRegion, sdfg: SDFG) -> Optional[Tuple[str, str, type, 
                     return None
                 # Allow SDFG symbols / constants / known dtype-cast roots; reject
                 # any other name (which would imply a connector or loop-local var).
-                if (sub.id not in sdfg.symbols and sub.id not in sdfg.constants and sub.id not in sdfg.free_symbols
+                if (sub.id not in sdfg.symbols and sub.id not in sdfg.constants and sub.id not in sdfg_free_symbols
                         and sub.id != 'dace' and not hasattr(__import__('builtins'), sub.id)):
                     return None
-                if (sub.id in sdfg.symbols or sub.id in sdfg.constants
-                        or sub.id in sdfg.free_symbols) and not _is_loop_invariant_symbol(sub.id, loop, sdfg):
+                if (sub.id in sdfg.symbols or sub.id in sdfg.constants or sub.id
+                        in sdfg_free_symbols) and not _is_loop_invariant_symbol(sub.id, loop, sdfg, sdfg_free_symbols):
                     return None
         # Render the expression back to a source string for the closed form. The
         # later tasklet body splices it directly, so ``dace.float64(step)`` stays
@@ -369,15 +381,23 @@ def _symbol_updated_in_other_loop(sdfg: SDFG, loop: LoopRegion, sym_name: str) -
     return False
 
 
-def _hoist_branch_uniform_iv(parent: ControlFlowRegion, loop: LoopRegion, sdfg: SDFG) -> bool:
+def _hoist_branch_uniform_iv(parent: ControlFlowRegion, loop: LoopRegion, sdfg: SDFG,
+                             sdfg_free_symbols: Set[str]) -> bool:
     """Hoist an IV increment that EVERY branch of a body ``ConditionalBlock``
-    performs identically (``sym := sym + step`` on all paths) to a single
-    pre-conditional iedge, so the branches share one increment.
+    performs identically (``sym := sym + step`` on all paths) out of the
+    conditional, so the branches share one increment on a single iedge.
+
+    The increment lands BEFORE the conditional when the branches read ``sym``
+    post-increment, and AFTER it when they read ``sym`` pre-increment -- whichever
+    keeps the in-branch uses seeing exactly the value the sequential body gave them
+    (see the ``side`` dispatch below).
 
     This is a structural enabler, not itself a substitution: after the hoist the
     increment is a plain between-blocks iedge that :func:`_try_substitute_iedge_iv`
     (next fixed-point round) closes. TSVC ``s124`` -- ``j += 1`` in BOTH the ``if``
-    and the ``else`` -- becomes ``j = i`` so ``a[j]`` is the parallel ``a[i]``.
+    and the ``else``, before the ``a[j]`` writes -- becomes ``j = i`` so ``a[j]`` is
+    the parallel ``a[i]``; the mirrored read-before-increment body closes the same
+    way with the pre-increment offset.
     Requires an exhaustive conditional (an ``else`` branch): with an implicit
     fall-through some path skips the increment and the hoist would be unsound.
     """
@@ -403,7 +423,7 @@ def _hoist_branch_uniform_iv(parent: ControlFlowRegion, loop: LoopRegion, sdfg: 
         per = [branch_increments(br) for br in branches]
         common = set.intersection(*[set(p) for p in per]) if per else set()
         for sym in common:
-            if sym == loop.loop_variable or (sym not in sdfg.symbols and sym not in sdfg.free_symbols):
+            if sym == loop.loop_variable or (sym not in sdfg.symbols and sym not in sdfg_free_symbols):
                 continue
             if any(len(p[sym]) != 1 for p in per):
                 continue  # a branch increments sym more than once
@@ -415,21 +435,58 @@ def _hoist_branch_uniform_iv(parent: ControlFlowRegion, loop: LoopRegion, sdfg: 
             if any(sym in (e2.data.assignments or {}) and id(e2) not in branch_edges
                    for e2 in loop.all_interstate_edges()):
                 continue  # sym also written outside the per-branch increments (incl. nested) -> not clean
-            # Strip the increment from each branch, then plant one pre-cb iedge.
+            # Soundness: the hoist moves each branch's increment to a single iedge
+            # OUTSIDE the conditional, and WHICH SIDE it lands on is dictated by where
+            # the branches read ``sym``. Blocks outside ``cb`` are unaffected either way
+            # (both positions keep the increment between the pre-cb and post-cb blocks),
+            # so only the in-branch uses decide:
+            #
+            # * ``'after'`` -- every branch increments before it reads (s124: ``j += 1``
+            #   precedes ``a[j]``), so the uses want the POST-increment value: hoist to a
+            #   single iedge BEFORE the conditional.
+            # * ``'before'`` -- every branch reads before it increments (``a[j] = ...;
+            #   j += 1``), so the uses want the PRE-increment value: hoist to a single
+            #   iedge AFTER the conditional. Same value seen in-branch, and the increment
+            #   is again a plain between-blocks iedge for the closed form (which then
+            #   picks the pre-increment ``body_offset = norm_iter``).
+            #
+            #
+            # A branch with NO use of ``sym`` (``'unused'``) is indifferent -- both
+            # positions give it the same (unread) value -- so it does not vote; the
+            # branches that DO read decide. If no branch reads at all, either position is
+            # correct and we take ``'after'``.
+            #
+            # Only genuine ambiguity refuses: branches disagreeing on the side, or a
+            # branch straddling its own increment (``None``).
+            sides = {_consistent_use_side(br, p[sym][0][0], sym) for br, p in zip(branches, per)} - {'unused'}
+            if not sides:
+                side = 'after'
+            elif sides in ({'after'}, {'before'}):
+                (side, ) = sides
+            else:
+                continue
+            # Strip the increment from each branch, then plant one iedge on the side the
+            # branches' uses demand.
             for p in per:
                 e, _ = p[sym][0]
                 assigns = dict(e.data.assignments)
                 assigns.pop(sym, None)
                 e.data.assignments = assigns
             hoist = loop.add_state(cb.label + '_iv_hoist')
-            was_start = loop.start_block is cb
-            for ie in list(loop.in_edges(cb)):
-                loop.add_edge(ie.src, hoist, ie.data)
-                loop.remove_edge(ie)
             new_rhs = symbolic.symstr(symbolic.pystr_to_symbolic(sym) + step)
-            loop.add_edge(hoist, cb, dace.InterstateEdge(assignments={sym: new_rhs}))
-            if was_start:
-                loop.start_block = loop.node_id(hoist)
+            if side == 'after':
+                was_start = loop.start_block is cb
+                for ie in list(loop.in_edges(cb)):
+                    loop.add_edge(ie.src, hoist, ie.data)
+                    loop.remove_edge(ie)
+                loop.add_edge(hoist, cb, dace.InterstateEdge(assignments={sym: new_rhs}))
+                if was_start:
+                    loop.start_block = loop.node_id(hoist)
+            else:
+                for oe in list(loop.out_edges(cb)):
+                    loop.add_edge(hoist, oe.dst, oe.data)
+                    loop.remove_edge(oe)
+                loop.add_edge(cb, hoist, dace.InterstateEdge(assignments={sym: new_rhs}))
             return True
     return False
 
@@ -440,8 +497,13 @@ def _consistent_use_side(loop: LoopRegion, iv_edge, sym_name: str) -> Optional[s
 
     Returns ``'before'`` if all uses run before the increment (pre-increment: the
     body sees ``sym_init + norm_iter * step``), ``'after'`` if all run after it
-    (post-increment: ``... + (norm_iter + 1) * step``), or ``None`` if the uses
-    straddle both sides (which would need per-block offsets) or none are found.
+    (post-increment: ``... + (norm_iter + 1) * step``), ``'unused'`` if the body
+    contains NO use at all (both sides are vacuously correct -- the caller is free
+    to pick either), or ``None`` if the uses straddle both sides, which genuinely
+    needs per-block offsets and is the only case that must refuse.
+
+    ``'unused'`` and ``None`` are deliberately distinct: conflating them would turn
+    "either answer is right" into "no answer exists" and refuse a liftable loop.
 
     This generalizes the TOP / BOTTOM shape check to an IV increment sitting
     *between* content blocks (TSVC ``s128``: ``k := j + 1`` before ``j := j + 2``
@@ -483,10 +545,41 @@ def _consistent_use_side(loop: LoopRegion, iv_edge, sym_name: str) -> Optional[s
         return 'before'
     if saw_after:
         return 'after'
-    return None  # no uses -> nothing meaningful to substitute
+    return 'unused'  # no body use -> either offset reproduces the (absent) reads
 
 
-def _try_substitute_derived_symbol(parent: ControlFlowRegion, loop: LoopRegion, sdfg: SDFG) -> bool:
+def _preloop_symbol_value(parent: ControlFlowRegion, loop: LoopRegion, sym_name: str):
+    """The value ``sym_name`` holds on ENTRY to ``loop``, or ``None`` if it is not
+    locally provable.
+
+    Sound because it only answers when EVERY edge entering ``loop`` assigns
+    ``sym_name`` the same expression -- then whichever path reached the loop, that
+    is the entry value. No in-edges (``loop`` starts ``parent``), a path that does
+    not assign it, or paths that disagree all mean "unknown", and the caller must
+    then refuse rather than guess.
+    """
+    in_edges = list(parent.in_edges(loop))
+    if not in_edges:
+        return None
+    vals = set()
+    for e in in_edges:
+        rhs = (e.data.assignments or {}).get(sym_name)
+        if rhs is None:
+            return None
+        try:
+            vals.add(symbolic.pystr_to_symbolic(rhs))
+        except Exception:
+            return None
+    if len(vals) != 1:
+        return None
+    (val, ) = vals
+    if loop.loop_variable in {str(s) for s in val.free_symbols}:
+        return None  # references the loop variable, which is undefined before the loop
+    return val
+
+
+def _try_substitute_derived_symbol(parent: ControlFlowRegion, loop: LoopRegion, sdfg: SDFG,
+                                   sdfg_free_symbols: Set[str]) -> bool:
     """Substitute a symbol defined *purely* by a loop-variable expression.
 
     A body iedge ``sym := f(loop_var, <loop-invariant symbols>)`` with NO
@@ -499,9 +592,22 @@ def _try_substitute_derived_symbol(parent: ControlFlowRegion, loop: LoopRegion, 
     :func:`_try_substitute_iedge_iv` turns a primary IV ``j`` into a constant, a
     derived ``k := j + 1`` becomes ``k := 2*i`` -- now a pure loop-var expression
     this catches, folding it into the ``b[k]`` gathers so ``LoopToMap`` can
-    parallelize (TSVC s128). Requires every use of ``sym`` to FOLLOW the
-    definition (same-iteration value); a use before it would read the previous
-    iteration's value and is refused.
+    parallelize (TSVC s128).
+
+    Uses of ``sym`` may sit on EITHER side of the definition; the side picks which
+    closed form the body reads (see the ``side`` dispatch below):
+
+    * uses AFTER the definition -- or no use at all -- read this iteration's ``f(i)``;
+    * uses BEFORE it read what the previous iteration left, ``f(i - stride)``, which
+      is a closed form too -- but only from the second iteration on. The FIRST
+      iteration reads whatever ``sym`` held on ENTRY to the loop, so this side is
+      sound exactly when that entry value is provably ``f(start - stride)``
+      (:func:`_preloop_symbol_value`). ``k = 0; for i: a[i] = b[k]; k = i + 1`` is the
+      canonical hit: entry ``0 == f(-1)``, so ``b[k]`` folds to the parallel ``b[i]``.
+      An entry value that disagrees (or is not locally provable) is refused -- the
+      lagged closed form would then mispredict exactly the first iteration.
+
+    Uses STRADDLING the definition need per-block offsets and are refused.
     """
     if not loop.loop_variable:
         return False
@@ -510,7 +616,7 @@ def _try_substitute_derived_symbol(parent: ControlFlowRegion, loop: LoopRegion, 
         if e.data.condition.as_string not in ('1', 'True', '(1)') or len(e.data.assignments) != 1:
             continue
         ((sym, rhs), ) = e.data.assignments.items()
-        if sym == loop_var or (sym not in sdfg.symbols and sym not in sdfg.free_symbols):
+        if sym == loop_var or (sym not in sdfg.symbols and sym not in sdfg_free_symbols):
             continue
         try:
             rhs_expr = symbolic.pystr_to_symbolic(rhs)
@@ -519,15 +625,38 @@ def _try_substitute_derived_symbol(parent: ControlFlowRegion, loop: LoopRegion, 
         free = {str(s) for s in rhs_expr.free_symbols}
         if sym in free:
             continue  # self-reference -> a recurrence, not a derived symbol
-        if not all(s == loop_var or _is_loop_invariant_symbol(s, loop, sdfg) for s in free):
+        if not all(s == loop_var or _is_loop_invariant_symbol(s, loop, sdfg, sdfg_free_symbols) for s in free):
             continue  # depends on another loop-carried symbol -> substitute that first (fixed point)
         if any(oe is not e and sym in (oe.data.assignments or {}) for oe in loop.all_interstate_edges()):
             continue  # sym written elsewhere (incl. a NESTED loop, s141) -> not a clean single definition
-        if _consistent_use_side(loop, e, sym) != 'after':
-            continue  # a use before the definition would see the previous iteration's value
+        side = _consistent_use_side(loop, e, sym)
+        if side in ('after', 'unused'):
+            body_expr = rhs_expr  # uses (if any) follow the definition -> this iteration's value
+        elif side == 'before':
+            # Every use precedes the definition, so it reads what the PREVIOUS iteration
+            # wrote: ``f(loop_var - stride)``. That holds for iterations 2..N; iteration 1
+            # instead reads the value ``sym`` carried INTO the loop, so the lagged form is
+            # correct iff that entry value is exactly ``f(start - stride)``.
+            start = loop_analysis.get_init_assignment(loop)
+            stride = loop_analysis.get_loop_stride(loop)
+            if start is None or stride is None:
+                continue
+            # The lagged form also assumes the definition runs on EVERY iteration; a
+            # condition on any body top-level edge could skip it and stale the value.
+            if any(oe.data.condition.as_string not in ('1', 'True', '(1)') for oe in loop.edges()):
+                continue
+            entry = _preloop_symbol_value(parent, loop, sym)
+            if entry is None:
+                continue  # entry value not provable -> cannot show the first iteration agrees
+            loop_var_sym = symbolic.pystr_to_symbolic(loop_var)
+            if symbolic.simplify(entry - rhs_expr.subs(loop_var_sym, start - stride)) != 0:
+                continue  # first iteration would read a value the lagged closed form mispredicts
+            body_expr = symbolic.simplify(rhs_expr.subs(loop_var_sym, loop_var_sym - stride))
+        else:
+            continue  # uses straddle the definition -> per-block offsets needed (unsupported)
 
         e.data.assignments = {}
-        loop.replace_dict({sym: symbolic.symstr(rhs_expr)})
+        loop.replace_dict({sym: symbolic.symstr(body_expr)})
         # Materialise the post-loop value (the last iteration's) for any reader
         # after the loop; harmless (dead) when ``sym`` is loop-local.
         end = loop_analysis.get_loop_end(loop)
@@ -543,7 +672,8 @@ def _try_substitute_derived_symbol(parent: ControlFlowRegion, loop: LoopRegion, 
     return False
 
 
-def _try_substitute_iedge_iv(parent: ControlFlowRegion, loop: LoopRegion, sdfg: SDFG) -> bool:
+def _try_substitute_iedge_iv(parent: ControlFlowRegion, loop: LoopRegion, sdfg: SDFG,
+                             sdfg_free_symbols: Set[str]) -> bool:
     """Substitute an interstate-edge induction variable (``sym := sym + literal``)
     in the loop body with its closed form.
 
@@ -577,17 +707,24 @@ def _try_substitute_iedge_iv(parent: ControlFlowRegion, loop: LoopRegion, sdfg: 
       scalar-to-symbol promotion);
     * the IV iedge has no other assignments and no condition;
     * the IV iedge is at the TOP (sourced from the empty ``loop.start_block`` --
-      body is post-increment) or the BOTTOM (its destination is the body's
-      unique, empty sink reached via a single in-edge -- body is pre-increment);
+      body is post-increment), at the BOTTOM (its destination is the body's
+      unique, empty sink reached via a single in-edge -- body is pre-increment),
+      or BETWEEN two non-empty content blocks, which is substitutable with a
+      single offset iff every use of ``sym`` sits consistently on one side of the
+      increment (see :func:`_consistent_use_side` and the ``side`` branch below;
+      TSVC ``s128``);
     * no other iedge in the body writes ``sym`` (the IV is unique);
     * ``sym`` is an SDFG symbol / free symbol (not a data container).
 
-    Out of scope (potential follow-ups):
+    Neighbouring shapes, closed by the other halves of the pass' fixed point
+    (see :meth:`InductionVariableSubstitution.apply_pass`):
 
-    * IV iedge between two non-empty content blocks (would need pre-iedge
-      vs post-iedge block partitioning + two different closed-form
-      substitutions);
-    * derived IVs (multiple symbols related by ``j := a*i + b``).
+    * derived IVs -- a symbol defined by a pure loop-variable expression
+      (``j := a*i + b``, no self-reference) -- are folded by
+      :func:`_try_substitute_derived_symbol`;
+    * an increment that EVERY branch of a body conditional performs identically
+      is first hoisted to a plain between-blocks iedge (which this function then
+      closes) by :func:`_hoist_branch_uniform_iv` -- TSVC ``s124``.
 
     :param parent: CFG containing ``loop``.
     :param loop: Candidate ``LoopRegion``.
@@ -631,12 +768,12 @@ def _try_substitute_iedge_iv(parent: ControlFlowRegion, loop: LoopRegion, sdfg: 
         # argument ``inc`` promoted to a symbol). A varying step has no closed form.
         if not getattr(diff, 'is_number', False):
             if not diff.free_symbols or not all(
-                    _is_loop_invariant_symbol(str(s), loop, sdfg) for s in diff.free_symbols):
+                    _is_loop_invariant_symbol(str(s), loop, sdfg, sdfg_free_symbols) for s in diff.free_symbols):
                 continue
         # ``lhs`` must be an SDFG symbol -- not a data container, not a loop var.
         if lhs == loop.loop_variable:
             continue
-        if lhs not in sdfg.symbols and lhs not in sdfg.free_symbols:
+        if lhs not in sdfg.symbols and lhs not in sdfg_free_symbols:
             continue
         # No other body iedge may also write ``lhs``.
         other_writers = [oe for oe in loop.edges() if oe is not e and lhs in (oe.data.assignments or {})]
@@ -696,6 +833,12 @@ def _try_substitute_iedge_iv(parent: ControlFlowRegion, loop: LoopRegion, sdfg: 
             body_offset = norm_iter
         elif side == 'after':
             body_offset = norm_iter + 1
+        elif side == 'unused':
+            # Nothing in the body reads ``sym``, so every offset agrees on the (empty) set
+            # of body reads -- the substitution is a body no-op and all this does is strip
+            # the loop-carried increment. The post-loop value below is what the surviving
+            # readers see, and it is independent of the offset chosen here.
+            body_offset = norm_iter
         else:
             return False
 

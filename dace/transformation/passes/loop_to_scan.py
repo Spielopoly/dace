@@ -137,7 +137,9 @@ class _Scan(NamedTuple):
     # :class:`NormalizeNegativeStride` normalises the loop. With ``coef == -1``,
     # ``k_w`` / ``k_r`` hold the array constants (i.e. the array index visited
     # at the first iteration), and the rewrite emits seed-add Map subscripts
-    # ``k_w - i`` instead of ``iter_start + k_w + i``.
+    # ``k_w - i`` instead of ``iter_start + k_w + i``. The reverse seed is not
+    # applied there but folded into the delta heads beforehand (one seed
+    # ``k_r - k`` per residue class ``k``; see :func:`_emit_reverse_seed_fold`).
     coef: int = 1
 
 
@@ -324,7 +326,8 @@ class LoopToScan(ppl.Pass):
         except Exception:  # noqa: BLE001 -- oracle refuses exotic shapes -> not a keepable map
             return False
 
-    def _specialize_scan_under_stride_guard(self, parent: ControlFlowRegion, loop: LoopRegion, guard: str, sdfg: SDFG):
+    def _specialize_scan_under_stride_guard(self, parent: ControlFlowRegion, loop: LoopRegion, guard: str, sdfg: SDFG,
+                                            infos: List['_Scan']):
         """Replace a symbolic-stride scan ``loop`` with ``if (guard) { scan } else
         { original sequential loop }`` via :func:`specialize_loop_under_condition`.
 
@@ -332,6 +335,21 @@ class LoopToScan(ppl.Pass):
         the else-branch clone is pinned sequential (``LoopToMap`` / a re-run of
         this pass leave it alone). ``guard`` is the ``stride >= 1`` predicate from
         :func:`_symbolic_stride_guard` under which the residue-class scan is valid.
+
+        When the guard is provably redundant (:func:`_stride_guard_is_statically_dischargeable`
+        -- the iteration span is no wider than the stride, so the loop carries no recurrence
+        at all), drop the conditional and lift the loop to a BARE MAP via
+        :func:`_lift_proven_doall_to_map`.
+
+        The bare form must be a ``Map``, never an unconditional residue-class ``Scan``. The
+        proof discharges the guard by covering the ``stride <= 0`` case with "the span is then
+        ``<= 0``, so the loop is empty" -- vacuous for a Map (an empty Map runs no iterations),
+        but NOT for a Scan: ``dace::scan::strided_inclusive_*`` calls ``std::abort()`` on
+        ``stride <= 0`` before it ever looks at the element count, so an unconditional Scan
+        would kill the process on the very inputs the proof calls harmless (TSVC ``s174``:
+        ``a[i + M] = a[i] + b[i]`` over ``i in [0, M)`` aborts at the legal ``M == 0``, where
+        the reference is a no-op). A Map is correct for every value the guard admitted and
+        every value it excluded, which is exactly what dropping the fallback requires.
         """
         from dace.transformation.passes.loop_specialization import specialize_loop_under_condition
 
@@ -345,6 +363,8 @@ class LoopToScan(ppl.Pass):
             for info in par_infos:
                 _rewrite(par_region, par_loop, info, sdfg)
 
+        if _stride_guard_is_statically_dischargeable(infos) and _lift_proven_doall_to_map(parent, loop, sdfg):
+            return
         specialize_loop_under_condition(loop, guard, _lift, sdfg)
 
     def apply_pass(self, sdfg: SDFG, _pipeline_results) -> Optional[int]:
@@ -459,7 +479,7 @@ class LoopToScan(ppl.Pass):
                     # rather than lift unconditionally: a violating runtime value
                     # (stride 0 -> a degenerate in-place update) degrades to the
                     # sequential fallback and still computes correctly.
-                    self._specialize_scan_under_stride_guard(parent, loop, guard, sdfg)
+                    self._specialize_scan_under_stride_guard(parent, loop, guard, sdfg, infos)
                     count += 1
                     continue
                 for info in infos:
@@ -2332,6 +2352,30 @@ def _iter_write_edges(state: SDFGState, name: str) -> List[Any]:
     return edges
 
 
+def _provably_nonpositive(expr) -> bool:
+    """``True`` iff ``expr`` is provably ``<= 0`` under the canonicalize nonnegative-symbol
+    contract (see :mod:`~dace.transformation.passes.canonicalize.assume_symbols_nonnegative`).
+
+    Plain ``expr.is_nonpositive`` is too weak on the expressions scan strides actually take:
+    ``int_floor`` / ``int_ceil`` are DaCe ``sympy.Function`` subclasses with no sign rule, so
+    a shift stride like ``-int_floor(LEN_1D, 2)`` reads as sign-UNKNOWN and gets mislabelled
+    an admissible symbolic scan stride (TSVC ``s1421``: ``b[i] = b[half + i] + a[i]`` is a pure
+    ``+half`` read-ahead over a disjoint region, not a recurrence). Rewrite them to SymPy's
+    ``floor`` / ``ceiling`` -- which DO propagate sign -- over nonnegative-rebuilt free symbols,
+    then test. Only *provable* nonpositivity is reported; a sign that stays unknown (a bare
+    symbolic stride ``K``, which may be ``0`` or positive) yields ``False``.
+    """
+    if not isinstance(expr, sympy.Basic):
+        return False
+    if expr.is_nonpositive is True:
+        return True
+    rebuilt = expr.subs({s: sympy.Symbol(s.name, nonnegative=True, integer=True) for s in expr.free_symbols})
+    rebuilt = rebuilt.replace(lambda n: isinstance(n, symbolic.int_floor), lambda n: sympy.floor(n.args[0] / n.args[1]))
+    rebuilt = rebuilt.replace(lambda n: isinstance(n, symbolic.int_ceil),
+                              lambda n: sympy.ceiling(n.args[0] / n.args[1]))
+    return rebuilt.is_nonpositive is True
+
+
 def _admissible_scan_stride(diff):
     """Return the scan stride if ``diff`` (``= k_w - k_r`` in iteration order) is an
     admissible positive stride, else ``None``.
@@ -2352,8 +2396,13 @@ def _admissible_scan_stride(diff):
         return None
     if diff.is_Integer:
         return int(diff) if int(diff) >= 1 else None
-    # Symbolic: admit an integer-typed stride whose sign is not provably non-positive.
-    if diff.is_integer and diff.is_nonpositive is not True:
+    # Symbolic: admit an integer-typed stride whose sign is not provably non-positive. A
+    # provably ``<= 0`` stride can never satisfy the residue-class scan's ``stride >= 1``
+    # validity condition, so specializing it would only ever emit a dead scan branch behind
+    # an always-false guard, leaving the pinned sequential fallback to run every time.
+    # Refusing the match instead lets the loop reach ``LoopToMap``, whose own dependency
+    # proof lifts it to an unconditional Map when the read/write regions are disjoint.
+    if diff.is_integer and not _provably_nonpositive(diff):
         return diff
     return None
 
@@ -2377,6 +2426,78 @@ def _symbolic_stride_guard(infos: List['_Scan']) -> Optional[str]:
                 seen.add(cond)
                 conds.append(cond)
     return ' && '.join(conds) if conds else None
+
+
+def _stride_guard_is_statically_dischargeable(infos: List['_Scan']) -> bool:
+    """Whether the ``stride >= 1`` guard :func:`_symbolic_stride_guard` would emit is
+    provably redundant -- i.e. the loop is DOALL for EVERY symbol value, so a bare ``Map``
+    is correct and the sequential fallback is never observably taken.
+
+    This licenses a bare ``Map`` ONLY (see :meth:`LoopToScan._specialize_scan_under_stride_guard`);
+    it does NOT license an unconditional residue-class ``Scan``, whose runtime aborts on
+    ``stride <= 0`` -- one of the very cases this proof discharges as harmless.
+
+    The guard is dischargeable when, for every matched scan contributing a guard term
+    (symbolic stride whose sign is not provably positive), the loop's iteration span is
+    provably no wider than that stride: ``iter_end - iter_start + 1 <= scan_stride``.
+
+    That inequality is exactly the DOALL condition for the apparent recurrence. Two
+    iterations ``i`` and ``i'`` conflict only if their write/read indices coincide,
+    ``i' + scan_stride == i`` with both in range -- which needs ``scan_stride`` strictly
+    less than the span ``iter_end - iter_start + 1``. When the span is ``<= scan_stride``
+    no such pair exists, so the loop carries no true recurrence at all (TSVC ``s173``:
+    ``a[i + LEN_1D//2] = a[i] + b[i]`` over ``i in [0, LEN_1D//2)`` -- the write region
+    ``a[half..2*half)`` is disjoint from the read region ``a[0..half)``). It is then
+    unconditionally DOALL: for ``scan_stride >= 1`` no two in-range iterations are
+    ``scan_stride`` apart, so every iteration is independent, and for ``scan_stride <= 0``
+    the span is ``<= scan_stride <= 0`` so the loop is empty and any parallel form is
+    vacuously correct. Either way a bare ``Map`` is bit-exact for all values, so the runtime
+    guard and its pinned sequential fallback can be dropped.
+
+    Restricted to the ``iter_start`` / ``iter_end`` (inclusive) the matcher records; the
+    proof uses :func:`loop_analysis._provably_le`, which is sound (never a guess),
+    respects the codebase's nonnegative symbols, and handles the ``Min`` / ``Max`` clamp
+    shapes a range split leaves behind. Returns ``False`` unless at least one guard term
+    exists AND every guard term is discharged.
+    """
+    guarded = False
+    for info in infos:
+        s = info.scan_stride
+        if not (isinstance(s, sympy.Basic) and not s.is_Integer and s.is_positive is not True):
+            continue
+        guarded = True
+        if info.iter_start is None or info.iter_end is None:
+            return False
+        span_end = symbolic.simplify(info.iter_end)  # inclusive last index
+        span_top = symbolic.simplify(symbolic.pystr_to_symbolic(info.iter_start) + s - 1)
+        if not loop_analysis._provably_le(span_end, span_top):
+            return False
+    return guarded
+
+
+def _lift_proven_doall_to_map(parent: ControlFlowRegion, loop: LoopRegion, sdfg: SDFG) -> bool:
+    """Lift a loop already PROVEN DOALL to a bare ``Map``, bypassing ``LoopToMap``'s own
+    ``can_be_applied`` dependency test. :returns: whether the lift happened.
+
+    The caller's proof (:func:`_stride_guard_is_statically_dischargeable`) is what makes this
+    sound: ``LoopToMap`` refuses this shape because its subset test cannot see that the
+    apparent recurrence ``out[i + k_w] = out[i + k_r] + delta`` needs two in-range iterations
+    ``scan_stride`` apart, which the proven span bound rules out. Same contract as
+    ``WavefrontSkew._convert_inner_to_map``, which forces the lift off its own legality proof.
+
+    Returns ``False`` (rather than raising) if the surgery does not go through, so the caller
+    falls back to the sound guarded specialization: this runs on the scan matcher's whole
+    shape zoo (nested/composite bodies), which is wider than ``LoopToMap``'s comfort zone, and
+    declining to lift only costs the guard we would have dropped.
+    """
+    from dace.transformation.interstate.loop_to_map import LoopToMap
+    instance = LoopToMap()
+    instance.loop = loop
+    try:
+        instance.apply(parent, sdfg)
+    except Exception:  # noqa: BLE001 -- an exotic body LoopToMap cannot restructure; keep the guard
+        return False
+    return True
 
 
 def _find_scan_update_tasklet(state: SDFGState,
@@ -2763,6 +2884,25 @@ def _rewrite(parent: ControlFlowRegion, loop: LoopRegion, info: _Scan, sdfg: SDF
     out_edges = list(parent.out_edges(loop))
     s_scan = parent.add_state(loop.label + '_scan')
     parent.add_edge(loop, s_scan, dace.InterstateEdge())
+
+    # REVERSE iteration folds each residue class's seed into that class's delta HEAD
+    # before the scan runs, so the apply is a plain copy rather than a seed-add.
+    # This is what keeps the lift BIT-EXACT: a seed-add computes
+    # ``seed OP (d0 OP d1 OP ...)`` whereas the sequential loop computes
+    # ``((seed OP d0) OP d1) OP ...``, and for floating-point ``+`` / ``*`` those
+    # two associations differ in the last ulp. Folding the seed in makes the
+    # libnode's own left-to-right class walk reproduce the sequential order
+    # exactly. The forward path gets the same guarantee from the ``Scan``
+    # libnode's ``_scan_init`` connector, which it cannot use here (``init`` with
+    # ``stride > 1`` is unsupported) and which is single-valued anyway, while the
+    # reverse residue-class scan needs one seed PER CLASS.
+    if info.coef == -1:
+        s_fold = parent.add_state(loop.label + '_scan_seed_fold')
+        for e in list(parent.in_edges(s_scan)):
+            parent.remove_edge(e)
+            parent.add_edge(e.src, s_fold, e.data)
+        parent.add_edge(s_fold, s_scan, dace.InterstateEdge())
+        _emit_reverse_seed_fold(s_fold, sdfg, info, delta_buf, trip)
 
     if _can_emit_direct_write(info, out_desc):
         for e in out_edges:
@@ -3395,6 +3535,50 @@ def _emit_scan(state: SDFGState, sdfg: SDFG, info: _Scan, delta_buf: str, scan_b
                    mm.Memlet(data=scan_buf, subset=subsets.Range([(0, trip - 1, 1)])))
 
 
+def _emit_reverse_seed_fold(state: SDFGState, sdfg: SDFG, info: _Scan, delta_buf: str, trip: Any):
+    """Reverse path only: Map over ``_k`` folding each residue class's pre-loop seed
+    into that class's delta HEAD -- ``delta_buf[_k] = out[k_r - _k] OP delta_buf[_k]``
+    for ``_k in [0, min(S, trip))``.
+
+    Class ``_k``'s first iteration is ``_i = _k`` (it reads the pre-loop value at
+    ``out[k_r - _k]``), and ``delta_buf[_k]`` is exactly that iteration's delta, so
+    folding here makes the libnode's subsequent left-to-right class walk emit
+    ``((seed OP d0) OP d1) OP ...`` -- the sequential association, bit for bit.
+    :func:`_emit_seed_add` then degenerates to a copy for ``coef == -1``.
+
+    The ``min(S, trip)`` clamp matters when the loop runs FEWER iterations than the
+    stride: only the first ``trip`` classes have any iteration at all, and
+    ``delta_buf`` is only ``trip`` long, so an unclamped ``0:S`` would write OOB.
+
+    The seed slots ``k_r - _k`` span ``k_w + 1 .. k_w + S`` -- strictly above the
+    scan's write range ``k_w - trip + 1 .. k_w`` -- so this Map reads ``out`` where
+    nothing in the rewritten chain ever writes it.
+    """
+    _k = symbolic.pystr_to_symbolic('_k')
+    out_desc = sdfg.arrays[info.out_name]
+    seed_axis_expr = symbolic.simplify(info.k_r - _k)
+    seed_subset = _build_subset(out_desc, info.scan_axis, seed_axis_expr, info.other_indices)
+    nclasses = symbolic.simplify(sympy.Min(info.scan_stride, trip))
+
+    op_expr = {
+        ScanOp.SUM: '__seed + __d',
+        ScanOp.PRODUCT: '__seed * __d',
+        ScanOp.MIN: 'min(__seed, __d)',
+        ScanOp.MAX: 'max(__seed, __d)',
+    }[info.op]
+    state.add_mapped_tasklet(
+        f'{state.label}_tasklet',
+        {'_k': f'0:{nclasses}'},
+        {
+            '__seed': mm.Memlet(data=info.out_name, subset=seed_subset),
+            '__d': mm.Memlet(data=delta_buf, subset=subsets.Range([('_k', '_k', 1)])),
+        },
+        f'__o = {op_expr}',
+        {'__o': mm.Memlet(data=delta_buf, subset=subsets.Range([('_k', '_k', 1)]))},
+        external_edges=True,
+    )
+
+
 def _emit_seed_add(state: SDFGState, sdfg: SDFG, info: _Scan, scan_buf: str, trip: Any):
     """Map over ``_i`` writing ``out[start + k_w + _i, ...] = seed OP scan_buf[_i]``.
 
@@ -3406,21 +3590,40 @@ def _emit_seed_add(state: SDFGState, sdfg: SDFG, info: _Scan, scan_buf: str, tri
     head of that class). The libnode has already run the ``S`` independent
     class scans into ``scan_buf``; this Map fans the ``S`` pre-loop seeds
     out by ``_i mod S``.
+
+    Reverse iteration (``coef == -1``) takes no seed here at all -- the per-class
+    seeds are folded into the delta heads up front by
+    :func:`_emit_reverse_seed_fold`, leaving this Map a plain copy into
+    ``out[k_w - _i, ...]``.
     """
     out_desc = sdfg.arrays[info.out_name]
     _i = symbolic.pystr_to_symbolic('_i')
     if info.coef == -1:
         # Reverse iteration: ``k_w`` / ``k_r`` are array constants (positions at
-        # iter 0). Seed reads from ``out[k_r]`` (pre-loop value, broadcast),
-        # write goes to ``out[k_w - _i]`` (i.e. iter 0 writes the highest array
-        # index, iter trip-1 writes the lowest).
-        seed_axis_expr = symbolic.simplify(info.k_r)
+        # iter 0), and the write goes to ``out[k_w - _i]`` (iter 0 writes the
+        # highest array index, iter trip-1 the lowest). Every residue class's seed
+        # was already folded into its delta head by :func:`_emit_reverse_seed_fold`
+        # -- which is what makes the reverse lift bit-exact, and which fans the
+        # seeds out per class rather than broadcasting one -- so ``scan_buf``
+        # already holds the final values and the apply is a straight copy.
         write_axis_expr = symbolic.simplify(info.k_w - _i)
-    elif info.scan_stride == 1:
+        state.add_mapped_tasklet(
+            f'{state.label}_tasklet',
+            {'_i': f'0:{trip}'},
+            {'__v': mm.Memlet(data=scan_buf, subset=subsets.Range([('_i', '_i', 1)]))},
+            '__o = __v',
+            {
+                '__o':
+                mm.Memlet(data=info.out_name,
+                          subset=_build_subset(out_desc, info.scan_axis, write_axis_expr, info.other_indices))
+            },
+            external_edges=True,
+        )
+        return
+    if info.scan_stride == 1:
         seed_axis_expr = symbolic.simplify(info.iter_start + info.k_r)
         write_axis_expr = symbolic.simplify(info.iter_start + info.k_w) + _i
     else:
-        import sympy
         class_idx = sympy.Mod(_i, info.scan_stride)
         seed_axis_expr = symbolic.simplify(info.iter_start + info.k_r + class_idx)
         write_axis_expr = symbolic.simplify(info.iter_start + info.k_w) + _i

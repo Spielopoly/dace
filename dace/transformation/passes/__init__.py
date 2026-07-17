@@ -6,6 +6,7 @@ from .dead_dataflow_elimination import DeadDataflowElimination
 from .dead_state_elimination import DeadStateElimination
 from .full_map_fusion import FullMapFusion
 from .fusion_inline import FuseStates, InlineSDFGs
+from .gpu_block_size_selection import SelectGPUDeviceBlockSize, pick_gpu_block_size, select_gpu_device_block_size
 from .loop_local_memory_reduction import LoopLocalMemoryReduction
 from .optional_arrays import OptionalArrayInference
 from .pattern_matching import PatternMatchAndApply, PatternMatchAndApplyRepeated, PatternApplyOnceEverywhere
@@ -18,6 +19,7 @@ from .simplify_induction_variables import SimplifyInductionVariables
 from .symbol_propagation import SymbolPropagation
 from .transient_reuse import TransientReuse
 from .offset_loop_and_maps import OffsetLoopsAndMaps
+from .outline_top_level_nests import OutlineTopLevelNests, outline_top_level_nests
 from .eliminate_branches import EliminateBranches
 from .util import available_passes
 from .canonicalize import CanonicalizationPipeline, canonicalize

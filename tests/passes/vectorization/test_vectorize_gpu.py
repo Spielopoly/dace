@@ -21,6 +21,7 @@ from dace.libraries.tileops import TileMaskGen, TileBinop
 from dace.transformation.passes.vectorization.vectorize_cpu_multi_dim import _TILE_NODE_TYPES
 from dace.transformation.passes.vectorization.vectorize_gpu import VectorizeGPU
 from dace.transformation.passes.vectorization.config import VectorizeConfig
+from dace.transformation.passes.canonicalize.finalize import offload_to_gpu
 
 _HAS_NVCC = shutil.which("nvcc") is not None
 N = dace.symbol("N")
@@ -69,10 +70,17 @@ def _heat3d16(A: dace.float16[N, N, N], B: dace.float16[N, N, N]):
 
 
 def _prep(prog):
-    """@dace.program -> simplify + LoopToMap + simplify (the caller-side recipe)."""
+    """@dace.program -> simplify + LoopToMap + simplify, THEN GPU-offload (the caller-side recipe).
+
+    ``VectorizeGPU`` assumes an already-offloaded SDFG -- it does NOT offload / schedule itself --
+    so the test mirrors the production canonicalize-GPU path (``finalize_for_target(sdfg, 'gpu')``
+    -> :func:`offload_to_gpu`) that moves the SDFG onto the device (``GPU_Device`` maps, ``GPU_Global``
+    storage, block sizes) BEFORE the vectorizer runs.
+    """
     sdfg = prog.to_sdfg(simplify=True)
     sdfg.apply_transformations_repeated(LoopToMap)
     sdfg.simplify()
+    offload_to_gpu(sdfg)
     return sdfg
 
 
@@ -81,11 +89,11 @@ def _inner_maps(sdfg):
 
 
 def test_assume_even_single_strided_gpu_map_no_mask():
-    """``assume_even`` (the GPU default) emits ONE ``0:N:2`` GPU_Device map per
-    original map -- no remainder split, no ``TileMaskGen`` (so no mismatched
-    thread-block sizes on GPU)."""
+    """``assume_even=True`` emits ONE ``0:N:2`` GPU_Device map per original map --
+    no remainder split, no ``TileMaskGen`` (so no mismatched thread-block sizes on
+    GPU). ``assume_even`` is opt-in: the GPU K=1 default is ``branched_tail``."""
     sdfg = _prep(_add16)
-    VectorizeGPU(VectorizeConfig(widths=(2, ))).apply_pass(sdfg, {})
+    VectorizeGPU(VectorizeConfig(widths=(2, ), assume_even=True)).apply_pass(sdfg, {})
     maps = _inner_maps(sdfg)
     assert len(maps) == 1, f"assume_even must not split the map; got {len(maps)} maps"
     m = maps[0]
@@ -161,7 +169,7 @@ def test_gpu_reduction_uses_gpu_expansion():
     reduction on the device rather than a CPU horizontal fold; it compiles with nvcc."""
     from dace.sdfg.nodes import MapExit
     sdfg = _prep(_vsum16)
-    VectorizeGPU(VectorizeConfig(widths=(2, ))).apply_pass(sdfg, {})
+    VectorizeGPU(VectorizeConfig(widths=(2, ), assume_even=True)).apply_pass(sdfg, {})
     # The reduction stays a map-exit WCR (an in-edge to a MapExit carrying a CR).
     wcr_exits = [(st, n) for sd in sdfg.all_sdfgs_recursive() for st in sd.states() for n in st.nodes()
                  if isinstance(n, MapExit) and any(e.data is not None and e.data.wcr is not None
@@ -223,3 +231,88 @@ def test_gpu_half2_reduce_lowers_to_native_f16x2():
         for f in (tmp, ptx):
             if os.path.exists(f):
                 os.remove(f)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("width", [4, 8])
+def test_gpu_vectorize_width_gt2_numeric(width):
+    """Widths > 2 (4, 8) tile the GPU map by ``width`` and compute correctly, using the SAME
+    half2 fast path as width 2 (two fp16 lanes per instruction, looping ``i += 2`` to emit
+    ``width / 2`` consecutive half2 ops) -- still one strided ``0:N:width`` GPU_Device map
+    (assume_even), numerically exact for a divisible extent."""
+    import numpy as np
+    import cupy
+    sdfg = _prep(_add16)
+    sdfg.name = f"add16_w{width}"
+    VectorizeGPU(VectorizeConfig(widths=(width, ), assume_even=True)).apply_pass(sdfg, {})
+    maps = _inner_maps(sdfg)
+    assert len(maps) == 1, f"assume_even keeps one map; got {len(maps)}"
+    n = 8 * width  # a multiple of the width (assume_even)
+    A = np.random.rand(n).astype(np.float16)
+    B = np.random.rand(n).astype(np.float16)
+    dA, dB, dC = cupy.asarray(A), cupy.asarray(B), cupy.zeros(n, cupy.float16)
+    sdfg(A=dA, B=dB, C=dC, N=n)
+    assert np.allclose(dC.get().astype(np.float32), (A + B).astype(np.float32), rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.skipif(not _HAS_NVCC, reason="nvcc not available; PTX check skipped")
+@pytest.mark.parametrize("width", [4, 8])
+def test_gpu_half2_wide_emits_width_over_2_f16x2(width):
+    """A wide fp16 tile (width 4 / 8) uses the SAME half2 fast path as width 2: the per-tile
+    binop lowers to exactly ``width / 2`` native ``add.f16x2`` instructions (the half2 branch
+    loops ``i += 2``, ``#pragma unroll``), NOT a per-lane scalar fallback -- verified in the PTX.
+    Refutes the (former) "only width 2 uses the half2 intrinsic; 4/8 lower per-lane"."""
+    import subprocess
+    src = ("#include \"dace/dace.h\"\n#include \"dace/tile_ops/cuda.h\"\n"
+           "__global__ void k(dace::float16* o, const dace::float16* a, const dace::float16* b) {\n"
+           f"  dace::tileops::tile_binop<dace::float16, {width}, '+', false, false, false>(o, a, b, nullptr);\n}}\n")
+    inc = os.path.join(os.path.dirname(dace.__file__), "runtime", "include")
+    tmp = os.path.join(os.path.dirname(__file__), f"_f16x2_w{width}_probe.cu")
+    ptx = tmp + ".ptx"
+    try:
+        with open(tmp, "w") as f:
+            f.write(src)
+        subprocess.run(["nvcc", "-I", inc, "-ptx", "-arch=sm_80", tmp, "-o", ptx], check=True, capture_output=True)
+        n = open(ptx).read().count("add.f16x2")
+        assert n == width // 2, f"width {width} fp16 add expected {width // 2} add.f16x2, got {n}"
+    finally:
+        for f in (tmp, ptx):
+            if os.path.exists(f):
+                os.remove(f)
+
+
+@pytest.mark.gpu
+def test_gpu_multidim_k2_runs():
+    """A K=2 (2D) GPU tile -- ``widths=(2, 2)`` tiles BOTH innermost axes -- compiles and runs
+    correctly on the device. K>=2 lowers each tile op to the portable ``pure`` per-lane body
+    inside the ``GPU_Device`` kernel (the half2 SIMD intrinsic applies to the single innermost
+    contiguous axis, K=1); still one strided map per axis (assume_even) and numerically exact."""
+    import numpy as np
+    import cupy
+    sdfg = _prep(_add16)
+    sdfg.name = "add16_k2"
+    VectorizeGPU(VectorizeConfig(widths=(2, 2))).apply_pass(sdfg, {})
+    n = 16  # a multiple of 2 on both tiled axes (assume_even)
+    A = np.random.rand(n, n).astype(np.float16)
+    B = np.random.rand(n, n).astype(np.float16)
+    dA, dB, dC = cupy.asarray(A), cupy.asarray(B), cupy.zeros((n, n), cupy.float16)
+    sdfg(A=dA, B=dB, C=dC, N=n)
+    assert np.allclose(dC.get().astype(np.float32), (A + B).astype(np.float32), rtol=1e-2, atol=1e-2)
+
+
+if __name__ == "__main__":
+    test_assume_even_single_strided_gpu_map_no_mask()
+    test_deferred_tile_nodes_are_cuda_stamped()
+    test_scalar_cast_constant_broadcasts()
+    test_gpu_half2_emits_tile_ops_in_device_tu()
+    test_gpu_half2_compiles("add16", _add16)
+    test_gpu_half2_compiles("jacobi2d16", _jacobi2d16)
+    test_gpu_half2_compiles("heat3d16", _heat3d16)
+    test_gpu_reduction_uses_gpu_expansion()
+    test_gpu_half2_lowers_to_native_f16x2()
+    test_gpu_half2_reduce_lowers_to_native_f16x2()
+    test_gpu_vectorize_width_gt2_numeric(4)
+    test_gpu_vectorize_width_gt2_numeric(8)
+    test_gpu_half2_wide_emits_width_over_2_f16x2(4)
+    test_gpu_half2_wide_emits_width_over_2_f16x2(8)
+    test_gpu_multidim_k2_runs()

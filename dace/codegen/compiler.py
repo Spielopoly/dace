@@ -27,6 +27,134 @@ from dace.codegen.target import make_absolute
 T = TypeVar('T')
 
 
+def deduplicate_lines(code: str, is_candidate: Callable[[str], bool]) -> str:
+    """
+    Order-preserving de-duplication: drops a line only when ``is_candidate(line.strip())``
+    is true AND that stripped line was already kept. Every other line passes through
+    untouched (raw, keepends). Used by the experimental readable code generator.
+    """
+    seen: Set[str] = set()
+    out: List[str] = []
+    for line in code.splitlines(keepends=True):
+        stripped = line.strip()
+        if is_candidate(stripped):
+            if stripped in seen:
+                continue
+            seen.add(stripped)
+        out.append(line)
+    return ''.join(out)
+
+
+def deduplicate_includes(code: str) -> str:
+    """Removes repeated ``#include`` directives (keeping the first occurrence of each)."""
+    return deduplicate_lines(code, lambda s: s.startswith('#include'))
+
+
+def deduplicate_functions(code: str) -> str:
+    """
+    Removes repeated single-line index / size helper definitions (keeping the first).
+    Each helper is a file-scope ``static`` free function on one line, e.g.
+    ``static DACE_HDFI constexpr long long A_idx(...) { return ...; }``. A non-inline
+    nested-SDFG function has its own function stream that shares the output file with the
+    outer stream, so the identical definition can appear more than once; C++ forbids the
+    redefinition. Matching is conservative -- only single-line ``static`` definitions naming
+    an ``*_idx`` / ``*_size`` helper are considered, and a line is dropped only when
+    byte-identical to one already kept, so call sites and other code are never touched.
+    """
+    return deduplicate_lines(
+        code,
+        lambda s: s.startswith('static ') and ('_idx(' in s or '_size(' in s) and 'return' in s and s.endswith('}'))
+
+
+def split_leading_includes(lines: List[str]) -> Tuple[List[str], List[str]]:
+    """
+    Splits a generated source into (leading header block, body). The header block
+    is the contiguous run of comments / blank lines / preprocessor directives
+    (``#include``, ``#pragma``, ``#define``, ...) at the top of the file, before
+    the first line of real code.
+    """
+    split = 0
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped == '' or stripped.startswith(('//', '/*', '*', '#')):
+            split = i + 1
+        else:
+            break
+    return lines[:split], lines[split:]
+
+
+# Only readability-* fixes safe on include-stripped code (apply_clang_tidy strips the header block,
+# so a fix depending on types or a variable's full use-set rewrites on a half-parse). Excluded:
+# identifier naming/length, magic-numbers, cognitive-complexity, uppercase-suffix (noise);
+# non-const-parameter (const-qualifies a pointer only forwarded to a nested-SDFG writer -> const vs
+# non-const clash nvcc rejects); and modernize-* (type-dependent -> miscompiled the CUDA
+# block-reduction: an empty ``using`` alias and a reduction index turned into a range-for value).
+CLANG_TIDY_CHECKS = ('readability-*,'
+                     '-readability-identifier-naming,-readability-identifier-length,-readability-magic-numbers,'
+                     '-readability-function-cognitive-complexity,-readability-uppercase-literal-suffix,'
+                     '-readability-avoid-const-params-in-decls,-readability-non-const-parameter')
+
+
+def apply_clang_tidy(code_path: str) -> None:
+    """
+    Best-effort standalone ``clang-tidy -fix-errors`` on a generated ``.cpp`` /
+    ``.cu`` file to improve readability, applied in place -- no CMake / compilation
+    database. Only the vetted ``CLANG_TIDY_CHECKS`` run: a fix that needs types or a
+    variable's full use-set cannot be trusted here (see that constant).
+
+    The leading ``#include`` block is stripped before tidying and restored after,
+    so clang-tidy never parses any header at all: no DaCe runtime, CUDA, cuBLAS,
+    or OpenBLAS include path is needed (GPU/vendor libraries do not all live under
+    the CUDA prefix, so relying on include discovery would be fragile). External
+    functions and types then appear undeclared; ``-fix-errors`` tolerates those as
+    black boxes -- their call sites are left intact while the surrounding readable
+    code (loops, index functions, tasklets) is tidied. This is also faster, since
+    the large runtime headers are not re-parsed.
+
+    Never fails the build: a missing binary or a tidy error only emits a warning.
+    """
+    tidy = shutil.which('clang-tidy')
+    if tidy is None:
+        warnings.warn('clang-tidy not found; skipping tidy pass')
+        return
+    try:
+        with open(code_path) as fh:
+            lines = fh.readlines()
+    except OSError as ex:
+        warnings.warn(f'clang-tidy: could not read {code_path}: {ex}')
+        return
+
+    header, body = split_leading_includes(lines)
+    tmp_path = code_path + '.tidytmp'
+    checks = CLANG_TIDY_CHECKS
+    # Tidy at the configured C++ standard (the same value CMake compiles with, see
+    # DACE_CPP_STANDARD), so a fix is never applied under a different standard than the code
+    # is built with.
+    std_arg = '-std=c++%s' % str(Config.get('compiler', 'cpp_standard')).strip()
+    lang_args = [std_arg]
+    if code_path.endswith('.cu'):
+        lang_args = ['-x', 'cuda', '--cuda-host-only', '--no-cuda-version-check', std_arg]
+    try:
+        with open(tmp_path, 'w') as fh:
+            fh.writelines(body)
+        subprocess.run([
+            tidy, '-quiet', '-fix-errors', f'--header-filter={re.escape(os.path.basename(tmp_path))}',
+            '-system-headers=0', f'-checks=-*,{checks}', tmp_path, '--'
+        ] + lang_args,
+                       capture_output=True,
+                       text=True,
+                       timeout=180)
+        with open(tmp_path) as fh:
+            tidied_body = fh.readlines()
+        with open(code_path, 'w') as fh:
+            fh.writelines(header + tidied_body)
+    except (subprocess.SubprocessError, OSError) as ex:
+        warnings.warn(f'clang-tidy failed to run: {ex}')
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
 def generate_program_folder(
     sdfg,
     code_objects: List[CodeObject],
@@ -91,23 +219,41 @@ def generate_program_folder(
         code_path = os.path.join(target_folder, basename)
         clean_code = code_object.clean_code
 
-        if Config.get_bool('compiler', 'format_code'):
+        # The experimental (readable) code generator produces human-oriented code;
+        # collapse duplicate headers and format by default for readability.
+        readable = Config.get('compiler', 'cpu', 'implementation') == 'experimental_readable'
+
+        if readable:
+            clean_code = deduplicate_includes(clean_code)
+            clean_code = deduplicate_functions(clean_code)
+
+        if Config.get_bool('compiler', 'format_code') or readable:
             config_file = Config.get('compiler', 'format_config_file')
             if config_file is not None and config_file != "":
                 run_arg_list = ['clang-format', f"-style=file:{config_file}"]
             else:
                 run_arg_list = ['clang-format']
-            result = subprocess.run(run_arg_list, input=clean_code, text=True, capture_output=True)
-            if result.returncode or result.stderr:
-                warnings.warn(f'clang-format failed to run: {result.stderr}')
-            else:
-                clean_code = result.stdout
+            try:
+                result = subprocess.run(run_arg_list, input=clean_code, text=True, capture_output=True)
+                if result.returncode or result.stderr:
+                    warnings.warn(f'clang-format failed to run: {result.stderr}')
+                else:
+                    clean_code = result.stdout
+            except FileNotFoundError:
+                warnings.warn('clang-format not found; skipping code formatting')
 
         # Save the file only if it changed (keeps old timestamps and saves
         # build time)
         if not identical_file_exists(code_path, clean_code):
             with open(code_path, "w") as code_file:
                 code_file.write(clean_code)
+
+        # Readability tidy-up of the generated CPU (.cpp) and GPU (.cu) files,
+        # standalone (no CMake). Run automatically by the experimental readable
+        # generator. Best-effort: never fails the build; a missing clang-tidy is
+        # a no-op.
+        if readable and extension in ('cpp', 'cu'):
+            apply_clang_tidy(code_path)
 
         if code_object.linkable == True:
             filelist.append("{},{},{}".format(target_name, target_type, basename))
@@ -291,23 +437,100 @@ def configure_and_compile(
         elif '/MT' not in os.environ['_CL_']:
             os.environ['_CL_'] = os.environ['_CL_'] + ' /MT'
 
+    # Resolve the environments the SDFG uses (shared by both build backends).
+    with open(os.path.join(program_folder, "dace_environments.csv"), "r") as f:
+        environments = set(l.strip() for l in f)
+    environments = dace.library.get_environments_and_dependencies(environments)
+
+    # Strip this process's MPI-rank identity from the build subprocesses so the compiler and the
+    # children it spawns never hang joining the outer MPI/PMI job (see _build_subprocess_env).
+    build_env = _build_subprocess_env()
+
+    # Build the shared library either directly (native) or through CMake (default). Both write it to
+    # the same development-mode location that the shared tail below expects.
+    build_mode = Config.get('compiler', 'build_mode').strip().lower()
+    if build_mode not in ('cmake', 'native'):
+        raise cgx.CompilerConfigurationError(
+            f"Unknown compiler.build_mode {Config.get('compiler', 'build_mode')!r}; expected 'cmake' or 'native'.")
+    if build_mode == 'native':
+        from dace.codegen import native_compiler
+        native_compiler.build_native(program_folder=program_folder,
+                                     program_name=program_name,
+                                     files=files,
+                                     targets=targets,
+                                     environments=environments,
+                                     build_folder=build_folder,
+                                     build_env=build_env,
+                                     output_stream=output_stream)
+    else:
+        _cmake_configure_and_build(program_folder=program_folder,
+                                   program_name=program_name,
+                                   src_folder=src_folder,
+                                   build_folder=build_folder,
+                                   files=files,
+                                   targets=targets,
+                                   environments=environments,
+                                   build_env=build_env,
+                                   output_stream=output_stream)
+
+    # Get the names of the library files that were generated.
+    #  Currently we are still in the `development` folder mode.
+    lib_path = get_binary_name(object_folder=program_folder, sdfg_name=program_name, folder_mode="development")
+    libstub_path = _get_stub_library_path(lib_path)
+
+    # In production mode, we are now deleting what we need and relocating it.
+    if folder_mode == "production":
+        lib_path = pathlib.Path(shutil.move(src=lib_path, dst=program_folder))
+        libstub_path = pathlib.Path(shutil.move(src=libstub_path, dst=program_folder))
+        program_folder = pathlib.Path(program_folder)
+        # TODO: Find out where `sample/` are generated and suppress their generation.
+        for to_delete in ["include", "src", "build", "sample", "dace_environments.csv", "dace_files.csv"]:
+            if (program_folder / to_delete).is_dir():
+                shutil.rmtree(os.path.join(program_folder, to_delete))
+            else:
+                (program_folder / to_delete).unlink()
+
+    return lib_path
+
+
+def _cmake_configure_and_build(program_folder,
+                               program_name,
+                               src_folder,
+                               build_folder,
+                               files,
+                               targets,
+                               environments,
+                               build_env,
+                               output_stream=None) -> None:
+    """Configure and build a prepared program folder with CMake (the default ``build_mode``).
+
+    Writes the shared library + loader stub into ``<build_folder>``; the caller
+    (:func:`configure_and_compile`) locates them afterwards.
+    """
     # Start forming CMake command
     dace_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    # Prefer the Ninja generator when it is available: the default generator on Linux is Make, whose
+    # per-directory dependency graph serializes more of the build than Ninja's global one. This matters
+    # most together with ``split_nsdfg_translation_units``, which exists to turn one big translation
+    # unit into several that can then compile concurrently. Absence of ninja is NOT an error -- fall
+    # back to the default generator, which builds the same sources with the same flags.
+    # Not on Windows: the ``-A x64`` platform flag above is a Visual Studio generator option and CMake
+    # rejects it for Ninja, so Windows keeps its existing generator untouched.
+    use_ninja = os.name != 'nt' and shutil.which('ninja') is not None
+    if not use_ninja and Config.get_bool('debugprint'):
+        print('ninja not found on PATH; using the default CMake generator')
+
     cmake_command = [
         "cmake",
         "-A x64" if os.name == 'nt' else "",  # Windows-specific flag
+        '-G Ninja' if use_ninja else "",
         '"' + os.path.join(dace_path, "codegen") + '"',
         "-DDACE_SRC_DIR=\"{}\"".format(src_folder),
         "-DDACE_FILES=\"{}\"".format(";".join(files)),
         "-DDACE_PROGRAM_NAME={}".format(program_name),
         "-DDACE_CPP_STANDARD={}".format(Config.get('compiler', 'cpp_standard')),
     ]
-
-    # Get required environments are retrieve the CMake information
-    with open(os.path.join(program_folder, "dace_environments.csv"), "r") as f:
-        environments = set(l.strip() for l in f)
-
-    environments = dace.library.get_environments_and_dependencies(environments)
 
     environment_flags, cmake_link_flags = get_environment_flags(environments)
     cmake_command += sorted(environment_flags)
@@ -351,10 +574,6 @@ def configure_and_compile(
 
     cmake_filename = os.path.join(build_folder, 'cmake_configure.sh')
 
-    # Strip this process's MPI-rank identity from the build subprocesses so CMake and the
-    # children it spawns never hang joining the outer MPI/PMI job (see _build_subprocess_env).
-    build_env = _build_subprocess_env()
-
     ##############################################
     # Configure
     try:
@@ -378,9 +597,14 @@ def configure_and_compile(
     with open(cmake_filename, "w") as fp:
         fp.write(cmake_command)
 
-    # Compile and link
+    # Compile and link. ``cmake --build .`` drives whichever generator was configured (Ninja included),
+    # so the invocation does not branch on the generator. ``--parallel`` is what actually bounds the
+    # build: Make would otherwise be serial, and Ninja would otherwise use every core -- neither is what
+    # we want on a shared machine. See ``compiler.build_jobs``.
+    build_jobs = max(1, int(Config.get('compiler', 'build_jobs')))
     try:
-        _run_liveoutput("cmake --build . --config %s" % (Config.get('compiler', 'build_type')),
+        _run_liveoutput("cmake --build . --config %s --parallel %d" %
+                        (Config.get('compiler', 'build_type'), build_jobs),
                         shell=True,
                         cwd=build_folder,
                         output_stream=output_stream,
@@ -391,25 +615,6 @@ def configure_and_compile(
             raise cgx.CompilationError('Compiler failure')
         else:
             raise cgx.CompilationError('Compiler failure:\n' + ex.output)
-
-    # Get the names of the library files that were generated.
-    #  Currently we are still in the `development` folder mode.
-    lib_path = get_binary_name(object_folder=program_folder, sdfg_name=program_name, folder_mode="development")
-    libstub_path = _get_stub_library_path(lib_path)
-
-    # In production mode, we are now deleting what we need and relocating it.
-    if folder_mode == "production":
-        lib_path = pathlib.Path(shutil.move(src=lib_path, dst=program_folder))
-        libstub_path = pathlib.Path(shutil.move(src=libstub_path, dst=program_folder))
-        program_folder = pathlib.Path(program_folder)
-        # TODO: Find out where `sample/` are generated and suppress their generation.
-        for to_delete in ["include", "src", "build", "sample", "dace_environments.csv", "dace_files.csv"]:
-            if (program_folder / to_delete).is_dir():
-                shutil.rmtree(os.path.join(program_folder, to_delete))
-            else:
-                (program_folder / to_delete).unlink()
-
-    return lib_path
 
 
 def get_program_handle(
@@ -493,6 +698,11 @@ def get_folder_mode(object_folder: Union[pathlib.Path, str], probe: bool = False
             if (object_folder / sub_folder).is_dir():
                 found_sub_folder = True
             elif found_sub_folder:
+                # A partial / corrupted cache (some sibling dirs missing). Under ``probe`` the
+                # caller wants to know whether this is a usable cache; report "not usable" so
+                # the next step regenerates from scratch instead of crashing the build.
+                if probe:
+                    return None
                 raise NotADirectoryError(f'Expected that folder ``{object_folder}`` contains ``{sub_folder}``')
 
         if found_sub_folder:

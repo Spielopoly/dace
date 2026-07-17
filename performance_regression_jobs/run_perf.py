@@ -7,7 +7,8 @@ NTASKS via engine.my_slice), so 1 node / 4 ranks distributes the corpus.
 Experiments (both CPU; vector_vs runs its dace lanes through the multi-dim
 vectorizer, native lanes are compiled fast-math either way):
 
-  canon_vs   dace-canon        engine.pipeline_canon
+  canon_vs   dace-autoopt      engine.pipeline_auto_opt
+             dace-canon        engine.pipeline_canon
              dace-parallel     engine.pipeline_parallel
              compiler-seq      native single-core -O3 -march=native -ffast-math
              compiler-autopar  native gcc auto-parallelized C
@@ -52,12 +53,26 @@ import native_harness as nh
 
 #: experiment -> its dace + native lane sets (numpy is added per-corpus below).
 EXPERIMENTS = {
-    'canon_vs': dict(dace=['dace-canon', 'dace-parallel'], native=['compiler-seq', 'compiler-autopar']),
-    'vector_vs': dict(dace=['dace-canon-vec', 'dace-parallel-vec'], native=['compiler-seq', 'compiler-autopar']),
+    # Native multi-core baselines run BOTH auto-parallelizers explicitly -- Polly (clang) AND
+    # Graphite (gcc) -- rather than the single cxx-following 'compiler-autopar', so one job reports
+    # both regardless of --cxx (matches the tsvc corpora, which already run both). 'compiler-seq'
+    # stays the single-core, cxx-following reference.
+    'canon_vs': dict(dace=['dace-autoopt', 'dace-canon', 'dace-parallel'],
+                     native=['compiler-seq', 'native-clang-polly-autopar', 'native-gcc-autopar']),
+    'vector_vs': dict(dace=['dace-canon-vec', 'dace-parallel-vec'],
+                      native=['compiler-seq', 'native-clang-polly-autopar', 'native-gcc-autopar']),
 }
 
-#: single-device sweep; every result folder uses this preset token.
+#: base result-folder preset token. On GPU the '-gpu' suffix is what
+#: engine.device_of_tag() reads to fill the summary `device` column, and it keeps
+#: GPU result folders from colliding with the CPU ones in the SAME results tree
+#: (so a CPU and a GPU sweep of the same experiment sit side by side, separable).
 PRESET = 'default'
+
+
+def preset_for(device):
+    """Result-folder preset token for a device: 'default' (cpu) / 'default-gpu' (gpu)."""
+    return PRESET if device == 'cpu' else f'{PRESET}-gpu'
 
 
 def corpus_lanes(experiment, corpus):
@@ -80,9 +95,10 @@ def _kdir(lane, kdir_dace, kdir_native):
     return kdir_native if lane in nh.LANES else kdir_dace
 
 
-def _check_lane(corpus, kernel_name, recipe, lane, native_libs, has_numpy_ref, timeout):
-    if lane in adapters.DACE_PIPELINE:
-        return engine.run_isolated(adapters.check_dace_job, (corpus, kernel_name, recipe, lane), timeout=timeout)
+def _check_lane(corpus, kernel_name, recipe, lane, native_libs, has_numpy_ref, timeout, device='cpu'):
+    if lane in adapters.DACE_PIPELINE:  # dace lanes honor the device; native/numpy are CPU-only
+        return engine.run_isolated(adapters.check_dace_job, (corpus, kernel_name, recipe, lane, device),
+                                   timeout=timeout)
     if lane in nh.LANES:
         entry = native_libs.get(lane)
         if entry is None:
@@ -97,9 +113,10 @@ def _check_lane(corpus, kernel_name, recipe, lane, native_libs, has_numpy_ref, t
     return False, f'unknown lane {lane}'
 
 
-def _time_lane(corpus, kernel_name, recipe, lane, reps, native_libs, timeout):
+def _time_lane(corpus, kernel_name, recipe, lane, reps, native_libs, timeout, device='cpu'):
     if lane in adapters.DACE_PIPELINE:
-        return engine.run_isolated(adapters.time_dace_job, (corpus, kernel_name, recipe, lane, reps), timeout=timeout)
+        return engine.run_isolated(adapters.time_dace_job, (corpus, kernel_name, recipe, lane, reps, device),
+                                   timeout=timeout)
     if lane in nh.LANES:
         so_path, c_name, sig = native_libs[lane]
         return engine.run_isolated(adapters.time_native_job, (corpus, kernel_name, recipe, so_path, c_name, sig, reps),
@@ -126,8 +143,9 @@ def kernel_complete(lanes, kdir_dace, kdir_native, reps):
 
 
 def process_kernel(corpus, kernel_name, recipe, lanes, args, rank, native_libs, has_numpy_ref):
-    kdir_dace = engine.kernel_dir(args.results_dir, corpus, kernel_name, PRESET)
-    kdir_native = engine.native_kernel_dir(args.results_dir, corpus, kernel_name, PRESET)
+    preset = preset_for(args.device)
+    kdir_dace = engine.kernel_dir(args.results_dir, corpus, kernel_name, preset)
+    kdir_native = engine.native_kernel_dir(args.results_dir, corpus, kernel_name, preset)
 
     if not args.force and kernel_complete(lanes, kdir_dace, kdir_native, args.reps):
         print(f'[{kernel_name}] already complete, skipping')
@@ -137,7 +155,8 @@ def process_kernel(corpus, kernel_name, recipe, lanes, args, rank, native_libs, 
         ldir = _kdir(lane, kdir_dace, kdir_native)
         status = None if args.force else engine.read_status(ldir, lane)
         if status is None:
-            ok, correct = _check_lane(corpus, kernel_name, recipe, lane, native_libs, has_numpy_ref, args.timeout)
+            ok, correct = _check_lane(corpus, kernel_name, recipe, lane, native_libs, has_numpy_ref, args.timeout,
+                                      args.device)
             engine.write_status(ldir, lane, bool(ok and correct), '' if ok and correct else str(correct))
             correct_now = bool(ok and correct)
         else:
@@ -150,7 +169,8 @@ def process_kernel(corpus, kernel_name, recipe, lanes, args, rank, native_libs, 
         if remaining <= 0:
             continue
         print(f'[{kernel_name}] {lane}: measuring {remaining} more rep(s)')
-        ok, payload = _time_lane(corpus, kernel_name, recipe, lane, remaining, native_libs, args.timeout)
+        ok, payload = _time_lane(corpus, kernel_name, recipe, lane, remaining, native_libs, args.timeout,
+                                 args.device)
         if ok:
             engine.append_results(ldir, lane, payload, have)
         else:
@@ -184,6 +204,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--experiment', required=True, choices=sorted(EXPERIMENTS), help='which experiment to run')
     ap.add_argument('--corpus', required=True, choices=sorted(adapters.ADAPTERS), help='which corpus to sweep')
+    ap.add_argument('--device', choices=('cpu', 'gpu'), default='cpu',
+                    help="run the dace lanes on cpu or gpu (native/numpy lanes are always cpu). GPU results "
+                         "land in a '-gpu' preset folder so they sit beside the cpu ones in the same tree.")
     engine.add_common_args(ap)
     args = ap.parse_args()
 

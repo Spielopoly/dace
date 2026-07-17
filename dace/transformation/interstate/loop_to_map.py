@@ -157,6 +157,29 @@ def _affine_coeffs(expr, itersym):
     return a, b
 
 
+def _same_injective_index(idx1, idx2, itersym) -> bool:
+    """ True iff ``idx1`` and ``idx2`` are the SAME injective affine function ``a*i+b``
+        (``a != 0``) of the iteration variable.
+
+        When two accesses index a dimension by such a function, a collision on that dimension
+        (``a*p+b == a*q+b``) forces the two iterations to coincide (``p == q``). Any overlap between
+        them is therefore confined to a single iteration -- where program order in the map body is
+        preserved -- and never becomes a cross-iteration dependency. Used both for write/write
+        overlap (:func:`_writes_may_overlap`) and read/write RAW (:func:`_read_write_same_iteration`).
+
+        Both indices and the iteration symbol are re-parsed through the symbol registry (via their
+        string form) before the comparison: a read subset and a write subset can carry copies of the
+        iteration variable that share the NAME ``i`` but different sympy assumptions, so ``idx1 -
+        idx2`` would not simplify to zero and ``coeff`` would not see them as the same symbol.
+        Canonicalizing drops the assumption metadata and makes both refer to one registry symbol.
+    """
+    sym = symbolic.pystr_to_symbolic(str(itersym))
+    e1 = symbolic.pystr_to_symbolic(str(idx1))
+    e2 = symbolic.pystr_to_symbolic(str(idx2))
+    coeffs = _affine_coeffs(e1, sym)
+    return coeffs is not None and coeffs[0] != 0 and sp.simplify(e1 - e2) == 0
+
+
 def _dim_provably_disjoint(idx1, idx2, itersym, step=1, start=0) -> bool:
     """ True iff ``idx1`` at any iteration can never equal ``idx2`` at any
         iteration, for any pair of in-domain iterations and any loop bounds.
@@ -246,6 +269,32 @@ def _read_write_dims_disjoint(read: subsets.Subset, write: subsets.Subset, iters
     return False
 
 
+def _read_write_same_iteration(read: subsets.Subset, write: subsets.Subset, itersym) -> bool:
+    """ True iff some point dimension indexes both ``read`` and ``write`` by the SAME injective
+        affine function of the iteration variable (see :func:`_same_injective_index`).
+
+        Then a read/write collision on that dimension forces the reading and writing iterations to
+        coincide, so the read and write touch the same element only WITHIN one iteration (where the
+        map body preserves program order) and never across iterations. This is the read/write analog
+        of the injective-index rule in :func:`_writes_may_overlap`: it recognizes that iteration
+        ``i`` reads and writes only its own slab (e.g. syrk's ``C[i, :i+1]`` row), so lifting the
+        loop to a DOALL map is safe even though the read and write overlap in-iteration.
+
+        Only ONE such dimension is required: if a collision on dimension ``d`` already forces
+        ``p == q``, no pair of distinct iterations can address the same multidimensional element.
+    """
+    rnd = list(read.ndrange())
+    wnd = list(write.ndrange())
+    if len(rnd) != len(wnd) or len(rnd) == 0:
+        return False
+    for (rb, re_, _), (wb, we_, _) in zip(rnd, wnd):
+        if rb != re_ or wb != we_:  # only point dimensions carry an injective index
+            continue
+        if _same_injective_index(rb, wb, itersym):
+            return True
+    return False
+
+
 def _collision_forces_same_iteration(m1: memlet.Memlet, m2: memlet.Memlet, itersym) -> bool:
     """ Prove that two point-subset writes ``m1``, ``m2`` to the same container can only address
         the same element when their loop iterations coincide.
@@ -326,8 +375,7 @@ def _writes_may_overlap(m1: memlet.Memlet, m2: memlet.Memlet, itersym, step=1, s
         # Both writes index this dim by the same injective function of the iter var: a collision
         # forces the two iterations equal, so they coincide only within one iteration (program
         # order in the map body), never across distinct iterations.
-        coeffs = _affine_coeffs(b1, itersym)
-        if coeffs is not None and coeffs[0] != 0 and sp.simplify(b1 - b2) == 0:
+        if _same_injective_index(b1, b2, itersym):
             return False
         if _dim_provably_disjoint(b1, b2, itersym, step, start):
             return False
@@ -415,6 +463,14 @@ class LoopToMap(xf.MultiStateTransformation):
             if [n for n in loop_state.data_nodes() if isinstance(n.desc(sdfg), dt.StructureView)]:
                 return refuse(f"loop body contains a StructureView in state {loop_state}")
 
+        # A loop that provably runs at most once carries no cross-iteration dependence, so it is
+        # trivially DOALL -- accept here, skipping the dependence analysis below (which a clamped
+        # ``Max``/``Min`` bound would otherwise confound). This maps the single-iteration middle
+        # segment a range split leaves behind (e.g. the ``{x}`` clamp of the s1113 broadcast split),
+        # where the dependence analysis has nothing to prove. The structural guards above still gate.
+        if loop_analysis.loop_provably_at_most_one_iteration(self.loop):
+            return True
+
         # Collect symbol reads and writes from inter-state assignments. The read-before-assigned
         # analysis needs the loop's blocks in topological order, but that (dominator-heavy) sort is
         # only meaningful when the loop body actually has inter-state assignments. A loop whose
@@ -429,6 +485,15 @@ class LoopToMap(xf.MultiStateTransformation):
             in_order_loop_blocks = list(
                 cfg_analysis.blockorder_topological_sort(self.loop, recursive=True, ignore_nonstate_blocks=False))
             for block in in_order_loop_blocks:
+                # A symbol read in the block's own dataflow (e.g. a memlet subset ``b[im]``) is read
+                # before any symbol the block assigns on its out-edges; if the loop later reassigns it,
+                # it is loop-carried. The per-edge ``read_symbols()`` below only sees interstate-edge
+                # reads, so fold in these in-state reads.
+                try:
+                    block_reads = {str(s) for s in block.free_symbols}
+                except Exception:
+                    block_reads = set()
+                used_before_assignment |= (block_reads - symbols_that_may_be_used)
                 for e in block.parent_graph.out_edges(block):
                     # Collect read-before-assigned symbols (states are in order; see
                     # blockorder_topological_sort above).
@@ -442,14 +507,18 @@ class LoopToMap(xf.MultiStateTransformation):
                             fsyms = {str(s) for s in symbolic.pystr_to_symbolic(v).free_symbols}
                         except AttributeError:
                             fsyms = set()
-                        if k in fsyms:
-                            # Self-recurrent assignment (k = f(k), e.g. k = k + inc) is a loop-carried
-                            # recurrence: each iteration reads the previous value, so the loop cannot be
-                            # parallelized -- refuse REGARDLESS of how k is used. Affine induction
-                            # variables are substituted to a closed form upstream, so a self-recurrence
-                            # that survives to here is a genuine carried dependency.
+                        if k in fsyms and k not in symbols_that_may_be_used:
+                            # Self-recurrent assignment (k = f(k), e.g. k = k + inc) whose ``k`` has
+                            # NOT been (re)assigned earlier this iteration is a loop-carried recurrence:
+                            # each iteration reads the previous value, so the loop cannot be
+                            # parallelized. Affine induction variables are substituted to a closed form
+                            # upstream, so a self-recurrence that survives to here is a genuine carried
+                            # dependency. If ``k`` was already assigned earlier in the iteration (e.g.
+                            # reset ``k = 0`` then ``k = k + 1``) it is a loop-local counter, not carried,
+                            # so it is handled by the read-before-assignment check below instead.
                             return refuse(f"self-recurrent carried symbol '{k}' (assignment {k} = {v})")
-                        assigned_symbols.add(k)
+                        if k not in fsyms:
+                            assigned_symbols.add(k)
                     if assigned_symbols & used_before_assignment:
                         return refuse("carried symbol dependency - "
                                       f"{assigned_symbols & used_before_assignment} read before being assigned")
@@ -690,6 +759,14 @@ class LoopToMap(xf.MultiStateTransformation):
             # than the propagate+intersect fallback below, which drops constant
             # disproving dims and ignores the loop stride.
             if _read_write_dims_disjoint(read, write, itersym, step, start):
+                continue
+            # Same-iteration collision: if some point dimension indexes both the read and the write
+            # by the same injective function of the iter var (e.g. syrk's ``C[i, :i+1]`` -- row ``i``
+            # read and written by iteration ``i``), a collision forces the read and write iterations
+            # to coincide. The overlap is then confined to one iteration (program order in the map
+            # body preserves it) and is never a cross-iteration RAW. Mirrors the write/write
+            # injective-index rule in :func:`_writes_may_overlap`.
+            if _read_write_same_iteration(read, write, itersym):
                 continue
             ridx = _dependent_indices(itervar, read)
             widx = _dependent_indices(itervar, write)
