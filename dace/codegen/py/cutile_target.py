@@ -617,27 +617,27 @@ def _build_aot_spec(sdfg: "SDFG", kernel_name: str, deduped_arrays: List[str], o
     escape = "set compiler.cutile.aot_compile=False to disable AOT"
     params: List[_AOTParam] = []
     for name in deduped_arrays:
-        desc = sdfg.arrays.get(name)
-        if isinstance(desc, data.Scalar) and name not in output_arrays:
+        root_name, _, member_path = name.partition(".")
+        desc = sdfg.arrays.get(root_name)
+        for member in member_path.split(".") if member_path else ():
+            desc = desc.members.get(member) if isinstance(desc, data.Structure) else None
+        if isinstance(desc, data.Scalar):
             if _is_device_scalar(desc):
                 params.append(("array", desc.dtype.as_numpy_dtype().name, 1, (1, )))
-            elif desc.dtype.as_numpy_dtype().kind == 'b':
+            elif desc.dtype.as_numpy_dtype().kind == 'b' and name not in output_arrays:
                 params.append(("scalar", "bool", 0, None))
+            elif desc.dtype.as_numpy_dtype().kind == 'b':
+                params.append(("array", "bool", 1, (1, )))
             else:
                 raise CodegenError(f"cuTile AOT: cannot type Scalar parameter {name!r} "
                                    f"(dtype {desc.dtype}) of kernel {kernel_name}; {escape}.")
         elif isinstance(desc, data.Array):
-            strides = []
-            for st in desc.strides:
-                try:
-                    strides.append(int(st))
-                except (TypeError, ValueError):
-                    strides.append(None)  # symbolic stride: no compile-time constant
-            params.append(("array", desc.dtype.as_numpy_dtype().name, len(desc.shape), tuple(strides)))
+            # External arrays are allowed to have any runtime layout. Descriptor strides describe
+            # generated indexing, not the actual cupy view passed to ct.launch.
+            params.append(("array", desc.dtype.as_numpy_dtype().name, len(desc.shape), None))
         else:
             raise CodegenError(f"cuTile AOT: cannot type kernel parameter {name!r} of kernel {kernel_name} "
-                               f"(descriptor {type(desc).__name__}; kernel-written scalars have no AOT "
-                               f"launch convention); {escape}.")
+                               f"(descriptor {type(desc).__name__}); {escape}.")
     for s in free_syms:
         if s in device_syms:
             np_name = device_syms[s]

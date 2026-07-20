@@ -20,7 +20,7 @@ import ast
 import pytest
 
 import dace
-from dace import dtypes
+from dace import data, dtypes
 from dace.codegen.exceptions import CodegenError
 from dace.dtypes import Language, ScheduleType, StorageType
 from dace.memlet import Memlet
@@ -183,6 +183,15 @@ def test_runtime_defined_bool_symbol_dtype_pinned(monkeypatch):
     assert 'cupy.asarray(c_rt,dtype=numpy.bool_).reshape(1)' in code
 
 
+def test_runtime_defined_true_division_pinned_as_float(monkeypatch):
+    """Host true division and the staged kernel argument must both stay floating point."""
+    monkeypatch.setenv(_AOT_ENV, '0')
+    sdfg = _runtime_defined_symbol_sdfg('rt_pin_div', 'N / 2', dace.float64, 'out = inp + c_rt')
+    sdfg.add_symbol('N', dace.int64)
+    code = sdfg.generate_code()[0].code.replace(' ', '').replace('\n', '')
+    assert 'cupy.asarray(c_rt,dtype=numpy.float64).reshape(1)' in code
+
+
 # ---------------------------------------------------------------------------
 # 2: spec registry emission (config on)
 # ---------------------------------------------------------------------------
@@ -200,8 +209,8 @@ def test_registry_schema_and_order(monkeypatch):
     assert kernel_name.startswith('__dace_cutile_aot_schema')
     params = spec['params']
     expected_by_name = {
-        'A': ('array', 'float64', 2, (None, 1)),  # symbolic outer stride M
-        'B': ('array', 'float64', 2, (None, 1)),
+        'A': ('array', 'float64', 2, None),  # runtime-derived layout
+        'B': ('array', 'float64', 2, None),
         's_in': ('array', 'float64', 1, (1, )),  # device-staged input Scalar
         'N': ('array', 'int64', 1, (1, )),  # declared int64 symbol
         'alpha': ('array', 'float64', 1, (1, )),  # declared float64 symbol
@@ -264,9 +273,8 @@ def test_config_off_no_registry_and_identical_code(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_output_scalar_raises_with_aot_on(monkeypatch):
-    """A kernel-written raw Scalar has no AOT launch convention -> raise with
-    the config escape hatch in the message."""
+def test_output_scalar_supported_with_aot_on(monkeypatch):
+    """A kernel-written numeric Scalar uses its one-element device-array convention."""
     monkeypatch.setenv(_AOT_ENV, '1')
     sdfg = dace.SDFG('aot_out_scalar')
     sdfg.backend = dtypes.BackendLanguage.Python
@@ -277,8 +285,8 @@ def test_output_scalar_raises_with_aot_on(monkeypatch):
     state.add_nedge(me, tk, dace.Memlet())
     state.add_memlet_path(tk, mx, state.add_write('s'), src_conn='out', memlet=Memlet('s[0]'))
     sdfg.fill_scope_connectors()
-    with pytest.raises(CodegenError, match='aot_compile'):
-        sdfg.generate_code()
+    specs = _extract_specs(sdfg.generate_code()[0].code)
+    assert any(("array", "float64", 1, (1, )) in spec["params"] for spec in specs.values())
 
 
 def test_build_aot_spec_unit_cases():
@@ -291,21 +299,28 @@ def test_build_aot_spec_unit_cases():
     sdfg.add_array('A', [N, 64], dace.float64, storage=StorageType.GPU_Global)
     sdfg.add_scalar('s', dace.float64, storage=StorageType.GPU_Global)
     sdfg.add_scalar('bs', dace.bool, storage=StorageType.GPU_Global)
+    sdfg.add_datadesc('obj', data.Structure({'field': data.Array(dace.float32, [4])}, name='Obj'))
 
-    # Literal strides are baked; the input Scalar and device symbol become
+    # External array strides are runtime-derived; the input Scalar and device symbol become
     # 1-element arrays; bool scalar/symbol are by-value scalar entries.
     spec = _build_aot_spec(sdfg, 'k', ['A', 's', 'bs'], [], ['N', 'flag'], {'N': 'int64'})
     assert spec == [
-        ('array', 'float64', 2, (64, 1)),
+        ('array', 'float64', 2, None),
         ('array', 'float64', 1, (1, )),
         ('scalar', 'bool', 0, None),
         ('array', 'int64', 1, (1, )),
         ('scalar', 'bool', 0, None),
     ]
 
-    # Kernel-written raw Scalar -> raise.
-    with pytest.raises(CodegenError, match='aot_compile'):
-        _build_aot_spec(sdfg, 'k', ['s'], ['s'], [], {})
+    # Dotted structure members resolve to their actual descriptor.
+    assert _build_aot_spec(sdfg, 'k', ['obj.field'], [], [], {}) == [
+        ('array', 'float32', 1, None),
+    ]
+
+    # Kernel-written numeric Scalars use the same one-element array convention.
+    assert _build_aot_spec(sdfg, 'k', ['s'], ['s'], [], {}) == [
+        ('array', 'float64', 1, (1, )),
+    ]
     # Complex device-staged symbol -> raise.
     with pytest.raises(CodegenError, match='complex'):
         _build_aot_spec(sdfg, 'k', [], [], ['z'], {'z': 'complex128'})

@@ -3,7 +3,7 @@
 
 At DaCe compile time, every generated ``@ct.kernel`` is exported to a cubin via
 ``cuda.tile.compilation.export_kernel`` with explicitly constructed conservative
-signatures (two per kernel: ``index_dtype`` int32 and int64). At launch, a
+signatures. At launch, a
 :class:`PrecompiledKernel` serves the exported cubin through the private
 ``ct.kernel._compile`` hook, so no JIT compilation happens.
 
@@ -19,8 +19,10 @@ cuda-tile and cupy are imported lazily inside functions; importing this module
 never requires them.
 """
 import dataclasses
+import io
 import inspect
 import os
+import tempfile
 import types
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
@@ -41,7 +43,7 @@ _SUPPORTED_VERSION_PREFIX = '1.5.'
 _REQUIRED_COMPILATION_ATTRS = ('export_kernel', 'KernelSignature', 'ArrayConstraint', 'ScalarConstraint',
                                'CallingConvention')
 
-#: Structural key of one kernel parameter: ("array", dtype, ndim, index_dtype) or ("scalar", dtype).
+#: Structural key of one kernel parameter, including assumptions that affect generated addressing.
 ParamKey = Tuple[Any, ...]
 #: Structural key of a full signature: the calling-convention code followed by one ParamKey per parameter.
 StructuralKey = Tuple[Any, ...]
@@ -176,8 +178,10 @@ def _structural_key(signature: Any) -> StructuralKey:
 
     Covers the calling convention (argument packing differs between conventions, e.g.
     ``cutile_python_v1`` and ``cutile_python_v2``) and, per parameter: constraint class, dtype, ndim
-    and index dtype (arrays). Incidental derived constants (alignment, divisibility, stride constants)
-    are deliberately excluded -- they only ever strengthen a signature, never change the ABI.
+    and index dtype, stride constants, and internal aliasing (arrays). Runtime-derived alignment and
+    divisibility are excluded because they only specialize code that is valid for the conservative
+    exported signature. Stride and internal-alias assumptions can change addressing semantics and
+    must match.
 
     :param signature: A ``cuda.tile.compilation.KernelSignature``.
     :returns: Hashable structural key.
@@ -187,7 +191,9 @@ def _structural_key(signature: Any) -> StructuralKey:
     key: List[ParamKey] = []
     for i, param in enumerate(signature.parameters):
         if isinstance(param, compilation.ArrayConstraint):
-            key.append(('array', param.dtype.name, param.ndim, param.index_dtype.name))
+            stride_constant = None if param.stride_constant is None else tuple(param.stride_constant)
+            key.append(('array', param.dtype.name, param.ndim, param.index_dtype.name, stride_constant,
+                        param.may_alias_internally))
         elif isinstance(param, compilation.ScalarConstraint):
             key.append(('scalar', param.dtype.name))
         else:
@@ -196,15 +202,31 @@ def _structural_key(signature: Any) -> StructuralKey:
     return (signature.calling_convention.code, ) + tuple(key)
 
 
-def build_export_plan(spec: Dict[str, Any], func_name: str) -> Tuple[List[Any], Dict[StructuralKey, str]]:
-    """Build the dual-index-dtype signatures and the structural-key-to-symbol map for one kernel.
+def _compatible_key(exported: StructuralKey, runtime: StructuralKey) -> bool:
+    """Return whether a conservative exported signature accepts a runtime-derived signature."""
+    if len(exported) != len(runtime) or exported[0] != runtime[0]:
+        return False
+    for expected, actual in zip(exported[1:], runtime[1:]):
+        if expected[:4] != actual[:4]:
+            return False
+        if expected[0] == 'scalar':
+            continue
+        expected_strides, runtime_strides = expected[4], actual[4]
+        if any(e is not None and e != a for e, a in zip(expected_strides, runtime_strides)):
+            return False
+        if not expected[5] and actual[5]:
+            return False
+    return True
 
-    One conservative ``KernelSignature`` is built per ``index_dtype`` in (int32, int64): shared alias
-    group across all arrays (or no aliasing constraint if there are fewer than two arrays), non-negative
-    strides, no divisibility or alignment assumptions, ``stride_constant`` only as given by the spec.
+
+def build_export_plan(spec: Dict[str, Any], func_name: str) -> Tuple[List[Any], Dict[StructuralKey, str]]:
+    """Build the signature and the structural-key-to-symbol map for one kernel.
+
+    A conservative int32-index ``KernelSignature`` is built with shared alias groups across arrays,
+    non-negative strides, no divisibility or alignment assumptions, and only explicitly safe stride
+    constants. cuda-tile 1.5 always derives int32 indices at the Python launch boundary.
     Symbols are mangled from ``func_name`` so the exported cubin contains exactly these symbols. A
-    kernel without array parameters yields one signature only -- the index dtype then has nothing to
-    apply to, so both variants would be identical.
+    kernel without array parameters also yields one signature.
 
     :param spec: Registry entry, ``{"params": [(kind, dtype_name, ndim, stride_constant), ...]}``.
     :param func_name: Python function name of the kernel (base of the mangled symbols).
@@ -219,7 +241,7 @@ def build_export_plan(spec: Dict[str, Any], func_name: str) -> Tuple[List[Any], 
 
     signatures: List[Any] = []
     symbols: Dict[StructuralKey, str] = {}
-    for index_dtype_name in ('int32', 'int64'):
+    for index_dtype_name in ('int32', ):
         index_dtype = _ct_dtype(index_dtype_name)
         constraints = []
         for i, (kind, dtype_name, ndim, stride_constant) in enumerate(params):
@@ -232,7 +254,7 @@ def build_export_plan(spec: Dict[str, Any], func_name: str) -> Tuple[List[Any], 
                             index_dtype=index_dtype,
                             stride_lower_bound_incl=0,
                             alias_groups=alias_groups,
-                            may_alias_internally=False,
+                            may_alias_internally=True,
                             stride_constant=(tuple(stride_constant) if stride_constant is not None else None)))
                 except CuTileAOTError:
                     raise
@@ -262,7 +284,7 @@ def build_export_plan(spec: Dict[str, Any], func_name: str) -> Tuple[List[Any], 
 
 
 def _export_cubin(dispatcher: Any, signatures: List[Any], path: str, arch: str, kernel_name: str) -> bytes:
-    """Export ``dispatcher`` for ``signatures`` to a cubin file and return its bytes.
+    """Export ``dispatcher`` to memory and atomically publish the cubin.
 
     :param dispatcher: The ``ct.kernel`` to export.
     :param signatures: Signatures (with mangled symbols) to compile.
@@ -270,23 +292,32 @@ def _export_cubin(dispatcher: Any, signatures: List[Any], path: str, arch: str, 
     :param arch: Target architecture, e.g. ``"sm_120"``.
     :param kernel_name: Kernel name for error messages.
     :returns: The cubin bytes.
-    :raises CuTileAOTError: If the export fails, or if the cubin cannot be read back or is empty.
+    :raises CuTileAOTError: If export or atomic publication fails, or if the cubin is empty.
     """
     compilation = _compilation()
+    output = io.BytesIO()
     try:
-        compilation.export_kernel(dispatcher, signatures, path, gpu_code=arch, output_format='cubin')
+        compilation.export_kernel(dispatcher, signatures, output, gpu_code=arch, output_format='cubin')
     except Exception as exc:
         raise CuTileAOTError(f'AOT export failed for kernel "{kernel_name}" (arch {arch}): {exc}. '
                              f'{_DISABLE_HINT}') from exc
-    try:
-        with open(path, 'rb') as f:
-            cubin = f.read()
-    except OSError as exc:
-        raise CuTileAOTError(f'Cannot read back the AOT cubin for kernel "{kernel_name}" from "{path}": '
-                             f'{exc}. {_DISABLE_HINT}') from exc
+    cubin = output.getvalue()
     if not cubin:
-        raise CuTileAOTError(f'The AOT cubin exported for kernel "{kernel_name}" at "{path}" is empty '
-                             f'(a concurrent export may have truncated it). {_DISABLE_HINT}')
+        raise CuTileAOTError(f'The AOT cubin exported for kernel "{kernel_name}" is empty. {_DISABLE_HINT}')
+    tmp_path = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(prefix=f'.{os.path.basename(path)}.', dir=os.path.dirname(path))
+        with os.fdopen(fd, 'wb') as f:
+            f.write(cubin)
+        os.replace(tmp_path, path)
+    except OSError as exc:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+        raise CuTileAOTError(f'Cannot publish the AOT cubin for kernel "{kernel_name}" at "{path}": '
+                             f'{exc}. {_DISABLE_HINT}') from exc
     return cubin
 
 
@@ -330,7 +361,8 @@ def get_precompiled_kernel_class() -> type:
                                      f'this machine or set compiler.cutile.aot_arch accordingly. '
                                      f'{_DISABLE_HINT}')
             key = _structural_key(signature)
-            symbol = entry.symbols.get(key)
+            symbol = next((symbol for exported, symbol in entry.symbols.items() if _compatible_key(exported, key)),
+                          None)
             if symbol is None:
                 raise CuTileAOTError(f'cuTile AOT signature mismatch for kernel "{self._pyfunc.__name__}" '
                                      f'(this indicates a bug in the DaCe AOT signature builder). Derived '
@@ -349,16 +381,19 @@ def _make_precompiled(dispatcher: Any, entry: AOTEntry) -> Any:
     :param entry: The precompiled artifact to serve.
     :returns: The replacement ``PrecompiledKernel``.
     """
-    cls = get_precompiled_kernel_class()
-    kernel = cls(dispatcher._pyfunc, **dataclasses.asdict(dispatcher._compiler_options))
-    kernel._aot_entry = entry
-    return kernel
+    try:
+        dispatcher.__class__ = get_precompiled_kernel_class()
+        dispatcher._aot_entry = entry
+    except Exception as exc:
+        raise CuTileAOTError(f'Cannot rebind kernel "{dispatcher._pyfunc.__name__}" to its AOT artifact: '
+                             f'{exc}. {_DISABLE_HINT}') from exc
+    return dispatcher
 
 
 def precompile_kernels(namespace: Dict[str, Any], sdfg: 'SDFG') -> None:
     """AOT-compile all kernels registered in ``namespace[AOT_SPECS_NAME]`` and rebind them.
 
-    For each kernel: build dual (int32/int64 index) conservative signatures from its spec, export one
+    For each kernel: build a conservative signature from its spec, export one
     cubin to ``<build_folder>/cutile_aot/<kernel>.cubin`` (overwriting), and replace the dispatcher in
     ``namespace`` with a :class:`PrecompiledKernel` serving the cubin. All failures raise.
 
@@ -374,7 +409,11 @@ def precompile_kernels(namespace: Dict[str, Any], sdfg: 'SDFG') -> None:
     arch = resolve_arch()
 
     out_dir = os.path.join(sdfg.build_folder, 'cutile_aot')
-    os.makedirs(out_dir, exist_ok=True)
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+    except OSError as exc:
+        raise CuTileAOTError(f'Cannot create the cuTile AOT output directory "{out_dir}": {exc}. '
+                             f'{_DISABLE_HINT}') from exc
     for kernel_name, spec in specs.items():
         dispatcher = namespace.get(kernel_name)
         if not isinstance(dispatcher, ct.kernel):

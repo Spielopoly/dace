@@ -38,10 +38,10 @@ SPEC = {
 
 class TestBuildExportPlan:
 
-    def test_dual_signatures(self):
+    def test_single_int32_signature(self):
         signatures, symbols = build_export_plan(SPEC, 'my_kernel')
-        assert len(signatures) == 2
-        assert len(symbols) == 2
+        assert len(signatures) == 1
+        assert len(symbols) == 1
         index_dtypes = set()
         for sig in signatures:
             assert isinstance(sig, compilation.KernelSignature)
@@ -57,7 +57,7 @@ class TestBuildExportPlan:
             assert scal.dtype is ct.bool_
             assert arr2d.index_dtype is arr1d.index_dtype
             index_dtypes.add(arr2d.index_dtype)
-        assert index_dtypes == {ct.int32, ct.int64}
+        assert index_dtypes == {ct.int32}
 
     def test_conservative_constraints(self):
         signatures, _ = build_export_plan(SPEC, 'my_kernel')
@@ -74,7 +74,7 @@ class TestBuildExportPlan:
                 assert all(d == 1 for d in param.shape_divisible_by)
                 assert param.base_addr_divisible_by == 1
                 assert all(s is None for s in param.shape_constant)
-                assert param.may_alias_internally is False
+                assert param.may_alias_internally is True
 
     def test_shared_alias_group(self):
         signatures, _ = build_export_plan(SPEC, 'my_kernel')
@@ -92,7 +92,7 @@ class TestBuildExportPlan:
 
     def test_symbols_mangled_and_keyed(self):
         signatures, symbols = build_export_plan(SPEC, 'my_kernel')
-        assert len(set(symbols.values())) == 2  # distinct symbol per index dtype
+        assert len(set(symbols.values())) == 1
         for sig in signatures:
             assert sig.symbol is not None and sig.symbol.startswith('my_kernel')
             assert symbols[cutile_aot._structural_key(sig)] == sig.symbol
@@ -117,7 +117,7 @@ class TestBuildExportPlan:
 
     def test_bad_stride_constant_raises(self):
         spec = {'params': [('array', 'float64', 2, (1, ))]}  # length mismatch with ndim
-        with pytest.raises(CuTileAOTError, match='k'):
+        with pytest.raises(CuTileAOTError, match='kernel "k"'):
             build_export_plan(spec, 'k')
 
 
@@ -134,12 +134,11 @@ class TestStructuralKey:
         for a, b in zip(sigs_a, sigs_b):
             assert cutile_aot._structural_key(a) == cutile_aot._structural_key(b)
 
-    def test_index_dtype_distinguishes(self):
-        (sig32, sig64), symbols = build_export_plan(SPEC, 'k')
-        key32 = cutile_aot._structural_key(sig32)
-        key64 = cutile_aot._structural_key(sig64)
-        assert key32 != key64
-        assert key32 in symbols and key64 in symbols
+    def test_index_dtype_is_int32(self):
+        (signature, ), symbols = build_export_plan(SPEC, 'k')
+        key = cutile_aot._structural_key(signature)
+        assert signature.parameters[0].index_dtype is ct.int32
+        assert key in symbols
 
     def test_dtype_and_ndim_distinguish(self):
         base = {'params': [('array', 'float64', 2, None), ('array', 'float64', 2, None)]}
@@ -155,9 +154,8 @@ class TestStructuralKey:
         key_a = cutile_aot._structural_key(build_export_plan(as_array, 'k')[0][0])
         assert key_s != key_a
 
-    def test_ignores_incidental_constraints(self):
-        # Alignment/divisibility/stride constants may differ between the conservative export
-        # signature and the runtime-derived one; the key must not depend on them.
+    def test_conservative_key_accepts_runtime_specialization(self):
+        # Runtime stride and alignment specialization must be accepted by a conservative export.
         cc = compilation.CallingConvention.cutile_python_v1()
         conservative = compilation.ArrayConstraint(ct.float64,
                                                    1,
@@ -176,7 +174,8 @@ class TestStructuralKey:
                                                   base_addr_divisible_by=16)
         key_c = cutile_aot._structural_key(compilation.KernelSignature([conservative], cc))
         key_s = cutile_aot._structural_key(compilation.KernelSignature([specialized], cc))
-        assert key_c == key_s
+        assert key_c != key_s
+        assert cutile_aot._compatible_key(key_c, key_s)
 
     def test_unsupported_constraint_raises(self):
         cc = compilation.CallingConvention.cutile_python_v1()
@@ -243,6 +242,14 @@ class TestVersionGate:
 # =============================================================================
 
 
+def test_compile_version_failure_has_no_jit_fallback(monkeypatch):
+    """The compiled-SDFG integration must propagate AOT prerequisite failures."""
+    monkeypatch.setattr(ct, "__version__", "1.4.0")
+    sdfg = _lower(_vadd, "aot_version_failure", (32, ))
+    with pytest.raises(CuTileAOTError, match="1.5"):
+        sdfg.compile()
+
+
 class TestResolveArch:
 
     def test_config_override(self):
@@ -272,15 +279,28 @@ class TestResolveArch:
                 resolve_arch()
 
 
-class TestExportCubinReadBack:
-    """Every AOT failure must surface as CuTileAOTError, including the cubin read-back."""
+class TestExportCubin:
+    """Every export and atomic-publication failure must surface as CuTileAOTError."""
 
-    def test_unreadable_cubin_raises(self, monkeypatch, tmp_path):
-        monkeypatch.setattr(compilation, 'export_kernel', lambda *a, **kw: None)  # writes nothing
+    def test_export_failure_raises(self, monkeypatch, tmp_path):
+
+        def fail(*args, **kwargs):
+            raise RuntimeError("export broke")
+
+        monkeypatch.setattr(compilation, 'export_kernel', fail)
+        with pytest.raises(CuTileAOTError, match='AOT export failed') as excinfo:
+            cutile_aot._export_cubin(None, [], str(tmp_path / 'k.cubin'), 'sm_120', 'my_kernel')
+        assert 'aot_compile=False' in str(excinfo.value)
+
+    def test_publish_failure_raises(self, monkeypatch, tmp_path):
+
+        def write_bytes(kernel, signatures, output, **kwargs):
+            output.write(b"cubin")
+
+        monkeypatch.setattr(compilation, 'export_kernel', write_bytes)
         missing = str(tmp_path / 'nope' / 'k.cubin')
-        with pytest.raises(CuTileAOTError, match='Cannot read back') as excinfo:
+        with pytest.raises(CuTileAOTError, match='Cannot publish') as excinfo:
             cutile_aot._export_cubin(None, [], missing, 'sm_120', 'my_kernel')
-        assert 'my_kernel' in str(excinfo.value)
         assert 'aot_compile=False' in str(excinfo.value)
 
     def test_empty_cubin_raises(self, monkeypatch, tmp_path):
@@ -290,6 +310,35 @@ class TestExportCubinReadBack:
         with pytest.raises(CuTileAOTError, match='is empty') as excinfo:
             cutile_aot._export_cubin(None, [], str(path), 'sm_120', 'my_kernel')
         assert 'my_kernel' in str(excinfo.value)
+
+
+class TestFailureContracts:
+
+    def test_output_directory_failure_is_wrapped(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(cutile_aot, "check_prerequisites", lambda: None)
+        monkeypatch.setattr(cutile_aot, "resolve_arch", lambda: "sm_120")
+
+        def fail_makedirs(*args, **kwargs):
+            raise OSError("read only")
+
+        monkeypatch.setattr(os, "makedirs", fail_makedirs)
+        sdfg = type("FakeSDFG", (), {"build_folder": str(tmp_path)})()
+        namespace = {cutile_aot.AOT_SPECS_NAME: {"k": {"params": []}}}
+        with pytest.raises(CuTileAOTError, match="output directory") as excinfo:
+            cutile_aot.precompile_kernels(namespace, sdfg)
+        assert "aot_compile=False" in str(excinfo.value)
+
+    def test_arch_mismatch_raises(self, monkeypatch):
+
+        @ct.kernel
+        def kernel_for_arch_test(x):
+            pass
+
+        entry = cutile_aot.AOTEntry(cubin=b"x", arch="sm_99", symbols={})
+        kernel = cutile_aot._make_precompiled(kernel_for_arch_test, entry)
+        monkeypatch.setattr(cutile_aot, "_current_arch", lambda: "sm_120")
+        with pytest.raises(CuTileAOTError, match="exported for sm_99"):
+            kernel._compile(None, None)
 
 
 class TestConfigDefaults:
@@ -318,6 +367,11 @@ def _vadd(x: dace.float64[N], y: dace.float64[N], z: dace.float64[N]):
 @dace.program
 def _scale_add_2d(A: dace.float64[M, N], B: dace.float64[M, N]):
     B[:] = A * 2.0 + B
+
+
+@dace.program
+def _vadd_f32(x: dace.float32[N], y: dace.float32[N], z: dace.float32[N]):
+    z[:] = x + y
 
 
 @dace.program
@@ -516,6 +570,52 @@ def test_aot_multi_kernel_sdfg(jit_compiles):
     np.testing.assert_allclose(cp.asnumpy(y), x_h * 2.0, rtol=1e-14)
     np.testing.assert_allclose(cp.asnumpy(z), z_h + 1.0, rtol=1e-14)
     assert jit_compiles == []
+
+
+@pytest.mark.gpu
+def test_aot_strided_views(jit_compiles):
+    """Non-unit runtime strides remain correct under AOT."""
+    import cupy as cp
+    sdfg = _lower(_vadd, "aot_it_strided", (32, ))
+    csdfg = sdfg.compile()
+    n = 64
+    x_base = cp.arange(n * 2, dtype=cp.float64)
+    y_base = cp.arange(n * 2, dtype=cp.float64) * 3
+    z_base = cp.zeros(n * 2, dtype=cp.float64)
+    csdfg(x=x_base[::2], y=y_base[::2], z=z_base[::2], N=n)
+    cp.testing.assert_array_equal(z_base[::2], x_base[::2] + y_base[::2])
+    assert jit_compiles == []
+
+
+@pytest.mark.gpu
+def test_aot_float32_launch(jit_compiles):
+    """Float32 launches from the exported cubin."""
+    import cupy as cp
+    sdfg = _lower(_vadd_f32, "aot_it_f32", (32, ))
+    csdfg = sdfg.compile()
+    n = 70
+    x = cp.arange(n, dtype=cp.float32)
+    y = cp.arange(n, dtype=cp.float32) * cp.float32(0.25)
+    z = cp.zeros(n, dtype=cp.float32)
+    csdfg(x=x, y=y, z=z, N=n)
+    cp.testing.assert_array_equal(z, x + y)
+    assert jit_compiles == []
+
+
+@pytest.mark.gpu
+def test_aot_and_jit_outputs_are_identical():
+    """AOT and JIT produce bit-identical output for identical inputs."""
+    import cupy as cp
+    n = 70
+    rng = np.random.default_rng(9)
+    x = cp.asarray(rng.random(n))
+    y = cp.asarray(rng.random(n))
+    aot_out = cp.zeros(n)
+    jit_out = cp.zeros(n)
+    _lower(_vadd, "aot_bit_equal", (32, )).compile()(x=x, y=y, z=aot_out, N=n)
+    with set_temporary("compiler", "cutile", "aot_compile", value=False):
+        _lower(_vadd, "jit_bit_equal", (32, )).compile()(x=x, y=y, z=jit_out, N=n)
+    cp.testing.assert_array_equal(aot_out, jit_out)
 
 
 @pytest.mark.gpu
