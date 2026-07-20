@@ -1073,6 +1073,33 @@ required:
                         default: gpu_streams,gpu_stream
 
             #############################################
+            # cuTile (Python backend) compiler
+            cutile:
+                type: dict
+                title: cuTile
+                description: cuTile (Python backend) compiler preferences
+                required:
+                    aot_compile:
+                        type: bool
+                        default: true
+                        title: Ahead-of-time kernel compilation
+                        description: >
+                            If enabled (default), every generated cuTile kernel is exported
+                            to a cubin at SDFG compile time and served at launch without JIT
+                            compilation. Requires cuda-tile 1.5.x and a known GPU architecture
+                            (see aot_arch); any AOT failure raises CuTileAOTError instead of
+                            silently falling back to JIT. Disable for the pure JIT path.
+
+                    aot_arch:
+                        type: str
+                        default: ''
+                        title: Target GPU architecture for AOT export
+                        description: >
+                            GPU architecture to compile cuTile kernels for, e.g. "sm_120".
+                            If empty (default), the architecture is auto-detected from the
+                            current GPU; compiling without a GPU then raises.
+
+            #############################################
             # MPI compiler
             mpi:
                 type: dict

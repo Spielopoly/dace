@@ -14,7 +14,9 @@ import sympy as sp
 
 from dace import data, dtypes, registry, subsets
 import dace.codegen.dispatcher as dispatcher_mod
+from dace.codegen.exceptions import CodegenError
 from dace.codegen.py import control_flow as py_cflow
+from dace.config import Config
 from dace.codegen.py.framecode import codeblock_to_python
 from dace.codegen.py.prettycode import PythonCodeIOStream
 from dace.codegen.py.target import PythonTargetCodeGenerator
@@ -571,6 +573,86 @@ def _is_cutile_node(state: "SDFGState", node: nodes.Node) -> bool:
     return _enclosing_cutile_entry(state, node) is not None
 
 
+#: One AOT spec parameter: (kind, numpy dtype name, ndim, per-dim stride constants or None).
+#: This tuple layout is the frozen interface to ``cutile_aot.build_export_plan``.
+_AOTParam = Tuple[str, str, int, Optional[Tuple[Optional[int], ...]]]
+
+
+def _cutile_aot_enabled() -> bool:
+    """Whether the cuTile AOT spec registry is emitted into generated code.
+
+    :returns: The ``compiler.cutile.aot_compile`` config value (default on).
+    """
+    return Config.get_bool('compiler', 'cutile', 'aot_compile')
+
+
+def _np_dtype_attr(np_name: str) -> str:
+    """Spell a numpy dtype name as a ``numpy`` module attribute.
+
+    :param np_name: A numpy dtype name (e.g. ``"float64"``, ``"bool"``).
+    :returns: The attribute name (``"bool"`` becomes ``"bool_"``, which
+        exists on every supported numpy version).
+    """
+    return 'bool_' if np_name == 'bool' else np_name
+
+
+def _build_aot_spec(sdfg: "SDFG", kernel_name: str, deduped_arrays: List[str], output_arrays: List[str],
+                    free_syms: List[str], device_syms: Dict[str, str]) -> List[_AOTParam]:
+    """Build the AOT signature spec for one kernel, in exact launch-arg order.
+
+    Each entry is ``(kind, dtype name, ndim, stride_constant)`` mirroring what
+    the launch site passes: arrays raw, device-staged scalars/symbols as
+    1-element device arrays, bool scalars/symbols by value.
+
+    :param sdfg: The SDFG containing the descriptors.
+    :param kernel_name: The kernel name (for error messages).
+    :param deduped_arrays: Deduplicated input+output data names (launch order).
+    :param output_arrays: Kernel-written data names.
+    :param free_syms: Free symbol names (launch order after the arrays).
+    :param device_syms: Symbol name -> pinned numpy dtype name for
+        device-staged symbols.
+    :returns: The per-parameter spec list.
+    :raises CodegenError: If a parameter cannot be AOT-typed.
+    """
+    escape = "set compiler.cutile.aot_compile=False to disable AOT"
+    params: List[_AOTParam] = []
+    for name in deduped_arrays:
+        desc = sdfg.arrays.get(name)
+        if isinstance(desc, data.Scalar) and name not in output_arrays:
+            if _is_device_scalar(desc):
+                params.append(("array", desc.dtype.as_numpy_dtype().name, 1, (1, )))
+            elif desc.dtype.as_numpy_dtype().kind == 'b':
+                params.append(("scalar", "bool", 0, None))
+            else:
+                raise CodegenError(f"cuTile AOT: cannot type Scalar parameter {name!r} "
+                                   f"(dtype {desc.dtype}) of kernel {kernel_name}; {escape}.")
+        elif isinstance(desc, data.Array):
+            strides = []
+            for st in desc.strides:
+                try:
+                    strides.append(int(st))
+                except (TypeError, ValueError):
+                    strides.append(None)  # symbolic stride: no compile-time constant
+            params.append(("array", desc.dtype.as_numpy_dtype().name, len(desc.shape), tuple(strides)))
+        else:
+            raise CodegenError(f"cuTile AOT: cannot type kernel parameter {name!r} of kernel {kernel_name} "
+                               f"(descriptor {type(desc).__name__}; kernel-written scalars have no AOT "
+                               f"launch convention); {escape}.")
+    for s in free_syms:
+        if s in device_syms:
+            np_name = device_syms[s]
+            if np_name.startswith('complex'):
+                raise CodegenError(f"cuTile AOT: cannot type complex symbol {s!r} of kernel {kernel_name}; "
+                                   f"{escape}.")
+            params.append(("array", np_name, 1, (1, )))
+        elif s in sdfg.symbols and sdfg.symbols[s].as_numpy_dtype().kind == 'b':
+            params.append(("scalar", "bool", 0, None))
+        else:
+            raise CodegenError(f"cuTile AOT: cannot type symbol parameter {s!r} of kernel {kernel_name}; "
+                               f"{escape}.")
+    return params
+
+
 # ---------------------------------------------------------------------------
 # Code generator class
 # ---------------------------------------------------------------------------
@@ -594,6 +676,11 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
         self._dispatcher = frame_codegen.dispatcher
         #: Tracks already-generated nested functions by position key to avoid duplicates.
         self._generated_nested_functions: Dict[str, str] = {}
+        #: Whether the AOT spec registry initializer was already emitted.
+        self._aot_registry_emitted = False
+        #: Read once per code generator, so a config flip mid-codegen cannot
+        #: produce registry entries without their initializer (or vice versa).
+        self._aot_enabled = _cutile_aot_enabled()
         # Register as the handler for CuTile map scopes.
         self._dispatcher.register_map_dispatcher(dtypes.ScheduleType.CuTile, self)
         # Register as node handler for all nodes inside CuTile scopes.
@@ -2123,6 +2210,9 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
         :raises ValueError: If the scope source is not a MapEntry.
         :raises NotImplementedError: If a Scalar is both a kernel input and a
             kernel output, or a complex Scalar is a kernel argument.
+        :raises CodegenError: If a runtime-defined symbol has no inferred
+            dtype, or (with AOT enabled) a kernel parameter cannot be typed
+            for the AOT signature spec.
         """
         entry = dfg_scope.source_nodes()[0]
         if not isinstance(entry, nodes.MapEntry):
@@ -2163,21 +2253,39 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
         # downstream use: binop broadcasting, tile indices, range() bounds,
         # and branch conditions all accept 0-d tiles). Grid-dimension
         # computations at the call site keep the raw host values.
-        # Maps sym name -> declared numpy dtype name, or None for a
-        # runtime-defined name (loop induction variable / interstate-
-        # assignment key, absent from ``sdfg.symbols``): those are staged with
-        # the runtime value's own dtype (``cupy.asarray`` types a Python float
-        # float64 and an int int64 -- exact; a bool becomes a 0-d bool tile,
-        # probe-verified as a branch condition). Declared bool symbols stay by
-        # value (typed exactly at the launch boundary).
-        device_syms: Dict[str, Optional[str]] = {}
+        # Maps sym name -> pinned numpy dtype name. Declared symbols use the
+        # declared dtype; runtime-defined names (loop induction variables /
+        # interstate-assignment keys, absent from ``sdfg.symbols``) use the
+        # frame's inferred dtype — the launch-arg dtype is a compile-time
+        # constant either way (deterministic for JIT and AOT alike, matching
+        # C++-backend symbol typing). Declared bool symbols stay by value
+        # (typed exactly at the launch boundary); a runtime-defined bool rides
+        # the device path as before, now with its inferred dtype.
+        device_syms: Dict[str, str] = {}
         for s in free_syms:
             if s in sdfg.symbols:
                 np_dtype = sdfg.symbols[s].as_numpy_dtype()
                 if np_dtype.kind in 'fiu':
                     device_syms[s] = np_dtype.name
             else:
-                device_syms[s] = None
+                inferred = self._frame.inferred_symbol_types.get(s)
+                if inferred is None:
+                    # Defense in depth: framecode already raises TypeError when
+                    # interstate type inference fails.
+                    raise CodegenError(f"cuTile codegen: no inferred dtype for runtime-defined "
+                                       f"symbol {s!r} (map {entry.map.label!r})")
+                inferred_np = inferred.as_numpy_dtype()
+                if inferred_np.kind == 'u':
+                    # The generated host code holds runtime-defined values as
+                    # Python ints (signed). An unsigned pin (e.g. a large
+                    # positive interstate literal inferring uint64) would make
+                    # the kernel mix signed and unsigned ints, which cuda.tile
+                    # refuses to promote implicitly ("Implicit promotion of
+                    # int64 and uint64 is not supported"). Same-width signed
+                    # staging is bit-exact for all values < 2**63.
+                    device_syms[s] = inferred_np.name.replace('uint', 'int')
+                else:
+                    device_syms[s] = inferred_np.name
 
         kernel_name = (f"__dace_cutile_{sdfg.name}_{cfg.cfg_id}_"
                        f"{state.block_id}_{state.node_id(entry)}")
@@ -2225,15 +2333,24 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
         launch_args = [self._launch_arg_expr(sdfg, n, is_output=n in output_arrays) for n in deduped_arrays]
         for s in free_syms:
             if s in device_syms:
-                # Numeric symbols travel through device memory (see above):
-                # declared symbols preserve the declared dtype, runtime-defined
-                # names use the runtime value's own dtype.
-                np_name = device_syms[s]
-                dtype_arg = f", dtype=numpy.{np_name}" if np_name is not None else ""
-                launch_args.append(f"cupy.asarray({s}{dtype_arg}).reshape(1)")
+                # Numeric symbols travel through device memory (see above)
+                # with a codegen-pinned dtype: the declared dtype for declared
+                # symbols, the frame-inferred one for runtime-defined names.
+                launch_args.append(f"cupy.asarray({s}, dtype=numpy.{_np_dtype_attr(device_syms[s])}).reshape(1)")
             else:
                 launch_args.append(s)
         args_tuple = (f"({', '.join(launch_args)},)" if len(launch_args) == 1 else f"({', '.join(launch_args)})")
+
+        # AOT spec registry: one module-level dict mapping kernel name -> the
+        # per-launch-arg signature spec, consumed by cutile_aot at compile
+        # time. Config off => nothing emitted (pure JIT).
+        if self._aot_enabled:
+            spec = _build_aot_spec(sdfg, kernel_name, deduped_arrays, output_arrays, free_syms, device_syms)
+            if not self._aot_registry_emitted:
+                function_stream.write("__dace_cutile_aot_specs = {}")
+                self._aot_registry_emitted = True
+            function_stream.write(f"__dace_cutile_aot_specs[{kernel_name!r}] = {{'params': {spec!r}}}")
+
         instrumented = (entry.map.instrument != dtypes.InstrumentationType.No_Instrumentation)
 
         # Instrumentation: kernel-scope begin (before launch)

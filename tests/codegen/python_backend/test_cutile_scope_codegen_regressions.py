@@ -15,8 +15,9 @@ Covers the code-review findings on the scope generator:
    the cuda.tile frontend (and by-value ints int32); numeric symbols must
    ride the same device-memory path as numeric Scalars (1-element device
    array + 0-d tile load). Runtime-defined names (interstate-assigned, absent
-   from ``sdfg.symbols``) ride it too, staged with the runtime value's own
-   dtype (``cupy.asarray(s).reshape(1)``, no ``dtype=``).
+   from ``sdfg.symbols``) ride it too, staged with the frame-inferred dtype
+   pinned at codegen time (``cupy.asarray(s, dtype=numpy.<name>).reshape(1)``)
+   so launch-arg dtypes are deterministic for JIT and AOT alike.
 4. **Launch guard**: non-positive grid dims (zero- or negative-trip maps) skip
    the launch (``min((...)) > 0``), not just zero dims.
 """
@@ -271,13 +272,13 @@ def _runtime_defined_symbol_sdfg(name: str,
     return sdfg
 
 
-def test_runtime_defined_symbol_staged_without_dtype():
+def test_runtime_defined_symbol_staged_with_pinned_dtype():
     """A runtime-defined name has no declared dtype: it is staged with the
-    runtime value's own dtype (bare ``cupy.asarray``) and rebound as a 0-d
-    tile at kernel entry, not passed by value."""
+    frame-inferred dtype pinned at codegen time and rebound as a 0-d tile at
+    kernel entry, not passed by value."""
     sdfg = _runtime_defined_symbol_sdfg('rt_sym_structural', '1.0 + 2.0**(-40)', dace.float64, '*')
     code = sdfg.generate_code()[0].code.replace(' ', '')
-    assert 'cupy.asarray(c_rt).reshape(1)' in code
+    assert 'cupy.asarray(c_rt,dtype=numpy.float64).reshape(1)' in code
     assert 'c_rt=ct.load(c_rt,(0,),shape=()).item()' in code
 
 
@@ -314,8 +315,6 @@ def test_runtime_defined_int_symbol_large_value_runtime():
 # ---------------------------------------------------------------------------
 # 5: py_mod / int_floor in rendered element-index expressions
 # ---------------------------------------------------------------------------
-
-
 
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])

@@ -202,6 +202,12 @@ class DaCePythonCodeGenerator(object):
         self.where_allocated: Dict[Tuple[SDFG, str], SDFG] = {}
         self.fsyms: Dict[int, Set[str]] = {}
         self._symbols_and_constants: Dict[int, Set[str]] = {}
+        #: Inferred dtypes for declared, loop, and interstate-assigned symbols
+        #: (filled in generate_code before states are generated; read by
+        #: targets that need compile-time launch-arg dtypes, e.g. cuTile).
+        #: Nested SDFGs share this frame instance and only add names, so an
+        #: outer entry is never replaced by a colliding nested one.
+        self.inferred_symbol_types: Dict[str, dtypes.typeclass] = {}
         self._runtime_defined_names = _collect_runtime_defined_names(sdfg)
         nested_runtime_defined_names = _collect_nested_runtime_defined_names(sdfg)
         nested_only_runtime_names = {name for name in nested_runtime_defined_names if name not in sdfg.symbols}
@@ -950,6 +956,18 @@ class DaCePythonCodeGenerator(object):
                 }
                 interstate_symbols.update(symbols)
                 global_symbols.update(symbols)
+
+        # Expose the inference result (declared + loop + interstate symbol names)
+        # so targets can pin launch-arg dtypes at codegen time. Array names are
+        # dropped -- they are only in global_symbols to type expressions -- as are
+        # names whose inference failed (None). Existing entries are never
+        # overwritten: nested SDFGs reuse this frame instance, and a nested name
+        # colliding with an outer symbol must not repoint the outer dtype.
+        self.inferred_symbol_types.update({
+            k: v
+            for k, v in global_symbols.items()
+            if v is not None and k not in sdfg.arrays and k not in self.inferred_symbol_types
+        })
 
         # In Python, variables don't need explicit declaration — they are
         # created on first assignment.  We still record them so that
