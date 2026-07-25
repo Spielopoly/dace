@@ -4,12 +4,11 @@ import collections
 import copy
 from typing import Any, DefaultDict, Dict, List, Optional, Set, Tuple, Union
 
-import numpy as np
-
 import dace
 from dace import data, dtypes
 from dace.cli import progress
 from dace.codegen.py import control_flow as py_cflow
+from dace.codegen.py import utils as pyutils
 from dace.codegen import dispatcher as disp
 from dace.codegen.py.prettycode import PythonCodeIOStream
 from dace.codegen.target import TargetCodeGenerator
@@ -124,6 +123,100 @@ def _extract_python_defined_names(source: str) -> Set[str]:
     return _collect_defined_names(module.body)
 
 
+class _PythonScopeBindingVisitor(ast.NodeVisitor):
+    """Collect names bound in one Python lexical scope."""
+
+    def __init__(self) -> None:
+        self.bound: Set[str] = set()
+        self.globals: Set[str] = set()
+
+    def visit_Name(self, node: ast.Name) -> None:
+        if isinstance(node.ctx, (ast.Store, ast.Del)):
+            self.bound.add(node.id)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self.bound.add(node.name)
+        for decorator in node.decorator_list:
+            self.visit(decorator)
+        for default in (*node.args.defaults, *node.args.kw_defaults):
+            if default is not None:
+                self.visit(default)
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        self.bound.add(node.name)
+        for expression in (*node.decorator_list, *node.bases):
+            self.visit(expression)
+        for keyword in node.keywords:
+            self.visit(keyword.value)
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        for default in (*node.args.defaults, *node.args.kw_defaults):
+            if default is not None:
+                self.visit(default)
+
+    def visit_Import(self, node: ast.Import) -> None:
+        self.bound.update(alias.asname or alias.name.split(".")[0] for alias in node.names)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        self.bound.update(alias.asname or alias.name for alias in node.names)
+
+    def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:
+        if node.name is not None:
+            self.bound.add(node.name)
+        for statement in node.body:
+            self.visit(statement)
+
+    def visit_Global(self, node: ast.Global) -> None:
+        self.globals.update(node.names)
+
+    def visit_MatchAs(self, node: ast.MatchAs) -> None:
+        if node.name is not None:
+            self.bound.add(node.name)
+        if node.pattern is not None:
+            self.visit(node.pattern)
+
+    def visit_MatchStar(self, node: ast.MatchStar) -> None:
+        if node.name is not None:
+            self.bound.add(node.name)
+
+    def visit_MatchMapping(self, node: ast.MatchMapping) -> None:
+        if node.rest is not None:
+            self.bound.add(node.rest)
+        for pattern in node.patterns:
+            self.visit(pattern)
+
+    def _visit_comprehension(self, node: Union[ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp]) -> None:
+        for generator in node.generators:
+            self.visit(generator.iter)
+            for condition in generator.ifs:
+                self.visit(condition)
+        if isinstance(node, ast.DictComp):
+            self.visit(node.key)
+            self.visit(node.value)
+        else:
+            self.visit(node.elt)
+
+    visit_ListComp = _visit_comprehension
+    visit_SetComp = _visit_comprehension
+    visit_GeneratorExp = _visit_comprehension
+    visit_DictComp = _visit_comprehension
+
+
+def _python_scope_bindings(source: str) -> Tuple[Set[str], Set[str]]:
+    """Return names bound and declared global in the current lexical scope."""
+    if not source.strip():
+        return set(), set()
+    try:
+        module = ast.parse(source)
+    except SyntaxError:
+        return set(), set()
+    visitor = _PythonScopeBindingVisitor()
+    visitor.visit(module)
+    return visitor.bound, visitor.globals
+
+
 def _extract_python_used_names(source: str) -> Set[str]:
     if not source.strip():
         return set()
@@ -143,6 +236,44 @@ def _codeblock_defined_names(code_block: CodeBlock) -> Set[str]:
         return set()
 
 
+def _definite_plain_codeblock_stores(code_block: Optional[CodeBlock]) -> Set[str]:
+    """Return unconditional plain-name stores in one emitted CodeBlock."""
+    if code_block is None or code_block.language != dtypes.Language.Python:
+        return set()
+    try:
+        module = ast.parse(codeblock_to_python(code_block))
+    except (SyntaxError, ValueError):
+        return set()
+
+    excluded: Set[str] = set()
+    for node in ast.walk(module):
+        if isinstance(node, (ast.Global, ast.Nonlocal)):
+            excluded.update(node.names)
+
+    result: Set[str] = set()
+    for statement in module.body:
+        if isinstance(statement, ast.Assign):
+            if all(isinstance(target, ast.Name) for target in statement.targets):
+                result.update(target.id for target in statement.targets)
+        elif isinstance(statement, ast.AnnAssign) and statement.value is not None and isinstance(
+                statement.target, ast.Name):
+            result.add(statement.target.id)
+    return result - excluded
+
+
+def _collect_emitted_loop_local_names(sdfg: SDFG) -> Set[str]:
+    """Return lexical locals stored by emitted C-style LoopRegions."""
+    names: Set[str] = set()
+    for region in sdfg.all_control_flow_regions():
+        if not isinstance(region, LoopRegion):
+            continue
+        if not (region.init_statement and region.update_statement and region.loop_variable):
+            continue
+        names |= _definite_plain_codeblock_stores(region.init_statement)
+        names |= _definite_plain_codeblock_stores(region.update_statement)
+    return names
+
+
 def _iter_runtime_codeblocks(sdfg: SDFG, attr_name: str):
     codeblocks = getattr(sdfg, attr_name)
     for key in (None, 'python', 'frame'):
@@ -160,7 +291,7 @@ def _runtime_sources_for_sdfg(sdfg: SDFG, attr_name: str) -> List[str]:
 
 
 def _collect_runtime_defined_names(sdfg: SDFG) -> Set[str]:
-    names: Set[str] = set()
+    names = _collect_emitted_loop_local_names(sdfg)
     for attr in ('global_code', 'init_code'):
         for codeblock in _iter_runtime_codeblocks(sdfg, attr):
             names |= _codeblock_defined_names(codeblock)
@@ -202,17 +333,13 @@ class DaCePythonCodeGenerator(object):
         self.where_allocated: Dict[Tuple[SDFG, str], SDFG] = {}
         self.fsyms: Dict[int, Set[str]] = {}
         self._symbols_and_constants: Dict[int, Set[str]] = {}
-        #: Inferred dtypes for declared, loop, and interstate-assigned symbols
-        #: (filled in generate_code before states are generated; read by
-        #: targets that need compile-time launch-arg dtypes, e.g. cuTile).
-        #: Nested SDFGs share this frame instance and only add names, so an
-        #: outer entry is never replaced by a colliding nested one.
-        self.inferred_symbol_types: Dict[str, dtypes.typeclass] = {}
+        self._routed_successful_exits: Set[int] = set()
         self._runtime_defined_names = _collect_runtime_defined_names(sdfg)
         nested_runtime_defined_names = _collect_nested_runtime_defined_names(sdfg)
         nested_only_runtime_names = {name for name in nested_runtime_defined_names if name not in sdfg.symbols}
         runtime_symbol_names = {name for name in _collect_runtime_used_names(sdfg) if name in sdfg.symbols}
-        fsyms = (self.free_symbols(sdfg) | runtime_symbol_names) - self._runtime_defined_names - nested_only_runtime_names
+        fsyms = (self.free_symbols(sdfg)
+                 | runtime_symbol_names) - self._runtime_defined_names - nested_only_runtime_names
         self.arglist = sdfg.arglist(scalars_only=False, free_symbols=fsyms)
 
         # resolve all symbols and constants
@@ -282,7 +409,9 @@ class DaCePythonCodeGenerator(object):
                     const_str = f"{cstname} = numpy.array({cstval.tolist()!r}, dtype={dtypes.NUMPY_TYPES[csttype.dtype.type]})"
                     callsite_stream.write(const_str, sdfg)
                 except KeyError as e:
-                    raise NotImplementedError(f"Unsupported constant value for array constant {cstname}: {cstval} with type {csttype.dtype.type}") from e
+                    raise NotImplementedError(
+                        f"Unsupported constant value for array constant {cstname}: {cstval} with type {csttype.dtype.type}"
+                    ) from e
             elif isinstance(csttype, data.Scalar):
                 callsite_stream.write(f"{cstname} = {cstval!r}", sdfg)
             else:
@@ -331,13 +460,15 @@ class DaCePythonCodeGenerator(object):
             _write_imports(import_statements, code_sdfg)
             if remaining_code:
                 global_stream.write(remaining_code, code_sdfg)
-        
+
         #########################################################
         # Target-based includes
         for target in self._dispatcher.used_targets:
             headers = target.get_includes()
             if backend in headers:
                 _write_imports(headers[backend], sdfg)
+        if pyutils.sdfg_needs_cupy(sdfg):
+            _write_imports(["cupy"], sdfg)
 
         # Environment-based includes
         for env in self.environments:
@@ -435,8 +566,7 @@ class DaCePythonCodeGenerator(object):
         # Collect external arrays to check if any exist
         for subsdfg, aname, arr in sdfg.arrays_recursive():
             if arr.lifetime == dtypes.AllocationLifetime.External:
-                raise NotImplementedError(
-                    'External memory management is not yet supported in the Python backend.')
+                raise NotImplementedError('External memory management is not yet supported in the Python backend.')
         # No external arrays — nothing to do.
         pass
 
@@ -499,7 +629,8 @@ class DaCePythonCodeGenerator(object):
                 if instr is not None:
                     instr.on_state_end(sdfg, cfg, state, callsite_stream, global_stream)
 
-    def generate_states(self, sdfg: SDFG, global_stream: PythonCodeIOStream, callsite_stream: PythonCodeIOStream) -> Set[SDFGState]:
+    def generate_states(self, sdfg: SDFG, global_stream: PythonCodeIOStream,
+                        callsite_stream: PythonCodeIOStream) -> Set[SDFGState]:
         states_generated = set()
 
         opbar = progress.OptionalProgressBar(len(sdfg.states()), title=f'Generating code (SDFG {sdfg.cfg_id})')
@@ -517,6 +648,15 @@ class DaCePythonCodeGenerator(object):
         opbar.done()
 
         return states_generated
+
+    def successful_exit_statement(self, sdfg: SDFG) -> str:
+        """Return code that routes a ReturnBlock through its function epilogue.
+
+        :param sdfg: SDFG containing the ReturnBlock.
+        :returns: A Python return statement.
+        """
+        self._routed_successful_exits.add(sdfg.cfg_id)
+        return f"return __dace_successful_exit_{sdfg.cfg_id}()"
 
     def _get_schedule(self, scope: Union[nodes.EntryNode, SDFGState, SDFG]) -> dtypes.ScheduleType:
         TOP_SCHEDULE = dtypes.ScheduleType.Sequential
@@ -566,7 +706,7 @@ class DaCePythonCodeGenerator(object):
         """
         # TODO: I don't believe this is correct for the python backend
         # Python only has one way to scope things and that is with functions
-        
+
         # Gather shared transients, free symbols, and first/last appearance
         shared_transients = {}
         fsyms = {}
@@ -886,10 +1026,10 @@ class DaCePythonCodeGenerator(object):
                      generation of this SDFG.
         """
         # TODO: This is not yet fully correct for a python implementation
-        # Also quite a bit of code was removed compared to C++ 
-        # version, so we should check that all necessary steps 
+        # Also quite a bit of code was removed compared to C++
+        # version, so we should check that all necessary steps
         # are still present and correct for python.
-        
+
         if len(cfg_id) == 0 and sdfg.cfg_id != 0:
             cfg_id = '_%d' % sdfg.cfg_id
 
@@ -923,7 +1063,9 @@ class DaCePythonCodeGenerator(object):
         # TODO: Check if this is correct for python
         for cname, (ctype, _) in sdfg.constants_prop.items():
             if isinstance(ctype, data.Array):
-                self.dispatcher.defined_vars.add(cname, disp.DefinedType.Pointer, ctype.dtype.ctype) # TODO: Pointer is almost definitely not correct for python
+                self.dispatcher.defined_vars.add(
+                    cname, disp.DefinedType.Pointer,
+                    ctype.dtype.ctype)  # TODO: Pointer is almost definitely not correct for python
             else:
                 self.dispatcher.defined_vars.add(cname, disp.DefinedType.Scalar, ctype.dtype.ctype)
 
@@ -957,18 +1099,6 @@ class DaCePythonCodeGenerator(object):
                 interstate_symbols.update(symbols)
                 global_symbols.update(symbols)
 
-        # Expose the inference result (declared + loop + interstate symbol names)
-        # so targets can pin launch-arg dtypes at codegen time. Array names are
-        # dropped -- they are only in global_symbols to type expressions -- as are
-        # names whose inference failed (None). Existing entries are never
-        # overwritten: nested SDFGs reuse this frame instance, and a nested name
-        # colliding with an outer symbol must not repoint the outer dtype.
-        self.inferred_symbol_types.update({
-            k: v
-            for k, v in global_symbols.items()
-            if v is not None and k not in sdfg.arrays and k not in self.inferred_symbol_types
-        })
-
         # In Python, variables don't need explicit declaration — they are
         # created on first assignment.  We still record them so that
         # ``defined_vars`` stays in sync with the C++ backend expectations.
@@ -983,7 +1113,8 @@ class DaCePythonCodeGenerator(object):
         #######################################################################
         # Generate actual program body
 
-        states_generated = self.generate_states(sdfg, global_stream, callsite_stream)
+        body_stream = PythonCodeIOStream()
+        states_generated = self.generate_states(sdfg, global_stream, body_stream)
 
         #######################################################################
 
@@ -994,13 +1125,50 @@ class DaCePythonCodeGenerator(object):
                 "\n  Generated: {}\n  Missing: {}".format(sdfg.label, [s.label for s in states_generated],
                                                           [s.label for s in (set(sdfg.states()) - states_generated)]))
 
-        # Deallocate transients
-        self.deallocate_arrays_in_scope(sdfg, sdfg, sdfg, global_stream, callsite_stream)
+        epilogue_stream = PythonCodeIOStream()
+
+        # Deallocate transients after every successful exit.
+        self.deallocate_arrays_in_scope(sdfg, sdfg, sdfg, global_stream, epilogue_stream)
+
+        # Synchronize once at the generated program boundary; nested helpers defer to their caller.
+        if is_top_level and pyutils.sdfg_needs_cupy(sdfg):
+            epilogue_stream.write('cupy.cuda.get_current_stream().synchronize()', sdfg)
 
         # Invoke all instrumentation providers
         for instr in self._dispatcher.instrumentation.values():
             if instr is not None:
-                instr.on_sdfg_end(sdfg, callsite_stream, global_stream)
+                instr.on_sdfg_end(sdfg, epilogue_stream, global_stream)
+
+        epilogue_body = epilogue_stream.getvalue().strip()
+        body = body_stream.getvalue()
+        epilogue_name = f'__dace_successful_exit_{sdfg.cfg_id}'
+        routed_exit = f'return {epilogue_name}()'
+        has_routed_exit = sdfg.cfg_id in self._routed_successful_exits
+
+        enclosing_source = "\n".join((function_body_preamble, callsite_stream.getvalue(), body))
+        enclosing_bound, enclosing_globals = _python_scope_bindings(enclosing_source)
+        enclosing_bound.update(self.arglist.keys())
+        epilogue_bound, epilogue_globals = _python_scope_bindings(epilogue_body)
+        combined_globals = enclosing_globals | epilogue_globals
+        function_scope_globals = epilogue_globals - enclosing_globals
+
+        if has_routed_exit:
+            nonlocal_names = sorted((epilogue_bound - combined_globals) & (enclosing_bound - combined_globals))
+            helper_globals = sorted(enclosing_globals - epilogue_globals)
+
+            callsite_stream.write(f'def {epilogue_name}():', sdfg)
+            with callsite_stream.indented():
+                if helper_globals:
+                    callsite_stream.write(f'global {", ".join(helper_globals)}', sdfg)
+                if nonlocal_names:
+                    callsite_stream.write(f'nonlocal {", ".join(nonlocal_names)}', sdfg)
+                callsite_stream.write(epilogue_body or 'pass', sdfg)
+            callsite_stream.write(body, sdfg)
+            callsite_stream.write(routed_exit, sdfg)
+        else:
+            callsite_stream.write(body, sdfg)
+            if epilogue_body:
+                callsite_stream.write(epilogue_body, sdfg)
 
         # Now that we have all the information about dependencies, generate
         # header and footer
@@ -1031,7 +1199,9 @@ class DaCePythonCodeGenerator(object):
             body = '\n'.join(section for section in (body_preamble, body) if section)
 
         if emit_function_wrapper:
-            generated_code = self._build_function(emitted_function_name, params, body, sdfg, function_body_finally)
+            scope_declarations = f'global {", ".join(sorted(function_scope_globals))}' if function_scope_globals else ""
+            generated_code = self._build_function(emitted_function_name, params, body, sdfg, function_body_finally,
+                                                  scope_declarations)
             if is_top_level and include_lifecycle:
                 generated_code = self._build_lifecycle_functions(sdfg, params) + generated_code
         else:
@@ -1045,10 +1215,13 @@ class DaCePythonCodeGenerator(object):
                         params: str,
                         body: str,
                         sdfg: SDFG,
-                        finalizer: str = "") -> str:
+                        finalizer: str = "",
+                        scope_declarations: str = "") -> str:
         func_code = PythonCodeIOStream()
         func_code.write(f'\ndef {function_name}({params}):\n', cfg=sdfg)
         with func_code.indented():
+            if scope_declarations:
+                func_code.write(scope_declarations, cfg=sdfg)
             if finalizer.strip():
                 func_code.write('try:', cfg=sdfg)
                 with func_code.indented():

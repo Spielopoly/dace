@@ -389,12 +389,6 @@ def _UnaryOp(t, symbols, inferred_symbols):
 
 
 def _BinOp(t, symbols, inferred_symbols):
-    # Python true division always produces a floating-point value for real operands. Keeping an
-    # integer result here can make generated host code and a dtype-pinned device argument disagree.
-    if isinstance(t.op, ast.Div):
-        type_left = _dispatch(t.left, symbols, inferred_symbols)
-        type_right = _dispatch(t.right, symbols, inferred_symbols)
-        return dtypes.result_type_of(type_left, type_right, dtypes.float64)
     # Operations that require a function call
     if t.op.__class__.__name__ in _funcops:
         separator, func = _funcops[t.op.__class__.__name__]

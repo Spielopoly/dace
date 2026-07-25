@@ -110,33 +110,6 @@ def _is_inside_cutile_scope(cfg: ControlFlowRegion, state_id: int, node: nodes.N
     return False
 
 
-def _sdfg_uses_cutile(sdfg: SDFG) -> bool:
-    """True if *sdfg* (or any nested SDFG) contains a CuTile-scheduled map."""
-    found = False
-    for node, _ in sdfg.all_nodes_recursive():
-        if isinstance(node, nodes.MapEntry) and node.map.schedule == dtypes.ScheduleType.CuTile:
-            found = True
-            break
-    return found
-
-
-def _sdfg_needs_cupy(sdfg: SDFG) -> bool:
-    """True if the generated module touches GPU (cupy) arrays.
-
-    Mirrors the allocation rule in :meth:`PythonCodeGen.allocate_array`: a
-    ``GPU_Global`` Array (or any non-Register Array transient of a cuTile
-    SDFG) allocates with ``cupy.empty``, so the frame needs ``import cupy``
-    even when the cuTile target itself is never dispatched (e.g. an SDFG with
-    ``GPU_Global`` transients but no host<->device copies and no CuTile map).
-    Scalars never allocate with cupy, so only Array descriptors are scanned.
-    """
-    if _sdfg_uses_cutile(sdfg):
-        return True
-    return any(
-        isinstance(desc, data.Array) and desc.storage == dtypes.StorageType.GPU_Global
-        for _, _, desc in sdfg.arrays_recursive())
-
-
 def _defined_ptype_for(desc: data.Data) -> str:
     if isinstance(desc, data.Scalar):
         return _python_type(desc.dtype)
@@ -216,7 +189,7 @@ class PythonCodeGen(PythonTargetCodeGenerator):
             'from dataclasses import dataclass',
             "from sympy_function_redefinitions import *",
         ]
-        if _sdfg_needs_cupy(self._sdfg):
+        if pyutils.sdfg_needs_cupy(self._sdfg):
             # GPU_Global allocations emit cupy.empty; do not rely on the cuTile
             # target being dispatch-'used' to provide the import.
             includes.insert(1, 'import cupy')
@@ -850,7 +823,7 @@ class PythonCodeGen(PythonTargetCodeGenerator):
         # Register-storage transients stay numpy: they are never passed to a
         # kernel directly.
         on_gpu = (isinstance(desc, data.Array) and desc.storage != dtypes.StorageType.Register
-                  and (desc.storage == dtypes.StorageType.GPU_Global or _sdfg_uses_cutile(sdfg)))
+                  and (desc.storage == dtypes.StorageType.GPU_Global or pyutils.sdfg_uses_cutile(sdfg)))
         init_expr = self._default_expression(desc, on_gpu=on_gpu, setzero=node.setzero)
 
         if is_global:

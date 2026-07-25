@@ -1,10 +1,35 @@
 from typing import TYPE_CHECKING
 
-from dace import data, subsets, symbolic
+from dace import data, dtypes, subsets, symbolic
+from dace.sdfg import SDFG, nodes
 
 if TYPE_CHECKING:
     from dace.codegen.py.framecode import DaCePythonCodeGenerator
     from dace.codegen.py.target import PythonTargetCodeGenerator
+
+
+def sdfg_uses_cutile(sdfg: SDFG) -> bool:
+    """Return whether an SDFG or one of its children uses a cuTile map.
+
+    :param sdfg: SDFG to inspect.
+    :returns: True if a cuTile-scheduled map is present.
+    """
+    return any(
+        isinstance(node, nodes.MapEntry) and node.map.schedule == dtypes.ScheduleType.CuTile
+        for node, _ in sdfg.all_nodes_recursive())
+
+
+def sdfg_needs_cupy(sdfg: SDFG) -> bool:
+    """Return whether a generated Python SDFG touches CuPy arrays.
+
+    :param sdfg: SDFG to inspect.
+    :returns: True if the generated module requires CuPy.
+    """
+    if sdfg_uses_cutile(sdfg):
+        return True
+    return any(
+        isinstance(desc, data.Array) and desc.storage == dtypes.StorageType.GPU_Global
+        for _, _, desc in sdfg.arrays_recursive())
 
 
 def python_symbolic(expr) -> str:

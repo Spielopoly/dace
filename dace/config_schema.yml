@@ -1079,16 +1079,15 @@ required:
                 title: cuTile
                 description: cuTile (Python backend) compiler preferences
                 required:
-                    aot_compile:
-                        type: bool
-                        default: true
-                        title: Ahead-of-time kernel compilation
+                    mode:
+                        type: str
+                        default: jit
+                        enum: [jit, aot]
+                        title: cuTile kernel compilation mode
                         description: >
-                            If enabled (default), every generated cuTile kernel is exported
-                            to a cubin at SDFG compile time and served at launch without JIT
-                            compilation. Requires cuda-tile 1.5.x and a known GPU architecture
-                            (see aot_arch); any AOT failure raises CuTileAOTError instead of
-                            silently falling back to JIT. Disable for the pure JIT path.
+                            Use "jit" (default) for cuda.tile runtime compilation, or "aot"
+                            to export embedded cubins during DaCe code generation and launch
+                            them directly through the CUDA driver. AOT failures never fall back.
 
                     aot_arch:
                         type: str

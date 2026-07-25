@@ -1,431 +1,348 @@
 # Copyright 2019-2026 ETH Zurich and the DaCe authors. All rights reserved.
-"""Ahead-of-time (AOT) compilation of generated cuTile kernels.
-
-At DaCe compile time, every generated ``@ct.kernel`` is exported to a cubin via
-``cuda.tile.compilation.export_kernel`` with explicitly constructed conservative
-signatures. At launch, a
-:class:`PrecompiledKernel` serves the exported cubin through the private
-``ct.kernel._compile`` hook, so no JIT compilation happens.
-
-All failures raise :class:`CuTileAOTError` -- there is no silent JIT fallback.
-Set the config ``compiler.cutile.aot_compile=False`` to disable AOT entirely.
-
-The interface to the code generator is the registry ``__dace_cutile_aot_specs``
-emitted into the generated frame code: ``{kernel_name: {"params": [(kind,
-dtype_name, ndim, stride_constant), ...]}}`` in launch-argument order, where
-``kind`` is ``"array"`` or ``"scalar"``.
-
-cuda-tile and cupy are imported lazily inside functions; importing this module
-never requires them.
-"""
-import dataclasses
+"""Ahead-of-time compilation support for generated cuTile kernels."""
+import base64
 import io
-import inspect
-import os
-import tempfile
-import types
-from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
+import linecache
+import pprint
+import zlib
+from dataclasses import dataclass
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from dace.config import Config
 
-if TYPE_CHECKING:
-    from dace.sdfg import SDFG
-
-#: Name of the module-level registry emitted by the cuTile code generator.
-AOT_SPECS_NAME = '__dace_cutile_aot_specs'
-
-_DISABLE_HINT = ('Set the DaCe config entry compiler.cutile.aot_compile=False to disable AOT compilation '
-                 '(pure JIT).')
-
-#: The cuda-tile version series whose private ``_compile`` dispatch contract has been verified.
-_SUPPORTED_VERSION_PREFIX = '1.5.'
-
-_REQUIRED_COMPILATION_ATTRS = ('export_kernel', 'KernelSignature', 'ArrayConstraint', 'ScalarConstraint',
-                               'CallingConvention')
-
-#: Structural key of one kernel parameter, including assumptions that affect generated addressing.
-ParamKey = Tuple[Any, ...]
-#: Structural key of a full signature: the calling-convention code followed by one ParamKey per parameter.
-StructuralKey = Tuple[Any, ...]
+AOT_ABI_VERSION = 1
 
 
 class CuTileAOTError(RuntimeError):
-    """Raised for any cuTile AOT failure (prerequisites, arch, export, launch-time mismatch)."""
-    pass
+    """Raised when a cuTile kernel cannot be exported or launched."""
 
 
-@dataclasses.dataclass(frozen=True)
-class AOTEntry:
-    """Precompiled artifact for one kernel: cubin bytes, target arch, and symbol per structural key."""
-    cubin: bytes
-    arch: str
-    symbols: Dict[StructuralKey, str]
+@dataclass(frozen=True)
+class AOTParam:
+    """One parameter in the generated direct-launch ABI."""
+
+    kind: str
+    dtype: str
+    ndim: int
+    strides: Optional[Tuple[Optional[int], ...]] = None
+
+    def to_metadata(self) -> Dict[str, Any]:
+        """Return the self-contained serialized representation."""
+        return {
+            'kind': self.kind,
+            'dtype': self.dtype,
+            'ndim': self.ndim,
+            'strides': self.strides,
+        }
 
 
-def _compilation() -> types.ModuleType:
-    """Return the ``cuda.tile.compilation`` module (lazy import).
-
-    :returns: The imported module.
-    :raises CuTileAOTError: If cuda-tile is not importable.
-    """
+def _compilation() -> Any:
     try:
         from cuda.tile import compilation
     except ImportError as exc:
-        raise CuTileAOTError(f'cuda-tile is not importable: {exc}. {_DISABLE_HINT}') from exc
+        raise CuTileAOTError(f'cuda-tile is required for cuTile AOT compilation: {exc}') from exc
     return compilation
 
 
 def check_prerequisites() -> None:
-    """Verify that the installed cuda-tile supports the AOT path this module relies on.
-
-    Requires cuda-tile 1.5.x (the version whose private ``_compile`` contract was verified), the
-    ``cuda.tile.compilation`` exports used here, and ``ct.kernel._compile`` with the expected arity.
-
-    :raises CuTileAOTError: If any prerequisite is missing.
-    """
-    try:
-        import cuda.tile as ct
-    except ImportError as exc:
-        raise CuTileAOTError(f'cuda-tile is not importable: {exc}. {_DISABLE_HINT}') from exc
+    """Check the public cuda-tile APIs required by the AOT path."""
     compilation = _compilation()
-
-    version = str(getattr(ct, '__version__', '<unknown>'))
-    if not version.startswith(_SUPPORTED_VERSION_PREFIX):
-        raise CuTileAOTError(f'cuTile AOT compilation requires cuda-tile {_SUPPORTED_VERSION_PREFIX}x '
-                             f'(found {version}); the private ct.kernel._compile dispatch contract is only '
-                             f'verified for that series. Install cuda-tile {_SUPPORTED_VERSION_PREFIX}x. '
-                             f'{_DISABLE_HINT}')
-
-    for attr in _REQUIRED_COMPILATION_ATTRS:
-        if not hasattr(compilation, attr):
-            raise CuTileAOTError(f'cuda.tile.compilation lacks the required attribute "{attr}". {_DISABLE_HINT}')
-    if not hasattr(compilation.CallingConvention, 'cutile_python_v1'):
-        raise CuTileAOTError(f'cuda.tile CallingConvention lacks "cutile_python_v1". {_DISABLE_HINT}')
-    if not hasattr(compilation.KernelSignature, 'with_mangled_symbol'):
-        raise CuTileAOTError(f'cuda.tile KernelSignature lacks "with_mangled_symbol", which is needed to '
-                             f'name the exported symbols. {_DISABLE_HINT}')
-
-    # Used at launch to detect a cubin exported for a different GPU.
-    try:
-        from cuda.tile._compile import get_sm_arch  # noqa: F401
-    except ImportError as exc:
-        raise CuTileAOTError(f'cuda.tile._compile lacks "get_sm_arch", which is needed to verify the '
-                             f'target architecture at launch: {exc}. {_DISABLE_HINT}') from exc
-
-    compile_fn = getattr(ct.kernel, '_compile', None)
-    if compile_fn is None:
-        raise CuTileAOTError(f'ct.kernel has no "_compile" method to override. {_DISABLE_HINT}')
-    try:
-        params = list(inspect.signature(compile_fn).parameters)
-    except (TypeError, ValueError) as exc:
-        raise CuTileAOTError(f'Cannot inspect ct.kernel._compile: {exc}. {_DISABLE_HINT}') from exc
-    if len(params) != 3:
-        raise CuTileAOTError(f'ct.kernel._compile has unexpected parameters {params} '
-                             f'(expected (self, signature, context)). {_DISABLE_HINT}')
+    required = ('export_kernel', 'KernelSignature', 'ArrayConstraint', 'ScalarConstraint', 'CallingConvention')
+    missing = [name for name in required if not hasattr(compilation, name)]
+    if missing or not hasattr(compilation.CallingConvention, 'cutile_python_v2'):
+        raise CuTileAOTError(f'cuda.tile.compilation lacks required public APIs: {missing or ["cutile_python_v2"]}')
 
 
 def resolve_arch() -> str:
-    """Determine the GPU architecture to export cubins for.
-
-    Uses the config ``compiler.cutile.aot_arch`` if set, otherwise auto-detects from the current GPU.
-
-    :returns: Architecture string, e.g. ``"sm_120"``.
-    :raises CuTileAOTError: If no override is set and no GPU is available.
-    """
-    arch = Config.get('compiler', 'cutile', 'aot_arch')
-    if arch:
-        return arch
+    """Resolve the architecture used for cubin export."""
+    configured = Config.get('compiler', 'cutile', 'aot_arch')
+    if configured:
+        return str(configured)
     try:
         import cupy
         return f'sm_{cupy.cuda.Device().compute_capability}'
     except Exception as exc:
-        raise CuTileAOTError('Cannot determine the GPU architecture for cuTile AOT export (no usable GPU: '
-                             f'{exc}). Set compiler.cutile.aot_arch (e.g. "sm_120"). '
-                             f'{_DISABLE_HINT}') from exc
-
-
-def _current_arch() -> str:
-    """Return the architecture of the current GPU, as the cuTile JIT would target it.
-
-    :returns: Architecture string, e.g. ``"sm_120"``.
-    :raises CuTileAOTError: If the GPU cannot be queried.
-    """
-    try:
-        from cuda.tile._compile import get_sm_arch
-        return get_sm_arch()
-    except Exception as exc:
-        raise CuTileAOTError(f'Cannot determine the current GPU architecture at launch: {exc}. '
-                             f'{_DISABLE_HINT}') from exc
+        raise CuTileAOTError('Cannot determine target GPU architecture; set compiler.cutile.aot_arch') from exc
 
 
 def _ct_dtype(name: str) -> Any:
-    """Map a numpy dtype name from a spec to the corresponding ``cuda.tile`` dtype.
-
-    :param name: Numpy dtype name, e.g. ``"float64"`` or ``"bool"``.
-    :returns: The ``cuda.tile`` DType.
-    :raises CuTileAOTError: If no such dtype exists.
-    """
     import cuda.tile as ct
-    dtype = getattr(ct, 'bool_' if name == 'bool' else name, None)
-    if dtype is None:
-        raise CuTileAOTError(f'cuda.tile has no dtype named "{name}"; the kernel cannot be AOT-typed. '
-                             f'{_DISABLE_HINT}')
-    return dtype
+    result = getattr(ct, 'bool_' if name == 'bool' else name, None)
+    if result is None:
+        raise CuTileAOTError(f'cuda.tile has no dtype matching {name!r}')
+    return result
 
 
-def _structural_key(signature: Any) -> StructuralKey:
-    """Reduce a ``KernelSignature`` to its ABI-relevant structure.
+def _validated_params(spec: Mapping[str, Any]) -> Tuple[AOTParam, ...]:
+    """Validate and normalize an AOT kernel signature descriptor."""
+    expected_spec_fields = {'abi_version', 'params'}
+    if set(spec) != expected_spec_fields:
+        raise CuTileAOTError(f'Invalid cuTile AOT descriptor fields {set(spec)!r}; '
+                             f'expected {expected_spec_fields!r}')
+    if spec['abi_version'] != AOT_ABI_VERSION:
+        raise CuTileAOTError(f"Unsupported cuTile AOT ABI version {spec['abi_version']!r}; "
+                             f'expected {AOT_ABI_VERSION}')
 
-    Covers the calling convention (argument packing differs between conventions, e.g.
-    ``cutile_python_v1`` and ``cutile_python_v2``) and, per parameter: constraint class, dtype, ndim
-    and index dtype, stride constants, and internal aliasing (arrays). Runtime-derived alignment and
-    divisibility are excluded because they only specialize code that is valid for the conservative
-    exported signature. Stride and internal-alias assumptions can change addressing semantics and
-    must match.
-
-    :param signature: A ``cuda.tile.compilation.KernelSignature``.
-    :returns: Hashable structural key.
-    :raises CuTileAOTError: On constraint types this module does not emit.
-    """
-    compilation = _compilation()
-    key: List[ParamKey] = []
-    for i, param in enumerate(signature.parameters):
-        if isinstance(param, compilation.ArrayConstraint):
-            stride_constant = None if param.stride_constant is None else tuple(param.stride_constant)
-            key.append(('array', param.dtype.name, param.ndim, param.index_dtype.name, stride_constant,
-                        param.may_alias_internally))
-        elif isinstance(param, compilation.ScalarConstraint):
-            key.append(('scalar', param.dtype.name))
+    result: List[AOTParam] = []
+    for value in spec['params']:
+        if isinstance(value, AOTParam):
+            param = value
+        elif isinstance(value, Mapping):
+            expected_param_fields = {'kind', 'dtype', 'ndim', 'strides'}
+            if set(value) != expected_param_fields:
+                raise CuTileAOTError(f'Invalid cuTile AOT parameter fields {set(value)!r}; '
+                                     f'expected {expected_param_fields!r}')
+            strides = value['strides']
+            param = AOTParam(value['kind'], value['dtype'], value['ndim'], None if strides is None else tuple(strides))
         else:
-            raise CuTileAOTError(f'Unsupported constraint type {type(param).__name__} at parameter #{i} of '
-                                 f'signature {signature!r}. {_DISABLE_HINT}')
-    return (signature.calling_convention.code, ) + tuple(key)
+            raise CuTileAOTError(f'Invalid cuTile AOT parameter descriptor {value!r}')
+
+        if param.kind not in ('array', 'scalar') or not isinstance(param.dtype, str):
+            raise CuTileAOTError(f'Invalid cuTile AOT parameter descriptor {param!r}')
+        if type(param.ndim) is not int or param.ndim < 0:
+            raise CuTileAOTError(f'Invalid cuTile AOT parameter rank in {param!r}')
+        if param.kind == 'scalar':
+            if param.ndim != 0 or param.strides is not None:
+                raise CuTileAOTError(f'Scalar cuTile AOT parameter must have rank zero and no strides: {param!r}')
+        elif param.ndim == 0:
+            raise CuTileAOTError(f'Array cuTile AOT parameter must have positive rank: {param!r}')
+        elif param.strides is not None:
+            if len(param.strides) != param.ndim or any(stride is not None and (type(stride) is not int or stride < 0)
+                                                       for stride in param.strides):
+                raise CuTileAOTError(f'Invalid cuTile AOT stride constraints in {param!r}')
+        result.append(param)
+    return tuple(result)
 
 
-def _compatible_key(exported: StructuralKey, runtime: StructuralKey) -> bool:
-    """Return whether a conservative exported signature accepts a runtime-derived signature."""
-    if len(exported) != len(runtime) or exported[0] != runtime[0]:
-        return False
-    for expected, actual in zip(exported[1:], runtime[1:]):
-        if expected[:4] != actual[:4]:
-            return False
-        if expected[0] == 'scalar':
-            continue
-        expected_strides, runtime_strides = expected[4], actual[4]
-        if any(e is not None and e != a for e, a in zip(expected_strides, runtime_strides)):
-            return False
-        if not expected[5] and actual[5]:
-            return False
-    return True
-
-
-def build_export_plan(spec: Dict[str, Any], func_name: str) -> Tuple[List[Any], Dict[StructuralKey, str]]:
-    """Build the signature and the structural-key-to-symbol map for one kernel.
-
-    A conservative int32-index ``KernelSignature`` is built with shared alias groups across arrays,
-    non-negative strides, no divisibility or alignment assumptions, and only explicitly safe stride
-    constants. cuda-tile 1.5 always derives int32 indices at the Python launch boundary.
-    Symbols are mangled from ``func_name`` so the exported cubin contains exactly these symbols. A
-    kernel without array parameters also yields one signature.
-
-    :param spec: Registry entry, ``{"params": [(kind, dtype_name, ndim, stride_constant), ...]}``.
-    :param func_name: Python function name of the kernel (base of the mangled symbols).
-    :returns: ``(signatures, {structural_key: symbol})``.
-    :raises CuTileAOTError: If any parameter cannot be typed or signature construction fails.
-    """
+def build_export_plan(spec: Mapping[str, Any], function_name: str) -> Tuple[List[Any], List[Dict[str, str]]]:
+    """Build conservative v2 signatures for the required index widths."""
     compilation = _compilation()
-    params = spec['params']
-    num_arrays = sum(1 for kind, *_ in params if kind == 'array')
-    # A shared alias group with a single member is rejected as redundant by cuda-tile.
-    alias_groups: Tuple[str, ...] = ('dace', ) if num_arrays >= 2 else ()
-
-    signatures: List[Any] = []
-    symbols: Dict[StructuralKey, str] = {}
-    for index_dtype_name in ('int32', ):
-        index_dtype = _ct_dtype(index_dtype_name)
+    parameters = _validated_params(spec)
+    alias_groups: Tuple[str, ...] = ('dace', ) if sum(p.kind == 'array' for p in parameters) > 1 else ()
+    signatures, variants = [], []
+    index_dtype_names = ('int32', 'int64') if any(p.kind == 'array' for p in parameters) else ('int32', )
+    for index_dtype_name in index_dtype_names:
         constraints = []
-        for i, (kind, dtype_name, ndim, stride_constant) in enumerate(params):
-            if kind == 'array':
-                try:
-                    constraints.append(
-                        compilation.ArrayConstraint(
-                            _ct_dtype(dtype_name),
-                            ndim,
-                            index_dtype=index_dtype,
-                            stride_lower_bound_incl=0,
-                            alias_groups=alias_groups,
-                            may_alias_internally=True,
-                            stride_constant=(tuple(stride_constant) if stride_constant is not None else None)))
-                except CuTileAOTError:
-                    raise
-                except Exception as exc:
-                    raise CuTileAOTError(f'Cannot build the array constraint for parameter #{i} of kernel '
-                                         f'"{func_name}" (dtype={dtype_name}, ndim={ndim}, '
-                                         f'stride_constant={stride_constant}): {exc}. {_DISABLE_HINT}') from exc
-            elif kind == 'scalar':
-                constraints.append(compilation.ScalarConstraint(_ct_dtype(dtype_name)))
+        for param in parameters:
+            if param.kind == 'array':
+                constraints.append(
+                    compilation.ArrayConstraint(_ct_dtype(param.dtype),
+                                                param.ndim,
+                                                index_dtype=_ct_dtype(index_dtype_name),
+                                                stride_lower_bound_incl=0,
+                                                alias_groups=alias_groups,
+                                                may_alias_internally=True,
+                                                stride_constant=param.strides))
+            elif param.kind == 'scalar':
+                constraints.append(compilation.ScalarConstraint(_ct_dtype(param.dtype)))
             else:
-                raise CuTileAOTError(f'Unsupported parameter kind "{kind}" at parameter #{i} of kernel '
-                                     f'"{func_name}". {_DISABLE_HINT}')
-        try:
-            signature = compilation.KernelSignature(constraints, compilation.CallingConvention.cutile_python_v1())
-            signature = signature.with_mangled_symbol(func_name)
-        except Exception as exc:
-            raise CuTileAOTError(f'Cannot build the {index_dtype_name}-index signature for kernel '
-                                 f'"{func_name}": {exc}. {_DISABLE_HINT}') from exc
-        key = _structural_key(signature)
-        if key in symbols:
-            # No array parameter: the index dtype is not part of the signature, so both loop
-            # iterations produce the same structure and symbol. Export it only once.
-            continue
+                raise CuTileAOTError(f'Unsupported AOT parameter kind {param.kind!r}')
+        signature = compilation.KernelSignature(
+            constraints, compilation.CallingConvention.cutile_python_v2()).with_mangled_symbol(function_name)
         signatures.append(signature)
-        symbols[key] = signature.symbol
-    return signatures, symbols
+        variants.append({'index_dtype': index_dtype_name, 'symbol': signature.symbol})
+    return signatures, variants
 
 
-def _export_cubin(dispatcher: Any, signatures: List[Any], path: str, arch: str, kernel_name: str) -> bytes:
-    """Export ``dispatcher`` to memory and atomically publish the cubin.
+def _load_kernel(source: str, function_name: str, namespace: Dict[str, Any]) -> Any:
+    filename = f'<dace_cutile_aot_{function_name}>'
+    linecache.cache[filename] = (len(source), None, source.splitlines(True), filename)
+    try:
+        exec(compile(source, filename, 'exec'), namespace)
+        return namespace[function_name]
+    except Exception as exc:
+        raise CuTileAOTError(f'Cannot construct generated cuTile kernel {function_name}: {exc}') from exc
 
-    :param dispatcher: The ``ct.kernel`` to export.
-    :param signatures: Signatures (with mangled symbols) to compile.
-    :param path: Output cubin path (overwritten).
-    :param arch: Target architecture, e.g. ``"sm_120"``.
-    :param kernel_name: Kernel name for error messages.
-    :returns: The cubin bytes.
-    :raises CuTileAOTError: If export or atomic publication fails, or if the cubin is empty.
-    """
-    compilation = _compilation()
+
+def _export_kernel(kernel: Any, signatures: Sequence[Any], arch: str, function_name: str) -> bytes:
     output = io.BytesIO()
     try:
-        compilation.export_kernel(dispatcher, signatures, output, gpu_code=arch, output_format='cubin')
+        _compilation().export_kernel(kernel, signatures, output, gpu_code=arch, output_format='cubin')
     except Exception as exc:
-        raise CuTileAOTError(f'AOT export failed for kernel "{kernel_name}" (arch {arch}): {exc}. '
-                             f'{_DISABLE_HINT}') from exc
-    cubin = output.getvalue()
-    if not cubin:
-        raise CuTileAOTError(f'The AOT cubin exported for kernel "{kernel_name}" is empty. {_DISABLE_HINT}')
-    tmp_path = None
-    try:
-        fd, tmp_path = tempfile.mkstemp(prefix=f'.{os.path.basename(path)}.', dir=os.path.dirname(path))
-        with os.fdopen(fd, 'wb') as f:
-            f.write(cubin)
-        os.replace(tmp_path, path)
-    except OSError as exc:
-        if tmp_path is not None:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-        raise CuTileAOTError(f'Cannot publish the AOT cubin for kernel "{kernel_name}" at "{path}": '
-                             f'{exc}. {_DISABLE_HINT}') from exc
-    return cubin
+        raise CuTileAOTError(f'AOT export failed for kernel {function_name!r} ({arch}): {exc}') from exc
+    if not output.getvalue():
+        raise CuTileAOTError(f'AOT export produced an empty cubin for {function_name!r}')
+    return output.getvalue()
 
 
-_precompiled_kernel_class: Optional[type] = None
-
-
-def get_precompiled_kernel_class() -> type:
-    """Return the :class:`PrecompiledKernel` class, creating it lazily.
-
-    The class subclasses ``ct.kernel``, so it can only be created once cuda-tile is importable;
-    importing this module alone never requires cuda-tile.
-
-    :returns: The ``PrecompiledKernel`` class.
-    :raises CuTileAOTError: If cuda-tile is not importable.
-    """
-    global _precompiled_kernel_class
-    if _precompiled_kernel_class is not None:
-        return _precompiled_kernel_class
-
-    try:
-        import cuda.tile as ct
-    except ImportError as exc:
-        raise CuTileAOTError(f'cuda-tile is not importable: {exc}. {_DISABLE_HINT}') from exc
-
-    class PrecompiledKernel(ct.kernel):
-        """A ``ct.kernel`` that serves an AOT-exported cubin instead of JIT-compiling.
-
-        ``_aot_entry`` (an :class:`AOTEntry`) is attached after construction by
-        :func:`precompile_kernels`. ``_compile`` receives the runtime-derived signature from
-        ``ct.launch``; a structural-key miss means the DaCe signature builder is buggy and raises.
-        """
-
-        _aot_entry: AOTEntry
-
-        def _compile(self, signature, context):
-            entry = self._aot_entry
-            arch = _current_arch()
-            if arch != entry.arch:
-                raise CuTileAOTError(f'AOT cubin for kernel "{self._pyfunc.__name__}" was exported for '
-                                     f'{entry.arch}, but the current GPU is {arch}. Recompile the SDFG on '
-                                     f'this machine or set compiler.cutile.aot_arch accordingly. '
-                                     f'{_DISABLE_HINT}')
-            key = _structural_key(signature)
-            symbol = next((symbol for exported, symbol in entry.symbols.items() if _compatible_key(exported, key)),
-                          None)
-            if symbol is None:
-                raise CuTileAOTError(f'cuTile AOT signature mismatch for kernel "{self._pyfunc.__name__}" '
-                                     f'(this indicates a bug in the DaCe AOT signature builder). Derived '
-                                     f'signature: {signature!r}; derived structural key: {key}; exported '
-                                     f'keys: {list(entry.symbols)}. {_DISABLE_HINT}')
-            return entry.cubin, symbol, None, []
-
-    _precompiled_kernel_class = PrecompiledKernel
-    return PrecompiledKernel
-
-
-def _make_precompiled(dispatcher: Any, entry: AOTEntry) -> Any:
-    """Create a :class:`PrecompiledKernel` mirroring ``dispatcher`` and attach the AOT entry.
-
-    :param dispatcher: The original ``ct.kernel``.
-    :param entry: The precompiled artifact to serve.
-    :returns: The replacement ``PrecompiledKernel``.
-    """
-    try:
-        dispatcher.__class__ = get_precompiled_kernel_class()
-        dispatcher._aot_entry = entry
-    except Exception as exc:
-        raise CuTileAOTError(f'Cannot rebind kernel "{dispatcher._pyfunc.__name__}" to its AOT artifact: '
-                             f'{exc}. {_DISABLE_HINT}') from exc
-    return dispatcher
-
-
-def precompile_kernels(namespace: Dict[str, Any], sdfg: 'SDFG') -> None:
-    """AOT-compile all kernels registered in ``namespace[AOT_SPECS_NAME]`` and rebind them.
-
-    For each kernel: build a conservative signature from its spec, export one
-    cubin to ``<build_folder>/cutile_aot/<kernel>.cubin`` (overwriting), and replace the dispatcher in
-    ``namespace`` with a :class:`PrecompiledKernel` serving the cubin. All failures raise.
-
-    :param namespace: The executed frame-code namespace of a compiled Python-backend SDFG.
-    :param sdfg: The SDFG (for the build folder).
-    :raises CuTileAOTError: On any prerequisite, arch, typing or export failure.
-    """
-    specs = namespace.get(AOT_SPECS_NAME)
-    if not specs:
-        return
+def generate_aot_module(kernels: Sequence[Dict[str, Any]], module_name: str) -> str:
+    """Export collected kernels and return an embedded direct-launch module."""
     check_prerequisites()
-    import cuda.tile as ct
     arch = resolve_arch()
+    import cuda.tile as ct
+    namespace: Dict[str, Any] = {'ct': ct, '__name__': module_name}
+    metadata: Dict[str, Any] = {}
+    for descriptor in kernels:
+        name = descriptor['name']
+        spec = {
+            'abi_version': descriptor.get('abi_version'),
+            'params': descriptor.get('params'),
+        }
+        params = _validated_params(spec)
+        filename = f'<dace_cutile_aot_{name}>'
+        try:
+            kernel = _load_kernel(descriptor['source'], name, namespace)
+            signatures, variants = build_export_plan(spec, name)
+            cubin = _export_kernel(kernel, signatures, arch, name)
+        finally:
+            linecache.cache.pop(filename, None)
+        metadata[name] = {
+            'abi_version': AOT_ABI_VERSION,
+            'arch': arch,
+            'cubin': base64.b85encode(zlib.compress(cubin, level=9)).decode('ascii'),
+            'params': [param.to_metadata() for param in params],
+            'variants': variants,
+        }
+    return _render_module(metadata)
 
-    out_dir = os.path.join(sdfg.build_folder, 'cutile_aot')
-    try:
-        os.makedirs(out_dir, exist_ok=True)
-    except OSError as exc:
-        raise CuTileAOTError(f'Cannot create the cuTile AOT output directory "{out_dir}": {exc}. '
-                             f'{_DISABLE_HINT}') from exc
-    for kernel_name, spec in specs.items():
-        dispatcher = namespace.get(kernel_name)
-        if not isinstance(dispatcher, ct.kernel):
-            raise CuTileAOTError(f'AOT spec refers to "{kernel_name}", which is not a ct.kernel in the '
-                                 f'generated code (got {type(dispatcher).__name__}). {_DISABLE_HINT}')
-        signatures, symbols = build_export_plan(spec, dispatcher._pyfunc.__name__)
-        cubin_path = os.path.join(out_dir, f'{kernel_name}.cubin')
-        cubin = _export_cubin(dispatcher, signatures, cubin_path, arch, kernel_name)
-        namespace[kernel_name] = _make_precompiled(dispatcher, AOTEntry(cubin=cubin, arch=arch, symbols=symbols))
 
+def _render_module(metadata: Dict[str, Any]) -> str:
+    literal = pprint.pformat(metadata, width=120, sort_dicts=True)
+    return f'''# Auto-generated by DaCe. Do not edit.
+import base64
+import zlib
+import cupy
+import numpy
+_AOT_ABI_VERSION = {AOT_ABI_VERSION}
+_KERNELS = {literal}
+_MODULE_CACHE = {{}}
+_FUNCTION_CACHE = {{}}
 
-def __getattr__(name: str) -> Any:
-    if name == 'PrecompiledKernel':
-        return get_precompiled_kernel_class()
-    raise AttributeError(f'module {__name__!r} has no attribute {name!r}')
+def _current_arch():
+    return f"sm_{{cupy.cuda.Device().compute_capability}}"
+
+def _validate_metadata(kernel_name, metadata):
+    expected_fields = {{"abi_version", "arch", "cubin", "params", "variants"}}
+    if set(metadata) != expected_fields:
+        raise RuntimeError(
+            f"Invalid cuTile AOT metadata fields for {{kernel_name}}: {{set(metadata)!r}}")
+    if metadata["abi_version"] != _AOT_ABI_VERSION:
+        raise RuntimeError(
+            f"Unsupported cuTile AOT ABI version for {{kernel_name}}: "
+            f"{{metadata['abi_version']!r}}; expected {{_AOT_ABI_VERSION}}")
+
+    expected_param_fields = {{"kind", "dtype", "ndim", "strides"}}
+    for param in metadata["params"]:
+        if set(param) != expected_param_fields:
+            raise RuntimeError(
+                f"Invalid cuTile AOT parameter fields for {{kernel_name}}: {{param!r}}")
+        if param["kind"] not in ("array", "scalar") or not isinstance(param["dtype"], str):
+            raise RuntimeError(
+                f"Invalid cuTile AOT parameter metadata for {{kernel_name}}: {{param!r}}")
+        if type(param["ndim"]) is not int or param["ndim"] < 0:
+            raise RuntimeError(
+                f"Invalid cuTile AOT parameter rank for {{kernel_name}}: {{param!r}}")
+        strides = param["strides"]
+        if param["kind"] == "scalar":
+            if param["ndim"] != 0 or strides is not None:
+                raise RuntimeError(
+                    f"Invalid cuTile AOT scalar metadata for {{kernel_name}}: {{param!r}}")
+        elif param["ndim"] == 0:
+            raise RuntimeError(
+                f"Invalid cuTile AOT array metadata for {{kernel_name}}: {{param!r}}")
+        elif strides is not None and (
+                len(strides) != param["ndim"]
+                or any(value is not None and (type(value) is not int or value < 0)
+                       for value in strides)):
+            raise RuntimeError(
+                f"Invalid cuTile AOT stride metadata for {{kernel_name}}: {{param!r}}")
+
+    expected_widths = (
+        {{"int32", "int64"}}
+        if any(param["kind"] == "array" for param in metadata["params"])
+        else {{"int32"}})
+    actual_widths = {{variant.get("index_dtype") for variant in metadata["variants"]}}
+    if actual_widths != expected_widths or any(
+            set(variant) != {{"index_dtype", "symbol"}}
+            or not isinstance(variant["symbol"], str)
+            for variant in metadata["variants"]):
+        raise RuntimeError(
+            f"Invalid cuTile AOT variants for {{kernel_name}}: {{metadata['variants']!r}}")
+
+def _array_layout(arg, param):
+    expected_dtype = numpy.dtype(param["dtype"])
+    if not hasattr(arg, "__cuda_array_interface__"):
+        raise TypeError(f"cuTile AOT array argument must be on a CUDA device, got {{type(arg).__name__}}")
+    if numpy.dtype(arg.dtype) != expected_dtype or arg.ndim != param["ndim"]:
+        raise TypeError(f"cuTile AOT array mismatch for {{param}}: dtype={{arg.dtype}}, ndim={{arg.ndim}}")
+    if arg.strides is None:
+        byte_strides, stride = [], expected_dtype.itemsize
+        for size in reversed(arg.shape):
+            byte_strides.append(stride)
+            stride *= size
+        byte_strides.reverse()
+    else:
+        byte_strides = arg.strides
+    if any(stride % expected_dtype.itemsize for stride in byte_strides):
+        raise ValueError("cuTile AOT strides must be integral numbers of elements")
+    strides = tuple(stride // expected_dtype.itemsize for stride in byte_strides)
+    if any(stride < 0 for stride in strides):
+        raise ValueError(f"cuTile AOT does not support negative element strides: {{strides}}")
+    if param["strides"] is not None and any(
+            expected is not None and expected != actual
+            for expected, actual in zip(param["strides"], strides)):
+        raise ValueError(
+            f"cuTile AOT stride mismatch: expected {{param['strides']}}, got {{strides}}")
+    return strides
+
+def _fits_int32(args, params):
+    low, high = numpy.iinfo(numpy.int32).min, numpy.iinfo(numpy.int32).max
+    for arg, param in zip(args, params):
+        if param["kind"] == "array":
+            if any(v < low or v > high for v in tuple(arg.shape) + _array_layout(arg, param)):
+                return False
+    return True
+
+def _flatten_args(args, params, index_dtype):
+    if len(args) != len(params):
+        raise TypeError(f"cuTile AOT expected {{len(params)}} arguments, got {{len(args)}}")
+    index_type = numpy.int32 if index_dtype == "int32" else numpy.int64
+    flattened = []
+    for arg, param in zip(args, params):
+        if param["kind"] == "array":
+            strides = _array_layout(arg, param)
+            flattened.extend((arg, *(index_type(v) for v in arg.shape), *(index_type(v) for v in strides)))
+        else:
+            flattened.append(numpy.asarray(arg, dtype=numpy.dtype(param["dtype"]))[()])
+    return tuple(flattened)
+
+def _cuda_context_key():
+    device = cupy.cuda.Device().id
+    context = int(cupy.cuda.driver.ctxGetCurrent())
+    if context == 0:
+        raise RuntimeError("cuTile AOT launch requires a current CUDA context")
+    return device, context
+
+def _load_function(kernel_name, metadata, variant):
+    context_key = _cuda_context_key()
+    module_key = (*context_key, kernel_name)
+    module = _MODULE_CACHE.get(module_key)
+    if module is None:
+        module = cupy.cuda.function.Module()
+        module.load(zlib.decompress(base64.b85decode(metadata["cubin"].encode("ascii"))))
+        _MODULE_CACHE[module_key] = module
+    function_key = (*context_key, kernel_name, variant["symbol"])
+    function = _FUNCTION_CACHE.get(function_key)
+    if function is None:
+        function = module.get_function(variant["symbol"])
+        _FUNCTION_CACHE[function_key] = function
+    return function
+
+def launch(kernel_name, grid, args):
+    metadata = _KERNELS[kernel_name]
+    _validate_metadata(kernel_name, metadata)
+    current_arch = _current_arch()
+    if current_arch != metadata["arch"]:
+        raise RuntimeError(f"cuTile AOT cubin for {{kernel_name}} targets {{metadata['arch']}}, current device is {{current_arch}}")
+    if len(args) != len(metadata["params"]):
+        raise TypeError(f"cuTile AOT expected {{len(metadata['params'])}} arguments, got {{len(args)}}")
+    index_dtype = "int32" if _fits_int32(args, metadata["params"]) else "int64"
+    variant = next(item for item in metadata["variants"] if item["index_dtype"] == index_dtype)
+    flattened = _flatten_args(args, metadata["params"], index_dtype)
+    launch_grid = tuple(grid) if isinstance(grid, (tuple, list)) else (grid,)
+    launch_grid += (1,) * (3 - len(launch_grid))
+    if len(launch_grid) != 3:
+        raise ValueError(f"cuTile AOT grid must have one to three dimensions, got {{launch_grid}}")
+    _load_function(kernel_name, metadata, variant)(launch_grid, (1, 1, 1), flattened,
+                                                    stream=cupy.cuda.get_current_stream())
+'''

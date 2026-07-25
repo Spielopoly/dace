@@ -9,7 +9,6 @@ from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 import numpy as np
 
-from dace.codegen.py.cutile_aot import AOT_SPECS_NAME
 
 if TYPE_CHECKING:
     from dace.codegen.codeobject import CodeObject
@@ -104,14 +103,6 @@ class PythonCompiledSDFG:
         }
         compiled_code = compile(self._code, pseudo_filename, 'exec')
         exec(compiled_code, self._namespace)
-
-        # AOT-precompile cuTile kernels. The generated code carries the spec
-        # registry only when compiler.cutile.aot_compile is on and cuTile
-        # kernels exist; without it this is a no-op and cutile_aot is never
-        # imported. Failures raise CuTileAOTError (no silent JIT fallback).
-        if self._namespace.get(AOT_SPECS_NAME):
-            from dace.codegen.py import cutile_aot
-            cutile_aot.precompile_kernels(self._namespace, sdfg)
 
         # Extract the generated function (name matches the SDFG name)
         func_name = sdfg.name

@@ -263,7 +263,8 @@ def _write_dispatch_block(node: ControlFlowBlock, dispatch_state: Callable[[SDFG
     elif isinstance(node, ContinueBlock):
         stream.write('continue', cfg=node.sdfg, state_id=node.block_id)
     elif isinstance(node, ReturnBlock):
-        stream.write('return', cfg=node.sdfg, state_id=node.block_id)
+        exit_statement = getattr(codegen, 'successful_exit_statement', lambda _: 'return')(node.sdfg)
+        stream.write(exit_statement, cfg=node.sdfg, state_id=node.block_id)
     elif isinstance(node, LoopRegion):
         _write_loop_region(node, dispatch_state, codegen, symbols, stream)
     elif isinstance(node, ConditionalBlock):
@@ -441,4 +442,3 @@ def control_flow_region_to_code(region: AbstractControlFlowRegion,
     _write_control_flow_region(region, dispatch_state, codegen, symbols, stream,
                                start=start, stop=stop, generate_children_of=generate_children_of,
                                ptree=parent_tree, visited=visited)
-    

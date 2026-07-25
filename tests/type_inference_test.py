@@ -342,10 +342,6 @@ value3=5000000000"""
         # bool * bool stays bool.
         self.assertEqual(dtypes.result_type_of(b, b), b)
 
-    def testPythonTrueDivisionProducesFloat(self):
-        self.assertEqual(type_inference.infer_expr_type("N / 2", {"N": dtypes.int64}), dtypes.float64)
-        self.assertEqual(type_inference.infer_expr_type("N // 2", {"N": dtypes.int64}), dtypes.int64)
-
 
 if __name__ == "__main__":
     unittest.main()

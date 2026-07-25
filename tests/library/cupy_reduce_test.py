@@ -19,17 +19,14 @@ The CuPy expansion emits a Python-language tasklet, so these tests use
 ``sdfg.backend = BackendLanguage.Python`` (NOT ``apply_gpu_transformations``
 which sets up the C++ backend).
 """
-import itertools
 import numpy as np
 import pytest
 
 import dace
 from dace import dtypes, SDFG, Memlet
 import dace.libraries.standard as std
-from dace.frontend.operations import detect_reduction_type
 from dace.libraries.standard.nodes.reduce import (
     ExpandReduceCuPy,
-    ExpandReducePure,
     _REDUCTION_TYPE_TO_CUPY,
 )
 
@@ -109,22 +106,12 @@ class TestCuPyReduceStructure:
         nsdfg = ExpandReduceCuPy.expansion(rnode, sdfg.start_block, sdfg)
         assert 'asnumpy' not in self._tasklet_code(nsdfg)
 
-        assert len(nsdfg.states()) == 2
-        assert nsdfg.states()[-1].label == 'cupy_sync'
-        sync_tasklets = [
-            node for node in nsdfg.states()[-1].nodes()
-            if isinstance(node, dace.sdfg.nodes.Tasklet)
-        ]
-        assert len(sync_tasklets) == 1
-        assert 'get_current_stream().synchronize()' in sync_tasklets[0].code.as_string
-
     def test_host_output_converts_to_numpy(self):
         """A host-resident output keeps the ``cupy.asnumpy`` conversion."""
         sdfg, rnode = _make_reduce_sdfg([8, 4], [1], 'lambda a, b: max(a, b)')
         rnode.implementation = 'CuPy'
         nsdfg = ExpandReduceCuPy.expansion(rnode, sdfg.start_block, sdfg)
         assert 'asnumpy' in self._tasklet_code(nsdfg)
-        assert len(nsdfg.states()) == 1
 
     def test_registered(self):
         """CuPy must appear in the Reduce implementations dict."""

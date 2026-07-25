@@ -305,6 +305,9 @@ def test_runtime_defined_int_symbol_large_value_runtime():
     n = 64
     big = 2**40 + 12345
     sdfg = _runtime_defined_symbol_sdfg('rt_int_runtime', str(big), dace.int64, '+', n=n)
+    code = ''.join(sdfg.generate_code()[0].code.split())
+    assert 'cupy.asarray(c_rt,dtype=numpy.int64).reshape(1)' in code
+    assert 'dtype=numpy.uint64' not in code
     x_host = np.arange(n, dtype=np.int64)
     x = cupy.asarray(x_host)
     y = cupy.zeros(n, dtype=cupy.int64)

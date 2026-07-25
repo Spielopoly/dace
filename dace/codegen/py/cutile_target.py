@@ -7,15 +7,21 @@ tiles).  MapExit is a no-op.
 """
 
 import ast
+import math
+import numbers
+import operator
 import warnings
-from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, FrozenSet, Iterable, List, NamedTuple, Optional, Set, Tuple
 
+import networkx as nx
+import numpy as np
 import sympy as sp
 
 from dace import data, dtypes, registry, subsets
 import dace.codegen.dispatcher as dispatcher_mod
 from dace.codegen.exceptions import CodegenError
 from dace.codegen.py import control_flow as py_cflow
+from dace.codegen.py.cutile_aot import AOT_ABI_VERSION, AOTParam
 from dace.config import Config
 from dace.codegen.py.framecode import codeblock_to_python
 from dace.codegen.py.prettycode import PythonCodeIOStream
@@ -481,9 +487,9 @@ def _ordered_unique(items: Iterable[str]) -> List[str]:
 def _collect_free_symbols(entry: nodes.MapEntry, dfg_scope: object, sdfg: "SDFG") -> List[str]:
     """Collect free symbols used in a map scope.
 
-    Returns symbols that appear in the map range, memlet subsets, or
-    NestedSDFG symbol mappings and are declared in the SDFG's symbol
-    table (but not constants).
+    Returns symbols that appear in the map range, memlet subsets,
+    NestedSDFG mappings, or tasklet code and are either declared by the
+    SDFG or defined by emitted host control flow. Constants are excluded.
 
     :param entry: The map entry node.
     :param dfg_scope: The scope subgraph view.
@@ -522,16 +528,11 @@ def _collect_free_symbols(entry: nodes.MapEntry, dfg_scope: object, sdfg: "SDFG"
         if isinstance(scope_node, nodes.MapEntry):
             bound_names |= {str(p) for p in scope_node.map.params}
     syms -= bound_names
-    # Loop induction variables and interstate-assigned names are module-level
-    # Python locals in the generated code but not necessarily in
-    # ``sdfg.symbols``; they must still become kernel parameters.
-    runtime_defined = set()
-    for region in sdfg.all_control_flow_regions():
-        loop_var = getattr(region, 'loop_variable', None)
-        if loop_var:
-            runtime_defined.add(str(loop_var))
-    for isedge in sdfg.all_interstate_edges():
-        runtime_defined |= set(isedge.data.assignments.keys())
+    # Generated control-flow locals are not necessarily declared SDFG
+    # symbols, but they must still become kernel parameters. Keep this filter
+    # synchronized with the reaching-type seed set, including names assigned
+    # only by an emitted LoopRegion init/update CodeBlock.
+    runtime_defined = set(_runtime_symbol_names(sdfg))
     syms = {
         s
         for s in syms
@@ -573,17 +574,1428 @@ def _is_cutile_node(state: "SDFGState", node: nodes.Node) -> bool:
     return _enclosing_cutile_entry(state, node) is not None
 
 
-#: One AOT spec parameter: (kind, numpy dtype name, ndim, per-dim stride constants or None).
-#: This tuple layout is the frozen interface to ``cutile_aot.build_export_plan``.
-_AOTParam = Tuple[str, str, int, Optional[Tuple[Optional[int], ...]]]
+def _cutile_mode() -> str:
+    """Return the explicitly selected cuTile compilation mode."""
+    mode = Config.get('compiler', 'cutile', 'mode')
+    if mode not in ('jit', 'aot'):
+        raise CodegenError(f"Unsupported compiler.cutile.mode {mode!r}; expected 'jit' or 'aot'")
+    return mode
 
 
-def _cutile_aot_enabled() -> bool:
-    """Whether the cuTile AOT spec registry is emitted into generated code.
+_STATIC_BINOPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.FloorDiv: operator.floordiv,
+    ast.Mod: operator.mod,
+    ast.Pow: operator.pow,
+    ast.LShift: operator.lshift,
+    ast.RShift: operator.rshift,
+    ast.BitOr: operator.or_,
+    ast.BitXor: operator.xor,
+    ast.BitAnd: operator.and_,
+}
 
-    :returns: The ``compiler.cutile.aot_compile`` config value (default on).
-    """
-    return Config.get_bool('compiler', 'cutile', 'aot_compile')
+_STATIC_UNARYOPS = {
+    ast.UAdd: operator.pos,
+    ast.USub: operator.neg,
+    ast.Invert: operator.invert,
+}
+
+_DYNAMIC_VALUE = object()
+_EXPRESSION_CANDIDATE_LIMIT = 64
+_STATIC_EXPONENT_LIMIT = 4096
+_STATIC_SHIFT_LIMIT = 4096
+_STATIC_INTEGER_BIT_LIMIT = 4096
+
+_HOST_NATIVE = 'native'
+_HOST_NUMPY = 'numpy'
+_HOST_UNKNOWN = 'unknown'
+
+
+class _ExpressionCandidate(NamedTuple):
+    """One possible host expression result and its staged ABI type."""
+
+    dtype: Optional[dtypes.typeclass]
+    value: object
+    host_category: str = _HOST_UNKNOWN
+    numeric_range: Optional[Tuple[object, object]] = None
+
+
+_ReachingCandidateSet = FrozenSet[_ExpressionCandidate]
+_ReachingCandidates = Dict[str, _ReachingCandidateSet]
+_ReachingTypeSet = FrozenSet[Optional[dtypes.typeclass]]
+_ReachingTypes = Dict[str, _ReachingTypeSet]
+
+
+def _integer_dtype(value: int, expression: str) -> dtypes.typeclass:
+    """Return the supported materialized dtype for an exact Python integer."""
+    if -(2**63) <= value <= 2**63 - 1:
+        return dtypes.int64
+    if 0 <= value <= 2**64 - 1:
+        return dtypes.uint64
+    raise CodegenError(f'cuTile codegen: statically evaluated integer assignment {expression!r} '
+                       f'has value {value}, outside the representable 64-bit range')
+
+
+def _provisional_integer_dtype(value: int) -> Optional[dtypes.typeclass]:
+    """Return an integer dtype when an exact intermediate already fits."""
+    if -(2**63) <= value <= 2**63 - 1:
+        return dtypes.int64
+    if 0 <= value <= 2**64 - 1:
+        return dtypes.uint64
+    return None
+
+
+def _static_candidate(value: object) -> _ExpressionCandidate:
+    """Create a candidate while preserving an exact scalar value."""
+    if isinstance(value, np.generic):
+        try:
+            dtype = dtypes.dtype_to_typeclass(value.dtype.type)
+        except (KeyError, TypeError, ValueError):
+            return _undefined_candidate()
+        kind = value.dtype.kind
+        if kind == 'b':
+            exact = int(bool(value))
+            return _ExpressionCandidate(dtype, value, _HOST_NUMPY, (exact, exact))
+        if kind in 'iu':
+            exact = int(value)
+            return _ExpressionCandidate(dtype, value, _HOST_NUMPY, (exact, exact))
+        if kind == 'f':
+            return _ExpressionCandidate(dtype, value, _HOST_NUMPY, (value, value))
+        if kind == 'c':
+            return _ExpressionCandidate(dtype, value, _HOST_NUMPY)
+        return _undefined_candidate()
+    if isinstance(value, bool):
+        exact = int(value)
+        return _ExpressionCandidate(dtypes.bool, value, _HOST_NATIVE, (exact, exact))
+    if isinstance(value, numbers.Integral):
+        exact = int(value)
+        return _ExpressionCandidate(_provisional_integer_dtype(exact), exact, _HOST_NATIVE, (exact, exact))
+    if isinstance(value, numbers.Real):
+        try:
+            dtype = dtypes.typeclass(type(value))
+        except (KeyError, TypeError, ValueError):
+            dtype = dtypes.float64
+        return _ExpressionCandidate(dtype, value, _HOST_NATIVE, (value, value))
+    if isinstance(value, numbers.Complex):
+        try:
+            dtype = dtypes.typeclass(type(value))
+        except (KeyError, TypeError, ValueError):
+            dtype = dtypes.complex128
+        return _ExpressionCandidate(dtype, value, _HOST_NATIVE)
+    return _undefined_candidate()
+
+
+def _undefined_candidate() -> _ExpressionCandidate:
+    """Return a candidate that cannot be typed safely."""
+    return _ExpressionCandidate(None, _DYNAMIC_VALUE)
+
+
+def _integer_range_dtype(lower: int, upper: int) -> Optional[dtypes.typeclass]:
+    """Return one 64-bit ABI dtype that represents an integer range."""
+    if -(2**63) <= lower <= upper <= 2**63 - 1:
+        return dtypes.int64
+    if 0 <= lower <= upper <= 2**64 - 1:
+        return dtypes.uint64
+    return None
+
+
+def _native_dynamic_candidate(dtype: Optional[dtypes.typeclass]) -> _ExpressionCandidate:
+    """Model a declared symbol after ``CompiledSDFG`` native marshalling."""
+    if dtype is None:
+        return _undefined_candidate()
+    np_dtype = dtype.as_numpy_dtype()
+    if np_dtype.kind == 'b':
+        return _ExpressionCandidate(dtypes.bool, _DYNAMIC_VALUE, _HOST_NATIVE, (0, 1))
+    if np_dtype.kind in 'iu':
+        limits = np.iinfo(np_dtype)
+        abi_dtype = dtypes.uint64 if np_dtype.kind == 'u' and np_dtype.itemsize == 8 else dtypes.int64
+        return _ExpressionCandidate(abi_dtype, _DYNAMIC_VALUE, _HOST_NATIVE, (int(limits.min), int(limits.max)))
+    if np_dtype.kind == 'f':
+        return _ExpressionCandidate(dtypes.float64, _DYNAMIC_VALUE, _HOST_NATIVE)
+    if np_dtype.kind == 'c':
+        return _ExpressionCandidate(dtypes.complex128, _DYNAMIC_VALUE, _HOST_NATIVE)
+    return _undefined_candidate()
+
+
+def _true_division_range(left: _ExpressionCandidate, right: _ExpressionCandidate) -> Optional[Tuple[float, float]]:
+    """Bound native true division by one exact, nonzero real value."""
+    if left.numeric_range is None or right.value is _DYNAMIC_VALUE or not isinstance(right.value, numbers.Real):
+        return None
+    denominator = float(right.value)
+    if denominator == 0.0 or not math.isfinite(denominator):
+        return None
+    try:
+        values = [float(bound) / denominator for bound in left.numeric_range]
+    except (OverflowError, TypeError, ValueError, ZeroDivisionError):
+        return None
+    if not all(math.isfinite(value) for value in values):
+        return None
+    lower = math.nextafter(min(values), -math.inf)
+    upper = math.nextafter(max(values), math.inf)
+    return lower, upper
+
+
+def _dynamic_int_cast_candidate(candidate: _ExpressionCandidate) -> _ExpressionCandidate:
+    """Convert a ranged host numeric value to a native Python integer."""
+    if candidate.dtype is None or candidate.numeric_range is None:
+        return _undefined_candidate()
+    if candidate.dtype.as_numpy_dtype().kind not in 'biuf':
+        return _undefined_candidate()
+    try:
+        bounds = tuple(math.trunc(bound) for bound in candidate.numeric_range)
+    except (OverflowError, TypeError, ValueError):
+        return _undefined_candidate()
+    lower, upper = min(bounds), max(bounds)
+    dtype = _integer_range_dtype(lower, upper)
+    if dtype is None:
+        return _undefined_candidate()
+    return _ExpressionCandidate(dtype, _DYNAMIC_VALUE, _HOST_NATIVE, (lower, upper))
+
+
+def _native_unary_candidate(op: ast.unaryop, operand: _ExpressionCandidate) -> _ExpressionCandidate:
+    """Infer a unary operation on a marshalled native Python scalar."""
+    if operand.dtype is None:
+        return _undefined_candidate()
+    kind = operand.dtype.as_numpy_dtype().kind
+    if kind in 'biu':
+        if operand.numeric_range is None:
+            return _undefined_candidate()
+        lower, upper = (int(bound) for bound in operand.numeric_range)
+        if isinstance(op, ast.UAdd):
+            result_range = (lower, upper)
+        elif isinstance(op, ast.USub):
+            result_range = (-upper, -lower)
+        elif isinstance(op, ast.Invert):
+            result_range = (-upper - 1, -lower - 1)
+        else:
+            return _undefined_candidate()
+        dtype = _integer_range_dtype(*result_range)
+        if dtype is None:
+            return _undefined_candidate()
+        return _ExpressionCandidate(dtype, _DYNAMIC_VALUE, _HOST_NATIVE, result_range)
+    if isinstance(op, ast.Invert):
+        return _undefined_candidate()
+    if kind == 'f':
+        return _ExpressionCandidate(dtypes.float64, _DYNAMIC_VALUE, _HOST_NATIVE, operand.numeric_range)
+    if kind == 'c':
+        return _ExpressionCandidate(dtypes.complex128, _DYNAMIC_VALUE, _HOST_NATIVE)
+    return _undefined_candidate()
+
+
+def _materialized_candidate_dtype(candidate: _ExpressionCandidate, expression: str) -> Optional[dtypes.typeclass]:
+    """Type a final candidate, enforcing integer ABI bounds only here."""
+    if (candidate.host_category == _HOST_NATIVE and isinstance(candidate.value, numbers.Integral)
+            and not isinstance(candidate.value, bool)):
+        return _integer_dtype(int(candidate.value), expression)
+    return candidate.dtype
+
+
+def _bounded_candidates(candidates: Iterable[_ExpressionCandidate], expression: str) -> FrozenSet[_ExpressionCandidate]:
+    """Deduplicate a bounded expression-candidate set."""
+    result = set()
+    for candidate in candidates:
+        result.add(candidate)
+        if len(result) > _EXPRESSION_CANDIDATE_LIMIT:
+            raise CodegenError(f'cuTile codegen: expression {expression!r} has more than '
+                               f'{_EXPRESSION_CANDIDATE_LIMIT} possible Python value/type candidates')
+    return frozenset(result)
+
+
+def _candidate_key(candidate: _ExpressionCandidate) -> Tuple[Optional[dtypes.typeclass], str]:
+    """Return the finite semantic key used by reaching-state joins."""
+    return candidate.dtype, candidate.host_category
+
+
+def _same_exact_value(left: object, right: object) -> bool:
+    """Compare exact scalar values without invoking array-like truth semantics."""
+    if left is _DYNAMIC_VALUE or right is _DYNAMIC_VALUE or type(left) is not type(right):
+        return False
+    try:
+        return bool(left == right)
+    except (TypeError, ValueError):
+        return False
+
+
+def _range_hull(candidates: Iterable[_ExpressionCandidate]) -> Optional[Tuple[object, object]]:
+    """Return a conservative hull, or no range if any input is unbounded."""
+    ranges = [candidate.numeric_range for candidate in candidates]
+    if not ranges or any(bounds is None for bounds in ranges):
+        return None
+    try:
+        return min(bounds[0] for bounds in ranges), max(bounds[1] for bounds in ranges)
+    except (TypeError, ValueError):
+        return None
+
+
+def _full_candidate_range(candidate: _ExpressionCandidate) -> Optional[Tuple[int, int]]:
+    """Return the complete finite integer domain for candidate widening."""
+    if candidate.dtype is None:
+        return None
+    if candidate.host_category == _HOST_NUMPY:
+        return _numpy_dtype_range(candidate.dtype)
+    np_dtype = candidate.dtype.as_numpy_dtype()
+    if np_dtype.kind == 'b':
+        return (0, 1)
+    if np_dtype.kind in 'iu':
+        limits = np.iinfo(np_dtype)
+        return int(limits.min), int(limits.max)
+    return None
+
+
+def _join_candidate_sets(current: _ReachingCandidateSet,
+                         incoming: _ReachingCandidateSet,
+                         expression: str,
+                         widen: bool = False) -> _ReachingCandidateSet:
+    """Join candidates by a finite semantic key, optionally widening ranges."""
+    current_groups: Dict[Tuple[Optional[dtypes.typeclass], str], List[_ExpressionCandidate]] = {}
+    all_groups: Dict[Tuple[Optional[dtypes.typeclass], str], List[_ExpressionCandidate]] = {}
+    for candidate in current:
+        current_groups.setdefault(_candidate_key(candidate), []).append(candidate)
+        all_groups.setdefault(_candidate_key(candidate), []).append(candidate)
+    for candidate in incoming:
+        all_groups.setdefault(_candidate_key(candidate), []).append(candidate)
+
+    result = []
+    for key, group in all_groups.items():
+        dtype, host_category = key
+        if dtype is None:
+            result.append(_undefined_candidate())
+            continue
+        first = group[0]
+        exact = first.value
+        if any(not _same_exact_value(exact, candidate.value) for candidate in group[1:]):
+            exact = _DYNAMIC_VALUE
+        numeric_range = _range_hull(group)
+        joined = _ExpressionCandidate(dtype, exact, host_category, numeric_range)
+        if widen and key in current_groups:
+            old_range = _range_hull(current_groups[key])
+            if old_range != numeric_range:
+                if old_range is None or numeric_range is None:
+                    joined = joined._replace(value=_DYNAMIC_VALUE, numeric_range=None)
+                elif numeric_range[0] < old_range[0] or numeric_range[1] > old_range[1]:
+                    joined = joined._replace(value=_DYNAMIC_VALUE, numeric_range=_full_candidate_range(joined))
+        result.append(joined)
+    return _bounded_candidates(result, expression)
+
+
+def _candidate_truth(candidate: _ExpressionCandidate) -> Optional[bool]:
+    """Return a statically known Python truth value, if any."""
+    if candidate.value is _DYNAMIC_VALUE:
+        return None
+    try:
+        return bool(candidate.value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _integer_kind(dtype: dtypes.typeclass) -> bool:
+    """Return whether a dtype behaves as an integer in host Python expressions."""
+    return dtype.as_numpy_dtype().kind in 'biu'
+
+
+def _native_nonbool_integer_candidate(candidate: _ExpressionCandidate) -> bool:
+    """Return whether a candidate is a native Python integer proof operand."""
+    return (candidate.host_category == _HOST_NATIVE and candidate.dtype is not None
+            and candidate.dtype.as_numpy_dtype().kind in 'iu')
+
+
+def _static_binop_candidate(op: ast.operator, left: object, right: object, expression: str) -> _ExpressionCandidate:
+    """Evaluate a bounded static binary operation."""
+    native_operands = not isinstance(left, np.generic) and not isinstance(right, np.generic)
+    if native_operands and isinstance(op, ast.Pow) and isinstance(right, numbers.Integral):
+        exponent = int(right)
+        if abs(exponent) > _STATIC_EXPONENT_LIMIT:
+            if isinstance(left, numbers.Integral) and int(left) in (-1, 0, 1):
+                base = int(left)
+                if exponent == 0:
+                    return _static_candidate(1)
+                if exponent > 0:
+                    return _static_candidate(0 if base == 0 else 1 if base == 1 or exponent % 2 == 0 else -1)
+                if base == 0:
+                    return _undefined_candidate()
+                return _static_candidate(1.0 if base == 1 or exponent % 2 == 0 else -1.0)
+            raise CodegenError(f'cuTile codegen: static exponent in expression {expression!r} exceeds '
+                               f'the bounded limit {_STATIC_EXPONENT_LIMIT}')
+        if exponent >= 0 and isinstance(left, numbers.Integral) and abs(int(left)) > 1:
+            estimated_bits = max(1, abs(int(left)).bit_length()) * max(1, exponent)
+            if estimated_bits > _STATIC_INTEGER_BIT_LIMIT:
+                raise CodegenError(f'cuTile codegen: static power in expression {expression!r} may exceed '
+                                   f'{_STATIC_INTEGER_BIT_LIMIT} intermediate bits')
+    if native_operands and isinstance(op, (ast.LShift, ast.RShift)) and isinstance(right, numbers.Integral):
+        shift = int(right)
+        if shift < 0:
+            raise CodegenError(f'cuTile codegen: static shift in expression {expression!r} is outside '
+                               f'the bounded range 0:{_STATIC_SHIFT_LIMIT}')
+        if shift > _STATIC_SHIFT_LIMIT:
+            if isinstance(left, numbers.Integral):
+                if isinstance(op, ast.RShift):
+                    return _static_candidate(0 if int(left) >= 0 else -1)
+                if int(left) == 0:
+                    return _static_candidate(0)
+            raise CodegenError(f'cuTile codegen: static shift in expression {expression!r} is outside '
+                               f'the bounded range 0:{_STATIC_SHIFT_LIMIT}')
+        if isinstance(op, ast.LShift) and isinstance(left, numbers.Integral):
+            estimated_bits = abs(int(left)).bit_length() + shift
+            if estimated_bits > _STATIC_INTEGER_BIT_LIMIT:
+                raise CodegenError(f'cuTile codegen: static shift in expression {expression!r} may exceed '
+                                   f'{_STATIC_INTEGER_BIT_LIMIT} intermediate bits')
+    function = _STATIC_BINOPS.get(type(op))
+    if function is None:
+        return _undefined_candidate()
+    try:
+        result = function(left, right)
+    except (ArithmeticError, OverflowError, TypeError, ValueError):
+        return _undefined_candidate()
+    if not isinstance(result, np.generic) and isinstance(result, numbers.Integral) and abs(
+            int(result)).bit_length() > _STATIC_INTEGER_BIT_LIMIT:
+        raise CodegenError(f'cuTile codegen: static operation in expression {expression!r} exceeds '
+                           f'{_STATIC_INTEGER_BIT_LIMIT} intermediate bits')
+    return _static_candidate(result)
+
+
+def _integer_candidate(result_range: Tuple[int, int]) -> _ExpressionCandidate:
+    """Create a native integer candidate when its complete range has one ABI."""
+    dtype = _integer_range_dtype(*result_range)
+    if dtype is None:
+        return _undefined_candidate()
+    return _ExpressionCandidate(dtype, _DYNAMIC_VALUE, _HOST_NATIVE, result_range)
+
+
+def _native_integer_binop_candidate(op: ast.operator, left: _ExpressionCandidate,
+                                    right: _ExpressionCandidate) -> _ExpressionCandidate:
+    """Infer native Python integer operations from complete operand ranges."""
+    if left.numeric_range is None or right.numeric_range is None:
+        return _undefined_candidate()
+    left_lower, left_upper = (int(bound) for bound in left.numeric_range)
+    right_lower, right_upper = (int(bound) for bound in right.numeric_range)
+
+    if isinstance(op, ast.Add):
+        result_range = (left_lower + right_lower, left_upper + right_upper)
+    elif isinstance(op, ast.Sub):
+        result_range = (left_lower - right_upper, left_upper - right_lower)
+    elif isinstance(op, ast.Mult):
+        products = (left_lower * right_lower, left_lower * right_upper, left_upper * right_lower,
+                    left_upper * right_upper)
+        result_range = (min(products), max(products))
+    elif isinstance(op, ast.FloorDiv):
+        if right_lower <= 0 <= right_upper:
+            return _undefined_candidate()
+        quotients = (left_lower // right_lower, left_lower // right_upper, left_upper // right_lower,
+                     left_upper // right_upper)
+        result_range = (min(quotients), max(quotients))
+    elif isinstance(op, ast.Mod):
+        if right_lower <= 0 <= right_upper:
+            return _undefined_candidate()
+        magnitude = max(abs(right_lower), abs(right_upper)) - 1
+        result_range = (0, magnitude) if right_lower > 0 else (-magnitude, 0)
+    elif isinstance(op, (ast.LShift, ast.RShift)):
+        if right_lower < 0 or right_upper > _STATIC_SHIFT_LIMIT:
+            return _undefined_candidate()
+        function = operator.lshift if isinstance(op, ast.LShift) else operator.rshift
+        values = (function(left_lower, right_lower), function(left_lower,
+                                                              right_upper), function(left_upper, right_lower),
+                  function(left_upper, right_upper))
+        result_range = (min(values), max(values))
+    elif isinstance(op, (ast.BitAnd, ast.BitOr, ast.BitXor)):
+        left_bool = left.dtype == dtypes.bool and left.numeric_range == (0, 1)
+        right_bool = right.dtype == dtypes.bool and right.numeric_range == (0, 1)
+        if left_bool and right_bool:
+            return _ExpressionCandidate(dtypes.bool, _DYNAMIC_VALUE, _HOST_NATIVE, (0, 1))
+        # A nonnegative exact mask gives a useful complete bound for ``&``.
+        if isinstance(op, ast.BitAnd) and left_lower >= 0 and right_lower >= 0:
+            result_range = (0, min(left_upper, right_upper))
+        else:
+            return _undefined_candidate()
+    else:
+        return _undefined_candidate()
+    return _integer_candidate(result_range)
+
+
+def _numpy_dtype_range(dtype: dtypes.typeclass) -> Optional[Tuple[int, int]]:
+    """Return the complete fixed-width NumPy bool/integer result range."""
+    np_dtype = dtype.as_numpy_dtype()
+    if np_dtype.kind == 'b':
+        return (0, 1)
+    if np_dtype.kind in 'iu':
+        limits = np.iinfo(np_dtype)
+        return int(limits.min), int(limits.max)
+    return None
+
+
+def _numpy_mixed_result_dtype(left: _ExpressionCandidate, right: _ExpressionCandidate) -> Optional[dtypes.typeclass]:
+    """Apply NumPy weak-scalar promotion only when the native scalar is exact."""
+    if left.host_category == right.host_category == _HOST_NUMPY:
+        return dtypes.result_type_of(left.dtype, right.dtype)
+    if left.host_category == _HOST_NUMPY and right.host_category == _HOST_NATIVE:
+        numpy_candidate, native_candidate = left, right
+    elif right.host_category == _HOST_NUMPY and left.host_category == _HOST_NATIVE:
+        numpy_candidate, native_candidate = right, left
+    else:
+        return None
+    if native_candidate.value is _DYNAMIC_VALUE:
+        return None
+    try:
+        return dtypes.dtype_to_typeclass(
+            np.result_type(numpy_candidate.dtype.as_numpy_dtype(), native_candidate.value).type)
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _dynamic_binop_candidate(op: ast.operator, left: _ExpressionCandidate,
+                             right: _ExpressionCandidate) -> _ExpressionCandidate:
+    """Infer one non-static Python binary operation conservatively."""
+    if left.dtype is None or right.dtype is None:
+        return _undefined_candidate()
+    if left.host_category == right.host_category == _HOST_NATIVE:
+        left_kind = left.dtype.as_numpy_dtype().kind
+        right_kind = right.dtype.as_numpy_dtype().kind
+        if left_kind in 'biu' and right_kind in 'biu' and not isinstance(op, ast.Div):
+            if isinstance(op, ast.Pow):
+                if right.value is _DYNAMIC_VALUE or not isinstance(right.value, numbers.Integral):
+                    return _undefined_candidate()
+                exponent = int(right.value)
+                if exponent < 0:
+                    return _ExpressionCandidate(dtypes.float64, _DYNAMIC_VALUE, _HOST_NATIVE)
+                if exponent == 0:
+                    return _static_candidate(1)
+                if left.numeric_range is None or exponent > _STATIC_EXPONENT_LIMIT:
+                    return _undefined_candidate()
+                values = (int(left.numeric_range[0])**exponent, int(left.numeric_range[1])**exponent)
+                if int(left.numeric_range[0]) <= 0 <= int(left.numeric_range[1]) and exponent % 2 == 0:
+                    values = (*values, 0)
+                return _integer_candidate((min(values), max(values)))
+            return _native_integer_binop_candidate(op, left, right)
+        if isinstance(op, (ast.LShift, ast.RShift, ast.BitAnd, ast.BitOr, ast.BitXor)):
+            return _undefined_candidate()
+        if isinstance(op, ast.Pow):
+            exact_integer_exponent = (right.value is not _DYNAMIC_VALUE and isinstance(right.value, numbers.Integral))
+            if not exact_integer_exponent and 'c' not in (left_kind, right_kind):
+                return _undefined_candidate()
+        if type(op) not in _STATIC_BINOPS:
+            return _undefined_candidate()
+        kind = 'c' if 'c' in (left_kind, right_kind) else 'f'
+        if isinstance(op, ast.Div) and kind == 'f':
+            numeric_range = _true_division_range(left, right)
+        else:
+            numeric_range = None
+        dtype = dtypes.complex128 if kind == 'c' else dtypes.float64
+        return _ExpressionCandidate(dtype, _DYNAMIC_VALUE, _HOST_NATIVE, numeric_range)
+
+    if _HOST_UNKNOWN in (left.host_category, right.host_category):
+        return _undefined_candidate()
+    dtype = _numpy_mixed_result_dtype(left, right)
+    if dtype is None:
+        return _undefined_candidate()
+    if isinstance(op, (ast.LShift, ast.RShift)):
+        return _undefined_candidate()
+    if isinstance(op, ast.Pow):
+        if right.value is _DYNAMIC_VALUE and (_integer_kind(left.dtype) or _integer_kind(right.dtype)):
+            return _undefined_candidate()
+    if type(op) not in _STATIC_BINOPS:
+        return _undefined_candidate()
+    if isinstance(op, ast.Div):
+        kind = dtype.as_numpy_dtype().kind
+        if kind in 'biu':
+            dtype = dtypes.float64
+    return _ExpressionCandidate(dtype, _DYNAMIC_VALUE, _HOST_NUMPY, _numpy_dtype_range(dtype))
+
+
+def _call_name(node: ast.AST) -> str:
+    """Return a dotted call target name, or an empty string."""
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        prefix = _call_name(node.value)
+        return f'{prefix}.{node.attr}' if prefix else node.attr
+    return ''
+
+
+def _numpy_cast_dtype(name: str) -> Optional[dtypes.typeclass]:
+    """Resolve an explicit ``numpy.<dtype>`` scalar cast."""
+    if not name.startswith('numpy.') or name.count('.') != 1:
+        return None
+    short_name = name.split('.', 1)[1]
+    dtype = getattr(dtypes, short_name, None)
+    if isinstance(dtype, dtypes.typeclass):
+        return dtype
+    try:
+        return dtypes.typeclass(short_name)
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _dynamic_builtin_abs_candidate(candidate: _ExpressionCandidate) -> _ExpressionCandidate:
+    """Type built-in ``abs`` using the operand's host representation."""
+    if candidate.host_category == _HOST_NUMPY:
+        return _dynamic_numpy_abs_candidate(candidate)
+    if candidate.dtype is None or candidate.host_category != _HOST_NATIVE:
+        return _undefined_candidate()
+    kind = candidate.dtype.as_numpy_dtype().kind
+    if kind == 'c':
+        return _ExpressionCandidate(dtypes.float64, _DYNAMIC_VALUE, _HOST_NATIVE)
+    if kind == 'f':
+        return _ExpressionCandidate(dtypes.float64, _DYNAMIC_VALUE, _HOST_NATIVE)
+    if kind in 'biu' and candidate.numeric_range is not None:
+        lower, upper = (int(bound) for bound in candidate.numeric_range)
+        result_lower = 0 if lower <= 0 <= upper else min(abs(lower), abs(upper))
+        result_upper = max(abs(lower), abs(upper))
+        dtype = _integer_range_dtype(result_lower, result_upper)
+        if dtype is not None:
+            return _ExpressionCandidate(dtype, _DYNAMIC_VALUE, _HOST_NATIVE, (result_lower, result_upper))
+    return _undefined_candidate()
+
+
+def _dynamic_numpy_abs_candidate(candidate: _ExpressionCandidate) -> _ExpressionCandidate:
+    """Type ``numpy.abs`` and record its NumPy-scalar result provenance."""
+    if candidate.dtype is None:
+        return _undefined_candidate()
+    np_dtype = candidate.dtype.as_numpy_dtype()
+    if np_dtype.kind == 'c':
+        dtype = dtypes.float32 if candidate.host_category == _HOST_NUMPY and np_dtype.itemsize == 8 else dtypes.float64
+    elif np_dtype.kind == 'b':
+        dtype = dtypes.bool
+    else:
+        dtype = candidate.dtype
+    return _ExpressionCandidate(dtype, _DYNAMIC_VALUE, _HOST_NUMPY, _numpy_dtype_range(dtype))
+
+
+def _dynamic_numpy_round_candidate(candidate: _ExpressionCandidate) -> _ExpressionCandidate:
+    """Type one-argument ``numpy.round`` with host provenance."""
+    if candidate.dtype is None:
+        return _undefined_candidate()
+    np_dtype = candidate.dtype.as_numpy_dtype()
+    if np_dtype.kind == 'b':
+        dtype = dtypes.float16
+    elif candidate.host_category == _HOST_NATIVE and np_dtype.kind == 'f':
+        dtype = dtypes.float64
+    elif candidate.host_category == _HOST_NATIVE and np_dtype.kind == 'c':
+        dtype = dtypes.complex128
+    else:
+        dtype = candidate.dtype
+    return _ExpressionCandidate(dtype, _DYNAMIC_VALUE, _HOST_NUMPY)
+
+
+def _expression_candidates(node: ast.AST, types: _ReachingCandidates, constants: Dict[str, object],
+                           expression: str) -> FrozenSet[_ExpressionCandidate]:
+    """Evaluate possible Python scalar values and types recursively."""
+    if isinstance(node, ast.Constant):
+        return frozenset({_static_candidate(node.value)})
+
+    if isinstance(node, ast.Name):
+        if node.id in constants:
+            value = constants[node.id]
+            if isinstance(value, numbers.Number):
+                return frozenset({_static_candidate(value)})
+        return types.get(node.id, frozenset({_undefined_candidate()}))
+
+    if isinstance(node, ast.NamedExpr):
+        return frozenset({_undefined_candidate()})
+
+    if isinstance(node, ast.UnaryOp):
+        operands = _expression_candidates(node.operand, types, constants, expression)
+        result = []
+        for operand in operands:
+            if operand.value is not _DYNAMIC_VALUE and type(node.op) in _STATIC_UNARYOPS:
+                try:
+                    result.append(_static_candidate(_STATIC_UNARYOPS[type(node.op)](operand.value)))
+                except (ArithmeticError, OverflowError, TypeError, ValueError):
+                    result.append(_undefined_candidate())
+            elif isinstance(node.op, ast.Not):
+                truth = _candidate_truth(operand)
+                if truth is not None:
+                    result.append(_static_candidate(not truth))
+                elif operand.dtype is None:
+                    result.append(_undefined_candidate())
+                else:
+                    result.append(_ExpressionCandidate(dtypes.bool, _DYNAMIC_VALUE, _HOST_NATIVE, (0, 1)))
+            elif operand.dtype is None or type(node.op) not in _STATIC_UNARYOPS:
+                result.append(_undefined_candidate())
+            elif operand.host_category == _HOST_NATIVE:
+                result.append(_native_unary_candidate(node.op, operand))
+            elif operand.host_category == _HOST_NUMPY:
+                if isinstance(node.op, ast.Invert) and not _integer_kind(operand.dtype):
+                    result.append(_undefined_candidate())
+                else:
+                    result.append(
+                        _ExpressionCandidate(operand.dtype, _DYNAMIC_VALUE, _HOST_NUMPY,
+                                             _numpy_dtype_range(operand.dtype)))
+            else:
+                result.append(_undefined_candidate())
+        return _bounded_candidates(result, expression)
+
+    if isinstance(node, ast.BinOp):
+        left_candidates = _expression_candidates(node.left, types, constants, expression)
+        right_candidates = _expression_candidates(node.right, types, constants, expression)
+        result = []
+        for left in left_candidates:
+            for right in right_candidates:
+                if left.value is not _DYNAMIC_VALUE and right.value is not _DYNAMIC_VALUE:
+                    result.append(_static_binop_candidate(node.op, left.value, right.value, expression))
+                else:
+                    result.append(_dynamic_binop_candidate(node.op, left, right))
+        return _bounded_candidates(result, expression)
+
+    if isinstance(node, ast.BoolOp):
+        active = True
+        finished = set()
+        for value_node in node.values:
+            if not active:
+                break
+            next_active = False
+            for candidate in _expression_candidates(value_node, types, constants, expression):
+                truth = _candidate_truth(candidate)
+                short_circuits = (truth is False if isinstance(node.op, ast.And) else truth is True)
+                continues = (truth is True if isinstance(node.op, ast.And) else truth is False)
+                if short_circuits or truth is None:
+                    finished.add(candidate)
+                if continues or truth is None:
+                    next_active = True
+            active = next_active
+        if active:
+            finished.update(_expression_candidates(node.values[-1], types, constants, expression))
+        return _bounded_candidates(finished, expression)
+
+    if isinstance(node, ast.IfExp):
+        tests = _expression_candidates(node.test, types, constants, expression)
+        take_body = any(_candidate_truth(test) is not False for test in tests)
+        take_else = any(_candidate_truth(test) is not True for test in tests)
+        result = []
+        if any(test.dtype is None and test.value is _DYNAMIC_VALUE for test in tests):
+            result.append(_undefined_candidate())
+        if take_body:
+            result.extend(_expression_candidates(node.body, types, constants, expression))
+        if take_else:
+            result.extend(_expression_candidates(node.orelse, types, constants, expression))
+        return _bounded_candidates(result, expression)
+
+    if isinstance(node, ast.Compare):
+        if any(isinstance(op, (ast.Is, ast.IsNot)) for op in node.ops):
+            return frozenset({_undefined_candidate()})
+        operands = [node.left, *node.comparators]
+        evaluated = [_expression_candidates(operand, types, constants, expression) for operand in operands]
+        if any(candidate.dtype is None and candidate.value is _DYNAMIC_VALUE for candidates in evaluated
+               for candidate in candidates):
+            return frozenset({_undefined_candidate()})
+        if all(len(candidates) == 1 and next(iter(candidates)).value is not _DYNAMIC_VALUE for candidates in evaluated):
+            values = [next(iter(candidates)).value for candidates in evaluated]
+            compare_ops = {
+                ast.Eq: operator.eq,
+                ast.NotEq: operator.ne,
+                ast.Lt: operator.lt,
+                ast.LtE: operator.le,
+                ast.Gt: operator.gt,
+                ast.GtE: operator.ge,
+                ast.Is: operator.is_,
+                ast.IsNot: operator.is_not,
+            }
+            try:
+                value = all(compare_ops[type(op)](left, right) for op, left, right in zip(node.ops, values, values[1:]))
+                return frozenset({_static_candidate(value)})
+            except (KeyError, TypeError, ValueError):
+                return frozenset({_undefined_candidate()})
+        categories = {candidate.host_category for candidates in evaluated for candidate in candidates}
+        host_category = _HOST_NATIVE if categories == {_HOST_NATIVE} else _HOST_NUMPY
+        if _HOST_UNKNOWN in categories:
+            host_category = _HOST_UNKNOWN
+        return frozenset({_ExpressionCandidate(dtypes.bool, _DYNAMIC_VALUE, host_category, (0, 1))})
+
+    if isinstance(node, ast.Call):
+        name = _call_name(node.func)
+        args = [_expression_candidates(arg, types, constants, expression) for arg in node.args]
+        if name in ('int', 'float', 'complex', 'bool') and len(args) == 1 and not node.keywords:
+            result = []
+            converter = {'int': int, 'float': float, 'complex': complex, 'bool': bool}[name]
+            for arg in args[0]:
+                if arg.value is not _DYNAMIC_VALUE:
+                    try:
+                        result.append(_static_candidate(converter(arg.value)))
+                    except (ArithmeticError, OverflowError, TypeError, ValueError):
+                        result.append(_undefined_candidate())
+                elif arg.dtype is None:
+                    result.append(_undefined_candidate())
+                elif name == 'int':
+                    result.append(_dynamic_int_cast_candidate(arg))
+                elif name == 'float':
+                    if arg.dtype.as_numpy_dtype().kind == 'c':
+                        result.append(_undefined_candidate())
+                    else:
+                        result.append(_ExpressionCandidate(dtypes.float64, _DYNAMIC_VALUE, _HOST_NATIVE))
+                elif name == 'complex':
+                    result.append(_ExpressionCandidate(dtypes.complex128, _DYNAMIC_VALUE, _HOST_NATIVE))
+                else:
+                    result.append(_ExpressionCandidate(dtypes.bool, _DYNAMIC_VALUE, _HOST_NATIVE, (0, 1)))
+            return _bounded_candidates(result, expression)
+
+        # The generated module star-imports the SymPy aliases, where bare
+        # ``round`` is rebound to ``numpy.round``. Other dotted aliases are
+        # not part of that namespace and deliberately fail closed.
+        if name in ('round', 'numpy.round') and len(args) == 1 and not node.keywords:
+            result = []
+            for candidate in args[0]:
+                if candidate.value is not _DYNAMIC_VALUE:
+                    try:
+                        result.append(_static_candidate(np.round(candidate.value)))
+                    except (ArithmeticError, OverflowError, TypeError, ValueError):
+                        result.append(_undefined_candidate())
+                elif candidate.dtype is None:
+                    result.append(_undefined_candidate())
+                else:
+                    result.append(_dynamic_numpy_round_candidate(candidate))
+            return _bounded_candidates(result, expression)
+
+        if name in ('abs', 'Abs', 'numpy.abs') and len(args) == 1 and not node.keywords:
+            numpy_call = name == 'numpy.abs'
+            result = []
+            for candidate in args[0]:
+                if candidate.value is not _DYNAMIC_VALUE:
+                    try:
+                        value = np.abs(candidate.value) if numpy_call else abs(candidate.value)
+                        result.append(_static_candidate(value))
+                    except (ArithmeticError, OverflowError, TypeError, ValueError):
+                        result.append(_undefined_candidate())
+                elif candidate.dtype is None:
+                    result.append(_undefined_candidate())
+                elif numpy_call:
+                    result.append(_dynamic_numpy_abs_candidate(candidate))
+                else:
+                    result.append(_dynamic_builtin_abs_candidate(candidate))
+            return _bounded_candidates(result, expression)
+
+        if name in ('min', 'Min', 'max', 'Max') and args and not node.keywords:
+            return _bounded_candidates((candidate for arg in args for candidate in arg), expression)
+
+        cast_dtype = _numpy_cast_dtype(name)
+        if cast_dtype is not None and len(args) == 1 and not node.keywords:
+            converter = getattr(np, name.split('.', 1)[1], None)
+            if converter is None:
+                return frozenset({_undefined_candidate()})
+            result = []
+            for candidate in args[0]:
+                if candidate.value is not _DYNAMIC_VALUE:
+                    try:
+                        result.append(_static_candidate(converter(candidate.value)))
+                    except (ArithmeticError, OverflowError, TypeError, ValueError):
+                        result.append(_undefined_candidate())
+                elif candidate.dtype is None:
+                    result.append(_undefined_candidate())
+                else:
+                    np_dtype = cast_dtype.as_numpy_dtype()
+                    if np_dtype.kind == 'b':
+                        numeric_range = (0, 1)
+                    elif np_dtype.kind in 'iu':
+                        limits = np.iinfo(np_dtype)
+                        numeric_range = (int(limits.min), int(limits.max))
+                    else:
+                        numeric_range = None
+                    result.append(_ExpressionCandidate(cast_dtype, _DYNAMIC_VALUE, _HOST_NUMPY, numeric_range))
+            return _bounded_candidates(result, expression)
+        return frozenset({_undefined_candidate()})
+
+    return frozenset({_undefined_candidate()})
+
+
+def _materialized_candidate(candidate: _ExpressionCandidate, expression: str) -> _ExpressionCandidate:
+    """Materialize a final candidate without discarding its provenance or range."""
+    return candidate._replace(dtype=_materialized_candidate_dtype(candidate, expression))
+
+
+def _python_assignment_candidates(expression: str, candidates: _ReachingCandidates,
+                                  constants: Dict[str, object]) -> _ReachingCandidateSet:
+    """Infer complete candidates for one host-Python assignment result."""
+    try:
+        tree = ast.parse(str(expression), mode='eval')
+    except SyntaxError:
+        return frozenset({_undefined_candidate()})
+    inferred = _expression_candidates(tree.body, candidates, constants, str(expression))
+    return _bounded_candidates((_materialized_candidate(candidate, str(expression)) for candidate in inferred),
+                               str(expression))
+
+
+def _python_assignment_types(expression: str, types: _ReachingTypes, constants: Dict[str, object]) -> _ReachingTypeSet:
+    """Infer all possible host-Python assignment result types."""
+    candidates = {
+        name: frozenset(_native_dynamic_candidate(dtype) for dtype in dtypes_)
+        for name, dtypes_ in types.items()
+    }
+    return frozenset(candidate.dtype for candidate in _python_assignment_candidates(expression, candidates, constants))
+
+
+def _python_assignment_type(expression: str, symbols: Dict[str, dtypes.typeclass],
+                            constants: Dict[str, object]) -> Optional[dtypes.typeclass]:
+    """Infer one unambiguous host-Python assignment result type."""
+    types = {name: frozenset({dtype}) for name, dtype in symbols.items()}
+    candidates = _python_assignment_types(expression, types, constants)
+    defined = {dtype for dtype in candidates if dtype is not None}
+    if None in candidates or len(defined) != 1:
+        labels = sorted(dtype.as_numpy_dtype().name for dtype in defined)
+        if None in candidates:
+            labels.insert(0, 'undefined')
+        raise CodegenError(f'cuTile codegen: expression {expression!r} has no unambiguous supported Python result '
+                           f'type: {", ".join(labels)}')
+    return next(iter(defined))
+
+
+def _loop_components_enabled(region: object) -> bool:
+    """Mirror whether Python codegen emits a loop's init and update."""
+    return bool(region.init_statement and region.update_statement and region.loop_variable)
+
+
+def _codeblock_assignment_names(codeblock: object) -> FrozenSet[str]:
+    """Return names assigned by a Python CodeBlock."""
+    if codeblock is None or getattr(codeblock, 'language', None) != dtypes.Language.Python:
+        return frozenset()
+    code = codeblock.code
+    statements = code if isinstance(code, list) else ast.parse(codeblock.as_string).body
+    return frozenset(node.id for statement in statements for node in ast.walk(statement)
+                     if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store))
+
+
+def _runtime_symbol_names(sdfg: "SDFG") -> FrozenSet[str]:
+    """Return names defined by generated control-flow assignments."""
+    from dace.sdfg.state import LoopRegion
+
+    result = set()
+    for edge in sdfg.all_interstate_edges():
+        result.update(edge.data.assignments)
+    for region in sdfg.all_control_flow_regions():
+        loop_variable = getattr(region, 'loop_variable', None)
+        if loop_variable:
+            result.add(str(loop_variable))
+        if isinstance(region, LoopRegion) and _loop_components_enabled(region):
+            result.update(_codeblock_assignment_names(region.init_statement))
+            result.update(_codeblock_assignment_names(region.update_statement))
+    return frozenset(result)
+
+
+def _definite_types(candidates: _ReachingCandidates) -> Dict[str, dtypes.typeclass]:
+    """Return names whose complete reaching candidates have one defined dtype."""
+    result: Dict[str, dtypes.typeclass] = {}
+    for name, facts in candidates.items():
+        defined = {candidate.dtype for candidate in facts if candidate.dtype is not None}
+        if not any(candidate.dtype is None for candidate in facts) and len(defined) == 1:
+            result[name] = next(iter(defined))
+    return result
+
+
+def _assignment_reaching_candidates(expression: str, candidates: _ReachingCandidates,
+                                    constants: Dict[str, object]) -> _ReachingCandidateSet:
+    """Infer an assignment with bounded, AST-local candidate propagation."""
+    return _python_assignment_candidates(expression, candidates, constants)
+
+
+def _transfer_reaching_types(edge: object, incoming: _ReachingCandidates,
+                             constants: Dict[str, object]) -> _ReachingCandidates:
+    """Apply one interstate edge's simultaneous assignments."""
+    result = dict(incoming)
+    assigned = {
+        name: _assignment_reaching_candidates(expression, incoming, constants)
+        for name, expression in edge.data.assignments.items()
+    }
+    result.update(assigned)
+    return result
+
+
+def _merge_reaching_types(current: Optional[_ReachingCandidates],
+                          incoming: _ReachingCandidates,
+                          widen: bool = False) -> Tuple[_ReachingCandidates, bool]:
+    """Join complete candidates at a control-flow merge."""
+    if current is None:
+        return dict(incoming), True
+    undefined = frozenset({_undefined_candidate()})
+    merged = {
+        name: _join_candidate_sets(current.get(name, undefined), incoming.get(name, undefined), name, widen)
+        for name in set(current) | set(incoming)
+    }
+    return merged, merged != current
+
+
+def _set_assignment_target(result: _ReachingCandidates, target: ast.AST, candidates: _ReachingCandidateSet) -> None:
+    """Assign a candidate set to a side-effect-free Python name target."""
+    if not isinstance(target, ast.Name):
+        raise CodegenError(f'cuTile codegen: unsupported loop assignment target {ast.unparse(target)!r}')
+    result[target.id] = candidates
+
+
+def _transfer_python_statements(statements: Iterable[ast.stmt], incoming: _ReachingCandidates,
+                                constants: Dict[str, object]) -> _ReachingCandidates:
+    """Apply supported sequential Python loop init/update statements."""
+    result = dict(incoming)
+    for statement in statements:
+        if isinstance(statement, ast.Assign):
+            candidates = _python_assignment_candidates(ast.unparse(statement.value), result, constants)
+            for target in statement.targets:
+                _set_assignment_target(result, target, candidates)
+        elif isinstance(statement, ast.AnnAssign):
+            if statement.value is not None:
+                candidates = _python_assignment_candidates(ast.unparse(statement.value), result, constants)
+                _set_assignment_target(result, statement.target, candidates)
+        elif isinstance(statement, ast.AugAssign):
+            if not isinstance(statement.target, ast.Name):
+                raise CodegenError(f'cuTile codegen: unsupported loop augmented-assignment target '
+                                   f'{ast.unparse(statement.target)!r}')
+            expression = ast.BinOp(left=ast.Name(id=statement.target.id, ctx=ast.Load()),
+                                   op=statement.op,
+                                   right=statement.value)
+            candidates = _python_assignment_candidates(ast.unparse(expression), result, constants)
+            result[statement.target.id] = candidates
+        elif isinstance(statement, ast.If):
+            tests = _expression_candidates(statement.test, result, constants, ast.unparse(statement.test))
+            if any(test.dtype is None and test.value is _DYNAMIC_VALUE for test in tests):
+                raise CodegenError(f'cuTile codegen: unsupported or undefined loop condition '
+                                   f'{ast.unparse(statement.test)!r}')
+            take_body = any(_candidate_truth(test) is not False for test in tests)
+            take_else = any(_candidate_truth(test) is not True for test in tests)
+            outcomes = []
+            if take_body:
+                outcomes.append(_transfer_python_statements(statement.body, result, constants))
+            if take_else:
+                outcomes.append(_transfer_python_statements(statement.orelse, result, constants))
+            merged = None
+            for outcome in outcomes:
+                merged, _ = _merge_reaching_types(merged, outcome)
+            if merged is not None:
+                result = merged
+        elif isinstance(statement, ast.Pass):
+            continue
+        else:
+            raise CodegenError(f'cuTile codegen: unsupported loop init/update statement '
+                               f'{type(statement).__name__}: {ast.unparse(statement)!r}')
+    return result
+
+
+def _transfer_codeblock(codeblock: object, incoming: _ReachingCandidates,
+                        constants: Dict[str, object]) -> _ReachingCandidates:
+    """Apply a supported Python CodeBlock or fail closed."""
+    if codeblock is None:
+        return dict(incoming)
+    if getattr(codeblock, 'language', None) != dtypes.Language.Python:
+        raise CodegenError('cuTile codegen: loop init/update analysis only supports Python CodeBlocks')
+    code = codeblock.code
+    statements = code if isinstance(code, list) else ast.parse(codeblock.as_string).body
+    return _transfer_python_statements(statements, incoming, constants)
+
+
+def _types_after_block(sdfg: "SDFG", block: object, incoming: _ReachingCandidates) -> _ReachingCandidates:
+    """Summarize runtime candidates after one control-flow block."""
+    from dace.sdfg.state import AbstractControlFlowRegion
+    if isinstance(block, AbstractControlFlowRegion):
+        return _types_after_region(sdfg, block, incoming)
+    return dict(incoming)
+
+
+def _scoped_region_types(region: object, entry_types: _ReachingCandidates) -> _ReachingCandidates:
+    """Add symbols introduced by one control-flow region."""
+    from dace.sdfg.state import LoopRegion
+
+    scoped_types = dict(entry_types)
+    if isinstance(region, LoopRegion) and not _loop_components_enabled(region):
+        return scoped_types
+    try:
+        new_symbols = region.new_symbols(_definite_types(scoped_types))
+    except (AttributeError, SyntaxError, TypeError, ValueError):
+        new_symbols = {}
+    for name, dtype in new_symbols.items():
+        if dtype is not None:
+            scoped_types[name] = frozenset({_native_dynamic_candidate(dtype)})
+    return scoped_types
+
+
+def _block_has_implicit_exit(region: object, block: object) -> bool:
+    """Return whether execution may leave a region after this block."""
+    edges = region.out_edges(block)
+    return not edges or not any(edge.data.is_unconditional() for edge in edges)
+
+
+def _region_block_inputs(sdfg: "SDFG", region: object,
+                         entry_types: _ReachingCandidates) -> Dict[object, _ReachingCandidates]:
+    """Compute a fixed point over the explicit edges inside one region."""
+    from dace.sdfg.state import BreakBlock, ContinueBlock, ReturnBlock
+
+    start = getattr(region, 'start_block', None)
+    if start is None:
+        return {}
+    inputs: Dict[object, _ReachingCandidates] = {start: dict(entry_types)}
+    worklist = [start]
+    while worklist:
+        block = worklist.pop()
+        incoming = inputs[block]
+        if isinstance(block, (BreakBlock, ContinueBlock, ReturnBlock)):
+            raise CodegenError(f'cuTile codegen: abrupt control-flow block {type(block).__name__} '
+                               f'in region {region.label!r} is unsupported by local symbol type analysis')
+        block_output = _types_after_block(sdfg, block, incoming)
+        for edge in region.out_edges(block):
+            outgoing = _transfer_reaching_types(edge, block_output, sdfg.constants)
+            cyclic_edge = edge.dst is block or nx.has_path(region.nx, edge.dst, block)
+            merged, changed = _merge_reaching_types(inputs.get(edge.dst), outgoing, widen=cyclic_edge)
+            if changed:
+                inputs[edge.dst] = merged
+                worklist.append(edge.dst)
+    return inputs
+
+
+class _LoopInductionInfo(NamedTuple):
+    """Proven finite abstraction for one canonical loop induction variable."""
+
+    candidates: _ReachingCandidateSet
+    iterations: Optional[int]
+
+
+def _codeblock_statements(codeblock: object) -> List[ast.stmt]:
+    """Return the top-level Python statements in a CodeBlock."""
+    if codeblock is None or getattr(codeblock, 'language', None) != dtypes.Language.Python:
+        return []
+    code = codeblock.code
+    return list(code) if isinstance(code, list) else ast.parse(codeblock.as_string).body
+
+
+def _canonical_loop_step(region: object, initialized: _ReachingCandidates,
+                         constants: Dict[str, object]) -> Optional[Tuple[int, Set[str]]]:
+    """Return a proven integer step and the names on which it depends."""
+    name = str(region.loop_variable)
+    updates = []
+    for statement in _codeblock_statements(region.update_statement):
+        if isinstance(statement, ast.Assign) and len(statement.targets) == 1:
+            target, value = statement.targets[0], statement.value
+            if isinstance(target, ast.Name) and target.id == name:
+                updates.append(value)
+        elif isinstance(statement, ast.AugAssign) and isinstance(statement.target, ast.Name):
+            if statement.target.id == name and isinstance(statement.op, (ast.Add, ast.Sub)):
+                sign = 1 if isinstance(statement.op, ast.Add) else -1
+                updates.append(
+                    ast.BinOp(left=ast.Name(id=name, ctx=ast.Load()),
+                              op=ast.Add(),
+                              right=ast.BinOp(left=ast.Constant(sign), op=ast.Mult(), right=statement.value)))
+    stored_names = [
+        node.id for statement in _codeblock_statements(region.update_statement) for node in ast.walk(statement)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
+    ]
+    if len(updates) != 1 or stored_names.count(name) != 1:
+        return None
+    update = updates[0]
+    step_node = None
+    sign = 1
+    if isinstance(update, ast.BinOp) and isinstance(update.op, ast.Add):
+        if isinstance(update.left, ast.Name) and update.left.id == name:
+            step_node = update.right
+        elif isinstance(update.right, ast.Name) and update.right.id == name:
+            step_node = update.left
+    elif isinstance(update, ast.BinOp) and isinstance(update.op, ast.Sub):
+        if isinstance(update.left, ast.Name) and update.left.id == name:
+            step_node = update.right
+            sign = -1
+    if step_node is None or any(isinstance(node, ast.Name) and node.id == name for node in ast.walk(step_node)):
+        return None
+    candidates = _python_assignment_candidates(ast.unparse(step_node), initialized, constants)
+    if len(candidates) != 1:
+        return None
+    candidate = next(iter(candidates))
+    if (not _native_nonbool_integer_candidate(candidate) or candidate.value is _DYNAMIC_VALUE
+            or not isinstance(candidate.value, numbers.Integral) or isinstance(candidate.value, bool)):
+        return None
+    step = sign * int(candidate.value)
+    step_names = {node.id for node in ast.walk(step_node) if isinstance(node, ast.Name)}
+    return (step, step_names) if step != 0 else None
+
+
+def _loop_bound_is_invariant(region: object, bound_names: Set[str]) -> bool:
+    """Return whether condition-bound names are not assigned in the loop body/update."""
+    name = str(region.loop_variable)
+    assigned = set()
+    for edge in region.all_interstate_edges():
+        assigned.update(edge.data.assignments)
+    assigned.update(_codeblock_assignment_names(region.update_statement))
+    for nested in region.all_control_flow_regions():
+        if nested is region:
+            continue
+        assigned.update(_codeblock_assignment_names(getattr(nested, 'init_statement', None)))
+        assigned.update(_codeblock_assignment_names(getattr(nested, 'update_statement', None)))
+    assigned.discard(name)
+    return not (assigned & bound_names)
+
+
+def _loop_induction_info(region: object, initialized: _ReachingCandidates,
+                         constants: Dict[str, object]) -> Optional[_LoopInductionInfo]:
+    """Prove and bound a canonical pre-condition integer induction loop."""
+    from dace.transformation.passes.analysis import loop_analysis
+
+    if region.inverted or not _loop_components_enabled(region):
+        return None
+    name = str(region.loop_variable)
+    seeds = initialized.get(name, frozenset())
+    seed_keys = {_candidate_key(candidate) for candidate in seeds}
+    if len(seed_keys) != 1 or any(not _native_nonbool_integer_candidate(candidate) for candidate in seeds):
+        return None
+    try:
+        condition = ast.parse(region.loop_condition.as_string, mode='eval').body
+    except SyntaxError:
+        return None
+    if (not isinstance(condition, ast.Compare) or len(condition.ops) != 1 or len(condition.comparators) != 1
+            or not isinstance(condition.left, ast.Name) or condition.left.id != name):
+        return None
+    operation = condition.ops[0]
+    if not isinstance(operation, (ast.Lt, ast.LtE, ast.Gt, ast.GtE)):
+        return None
+    bound_node = condition.comparators[0]
+    if any(isinstance(node, ast.Name) and node.id == name for node in ast.walk(bound_node)):
+        return None
+    bound_names = {node.id for node in ast.walk(bound_node) if isinstance(node, ast.Name)}
+    if not _loop_bound_is_invariant(region, bound_names):
+        return None
+
+    step_info = _canonical_loop_step(region, initialized, constants)
+    if step_info is None:
+        return None
+    step, step_names = step_info
+    if not _loop_bound_is_invariant(region, step_names) or (step > 0) != isinstance(operation, (ast.Lt, ast.LtE)):
+        return None
+    try:
+        start = loop_analysis.get_init_assignment(region)
+        end = loop_analysis.get_loop_end(region)
+    except (AttributeError, SyntaxError, TypeError, ValueError):
+        return None
+    if start is None or end is None:
+        return None
+    starts = _python_assignment_candidates(str(start), initialized, constants)
+    ends = _python_assignment_candidates(str(end), initialized, constants)
+    result = []
+    exact_iterations = []
+    for start_candidate in starts:
+        for end_candidate in ends:
+            if (not _native_nonbool_integer_candidate(start_candidate)
+                    or not _native_nonbool_integer_candidate(end_candidate)
+                    or _candidate_key(start_candidate) not in seed_keys or start_candidate.numeric_range is None
+                    or end_candidate.numeric_range is None):
+                return None
+            start_lower, start_upper = (int(value) for value in start_candidate.numeric_range)
+            end_lower, end_upper = (int(value) for value in end_candidate.numeric_range)
+            post_lower, post_upper = end_lower + step, end_upper + step
+            candidate = _integer_candidate((min(start_lower, end_lower,
+                                                post_lower), max(start_upper, end_upper, post_upper)))
+            if candidate.dtype is None or _candidate_key(candidate) != _candidate_key(start_candidate):
+                return None
+            result.append(candidate)
+            if (start_candidate.value is not _DYNAMIC_VALUE and end_candidate.value is not _DYNAMIC_VALUE
+                    and isinstance(start_candidate.value, numbers.Integral)
+                    and isinstance(end_candidate.value, numbers.Integral)):
+                start_value, end_value = int(start_candidate.value), int(end_candidate.value)
+                if step > 0:
+                    count = 0 if start_value > end_value else (end_value - start_value) // step + 1
+                else:
+                    count = 0 if start_value < end_value else (start_value - end_value) // (-step) + 1
+                exact_iterations.append(count)
+            else:
+                exact_iterations.append(None)
+    iterations = exact_iterations[0] if exact_iterations and all(value == exact_iterations[0]
+                                                                 for value in exact_iterations) else None
+    return _LoopInductionInfo(_join_candidate_sets(frozenset(), frozenset(result), name), iterations)
+
+
+def _finite_loop_recurrences(region: object, initialized: _ReachingCandidates, constants: Dict[str, object],
+                             induction: Optional[_LoopInductionInfo]) -> Dict[str, _ReachingCandidateSet]:
+    """Summarize proven finite native integer increment/decrement recurrences."""
+    if induction is None:
+        return {}
+    result = {str(region.loop_variable): induction.candidates}
+    if induction.iterations is None:
+        return result
+    update_statements = _codeblock_statements(region.update_statement)
+    stored_names = [
+        node.id for statement in update_statements for node in ast.walk(statement)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
+    ]
+    body_assignments = {name for edge in region.all_interstate_edges() for name in edge.data.assignments}
+    for nested in region.all_control_flow_regions():
+        if nested is region:
+            continue
+        body_assignments.update(_codeblock_assignment_names(getattr(nested, 'init_statement', None)))
+        body_assignments.update(_codeblock_assignment_names(getattr(nested, 'update_statement', None)))
+    for statement in update_statements:
+        target = None
+        value = None
+        if isinstance(statement, ast.Assign) and len(statement.targets) == 1 and isinstance(
+                statement.targets[0], ast.Name):
+            target, value = statement.targets[0].id, statement.value
+        elif isinstance(statement, ast.AugAssign) and isinstance(statement.target, ast.Name):
+            if isinstance(statement.op, (ast.Add, ast.Sub)):
+                target = statement.target.id
+                sign = 1 if isinstance(statement.op, ast.Add) else -1
+                value = ast.BinOp(left=ast.Name(id=target, ctx=ast.Load()),
+                                  op=ast.Add(),
+                                  right=ast.BinOp(left=ast.Constant(sign), op=ast.Mult(), right=statement.value))
+        if (target is None or target == region.loop_variable or value is None or target not in initialized
+                or stored_names.count(target) != 1 or target in body_assignments):
+            continue
+        step_node = None
+        sign = 1
+        if isinstance(value, ast.BinOp) and isinstance(value.op, ast.Add):
+            if isinstance(value.left, ast.Name) and value.left.id == target:
+                step_node = value.right
+            elif isinstance(value.right, ast.Name) and value.right.id == target:
+                step_node = value.left
+        elif isinstance(value, ast.BinOp) and isinstance(value.op, ast.Sub):
+            if isinstance(value.left, ast.Name) and value.left.id == target:
+                step_node = value.right
+                sign = -1
+        if step_node is None or any(
+                isinstance(node, ast.Name) and node.id in (target, str(region.loop_variable))
+                for node in ast.walk(step_node)):
+            continue
+        step_names = {node.id for node in ast.walk(step_node) if isinstance(node, ast.Name)}
+        if not _loop_bound_is_invariant(region, step_names):
+            continue
+        steps = _python_assignment_candidates(ast.unparse(step_node), initialized, constants)
+        sources = initialized[target]
+        if len(steps) != 1 or len(sources) != 1:
+            continue
+        step_candidate, source = next(iter(steps)), next(iter(sources))
+        if (not _native_nonbool_integer_candidate(step_candidate) or step_candidate.value is _DYNAMIC_VALUE
+                or not isinstance(step_candidate.value, numbers.Integral) or isinstance(step_candidate.value, bool)
+                or not _native_nonbool_integer_candidate(source) or source.numeric_range is None):
+            continue
+        step = sign * int(step_candidate.value)
+        delta = step * induction.iterations
+        lower, upper = (int(bound) for bound in source.numeric_range)
+        recurrence = _integer_candidate((min(lower, lower + delta), max(upper, upper + delta)))
+        if recurrence.dtype is not None and _candidate_key(recurrence) == _candidate_key(source):
+            result[target] = frozenset({recurrence})
+    return result
+
+
+def _loop_iteration_outcomes(
+        sdfg: "SDFG",
+        region: object,
+        header_types: _ReachingCandidates,
+        stabilized: Optional[Dict[str, _ReachingCandidateSet]] = None) -> List[_ReachingCandidates]:
+    """Return all normal loop-feedback outcomes for one abstract iteration."""
+    inputs = _region_block_inputs(sdfg, region, header_types)
+    outcomes = []
+    for block, incoming in inputs.items():
+        if not _block_has_implicit_exit(region, block):
+            continue
+        output = _types_after_block(sdfg, block, incoming)
+        if _loop_components_enabled(region):
+            output = _transfer_codeblock(region.update_statement, output, sdfg.constants)
+            if stabilized is not None:
+                output.update(stabilized)
+        outcomes.append(output)
+    return outcomes
+
+
+def _loop_header_types(
+    sdfg: "SDFG", region: object, entry_types: _ReachingCandidates
+) -> Tuple[_ReachingCandidates, _ReachingCandidates, Dict[str, _ReachingCandidateSet]]:
+    """Compute initialized and loop-carried header candidates to a fixed point."""
+    scoped_types = _scoped_region_types(region, entry_types)
+    initialized = dict(scoped_types)
+    induction = None
+    if _loop_components_enabled(region):
+        initialized = _transfer_codeblock(region.init_statement, initialized, sdfg.constants)
+        induction = _loop_induction_info(region, initialized, sdfg.constants)
+    stabilized = _finite_loop_recurrences(region, initialized, sdfg.constants, induction)
+    initialized.update(stabilized)
+    header = dict(initialized)
+    if induction is not None and induction.iterations == 0:
+        return initialized, header, stabilized
+    for _ in range(128):
+        merged = dict(header)
+        changed = False
+        for outcome in _loop_iteration_outcomes(sdfg, region, header, stabilized):
+            merged, outcome_changed = _merge_reaching_types(merged, outcome, widen=True)
+            changed |= outcome_changed
+        if not changed:
+            return initialized, header, stabilized
+        header = merged
+    raise CodegenError(f'cuTile codegen: loop-carried type analysis did not converge for region {region.label!r}')
+
+
+def _normal_region_outcomes(sdfg: "SDFG", region: object,
+                            entry_types: _ReachingCandidates) -> List[_ReachingCandidates]:
+    """Return all explicit and implicit normal exits from a region."""
+    inputs = _region_block_inputs(sdfg, region, entry_types)
+    return [
+        _types_after_block(sdfg, block, incoming) for block, incoming in inputs.items()
+        if _block_has_implicit_exit(region, block)
+    ]
+
+
+def _types_after_region(sdfg: "SDFG", region: object, entry_types: _ReachingCandidates) -> _ReachingCandidates:
+    """Summarize runtime candidates at all normal exits of a nested region."""
+    from dace.sdfg.state import ConditionalBlock, LoopRegion
+
+    if isinstance(region, LoopRegion):
+        initialized, header, stabilized = _loop_header_types(sdfg, region, entry_types)
+        outcomes = _loop_iteration_outcomes(sdfg, region, header, stabilized)
+        if not region.inverted:
+            outcomes.append(initialized)
+        if (region.inverted and not region.update_before_condition and _loop_components_enabled(region)):
+            outcomes.extend(_normal_region_outcomes(sdfg, region, header))
+    else:
+        scoped_types = _scoped_region_types(region, entry_types)
+        outcomes = []
+        if isinstance(region, ConditionalBlock):
+            outcomes.extend(_types_after_region(sdfg, branch, scoped_types) for _, branch in region.branches)
+            if not any(condition is None for condition, _ in region.branches):
+                outcomes.append(scoped_types)
+        else:
+            outcomes.extend(_normal_region_outcomes(sdfg, region, scoped_types))
+
+    result = None
+    for outcome in outcomes:
+        result, _ = _merge_reaching_types(result, outcome)
+    if result is None:
+        return {name: frozenset({_undefined_candidate()}) for name in entry_types}
+    return result
+
+
+def _types_reaching_block(sdfg: "SDFG", region: object, target: object,
+                          entry_types: _ReachingCandidates) -> _ReachingCandidates:
+    """Compute candidates reaching one block, including loop-carried iterations."""
+    from dace.sdfg.state import LoopRegion
+
+    if target not in region.nodes():
+        return dict(entry_types)
+    if isinstance(region, LoopRegion):
+        _, entry_types, _ = _loop_header_types(sdfg, region, entry_types)
+    inputs = _region_block_inputs(sdfg, region, entry_types)
+    return inputs.get(target, {name: frozenset({_undefined_candidate()}) for name in entry_types})
+
+
+def _state_symbol_types(sdfg: "SDFG", cfg: object, state: "SDFGState") -> _ReachingCandidates:
+    """Compute reaching runtime candidates at a state, including region ancestry."""
+    types: _ReachingCandidates = {
+        name: frozenset({_native_dynamic_candidate(dtype)})
+        for name, dtype in sdfg.symbols.items()
+    }
+    types.update({
+        name: frozenset({_ExpressionCandidate(desc.dtype, _DYNAMIC_VALUE, _HOST_NUMPY)})
+        for name, desc in sdfg.arrays.items()
+    })
+    for name in _runtime_symbol_names(sdfg):
+        types.setdefault(name, frozenset({_undefined_candidate()}))
+
+    regions = []
+    current = cfg
+    while current is not None and getattr(current, 'sdfg', sdfg) is sdfg:
+        regions.append(current)
+        current = getattr(current, 'parent_graph', None)
+    regions.reverse()
+
+    from dace.sdfg.state import LoopRegion
+    for index, region in enumerate(regions):
+        if not isinstance(region, LoopRegion) or _loop_components_enabled(region):
+            try:
+                new_symbols = region.new_symbols(_definite_types(types))
+            except (AttributeError, SyntaxError, TypeError, ValueError):
+                new_symbols = {}
+            for name, dtype in new_symbols.items():
+                if dtype is not None:
+                    types[name] = frozenset({_native_dynamic_candidate(dtype)})
+        target = regions[index + 1] if index + 1 < len(regions) else state
+        types = _types_reaching_block(sdfg, region, target, types)
+    return types
 
 
 def _np_dtype_attr(np_name: str) -> str:
@@ -597,12 +2009,11 @@ def _np_dtype_attr(np_name: str) -> str:
 
 
 def _build_aot_spec(sdfg: "SDFG", kernel_name: str, deduped_arrays: List[str], output_arrays: List[str],
-                    free_syms: List[str], device_syms: Dict[str, str]) -> List[_AOTParam]:
+                    free_syms: List[str], device_syms: Dict[str, str]) -> List[AOTParam]:
     """Build the AOT signature spec for one kernel, in exact launch-arg order.
 
-    Each entry is ``(kind, dtype name, ndim, stride_constant)`` mirroring what
-    the launch site passes: arrays raw, device-staged scalars/symbols as
-    1-element device arrays, bool scalars/symbols by value.
+    Arrays are passed directly, device-staged scalars and symbols are
+    one-element arrays, and bool scalars and symbols are passed by value.
 
     :param sdfg: The SDFG containing the descriptors.
     :param kernel_name: The kernel name (for error messages).
@@ -614,8 +2025,8 @@ def _build_aot_spec(sdfg: "SDFG", kernel_name: str, deduped_arrays: List[str], o
     :returns: The per-parameter spec list.
     :raises CodegenError: If a parameter cannot be AOT-typed.
     """
-    escape = "set compiler.cutile.aot_compile=False to disable AOT"
-    params: List[_AOTParam] = []
+    escape = "set compiler.cutile.mode=jit to use JIT"
+    params: List[AOTParam] = []
     for name in deduped_arrays:
         root_name, _, member_path = name.partition(".")
         desc = sdfg.arrays.get(root_name)
@@ -623,18 +2034,18 @@ def _build_aot_spec(sdfg: "SDFG", kernel_name: str, deduped_arrays: List[str], o
             desc = desc.members.get(member) if isinstance(desc, data.Structure) else None
         if isinstance(desc, data.Scalar):
             if _is_device_scalar(desc):
-                params.append(("array", desc.dtype.as_numpy_dtype().name, 1, (1, )))
+                params.append(AOTParam("array", desc.dtype.as_numpy_dtype().name, 1, (1, )))
             elif desc.dtype.as_numpy_dtype().kind == 'b' and name not in output_arrays:
-                params.append(("scalar", "bool", 0, None))
+                params.append(AOTParam("scalar", "bool", 0))
             elif desc.dtype.as_numpy_dtype().kind == 'b':
-                params.append(("array", "bool", 1, (1, )))
+                params.append(AOTParam("array", "bool", 1, (1, )))
             else:
                 raise CodegenError(f"cuTile AOT: cannot type Scalar parameter {name!r} "
                                    f"(dtype {desc.dtype}) of kernel {kernel_name}; {escape}.")
         elif isinstance(desc, data.Array):
             # External arrays are allowed to have any runtime layout. Descriptor strides describe
-            # generated indexing, not the actual cupy view passed to ct.launch.
-            params.append(("array", desc.dtype.as_numpy_dtype().name, len(desc.shape), None))
+            # generated indexing, not the actual cupy view passed to the kernel.
+            params.append(AOTParam("array", desc.dtype.as_numpy_dtype().name, len(desc.shape)))
         else:
             raise CodegenError(f"cuTile AOT: cannot type kernel parameter {name!r} of kernel {kernel_name} "
                                f"(descriptor {type(desc).__name__}); {escape}.")
@@ -644,9 +2055,9 @@ def _build_aot_spec(sdfg: "SDFG", kernel_name: str, deduped_arrays: List[str], o
             if np_name.startswith('complex'):
                 raise CodegenError(f"cuTile AOT: cannot type complex symbol {s!r} of kernel {kernel_name}; "
                                    f"{escape}.")
-            params.append(("array", np_name, 1, (1, )))
+            params.append(AOTParam("array", np_name, 1, (1, )))
         elif s in sdfg.symbols and sdfg.symbols[s].as_numpy_dtype().kind == 'b':
-            params.append(("scalar", "bool", 0, None))
+            params.append(AOTParam("scalar", "bool", 0))
         else:
             raise CodegenError(f"cuTile AOT: cannot type symbol parameter {s!r} of kernel {kernel_name}; "
                                f"{escape}.")
@@ -676,11 +2087,10 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
         self._dispatcher = frame_codegen.dispatcher
         #: Tracks already-generated nested functions by position key to avoid duplicates.
         self._generated_nested_functions: Dict[str, str] = {}
-        #: Whether the AOT spec registry initializer was already emitted.
-        self._aot_registry_emitted = False
-        #: Read once per code generator, so a config flip mid-codegen cannot
-        #: produce registry entries without their initializer (or vice versa).
-        self._aot_enabled = _cutile_aot_enabled()
+        self._mode = _cutile_mode()
+        self._aot_kernels: List[Dict[str, object]] = []
+        self._aot_module_name = f"__dace_cutile_aot_{sdfg.name}"
+        self._state_types: Dict[Tuple[int, int, int], _ReachingCandidates] = {}
         # Register as the handler for CuTile map scopes.
         self._dispatcher.register_map_dispatcher(dtypes.ScheduleType.CuTile, self)
         # Register as node handler for all nodes inside CuTile scopes.
@@ -714,18 +2124,30 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
         self._dispatcher.register_array_dispatcher(dtypes.StorageType.CuTile_Tile, self)
 
     def get_generated_codeobjects(self) -> list:
-        """Return generated code objects (none for this target).
-
-        :returns: Empty list.
-        """
-        return []
+        """Return the embedded-cubin launcher module in AOT mode."""
+        if self._mode != 'aot' or not self._aot_kernels:
+            return []
+        from dace.codegen.codeobject import CodeObject
+        from dace.codegen.py import cutile_aot
+        return [
+            CodeObject(name=self._aot_module_name,
+                       code=cutile_aot.generate_aot_module(self._aot_kernels, self._aot_module_name),
+                       language='py',
+                       target=type(self),
+                       title='cuTile AOT kernels')
+        ]
 
     def get_includes(self) -> Dict[str, List[str]]:
         """Return import statements needed for cuTile kernels.
 
         :returns: Mapping from code section to list of import lines.
         """
-        return {"frame": ["import cuda.tile as ct", "import cupy"]}
+        includes = ["import cupy"]
+        if self._mode == 'jit':
+            includes.insert(0, "import cuda.tile as ct")
+        else:
+            includes.append(f"import {self._aot_module_name} as __dace_cutile_aot_runtime")
+        return {"frame": includes}
 
     def preprocess(self, sdfg: "SDFG") -> None:
         """Preprocessing hook (no-op for cuTile).
@@ -2155,12 +3577,12 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
 
     @staticmethod
     def _launch_arg_expr(sdfg: "SDFG", name: str, is_output: bool) -> str:
-        """Return the ``ct.launch`` argument expression for a data name.
+        """Return the kernel-launch argument expression for a data name.
 
         Input-only Scalar arguments are unwrapped to native Python scalars:
         at runtime they may be 0-d numpy buffers (scalar SDFG arguments),
         numpy scalars, or 0-d cupy arrays (values read from GPU memory), all
-        of which ``ct.launch`` rejects. Arrays and kernel-written scalars are
+        of which the cuTile launch ABI rejects. Arrays and kernel-written scalars are
         passed through unchanged.
 
         :param sdfg: The SDFG containing the data descriptor.
@@ -2198,8 +3620,8 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
                        function_stream: PythonCodeIOStream, callsite_stream: PythonCodeIOStream) -> None:
         """Generate the cuTile kernel wrapper and launch call for a map scope.
 
-        Emits a ``@ct.kernel``-decorated function containing the scope body,
-        then emits a ``ct.launch(...)`` call at the call site.
+        JIT mode emits a runtime ``@ct.kernel`` and ``ct.launch``. AOT mode
+        collects the kernel for export and emits a direct auxiliary-module launch.
 
         :param sdfg: The SDFG.
         :param cfg: The control flow graph.
@@ -2256,9 +3678,8 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
         # Maps sym name -> pinned numpy dtype name. Declared symbols use the
         # declared dtype; runtime-defined names (loop induction variables /
         # interstate-assignment keys, absent from ``sdfg.symbols``) use the
-        # frame's inferred dtype — the launch-arg dtype is a compile-time
-        # constant either way (deterministic for JIT and AOT alike, matching
-        # C++-backend symbol typing). Declared bool symbols stay by value
+        # current control-flow region's inferred dtype. The launch-arg dtype
+        # is a compile-time constant either way. Declared bool symbols stay by value
         # (typed exactly at the launch boundary); a runtime-defined bool rides
         # the device path as before, now with its inferred dtype.
         device_syms: Dict[str, str] = {}
@@ -2268,28 +3689,25 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
                 if np_dtype.kind in 'fiu':
                     device_syms[s] = np_dtype.name
             else:
-                inferred = self._frame.inferred_symbol_types.get(s)
-                if inferred is None:
-                    # Defense in depth: framecode already raises TypeError when
-                    # interstate type inference fails.
-                    raise CodegenError(f"cuTile codegen: no inferred dtype for runtime-defined "
-                                       f"symbol {s!r} (map {entry.map.label!r})")
-                inferred_np = inferred.as_numpy_dtype()
-                if inferred_np.kind == 'u':
-                    # The generated host code holds runtime-defined values as
-                    # Python ints (signed). An unsigned pin (e.g. a large
-                    # positive interstate literal inferring uint64) would make
-                    # the kernel mix signed and unsigned ints, which cuda.tile
-                    # refuses to promote implicitly ("Implicit promotion of
-                    # int64 and uint64 is not supported"). Same-width signed
-                    # staging is bit-exact for all values < 2**63.
-                    device_syms[s] = inferred_np.name.replace('uint', 'int')
-                else:
-                    device_syms[s] = inferred_np.name
+                state_key = (id(sdfg), id(cfg), id(state))
+                if state_key not in self._state_types:
+                    self._state_types[state_key] = _state_symbol_types(sdfg, cfg, state)
+                candidates = self._state_types[state_key].get(s, frozenset({_undefined_candidate()}))
+                defined = {candidate.dtype for candidate in candidates if candidate.dtype is not None}
+                undefined = any(candidate.dtype is None for candidate in candidates)
+                if undefined or len(defined) != 1:
+                    labels = sorted(dtype.as_numpy_dtype().name for dtype in defined)
+                    if undefined:
+                        labels.insert(0, 'undefined')
+                    reason = 'conflicting reaching dtypes' if len(defined) > 1 else 'no unambiguous reaching dtype'
+                    raise CodegenError(f"cuTile codegen: {reason} for runtime-defined symbol {s!r} "
+                                       f"at state {state.label!r}: {', '.join(labels)}")
+                device_syms[s] = next(iter(defined)).as_numpy_dtype().name
 
         kernel_name = (f"__dace_cutile_{sdfg.name}_{cfg.cfg_id}_"
                        f"{state.block_id}_{state.node_id(entry)}")
 
+        helper_stream = function_stream if self._mode == 'jit' else PythonCodeIOStream()
         kernel_stream = PythonCodeIOStream()
         kernel_stream.write("@ct.kernel")
         kernel_stream.write(f"def {kernel_name}({', '.join(kernel_params)}):")
@@ -2299,7 +3717,7 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
             # Emit MapEntry (pid setup) ourselves; the dispatcher's
             # topological walk treats MapEntry specially (dispatch_scope), so
             # we cannot rely on dispatch_subgraph to invoke our handler for it.
-            self.generate_node(sdfg, cfg, dfg_scope, state_id, entry, function_stream, kernel_stream)
+            self.generate_node(sdfg, cfg, dfg_scope, state_id, entry, helper_stream, kernel_stream)
             # Walk the rest of the scope. Tasklets, MapExit, AccessNodes, and
             # NestedSDFGs are routed to our predicated handlers.
             self._dispatcher.dispatch_subgraph(
@@ -2307,14 +3725,15 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
                 cfg,
                 dfg_scope,
                 state_id,
-                function_stream,
+                helper_stream,
                 kernel_stream,
                 skip_entry_node=True,
             )
 
-        function_stream.write("")
-        function_stream.write(kernel_stream.getvalue())
-        function_stream.write("")
+        if self._mode == 'jit':
+            function_stream.write("")
+            function_stream.write(kernel_stream.getvalue())
+            function_stream.write("")
 
         # The cuTile launch grid is capped at 3 axes by the runtime. Grids with
         # more than 3 tiled dimensions are folded onto the 3 available axes (the
@@ -2341,15 +3760,14 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
                 launch_args.append(s)
         args_tuple = (f"({', '.join(launch_args)},)" if len(launch_args) == 1 else f"({', '.join(launch_args)})")
 
-        # AOT spec registry: one module-level dict mapping kernel name -> the
-        # per-launch-arg signature spec, consumed by cutile_aot at compile
-        # time. Config off => nothing emitted (pure JIT).
-        if self._aot_enabled:
-            spec = _build_aot_spec(sdfg, kernel_name, deduped_arrays, output_arrays, free_syms, device_syms)
-            if not self._aot_registry_emitted:
-                function_stream.write("__dace_cutile_aot_specs = {}")
-                self._aot_registry_emitted = True
-            function_stream.write(f"__dace_cutile_aot_specs[{kernel_name!r}] = {{'params': {spec!r}}}")
+        if self._mode == 'aot':
+            params = _build_aot_spec(sdfg, kernel_name, deduped_arrays, output_arrays, free_syms, device_syms)
+            self._aot_kernels.append({
+                'abi_version': AOT_ABI_VERSION,
+                'name': kernel_name,
+                'source': helper_stream.getvalue() + kernel_stream.getvalue(),
+                'params': params,
+            })
 
         instrumented = (entry.map.instrument != dtypes.InstrumentationType.No_Instrumentation)
 
@@ -2363,13 +3781,12 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
         # ``i == 0``, or ``1:N-1`` at ``N == 1``) yield a non-positive grid
         # dimension, which the cuTile runtime rejects ("invalid argument");
         # the launch is a no-op then, so skip it.
-        callsite_stream.write(
-            f"if min(({', '.join(launch_dims)},)) > 0: "
-            f"ct.launch(cupy.cuda.get_current_stream(), {grid_tuple}, "
-            f"{kernel_name}, {args_tuple})",
-            cfg,
-            state_id,
-        )
+        if self._mode == 'jit':
+            launch = (f"ct.launch(cupy.cuda.get_current_stream(), {grid_tuple}, "
+                      f"{kernel_name}, {args_tuple})")
+        else:
+            launch = f"__dace_cutile_aot_runtime.launch({kernel_name!r}, {grid_tuple}, {args_tuple})"
+        callsite_stream.write(f"if min(({', '.join(launch_dims)},)) > 0: {launch}", cfg, state_id)
 
         # Always synchronize so the kernel completes before the host
         # continues (and before any timing measurement ends).
