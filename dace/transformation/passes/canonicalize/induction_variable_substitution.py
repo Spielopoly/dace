@@ -47,6 +47,10 @@ from dace import SDFG, dtypes, nodes, properties, symbolic
 from dace.sdfg import SDFGState
 from dace.sdfg import utils as sdutil
 from dace.sdfg.state import BreakBlock, ConditionalBlock, ContinueBlock, ControlFlowRegion, LoopRegion
+
+#: Builtin names the closed-form expression may mention; it is spliced verbatim into a tasklet
+#: body. Probing ``builtins`` instead would admit ``open``, ``id``, ``sum``, ... as valid operands.
+SPLICEABLE_BUILTINS = frozenset({'True', 'False', 'None', 'abs', 'min', 'max', 'int', 'float'})
 from dace.transformation import pass_pipeline as ppl
 from dace.transformation import transformation as xf
 from dace.transformation.passes.analysis import loop_analysis
@@ -277,7 +281,7 @@ def _extract_iv(loop: LoopRegion, sdfg: SDFG,
                 # Allow SDFG symbols / constants / known dtype-cast roots; reject
                 # any other name (which would imply a connector or loop-local var).
                 if (sub.id not in sdfg.symbols and sub.id not in sdfg.constants and sub.id not in sdfg_free_symbols
-                        and sub.id != 'dace' and not hasattr(__import__('builtins'), sub.id)):
+                        and sub.id != 'dace' and sub.id not in SPLICEABLE_BUILTINS):
                     return None
                 if (sub.id in sdfg.symbols or sub.id in sdfg.constants or sub.id
                         in sdfg_free_symbols) and not _is_loop_invariant_symbol(sub.id, loop, sdfg, sdfg_free_symbols):
@@ -334,7 +338,7 @@ def _extract_iv(loop: LoopRegion, sdfg: SDFG,
         return None
 
     # Trip count = (end - start) // stride + 1 (loop_analysis.get_loop_end is inclusive).
-    trip_count = symbolic.simplify((end - start) // stride + 1)
+    trip_count = symbolic.simplify(symbolic.int_floor(end - start, stride) + 1)
 
     return final_accum, str(final_subset), type(rhs.op), const_val, trip_count
 
@@ -416,13 +420,19 @@ def _hoist_branch_uniform_iv(parent: ControlFlowRegion, loop: LoopRegion, sdfg: 
                         delta = symbolic.simplify(symbolic.pystr_to_symbolic(rhs) - symbolic.pystr_to_symbolic(lhs))
                     except Exception:
                         continue
-                    if getattr(delta, 'is_number', False):
+                    if delta.is_number:
                         incs.setdefault(lhs, []).append((e, delta))
             return incs
 
         per = [branch_increments(br) for br in branches]
         common = set.intersection(*[set(p) for p in per]) if per else set()
-        for sym in common:
+        # sorted(): this loop RETURNS on the first symbol it hoists, and the pass is a first-match/restart
+        # fixpoint -- so with two co-incrementing IVs (s124/s126/s128) the pick decides whether the OTHER one
+        # still passes its guards afterwards, i.e. whether the loop reaches closed form and becomes a Map.
+        # Iterating the raw set made that a PYTHONHASHSEED coin-flip (str hashing is per-process randomized).
+        # ``set.intersection`` has no meaningful insertion order to preserve, so a stable sort -- not an
+        # ordered set -- is the canonical, branch-independent choice.
+        for sym in sorted(common):
             if sym == loop.loop_variable or (sym not in sdfg.symbols and sym not in sdfg_free_symbols):
                 continue
             if any(len(p[sym]) != 1 for p in per):
@@ -622,6 +632,15 @@ def _try_substitute_derived_symbol(parent: ControlFlowRegion, loop: LoopRegion, 
             rhs_expr = symbolic.pystr_to_symbolic(rhs)
         except Exception:
             continue
+        # An array-dependent value is a data gather, NOT an induction variable: its
+        # per-iteration value is read from memory, not a closed form of the loop var.
+        # Inlining it would bake the array read into every memlet subset that uses
+        # ``sym`` -- a nested ``Subscript`` codegen can't lower (it emits
+        # ``arr[std::make_tuple(...)]``). The frontend already keeps such indirection
+        # as its own symbol (cloudsc ``LLINDEX1(JL,IORDER(JL,JM))`` -> the interstate
+        # ``iorder_at = IORDER(JL,JM)`` load); leave it a symbol, don't dissolve it.
+        if symbolic.arrays(rhs):
+            continue
         free = {str(s) for s in rhs_expr.free_symbols}
         if sym in free:
             continue  # self-reference -> a recurrence, not a derived symbol
@@ -766,7 +785,7 @@ def _try_substitute_iedge_iv(parent: ControlFlowRegion, loop: LoopRegion, sdfg: 
         # Step must be loop-invariant: a numeric literal, or a symbolic
         # expression whose free symbols are all loop-invariant (e.g. a stride
         # argument ``inc`` promoted to a symbol). A varying step has no closed form.
-        if not getattr(diff, 'is_number', False):
+        if not diff.is_number:
             if not diff.free_symbols or not all(
                     _is_loop_invariant_symbol(str(s), loop, sdfg, sdfg_free_symbols) for s in diff.free_symbols):
                 continue
@@ -873,7 +892,7 @@ def _try_substitute_iedge_iv(parent: ControlFlowRegion, loop: LoopRegion, sdfg: 
     #      next-block-after-loop inside the parent, ensuring the IV update
     #      runs once per containing-loop iteration before the body restarts.
     import dace
-    trip_count = symbolic.simplify((end - start) // stride + 1)
+    trip_count = symbolic.simplify(symbolic.int_floor(end - start, stride) + 1)
     post_loop_value = symbolic.symstr(symbolic.simplify(sym_sym + trip_count * step))
 
     iv_post = parent.add_state(loop.label + '_iv_post')

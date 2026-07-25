@@ -710,7 +710,7 @@ class DataflowGraphView(BlockGraphView, abc.ABC):
         # Free symbols from nodes
         for n in self.nodes():
             if isinstance(n, nd.EntryNode):
-                new_symbols |= set(n.new_symbols(sdfg, self, {}).keys())
+                new_symbols |= n.new_symbol_names(self)
             elif isinstance(n, nd.AccessNode):
                 # Add data descriptor symbols
                 freesyms |= set(map(str, n.desc(sdfg).used_symbols(all_symbols)))
@@ -732,7 +732,7 @@ class DataflowGraphView(BlockGraphView, abc.ABC):
                     freesyms |= codesyms
                     continue
 
-            if hasattr(n, 'used_symbols'):
+            if isinstance(n, nd.NestedSDFG):
                 freesyms |= n.used_symbols(all_symbols)
             else:
                 freesyms |= n.free_symbols
@@ -1337,11 +1337,8 @@ class ControlFlowBlock(BlockGraphView, abc.ABC):
                 continue
             setattr(result, k, copy.deepcopy(v, memo))
 
-        for k in ('_parent_graph', '_sdfg'):
-            if id(getattr(self, k)) in memo:
-                setattr(result, k, memo[id(getattr(self, k))])
-            else:
-                setattr(result, k, None)
+        result._parent_graph = memo.get(id(self._parent_graph))
+        result._sdfg = memo.get(id(self._sdfg))
 
         return result
 
@@ -1376,6 +1373,35 @@ class ControlFlowBlock(BlockGraphView, abc.ABC):
     @property
     def block_id(self) -> int:
         return self.parent_graph.node_id(self)
+
+
+def sdfg_scope_symbols(sdfg) -> Dict[str, dtypes.typeclass]:
+    """Symbols visible at ``sdfg`` scope: its own symbols, array extents, and interstate edges."""
+    symbols = collections.OrderedDict(sdfg.symbols)
+    for desc in sdfg.arrays.values():
+        symbols.update([(str(s), s.dtype) for s in desc.free_symbols])
+    try:
+        for e in sdfg.predecessor_state_transitions(sdfg.start_state):
+            symbols.update(e.data.new_symbols(sdfg, symbols))
+    except ValueError:  # starting state ambiguous (some interstate edges may not exist yet)
+        for e in sdfg.edges():
+            symbols.update(e.data.new_symbols(sdfg, symbols))
+    return symbols
+
+
+def enclosing_region_symbols(state, base: Dict[str, dtypes.typeclass]) -> Dict[str, dtypes.typeclass]:
+    """``base`` plus what the control-flow regions enclosing ``state`` bind, outermost first (a
+    LoopRegion binds its iterator; ``new_symbols`` returns {} otherwise). Without it a node in a loop
+    body does not see the loop variable and memlet propagation widens a jk-indexed access to the whole array."""
+    symbols = collections.OrderedDict(base)
+    enclosing_regions = []
+    cfg = state.parent_graph
+    while cfg is not None:
+        enclosing_regions.append(cfg)
+        cfg = cfg.parent_graph
+    for region in reversed(enclosing_regions):
+        symbols.update(region.new_symbols(symbols))
+    return symbols
 
 
 @make_properties
@@ -1645,42 +1671,11 @@ class SDFGState(OrderedMultiDiConnectorGraph[nd.Node, mm.Memlet], ControlFlowBlo
         :param node: The given node.
         :return: A dictionary mapping symbol names to their types.
         """
-        from dace.sdfg.sdfg import SDFG
-
         if node is None:
             return collections.OrderedDict()
 
-        sdfg: SDFG = self.sdfg
-
-        # Start with global symbols
-        symbols = collections.OrderedDict(sdfg.symbols)
-        for desc in sdfg.arrays.values():
-            symbols.update([(str(s), s.dtype) for s in desc.free_symbols])
-
-        # Add symbols from inter-state edges along the path to the state
-        try:
-            start_state = sdfg.start_state
-            for e in sdfg.predecessor_state_transitions(start_state):
-                symbols.update(e.data.new_symbols(sdfg, symbols))
-        except ValueError:
-            # Cannot determine starting state (possibly some inter-state edges
-            # do not yet exist)
-            for e in sdfg.edges():
-                symbols.update(e.data.new_symbols(sdfg, symbols))
-
-        # Add the loop variables of the control-flow loops enclosing this state,
-        # outermost first. Without this only global, inter-state-edge and dataflow-scope
-        # (map) symbols are seen; a node inside a LoopRegion must also see the loop
-        # variable as defined -- e.g. so memlet propagation keeps a ``jk``-indexed
-        # nested-SDFG access parametric instead of widening it to the whole array.
-        enclosing_loops = []
-        cfg = self.parent_graph
-        while cfg is not None:
-            if isinstance(cfg, LoopRegion) and cfg.loop_variable:
-                enclosing_loops.append(cfg)
-            cfg = cfg.parent_graph
-        for loop in reversed(enclosing_loops):
-            symbols.update(loop.new_symbols(symbols))
+        sdfg = self.sdfg
+        symbols = enclosing_region_symbols(self, sdfg_scope_symbols(sdfg))
 
         # Find scopes this node is situated in
         sdict = self.scope_dict()
@@ -1751,9 +1746,11 @@ class SDFGState(OrderedMultiDiConnectorGraph[nd.Node, mm.Memlet], ControlFlowBlo
         debuginfo = _get_debug_info(debuginfo or self._default_lineinfo)
 
         # Make dictionary of autodetect connector types from set
-        if isinstance(inputs, (set, collections.abc.KeysView)):
+        if isinstance(inputs, set) or isinstance(outputs, set):
+            warnings.warn("Using sets as inputs is discouraged as it leads to indeterministic behavior.")
+        if isinstance(inputs, (set, collections.abc.KeysView, collections.abc.Set)):
             inputs = {k: None for k in inputs}
-        if isinstance(outputs, (set, collections.abc.KeysView)):
+        if isinstance(outputs, (set, collections.abc.KeysView, collections.abc.Set)):
             outputs = {k: None for k in outputs}
 
         tasklet = nd.Tasklet(
@@ -1829,9 +1826,11 @@ class SDFGState(OrderedMultiDiConnectorGraph[nd.Node, mm.Memlet], ControlFlowBlo
             sdfg.update_cfg_list([])
 
         # Make dictionary of autodetect connector types from set
-        if isinstance(inputs, (set, collections.abc.KeysView)):
+        if isinstance(inputs, set) or isinstance(outputs, set):
+            warnings.warn("Using sets as inputs is discouraged as it leads to indeterministic behavior.")
+        if isinstance(inputs, (set, collections.abc.KeysView, collections.abc.Set)):
             inputs = {k: None for k in inputs}
-        if isinstance(outputs, (set, collections.abc.KeysView)):
+        if isinstance(outputs, (set, collections.abc.KeysView, collections.abc.Set)):
             outputs = {k: None for k in outputs}
 
         s = nd.NestedSDFG(
@@ -1849,8 +1848,8 @@ class SDFGState(OrderedMultiDiConnectorGraph[nd.Node, mm.Memlet], ControlFlowBlo
         if sdfg is not None:
             sdfg.parent_nsdfg_node = s
 
-            # Add "default" undefined symbols if None are given
-            symbols = sdfg.free_symbols
+            # Default undefined symbols if none given; NoneSymbol is an optional-array marker, not a runtime symbol.
+            symbols = sdfg.free_symbols - {'NoneSymbol'}
             if symbol_mapping is None:
                 symbol_mapping = {s: s for s in symbols}
                 s.symbol_mapping = symbol_mapping
@@ -2278,12 +2277,12 @@ class SDFGState(OrderedMultiDiConnectorGraph[nd.Node, mm.Memlet], ControlFlowBlo
         cur_memlet._is_data_src = (isinstance(src_node, nd.AccessNode) and src_node.data == cur_memlet.data)
 
         # Verify that connectors exist
-        if (not memlet.is_empty() and hasattr(edges[0].src, "out_connectors") and isinstance(edges[0].src, nd.CodeNode)
+        if (not memlet.is_empty() and isinstance(edges[0].src, nd.CodeNode)
                 and not isinstance(edges[0].src, nd.LibraryNode)
                 and (src_conn is None or src_conn not in edges[0].src.out_connectors)):
             raise ValueError("Output connector {} does not exist in {}".format(src_conn, edges[0].src.label))
-        if (not memlet.is_empty() and hasattr(edges[-1].dst, "in_connectors")
-                and isinstance(edges[-1].dst, nd.CodeNode) and not isinstance(edges[-1].dst, nd.LibraryNode)
+        if (not memlet.is_empty() and isinstance(edges[-1].dst, nd.CodeNode)
+                and not isinstance(edges[-1].dst, nd.LibraryNode)
                 and (dst_conn is None or dst_conn not in edges[-1].dst.in_connectors)):
             raise ValueError("Input connector {} does not exist in {}".format(dst_conn, edges[-1].dst.label))
 

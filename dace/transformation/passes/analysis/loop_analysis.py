@@ -4,13 +4,73 @@ Various analyses concerning LopoRegions, and utility functions to get informatio
 """
 
 from dataclasses import dataclass
-from typing import Dict, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Dict, Optional, Set, Tuple
 from dace.frontend.python import astutils
 
 import sympy
 
 from dace import symbolic
-from dace.sdfg.state import LoopRegion
+from dace.sdfg.state import AbstractControlFlowRegion, LoopRegion
+
+if TYPE_CHECKING:
+    # Import-time only: ``dace.sdfg.state`` reaches back into this module (LoopRegion.new_symbols does
+    # the import inside the function body, "avoid cyclic import"), so importing the SDFG class here at
+    # module scope would close that cycle from the other side.
+    from dace.sdfg.sdfg import SDFG
+
+
+def symbol_use_sites(sdfg: 'SDFG') -> Tuple[Dict[str, Set[int]], Set[str]]:
+    """One walk of ``sdfg`` indexing where each symbol is used: name -> ``id()`` of every block and
+    inter-state edge that references it, plus the set of names any data descriptor's shape or strides
+    mention (anywhere in the SDFG tree, since a nested descriptor is materialised just as eagerly).
+
+    Answering "is this symbol used outside that loop?" costs a full traversal, so a caller asking it per
+    loop pays it per loop. Build the index once and answer every loop from it.
+
+    Each block is enumerated individually, hence a REGION is asked only for the symbols it uses on
+    itself (``with_contents=False`` -- its condition / init / update); its contents arrive as their own
+    blocks. A state must be asked WITH contents: ``SDFGState.used_symbols(with_contents=False)`` returns
+    the empty set, which would silently hide every real use.
+    """
+    uses: Dict[str, Set[int]] = {}
+    for block in sdfg.all_control_flow_blocks():
+        with_contents = not isinstance(block, AbstractControlFlowRegion)
+        for name in block.used_symbols(all_symbols=True, with_contents=with_contents):
+            uses.setdefault(name, set()).add(id(block))
+    for edge in sdfg.all_interstate_edges():
+        for name in set(edge.data.free_symbols) | set(edge.data.assignments):
+            uses.setdefault(name, set()).add(id(edge))
+    descriptor_symbols: Set[str] = set()
+    for nested in sdfg.all_sdfgs_recursive():
+        for desc in nested.arrays.values():
+            descriptor_symbols.update(str(s) for s in desc.free_symbols)
+    return uses, descriptor_symbols
+
+
+def counter_used_outside_loop(name: str,
+                              loop: LoopRegion,
+                              sdfg: 'SDFG',
+                              use_sites: Optional[Dict[str, Set[int]]] = None,
+                              descriptor_symbols: Optional[Set[str]] = None) -> bool:
+    """Whether ``name`` is read or written anywhere outside ``loop``.
+
+    A LoopRegion counter is NOT scoped to its loop the way a map parameter is scoped to its map: DaCe
+    leaks its final value to subsequent blocks, and the default ``eager`` declaration placement hoists
+    its ``int64_t i;`` to the top of the generated function. So any question of the form "may I treat
+    this counter as loop-local?" -- scoping its declaration into the ``for``-init clause, dropping its
+    value at a nesting boundary -- has to ask this, not assume it.
+
+    Pass ``use_sites`` / ``descriptor_symbols`` from :func:`symbol_use_sites` when asking about several
+    loops of the same SDFG; omitted, the index is built here for this one query.
+    """
+    if use_sites is None or descriptor_symbols is None:
+        use_sites, descriptor_symbols = symbol_use_sites(sdfg)
+    if name in descriptor_symbols:
+        return True
+    inside = {id(loop)}
+    inside.update(id(block) for block in loop.all_control_flow_blocks())
+    inside.update(id(edge) for edge in loop.all_interstate_edges())
+    return any(site not in inside for site in use_sites.get(name, ()))
 
 
 def get_loop_end(loop: LoopRegion) -> Optional[symbolic.SymbolicType]:
@@ -138,6 +198,40 @@ def loop_provably_at_most_one_iteration(loop: LoopRegion) -> bool:
     return _provably_le(symbolic.simplify(end), symbolic.simplify(start))
 
 
+def loop_provably_at_least_one_iteration(loop: LoopRegion) -> bool:
+    """Whether ``loop`` provably runs at least one iteration.
+
+    Needed by any must-def reasoning that wants to carry a write out of a loop body: a write
+    inside a loop that may run zero times defines nothing after the loop. The mirror image of
+    :func:`loop_provably_at_most_one_iteration`, and conservative in the same direction --
+    ``False`` whenever the entry test cannot be decided.
+
+    Note the codebase-wide "symbols are NONNEGATIVE" assumption gives ``N >= 0``, not ``N >= 1``,
+    so the ubiquitous ``for i in range(N)`` is correctly REFUSED; only a concrete (or otherwise
+    provably nonempty) bound is accepted.
+
+    :param loop: The loop region to test.
+    :returns: ``True`` only if at least one iteration is proven to execute.
+    """
+    # An inverted (do-while) loop runs its body before the condition is ever observed, so the
+    # first iteration is unconditional whatever the bound says.
+    if loop.inverted:
+        return True
+    start = get_init_assignment(loop)
+    end = get_loop_end(loop)  # inclusive bound of the entry condition
+    step = get_loop_stride(loop)
+    if start is None or end is None or step is None:
+        return False
+    step = symbolic.simplify(step)
+    # The direction of the entry test follows the sign of the stride, so an unknown or zero stride
+    # decides nothing.
+    if not step.is_number or step == 0:
+        return False
+    start = symbolic.simplify(start)
+    end = symbolic.simplify(end)
+    return _provably_le(start, end) if step > 0 else _provably_le(end, start)
+
+
 @dataclass(frozen=True)
 class InductionVariable:
     """
@@ -201,21 +295,42 @@ def affine_in_iv(
 
     for iv_name in referenced:
         iv_sym = sym_by_name[iv_name]
-        try:
-            scale = symbolic.simplify(sympy.diff(e, iv_sym))
-        except Exception:
+        # ``sympy.simplify`` is a sledgehammer for deciding this: reaching it through a comparison
+        # sends it into ``equals``/``is_constant``, which samples numerically via mpmath PSLQ and
+        # dominates the whole IV pass. Distribution alone settles almost every affine split, so
+        # ``expand`` screens first and ``simplify`` is only consulted when the cheap form still
+        # leaves the IV in the scale or the remainder.
+        #
+        # The screen decides only WHETHER to fold. What actually gets folded is always recomputed
+        # with ``simplify`` below, because ``scale``/``offset`` are substituted into the SDFG
+        # verbatim -- an expanded-but-unsimplified form would be equal in value yet different in
+        # text, changing emitted subsets for every fold this pass performs.
+        scale = offset = None
+        screened_by_expand = False
+        for normalize in (sympy.expand, symbolic.simplify):
+            try:
+                cand_scale = normalize(sympy.diff(e, iv_sym))
+                cand_offset = normalize(e - cand_scale * iv_sym)
+            except Exception:
+                break
+            cand_scale_free = {str(s) for s in cand_scale.free_symbols}
+            cand_offset_free = {str(s) for s in cand_offset.free_symbols}
+            if cand_scale_free & iv_names or iv_name in cand_offset_free or cand_offset_free & iv_names:
+                continue
+            scale, offset = cand_scale, cand_offset
+            screened_by_expand = normalize is sympy.expand
+            break
+        if scale is None:
             continue
+        if screened_by_expand:
+            try:
+                scale = symbolic.simplify(sympy.diff(e, iv_sym))
+                offset = symbolic.simplify(e - scale * iv_sym)
+            except Exception:
+                continue
         scale_free = {str(s) for s in scale.free_symbols}
-        if scale_free & iv_names:
-            continue
-        try:
-            offset = symbolic.simplify(e - scale * iv_sym)
-        except Exception:
-            continue
         offset_free = {str(s) for s in offset.free_symbols}
-        if iv_name in offset_free:
-            continue
-        if offset_free & iv_names:
+        if scale_free & iv_names or iv_name in offset_free or offset_free & iv_names:
             continue
         if invariant_syms is not None:
             if not ((scale_free | offset_free) <= invariant_syms):

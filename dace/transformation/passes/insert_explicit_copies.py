@@ -14,15 +14,22 @@ from dace.libraries.standard.nodes.copy_node import CopyLibraryNode
 
 
 def _derive_matching_dst_subset(src_subset: subsets.Range, dst_desc: data.Data) -> subsets.Range:
-    """Derive the absent side of a copy memlet: the full array when volumes are not
-    provably unequal, else ``src_subset``.
+    """Derive the absent side of a copy memlet.
+
+    A copy edge that names only one side moves ``src_subset``'s volume; the legacy generator
+    (``cpp.memlet_copy_to_absolute_strides``) drives the copy shape from that known side. So the
+    derived side is a region of ``src_subset``'s shape at the array origin -- EXCEPT when the whole
+    destination array provably holds exactly that volume, which is the reshape case (a ``[20]`` into a
+    ``[4, 5]``): there the full array is the intended target. A merely *unprovable* equality
+    (``i + 1`` vs ``20``, symbolic) is NOT a reshape -- taking the full array would copy the wrong
+    element count (and read out of bounds on the smaller side), so it falls to ``src_subset``.
 
     :param src_subset: the known (source) side of the copy.
     :param dst_desc: descriptor whose subset is being derived.
     :returns: the destination :class:`~dace.subsets.Range`.
     """
     dst_range = subsets.Range.from_array(dst_desc)
-    if symbolic.equal(src_subset.num_elements(), dst_range.num_elements()) is not False:
+    if symbolic.equal(src_subset.num_elements(), dst_range.num_elements()) is True:
         return dst_range
     return src_subset
 
@@ -120,13 +127,15 @@ class InsertExplicitCopies(ppl.Pass):
             src_name = src_node.data
             dst_name = dst_node.data
 
-            # Resolve src and dst subset. Self-copy: subset is the dst side;
-            # otherwise the memlet path maps ``data`` to an endpoint.
-            if src_name == dst_name:
-                src_subset, dst_subset = memlet.other_subset, memlet.subset
-            else:
-                src_subset = memlet.get_src_subset(edge, state)
-                dst_subset = memlet.get_dst_subset(edge, state)
+            # Resolve src and dst subset. ``get_src_subset`` / ``get_dst_subset`` are the only correct
+            # readers of the ``subset`` / ``other_subset`` pair: which side ``subset`` names is carried
+            # by the memlet's own ``_is_data_src`` flag, NOT derivable from the endpoint names. A
+            # self-copy is no exception -- both endpoints match ``memlet.data``, so the flag is what
+            # decides, and ``try_initialize`` defaults it to src-relative. This is what the legacy
+            # generator lowers a copy edge with (``cpp.memlet_copy_to_absolute_strides``); reading
+            # the pair positionally instead reverses every src-relative self-copy.
+            src_subset = memlet.get_src_subset(edge, state)
+            dst_subset = memlet.get_dst_subset(edge, state)
 
             # Derive any side the memlet did not carry from the array shape (handles
             # implicit copies between different-shaped but same-volume arrays).

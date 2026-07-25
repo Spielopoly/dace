@@ -75,6 +75,7 @@ import sympy
 
 import dace
 from dace import SDFG, properties, symbolic
+from dace.sdfg import nodes
 from dace.sdfg.graph import NodeNotFoundError
 from dace.sdfg.state import LoopRegion, SDFGState, ControlFlowRegion
 from dace.transformation import pass_pipeline as ppl
@@ -84,6 +85,17 @@ from dace.transformation.passes.canonicalize.tracked_assumptions import record_a
 
 #: Prefix for the synthesised unit-stride iterator that replaces the (i, ii) pair.
 _UNTILE_PREFIX = '_untile_k_'
+
+
+def count_applied(result) -> int:
+    """Number of transformations a ``PatternMatchAndApplyRepeated`` run applied.
+
+    It returns ``{transformation name: [applied, ...]}``, or ``None`` when it matched nothing.
+    Callers need the count to report their own modification honestly.
+    """
+    if not result:
+        return 0
+    return sum(len(applied) for applied in result.values())
 
 
 def _next_id(sdfg: SDFG) -> int:
@@ -195,7 +207,7 @@ def _is_constant_positive_int(expr) -> Optional[int]:
         s = symbolic.simplify(expr)
     except Exception:
         return None
-    if not getattr(s, 'is_number', False) or not getattr(s, 'is_Integer', False):
+    if not s.is_number or not s.is_Integer:
         return None
     v = int(s)
     return v if v > 0 else None
@@ -206,7 +218,7 @@ def _is_zero(expr) -> bool:
         s = symbolic.simplify(expr)
     except Exception:
         return False
-    return getattr(s, 'is_number', False) and s == 0
+    return s.is_number and s == 0
 
 
 def _tile_size(expr) -> Optional[Tuple[symbolic.SymbolicType, Optional[int]]]:
@@ -236,8 +248,8 @@ def _tile_size(expr) -> Optional[Tuple[symbolic.SymbolicType, Optional[int]]]:
         s = symbolic.simplify(expr)
     except Exception:
         return None
-    if getattr(s, 'is_number', False):
-        if not getattr(s, 'is_Integer', False):
+    if s.is_number:
+        if not s.is_Integer:
             return None
         v = int(s)
         if v <= 1:
@@ -339,7 +351,7 @@ def _diff_is_zero(a, b) -> bool:
         diff = symbolic.simplify(a - b)
     except Exception:
         return False
-    if hasattr(diff, "is_number") and diff.is_number:
+    if diff.is_number:
         try:
             return int(diff) == 0
         except (TypeError, ValueError):
@@ -391,13 +403,25 @@ def _all_memlet_uses_only(inner: LoopRegion, allowed_atoms: Set[str], forbidden_
     return True
 
 
+def depends_only_on_sum(ex: sympy.Basic, i_sym: sympy.Symbol, ii_sym: sympy.Symbol) -> bool:
+    """``True`` iff ``ex`` reads ``i`` and ``ii`` only through the sum ``i + ii``.
+
+    The case-A rewrite substitutes ``ii -> k - i`` and then ``i -> 0``, which preserves a
+    subexpression's value exactly when that subexpression is a function of ``i + ii``: any such
+    function has equal partials in both. Co-occurrence is NOT sufficient -- ``2*i + ii`` and
+    ``i**2 + ii**2`` both mention the two together yet collapse to ``k`` and ``k**2``. Anything
+    sympy cannot differentiate (``int_floor`` and friends) refuses, so the audit fails closed.
+    """
+    try:
+        return symbolic.simplify(sympy.diff(ex, i_sym) - sympy.diff(ex, ii_sym)) == 0
+    except (TypeError, ValueError, AttributeError, NotImplementedError):
+        return False
+
+
 def _audit_combined_access(inner: LoopRegion, outer_var: str, inner_var: str, case: str) -> bool:
     """The structural safety check the docstring describes.
 
-    Case A (``ii in range(0, K)``): the combined expression ``i + ii`` must be
-    the *only* way ``i`` and ``ii`` enter any memlet. Conservative test: every
-    memlet-subset expression that mentions ``i`` must also mention ``ii``, and
-    vice-versa.
+    Case A (``ii in range(0, K)``): ``i`` and ``ii`` must enter every memlet only as ``i + ii``.
 
     Case B (``ii in range(i, i + K)``): ``i`` must NEVER appear in a memlet
     (only ``ii``). The new iterator ``k`` becomes ``ii`` directly.
@@ -409,13 +433,7 @@ def _audit_combined_access(inner: LoopRegion, outer_var: str, inner_var: str, ca
             if i_sym in ex.free_symbols:
                 return False
         return True
-    # Case A: ``i`` and ``ii`` must always appear together.
-    for ex in _collect_body_subset_exprs(inner):
-        has_i = i_sym in ex.free_symbols
-        has_ii = ii_sym in ex.free_symbols
-        if has_i != has_ii:
-            return False
-    return True
+    return all(depends_only_on_sum(ex, i_sym, ii_sym) for ex in _collect_body_subset_exprs(inner))
 
 
 @properties.make_properties
@@ -480,7 +498,7 @@ class UntileLoops(ppl.Pass):
     def should_reapply(self, _modified: ppl.Modifies) -> bool:
         return False
 
-    def _maps_to_loops(self, sdfg: SDFG) -> None:
+    def _maps_to_loops(self, sdfg: SDFG) -> int:
         """Pre-round-trip step: lower every Map to a LoopRegion.
 
         Sequence:
@@ -504,29 +522,30 @@ class UntileLoops(ppl.Pass):
         from dace.transformation.interstate.expand_nested_sdfg_inputs import ExpandNestedSDFGInputs
         from dace.transformation.interstate.multistate_inline import InlineMultistateSDFG
         from dace.transformation.passes.pattern_matching import PatternMatchAndApplyRepeated
-        PatternMatchAndApplyRepeated([MapExpansion()]).apply_pass(sdfg, {})
-        PatternMatchAndApplyRepeated([MapToForLoop()]).apply_pass(sdfg, {})
+        applied = count_applied(PatternMatchAndApplyRepeated([MapExpansion()]).apply_pass(sdfg, {}))
+        applied += count_applied(PatternMatchAndApplyRepeated([MapToForLoop()]).apply_pass(sdfg, {}))
         # Sweep up any NSDFG wrappers that survived MapToForLoop's
         # inline_after step because they were Map-scoped at the time.
         # After all Maps are lifted they are no longer scoped, so a
         # fixpoint sweep flattens them.
         for _ in range(16):
-            before = sum(1 for n, _ in sdfg.all_nodes_recursive()
-                         if hasattr(n, "sdfg") and hasattr(n, "symbol_mapping"))
-            PatternMatchAndApplyRepeated([ExpandNestedSDFGInputs()]).apply_pass(sdfg, {})
-            PatternMatchAndApplyRepeated([InlineMultistateSDFG()]).apply_pass(sdfg, {})
-            after = sum(1 for n, _ in sdfg.all_nodes_recursive() if hasattr(n, "sdfg") and hasattr(n, "symbol_mapping"))
+            before = sum(1 for n, _ in sdfg.all_nodes_recursive() if isinstance(n, nodes.NestedSDFG))
+            applied += count_applied(PatternMatchAndApplyRepeated([ExpandNestedSDFGInputs()]).apply_pass(sdfg, {}))
+            applied += count_applied(PatternMatchAndApplyRepeated([InlineMultistateSDFG()]).apply_pass(sdfg, {}))
+            after = sum(1 for n, _ in sdfg.all_nodes_recursive() if isinstance(n, nodes.NestedSDFG))
             if after >= before:
                 break
+        return applied
 
-    def _loops_back_to_maps(self, sdfg: SDFG) -> None:
+    def _loops_back_to_maps(self, sdfg: SDFG) -> int:
         """Post-round-trip step: re-lift every parallelizable LoopRegion
         to a Map and re-fuse adjacent uni-dim Maps."""
         from dace.transformation.dataflow.map_collapse import MapCollapse
         from dace.transformation.interstate.loop_to_map import LoopToMap
         from dace.transformation.passes.pattern_matching import PatternMatchAndApplyRepeated
-        PatternMatchAndApplyRepeated([LoopToMap()]).apply_pass(sdfg, {})
-        PatternMatchAndApplyRepeated([MapCollapse()]).apply_pass(sdfg, {})
+        applied = count_applied(PatternMatchAndApplyRepeated([LoopToMap()]).apply_pass(sdfg, {}))
+        applied += count_applied(PatternMatchAndApplyRepeated([MapCollapse()]).apply_pass(sdfg, {}))
+        return applied
 
     def apply_pass(self, sdfg: SDFG, _) -> Optional[int]:
         """Run the per-loop rewrite as a fixpoint over the SDFG.
@@ -539,8 +558,12 @@ class UntileLoops(ppl.Pass):
         progressively. Iteration cap = 1 + (loop count); once an
         iteration rewrites nothing we stop.
         """
+        # The round trip rewrites the graph even when no tile pair is found, so its edits have to
+        # be reported too -- returning None after lowering and re-lifting every map would tell the
+        # caller nothing changed and let it reuse stale analyses.
+        roundtrip = 0
         if self.map_roundtrip:
-            self._maps_to_loops(sdfg)
+            roundtrip += self._maps_to_loops(sdfg)
 
         total = 0
         # Safety cap: at most one rewrite per LoopRegion in the SDFG.
@@ -559,13 +582,17 @@ class UntileLoops(ppl.Pass):
             total += rewritten_this_pass
 
         if self.map_roundtrip:
-            self._loops_back_to_maps(sdfg)
+            roundtrip += self._loops_back_to_maps(sdfg)
         if total:
             # Propagate once, at the end of the pass -- the in-place iterator
             # rewrites above intentionally do not self-propagate per rewrite.
             from dace.sdfg.propagation import propagate_memlets_sdfg
             propagate_memlets_sdfg(sdfg)
-        return total or None
+        # ``total`` counts untiled loops; the round trip's edits do not add to that number, but
+        # they still mean "modified", hence 0 rather than None.
+        if total:
+            return total
+        return 0 if roundtrip else None
 
     def _try_untile(self, outer: LoopRegion, sdfg: SDFG) -> bool:
         # The outer must be ``for i in range(0, N, K)`` with a positive tile

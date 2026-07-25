@@ -1,5 +1,6 @@
 # Copyright 2019-2026 ETH Zurich and the DaCe authors. All rights reserved.
 """ A module that contains various DaCe type definitions. """
+import builtins
 import ctypes
 import json
 import inspect
@@ -244,56 +245,30 @@ STORAGEDEFAULT_SCHEDULE = {
 
 # Translation of types to C types
 _CTYPES = {
-    None:
-    "void",
-    int:
-    "int",
-    float:
-    "float",
-    complex:
-    "dace::complex64",
-    bool:
-    "bool",
-    numpy.bool_:
-    "bool",
-    numpy.int8:
-    "int8_t",
-    numpy.int16:
-    "int16_t",
-    numpy.int32:
-    "int32_t",
-    numpy.intc:
-    "int",
-    numpy.int64:
-    "int64_t",
-    numpy.uint8:
-    "uint8_t",
-    numpy.uint16:
-    "uint16_t",
-    numpy.uint32:
-    "uint32_t",
-    numpy.uintc:
-    "dace::uint",
-    numpy.uint64:
-    "uint64_t",
-    numpy.float16:
-    "dace::float16",
-    numpy.float32:
-    "float",
-    numpy.float64:
-    "double",
-    numpy.complex64:
-    "dace::complex64",
-    numpy.complex128:
-    "dace::complex128",
-    # Low-precision types (runtime C++ headers not yet implemented -- see
-    # ``dace::bfloat16`` / ``dace::float8_e4m3`` / ``dace::float8_e5m2``).
-    ml_dtypes.bfloat16:
-    "dace::bfloat16",
-    ml_dtypes.float8_e4m3fn:
-    "dace::float8_e4m3fn",
-    ml_dtypes.float8_e5m2:
-    "dace::float8_e5m2",
+    None: "void",
+    int: "int",
+    float: "float",
+    complex: "dace::complex64",
+    bool: "bool",
+    numpy.bool_: "bool",
+    numpy.int8: "int8_t",
+    numpy.int16: "int16_t",
+    numpy.int32: "int32_t",
+    numpy.intc: "int",
+    numpy.int64: "int64_t",
+    numpy.uint8: "uint8_t",
+    numpy.uint16: "uint16_t",
+    numpy.uint32: "uint32_t",
+    numpy.uintc: "dace::uint",
+    numpy.uint64: "uint64_t",
+    numpy.float16: "dace::float16",
+    ml_dtypes.bfloat16: "dace::bfloat16",
+    ml_dtypes.float8_e4m3fn: "dace::float8_e4m3fn",
+    ml_dtypes.float8_e5m2: "dace::float8_e5m2",
+    numpy.float32: "float",
+    numpy.float64: "double",
+    numpy.complex64: "dace::complex64",
+    numpy.complex128: "dace::complex128",
 }
 
 # Translation of types to python or numpy types
@@ -402,6 +377,20 @@ _BYTES = {
     ml_dtypes.float8_e5m2: 1,
 }
 
+#: Width of Python's scalar types, per ``compiler.default_data_types``.
+_DEFAULT_DATA_TYPES = {
+    'python': {
+        int: numpy.int64,
+        float: numpy.float64,
+        complex: numpy.complex128
+    },
+    'c': {
+        int: numpy.int32,
+        float: numpy.float32,
+        complex: numpy.complex64
+    },
+}
+
 
 class typeclass(object):
     """ An extension of types that enables their use in DaCe.
@@ -423,30 +412,15 @@ class typeclass(object):
             except AttributeError:
                 raise ValueError("Unknown type: {}".format(wrapped_type))
 
-        config_data_types = Config.get('compiler', 'default_data_types')
-
-        if wrapped_type is int:
-            if config_data_types.lower() == 'python':
-                wrapped_type = numpy.int64
-            elif config_data_types.lower() == 'c':
-                wrapped_type = numpy.int32
-            else:
+        # Only Python's scalar types consult the configuration; every other type paid the lookup.
+        if wrapped_type is int or wrapped_type is float or wrapped_type is complex:
+            config_data_types = Config.get('compiler', 'default_data_types')
+            widths = _DEFAULT_DATA_TYPES.get(config_data_types.lower())
+            if widths is None:
                 raise NameError("Unknown configuration for default_data_types: {}".format(config_data_types))
-        elif wrapped_type is float:
-            if config_data_types.lower() == 'python':
-                wrapped_type = numpy.float64
-            elif config_data_types.lower() == 'c':
-                wrapped_type = numpy.float32
-            else:
-                raise NameError("Unknown configuration for default_data_types: {}".format(config_data_types))
-        elif wrapped_type is complex:
-            if config_data_types.lower() == 'python':
-                wrapped_type = numpy.complex128
-            elif config_data_types.lower() == 'c':
-                wrapped_type = numpy.complex64
-            else:
-                raise NameError("Unknown configuration for default_data_types: {}".format(config_data_types))
-        elif wrapped_type is bool:
+            wrapped_type = widths[wrapped_type]
+        elif wrapped_type is builtins.bool:
+            # This module rebinds ``bool`` to a typeclass below, so name the builtin explicitly.
             wrapped_type = numpy.bool_
         elif getattr(wrapped_type, '__name__', '') == 'bool_' and typename is None:
             typename = 'bool'
@@ -1343,9 +1317,8 @@ else:
     # Low-precision types backed by ml_dtypes scalars (numpy-registered), named
     # verbatim as ml_dtypes names them. E4M3 is the finite ``fn`` variant
     # (max +-448, no inf) -- the hardware E4M3 of NVIDIA __nv_fp8_e4m3 / AMD /
-    # OCP training. The C++ runtime headers (dace::bfloat16 / dace::float8_e4m3fn
-    # / dace::float8_e5m2) are not implemented yet -- this registers the
-    # Python-side dtypes only.
+    # OCP training. Backed by dace::bfloat16 / dace::float8_e4m3fn / dace::float8_e5m2 in
+    # runtime/include/dace/types.h -- bit-identical to the CUDA/HIP native types.
     bfloat16 = typeclass(ml_dtypes.bfloat16)
     float8_e4m3fn = typeclass(ml_dtypes.float8_e4m3fn)
     float8_e5m2 = typeclass(ml_dtypes.float8_e5m2)
@@ -1772,9 +1745,14 @@ def is_gpu_array(obj: Any) -> bool:
         # variables that require grad, or KeyError when a boolean array is used
         return False
 
-    if hasattr(obj, 'data') and hasattr(obj.data, 'ptr'):  # CuPy special case with HIP
-        if hasattr(obj, 'device') and getattr(obj.device, 'id', -1) >= 0:
-            return True
+    try:
+        if hasattr(obj, 'data') and hasattr(obj.data, 'ptr'):  # CuPy special case with HIP
+            if hasattr(obj, 'device') and getattr(obj.device, 'id', -1) >= 0:
+                return True
+    except (ValueError, TypeError):
+        # numpy arrays of extension dtypes (ml_dtypes bf16/fp8) raise when building a
+        # buffer for .data; they are host arrays, so fall through to the False below.
+        pass
 
     return False
 

@@ -10,8 +10,7 @@ import warnings
 import numpy as np
 
 from dace import data, dtypes, registry, memlet as mmlt, subsets, symbolic, Config
-from dace.codegen import cppunparse, exceptions as cgx
-from dace.codegen.codeobject import CodeObject
+from dace.codegen import compiler_family, cppunparse, exceptions as cgx
 from dace.codegen.prettycode import CodeIOStream
 from dace.codegen.targets import cpp
 from dace.codegen.common import codeblock_to_cpp, sym2cpp, update_persistent_desc
@@ -23,6 +22,7 @@ from dace.sdfg import (ScopeSubgraphView, SDFG, scope_contains_scope, is_array_s
                        dynamic_map_inputs)
 from dace.sdfg.scope import is_devicelevel_gpu, is_in_scope
 from dace.sdfg.validation import validate_memlet_data
+from dace.transformation.passes.analysis.loop_analysis import counter_used_outside_loop
 from typing import TYPE_CHECKING, Dict, Optional, Set, Tuple, Union
 
 import re
@@ -85,37 +85,6 @@ def counter_init_assigns_only(loop: LoopRegion) -> bool:
     stmt = code[0]
     return (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name)
             and stmt.targets[0].id == loop.loop_variable)
-
-
-def counter_used_outside_loop(name: str, loop: LoopRegion, sdfg: SDFG) -> bool:
-    """Whether ``name`` is read or written anywhere outside ``loop``. Declaring the counter in the
-    loop's own ``for``-init clause scopes it to the loop, so its value stops being observable after the
-    loop closes -- exactly what a use outside would need. DaCe permits such a use (a LoopRegion leaks
-    its counter's final value to subsequent blocks), so this must be checked, not assumed.
-
-    Every block of the SDFG is enumerated individually, hence a REGION is asked only for the symbols it
-    uses on itself (``with_contents=False`` -- its condition / init / update); its contents arrive as
-    their own blocks. A state must be asked WITH contents: ``SDFGState.used_symbols(with_contents=False)``
-    returns the empty set, which would silently hide every real use.
-    """
-    inside = {id(loop)} | {id(block) for block in loop.all_control_flow_blocks()}
-    for block in sdfg.all_control_flow_blocks():
-        if id(block) in inside:
-            continue
-        with_contents = not isinstance(block, AbstractControlFlowRegion)
-        if name in block.used_symbols(all_symbols=True, with_contents=with_contents):
-            return True
-    inside_edges = {id(edge) for edge in loop.all_interstate_edges()}
-    for edge in sdfg.all_interstate_edges():
-        if id(edge) in inside_edges:
-            continue
-        if name in edge.data.free_symbols or name in edge.data.assignments:
-            return True
-    # A descriptor whose shape/strides mention the counter is materialised outside the loop.
-    for desc in sdfg.arrays.values():
-        if name in {str(s) for s in desc.free_symbols}:
-            return True
-    return False
 
 
 def loop_local_counter_ctype(name: str, dtype: dtypes.typeclass, sdfg: SDFG) -> Optional[str]:
@@ -534,6 +503,13 @@ class CPUCodeGen(TargetCodeGenerator):
         # CodeObject (= its own .cpp). Empty unless the flag is on, so the default path is untouched.
         self._nsdfg_translation_units: Dict[str, Tuple[str, Set[str]]] = {}
 
+        # Top-level GPU nests lifted into their OWN standalone SDFG + translation unit
+        # (``compiler.cpu.codegen_params.external_translation_units``, Model 2):
+        # public-ABI child name -> the child SDFG. ``_generate_NestedSDFG`` emits a handle-ABI call
+        # to the child instead of inlining its kernels here, and ``get_generated_codeobjects`` runs a
+        # fresh ``generate_code`` per child (its own ``.cu``). Empty unless the flag is on.
+        self.external_children: Dict[str, SDFG] = {}
+
         # Identifies the host OUTPUT FILE being generated right now. ``id(self)`` is the frame .cpp,
         # which is the only host file unless the per-nest split routes a top-level nest into its own
         # .cpp -- ``_generate_NestedSDFG`` then re-points this at that nest while generating its
@@ -575,12 +551,12 @@ class CPUCodeGen(TargetCodeGenerator):
     def cmake_options():
         options = []
 
-        if Config.get('compiler', 'cpu', 'executable'):
-            compiler = make_absolute(Config.get('compiler', 'cpu', 'executable'))
-            options.append('-DCMAKE_CXX_COMPILER="{}"'.format(compiler))
+        # Always pinned, so the compiler the flags were chosen for is the one CMake uses. This wins
+        # over a CMAKE_CXX_COMPILER set in a toolchain file passed through extra_cmake_args.
+        options.append('-DCMAKE_CXX_COMPILER="{}"'.format(make_absolute(compiler_family.host_compiler())))
 
-        if Config.get('compiler', 'cpu', 'args'):
-            flags = Config.get('compiler', 'cpu', 'args')
+        flags = compiler_family.cpu_args()
+        if flags:
             options.append('-DCMAKE_CXX_FLAGS="{}"'.format(flags))
 
         return options
@@ -609,14 +585,97 @@ class CPUCodeGen(TargetCodeGenerator):
                         return False
         return True
 
+    @staticmethod
+    def _rename_full_array_connectors_to_outer(sdfg, state, node):
+        """Rename each full-array connector of ``node`` to its OUTER array's name where that binding is
+        unambiguous, so the connector and the outer array share a name and codegen emits no alias at all
+        (the body just uses the outer pointer, in scope via ``can_access_parent``). Skips a rename that
+        would clash -- the same outer array bound through a SEPARATE in- and out-connector (an in/out name
+        clash), or a target name already used by a distinct nested array/symbol -- leaving those to the
+        ``__restrict__`` alias path. Mutates ``node.sdfg`` in place; only sound because a nest reaching the
+        inline path is generated exactly once, here.
+        """
+        bindings = {}  # outer array name -> list of (edge, connector, is_input)
+        for e in state.in_edges(node):
+            if e.data is not None and e.data.data is not None and e.dst_conn:
+                bindings.setdefault(e.data.data, []).append((e, e.dst_conn, True))
+        for e in state.out_edges(node):
+            if e.data is not None and e.data.data is not None and e.src_conn:
+                bindings.setdefault(e.data.data, []).append((e, e.src_conn, False))
+        for outer, binds in bindings.items():
+            conns = {conn for _, conn, _ in binds}
+            if len(conns) != 1:
+                continue  # in/out name clash: in- and out-connectors are distinct nested arrays -> alias
+            conn = next(iter(conns))
+            if conn == outer:
+                continue  # already the same name
+            if outer in node.sdfg.arrays or outer in node.sdfg.symbols or outer in node.sdfg.constants:
+                continue  # target name already taken inside the nest -> alias
+            node.sdfg.replace(conn, outer)  # rename the nested array + every reference to it
+            for e, _, is_input in binds:
+                if is_input:
+                    node.in_connectors[outer] = node.in_connectors.pop(conn)
+                    e.dst_conn = outer
+                else:
+                    node.out_connectors[outer] = node.out_connectors.pop(conn)
+                    e.src_conn = outer
+
+    @staticmethod
+    def _nsdfg_connectors_are_full_arrays(sdfg, state, node) -> bool:
+        """True iff EVERY in/out connector of ``node`` binds a whole outer array (full range, offset 0)
+        to a nested array of identical shape and strides -- the case where the two can be aliased with
+        one ``T* __restrict__`` pointer assignment instead of passed through a function argument. Rejects
+        scalars, sub-ranges, WCR and views, which each need real argument handling. Backs the
+        ``inline_full_array_nsdfg`` knob.
+        """
+        edges = [(e, e.dst_conn) for e in state.in_edges(node)] + [(e, e.src_conn) for e in state.out_edges(node)]
+        seen = False
+        for e, conn in edges:
+            if e.data is None or e.data.data is None:
+                continue
+            seen = True
+            if conn is None or e.data.wcr is not None or conn not in node.sdfg.arrays:
+                return False
+            outer = sdfg.arrays.get(e.data.data)
+            inner = node.sdfg.arrays[conn]
+            if outer is None or isinstance(outer, data.Scalar) or isinstance(inner, data.Scalar):
+                return False
+            if isinstance(outer, data.View) or isinstance(inner, data.View):
+                return False
+            full = subsets.Range.from_array(outer)
+            if e.data.subset is None or not (e.data.subset.covers(full) and full.covers(e.data.subset)):
+                return False
+            if list(inner.shape) != list(outer.shape) or list(inner.strides) != list(outer.strides):
+                return False
+        return seen
+
     def get_generated_codeobjects(self):
+        objects = []
+
+        # External-TU children (Model 2): each top-level GPU nest, lifted in ``_generate_NestedSDFG``,
+        # is code-generated here as its OWN standalone program -- a fresh ``generate_code`` pass, so its
+        # kernels get their own ``.cu``. The child's CodeObjects (its ``.cu``, frame ``.cpp``, etc.) are
+        # flattened into this target's output, which feeds the one flat source list both builders
+        # (cmake ``DACE_FILES`` and the native compiler) consume -- one project, no sub-libraries.
+        if self.external_children:
+            from dace.codegen.codegen import generate_code
+            for name, child_sdfg in sorted(self.external_children.items()):
+                child = deepcopy(child_sdfg)
+                child.name = name  # the public ABI the parent forward-declared: __program_<name>, ...
+                child.reset_cfg_list()  # deepcopy leaves _cfg_list empty; rebuild so it is a valid root
+                # Depth 1: a child is generated with the split OFF, so a nest inside it is not re-lifted.
+                with set_temporary('compiler', 'cpu', 'codegen_params', 'external_translation_units', value=False):
+                    child_objects = generate_code(child, validate=False)
+                # Namespace the child's target-level init/exit so N sub-programs share one binary.
+                self._namespace_child_module_symbols(child_objects, name)
+                objects.extend(child_objects)
+
         # The CPU target normally generates inline code (everything lands in the frame's .cpp), so
-        # unless the per-nest split buffered something there is nothing to emit here.
+        # unless the per-nest split buffered something there is nothing further to emit here.
         if not self._nsdfg_translation_units:
-            return []
+            return objects
 
         top_sdfg = self._global_sdfg
-        objects = []
         for label, (code, envs) in sorted(self._nsdfg_translation_units.items()):
             fileheader = CodeIOStream()
             # Re-emit the shared preamble into this TU: includes, custom type definitions and
@@ -1342,7 +1401,7 @@ class CPUCodeGen(TargetCodeGenerator):
                             state_id,
                             [src_node, dst_node],
                         )
-                    elif hasattr(src_nodedesc, "src"):  # ArrayStreamView
+                    elif hasattr(src_nodedesc, "src"):  # Array-stream view, ``src`` set by is_array_stream_view
                         stream.write(
                             "{s}.push({arr});".format(s=self.ptr(dst_node.data, dst_nodedesc, sdfg),
                                                       arr=self.ptr(src_nodedesc.src, sdfg.arrays[src_nodedesc.src],
@@ -2437,9 +2496,22 @@ class CPUCodeGen(TargetCodeGenerator):
         callsite_stream: CodeIOStream,
     ):
         inline = Config.get_bool('compiler', 'inline_sdfgs')
+        state_dfg = cfg.nodes()[state_id]
+        # inline_full_array_nsdfg: a CPU-only nest whose connectors are ALL whole outer arrays can be
+        # emitted inline via __restrict__ pointer aliases (see the inline branch below) instead of a
+        # function. Take the inline path -- which also enters the scopes with can_access_parent=True so
+        # the aliased outer pointers resolve. GPU nests (not cpu-only) fall through to do_external.
+        do_alias_inline = (not inline and self.calling_codegen is self
+                           and Config.get_bool('compiler', 'cpu', 'codegen_params', 'inline_full_array_nsdfg')
+                           and self._nsdfg_subtree_is_cpu_only(node.sdfg)
+                           and self._nsdfg_connectors_are_full_arrays(sdfg, state_dfg, node))
+        if do_alias_inline:
+            # Prefer renaming each connector to its outer array's name (no alias needed at all); only a
+            # connector that cannot be renamed without a clash keeps its __restrict__ alias below.
+            self._rename_full_array_connectors_to_outer(sdfg, state_dfg, node)
+            inline = True
         self._dispatcher.defined_vars.enter_scope(sdfg, can_access_parent=inline)
         self._dispatcher.declared_arrays.enter_scope(sdfg, can_access_parent=inline)
-        state_dfg = cfg.nodes()[state_id]
 
         fsyms = self._frame.free_symbols(node.sdfg)
         arglist = node.sdfg.arglist(scalars_only=False, free_symbols=fsyms)
@@ -2530,6 +2602,21 @@ class CPUCodeGen(TargetCodeGenerator):
                     and codegen is self and sdfg.parent is None and not inline and node.no_inline
                     and self._nsdfg_subtree_is_cpu_only(node.sdfg))
 
+        # Model 2 (``external_translation_units``): the COMPLEMENT of do_split -- a top-level nest that
+        # DOES contain GPU work is lifted into its own standalone SDFG and called through that SDFG's
+        # public handle ABI, so its kernels land in their own ``.cu`` (one generate_code pass per nest)
+        # rather than being folded into the parent's. Same enabling conditions as do_split (top-level,
+        # standalone no_inline function, host-side codegen), only the CPU-only test is inverted.
+        do_external = (Config.get_bool('compiler', 'cpu', 'codegen_params', 'external_translation_units')
+                       and codegen is self and sdfg.parent is None and not inline and node.no_inline
+                       and not self._nsdfg_subtree_is_cpu_only(node.sdfg))
+        if do_external:
+            self._emit_external_translation_unit_call(sdfg, node, memlet_references, sdfg_label,
+                                                      function_stream, callsite_stream, cfg, state_id)
+            self._dispatcher.declared_arrays.exit_scope(sdfg)
+            self._dispatcher.defined_vars.exit_scope(sdfg)
+            return
+
         if not inline and (not unique_functions or not code_already_generated):
             # A split nest is DEFINED in its own TU and only DECLARED in the frame's, so it must not be
             # ``inline``: an inline function used in a TU that lacks its definition is ODR-ill-formed
@@ -2547,8 +2634,22 @@ class CPUCodeGen(TargetCodeGenerator):
 
         if inline:
             callsite_stream.write('{', cfg, state_id, node)
-            for ref in memlet_references:
-                callsite_stream.write('%s %s = %s;' % ref, cfg, state_id, node)
+            # inline_full_array_nsdfg: a connector that already shares its outer array's NAME needs no
+            # binding at all (the outer pointer is in scope, can_access_parent=True); every other
+            # full-array connector is aliased with a single __restrict__ pointer assignment.
+            alias_same_name = set()
+            if do_alias_inline:
+                for e in list(state_dfg.in_edges(node)) + list(state_dfg.out_edges(node)):
+                    conn = e.dst_conn if e.dst is node else e.src_conn
+                    if conn is not None and e.data is not None and e.data.data == conn:
+                        alias_same_name.add(conn)
+            for atype, aname, argval in memlet_references:
+                if do_alias_inline:
+                    if aname in alias_same_name:
+                        continue
+                    callsite_stream.write('%s __restrict__ %s = %s;' % (atype, aname, argval), cfg, state_id, node)
+                else:
+                    callsite_stream.write('%s %s = %s;' % (atype, aname, argval), cfg, state_id, node)
             # Emit symbol mappings
             # We first emit variables of the form __dacesym_X = Y to avoid
             # overriding symbolic expressions when the symbol names match
@@ -2650,6 +2751,81 @@ class CPUCodeGen(TargetCodeGenerator):
 
         self._dispatcher.declared_arrays.exit_scope(sdfg)
         self._dispatcher.defined_vars.exit_scope(sdfg)
+
+    def _emit_external_translation_unit_call(self, sdfg, node, memlet_references, child_name, function_stream,
+                                             callsite_stream, cfg, state_id):
+        """Call a top-level GPU nest that is code-generated as its OWN standalone SDFG (Model 2).
+
+        The nest is not inlined here; the parent calls the child SDFG's public extern-C handle ABI --
+        ``__dace_init_<name>`` (allocate the child's state, return an opaque handle), ``__program_<name>``
+        (run it), ``__dace_exit_<name>`` (free it) -- forward-declared and resolved in-binary by the
+        static linker. Device pointers pass straight through: parent and child share the process CUDA
+        context. The child is registered for a separate ``generate_code`` pass in
+        ``get_generated_codeobjects`` (its kernels land in its own ``.cu``).
+        """
+        child_sdfg = node.sdfg
+        # Match the child's generated signature EXACTLY: framecode derives both its arglist and its init
+        # parameters from ``used_symbols(all_symbols=False)``, so use the same here, and render the
+        # prototype from the child's own ``signature`` / ``init_signature`` -- that makes the parent's
+        # declaration identical to the child's definition by construction (extern "C", nothing to mangle).
+        child_fsyms = child_sdfg.used_symbols(all_symbols=False)
+        child_arglist = child_sdfg.arglist(scalars_only=False, free_symbols=child_fsyms)
+
+        # Parent-side value for each child argument NAME: array pointers from the memlet references,
+        # symbols from the nest's symbol mapping. Emitted in the child's ARGLIST order -- not the
+        # memlet-reference order, which sorts inputs-then-outputs and would pass swapped pointers when
+        # in/out arrays interleave alphabetically.
+        argval_by_name = {aname: argval for _, aname, argval in memlet_references}
+        for symname, symval in node.symbol_mapping.items():
+            if symname not in sdfg.constants:
+                argval_by_name[symname] = cpp.sym2cpp(symval)
+
+        init_symbols = [s for s in sorted(str(sym) for sym in child_fsyms) if not s.startswith('__dace')]
+        program_args = [argval_by_name[name] for name in child_arglist.keys()]
+        init_args = [argval_by_name[name] for name in init_symbols]
+
+        # Forward declarations. ``void *`` stands in for the child's ``<name>Handle_t`` typedef so the
+        # parent needs none of the child's generated headers.
+        program_sig = child_sdfg.signature(with_types=True, for_call=False, arglist=child_arglist)
+        program_params = 'void *__handle' + (f', {program_sig}' if program_sig else '')
+        function_stream.write(
+            f'extern "C" void *__dace_init_{child_name}({child_sdfg.init_signature(free_symbols=child_fsyms)});\n'
+            f'extern "C" int __dace_exit_{child_name}(void *__handle);\n'
+            f'extern "C" void __program_{child_name}({program_params});\n', cfg, state_id, node)
+
+        # Call site: init -> run -> exit, braced so the handle stays local.
+        handle_var = f'__exttu_h_{child_name}'
+        callsite_stream.write(
+            f'{{\nvoid *{handle_var} = __dace_init_{child_name}({", ".join(init_args)});\n'
+            f'__program_{child_name}({", ".join([handle_var] + program_args)});\n'
+            f'__dace_exit_{child_name}({handle_var});\n}}\n', cfg, state_id, node)
+
+        self.external_children[child_name] = child_sdfg
+
+    def _namespace_child_module_symbols(self, objects, child_name):
+        """Namespace a child sub-program's TARGET-level ``__dace_init``/``__dace_exit`` symbols.
+
+        Each standalone child is a full program, so its generate_code pass emits target-level init/exit
+        named by the TARGET, not the SDFG -- e.g. ``__dace_init_experimental_cuda`` (and the same for
+        every other target it uses). Linking several children plus the parent into one binary would give
+        each such symbol multiple definitions. Suffix every one with the child name so the copies stay
+        distinct, in lockstep across the child's own translation units (definition and every internal
+        caller). The child's PUBLIC ``__dace_init_<child>`` -- the only entry the parent calls -- is left
+        untouched, so the cross-program handle call still resolves.
+        """
+        module_targets = set()
+        finder = re.compile(r'__dace_(?:init|exit)_(\w+)')
+        for obj in objects:
+            module_targets.update(m.group(1) for m in finder.finditer(obj.code) if m.group(1) != child_name)
+        if not module_targets:
+            return
+        for obj in objects:
+            code = obj.code
+            for target in module_targets:
+                for kind in ('init', 'exit'):
+                    code = re.sub(r'\b__dace_%s_%s\b' % (kind, re.escape(target)),
+                                  '__dace_%s_%s_%s' % (kind, target, child_name), code)
+            obj.code = code
 
     def _collect_omp_reductions(self, sdfg: SDFG, state: SDFGState, map_entry: nodes.MapEntry):
         """Walk the map's WCR-write edges that target an accumulator outside the scope and

@@ -584,19 +584,18 @@ def _array_slot_const_product(q: dace.float64[N]):
         q[0] = q[0] * 0.99
 
 
-@pytest.mark.xfail(reason="TSVC s317: ``q[0] *= 0.99`` is a multiplicative induction variable. The preferred "
-                   "path -- ``InductionVariableSubstitution`` (canonicalize/induction_variable_substitution.py) -- "
-                   "now collapses it to the O(1) closed form ``q[0] *= 0.99**N`` and is wired into the "
-                   "canonicalize pipeline. This test still xfails because it exercises ``LoopToReduce`` "
-                   "in isolation, which intentionally does NOT recognise the IV shape (no array to fold). "
-                   "See tests/passes/induction_variable_substitution_test.py for the passing IV-pass tests.",
-                   strict=True)
-def test_array_slot_const_product_is_lifted(prefer):
-    """TSVC s317."""
+def test_array_slot_const_product_not_lifted_iv(prefer):
+    """TSVC s317 ``q[0] *= 0.99`` is a geometric induction variable, NOT a reduction: there
+    is no array to fold, so ``LoopToReduce`` alone (either mode) must refuse it. The O(1)
+    closed form ``q[0] *= 0.99**N`` is produced by ``InductionVariableSubstitution`` (run
+    before LoopToReduce in the pipeline) -- see
+    ``test_geometric_iv_handled_by_induction_pass_not_loop_to_reduce`` and
+    tests/passes/induction_variable_substitution_test.py for the passing IV-pass coverage.
+    """
     sdfg = _array_slot_const_product.to_sdfg(simplify=True)
     sdfg.validate()
     lifted = _prep_and_lift(sdfg, prefer)
-    assert lifted >= 1
+    assert lifted == 0
 
 
 # ---- s314 / s316: branched min / max -------------------------------------
@@ -924,7 +923,7 @@ def test_geometric_iv_handled_by_induction_pass_not_loop_to_reduce():
     induction-variable closed form ``q[0] *= 0.99**N`` handled by
     ``InductionVariableSubstitution`` (run BEFORE LoopToReduce in the pipeline). After
     ``TTE + IVS`` the loop is gone, so a subsequent LoopToReduce has nothing to lift. The
-    ``test_array_slot_const_product_is_lifted`` xfails pin the inverse: LoopToReduce alone
+    ``test_array_slot_const_product_not_lifted_iv`` test pins the inverse: LoopToReduce alone
     must NOT recognise the IV shape.
     """
     import numpy as np
@@ -1031,6 +1030,173 @@ def test_wcr_scalar_refuses_scan_shape_recurrence():
     out[n - 1] = 1.0
     sdfg(a=a_arr.copy(), b=out, NN=n)
     assert np.allclose(out, expected), f'recurrence value-preservation broke: got {out[:3]}, expected {expected[:3]}'
+
+
+def _build_scalarised_scan_writeback(n_sym=N):
+    """``c = A[0]; for i in 0..N-2: c = c + A[i]; A[i+1] = c`` -- a prefix-sum scan whose
+    vertical carry has been scalarised into ``c`` (the shape CloudSC's flux integral
+    ``PFLUX(jk+1) = PFLUX(jk) + term`` collapses to after the pipeline stamps out the
+    intra-iteration scalar intermediates). The accumulate ``c = c + A[i]`` looks like a plain
+    reduction, but the running value is written BACK into the folded array ``A`` at ``i+1``
+    every iteration -- a per-iteration output a single ``Reduce`` cannot reproduce.
+    """
+    sdfg = dace.SDFG("scalarised_scan_writeback")
+    sdfg.add_array("A", [n_sym], dace.float64)
+    sdfg.add_scalar("c", dace.float64, transient=True)
+
+    pre = sdfg.add_state("pre", is_start_block=True)
+    pre.add_edge(pre.add_read("A"), None, pre.add_write("c"), None, mm.Memlet("A[0]"))
+
+    loop = LoopRegion("loop",
+                      condition_expr="i < N - 1",
+                      loop_var="i",
+                      initialize_expr="i = 0",
+                      update_expr="i = i + 1")
+    sdfg.add_node(loop)
+    sdfg.add_edge(pre, loop, dace.InterstateEdge())
+
+    body = loop.add_state("body", is_start_block=True)
+    t = body.add_tasklet("acc", {"cin", "ain"}, {"cout"}, "cout = cin + ain")
+    c_w = body.add_write("c")
+    body.add_edge(body.add_read("c"), None, t, "cin", mm.Memlet("c[0]"))
+    body.add_edge(body.add_read("A"), None, t, "ain", mm.Memlet("A[i]"))
+    body.add_edge(t, "cout", c_w, None, mm.Memlet("c[0]"))
+    # scan output: the running carry written back into the folded array at the next level.
+    body.add_edge(c_w, None, body.add_write("A"), None, mm.Memlet("A[i + 1]"))
+
+    post = sdfg.add_state("post")
+    sdfg.add_edge(loop, post, dace.InterstateEdge())
+    sdfg.validate()
+    return sdfg
+
+
+def test_scalarised_scan_writeback_into_folded_array_not_lifted(prefer):
+    """A scalarised prefix-sum that writes its running carry BACK into the folded array
+    (``c = c + A[i]; A[i + 1] = c``) must NOT be lifted to a ``Reduce`` in either emit mode.
+
+    Regression: ``_extract`` used to exempt the folded ``array`` from its "writes only the
+    accumulator" guard (``allowed = {accum, array, ...}``), so a writeback into that array
+    slipped through and the vertical scan was collapsed to a single ``Reduce`` -- the CloudSC
+    flux-integral (PFPLSL/PFHPSL) miscompile, ~2.5% error, because a ``Reduce`` emits one final
+    value instead of the running per-level sequence. The array is now NOT exempt; the writeback
+    is recognised as a scan output and the loop is left for ``LoopToScan``.
+    """
+    import numpy as np
+    from dace.libraries.standard.nodes.reduce import Reduce
+
+    sdfg = _build_scalarised_scan_writeback()
+    sdfg.validate()
+    assert _count_loops(sdfg) == 1
+
+    lifted = LoopToReduce(prefer=prefer).apply_pass(sdfg, {})
+    sdfg.validate()
+
+    assert not lifted, f'scalarised scan writeback must not lift; got {lifted}'
+    assert _count_loops(sdfg) == 1, 'the scan loop must survive for LoopToScan'
+    assert not [n for n, _ in sdfg.all_nodes_recursive() if isinstance(n, Reduce)], 'no Reduce may be emitted'
+
+    # Value preservation: the surviving loop still computes the in-place prefix scan.
+    n = 12
+    rng = np.random.default_rng(3)
+    a = rng.standard_normal(n)
+    expected = a.copy()
+    c = expected[0]
+    for i in range(n - 1):
+        c = c + expected[i]
+        expected[i + 1] = c
+    got = a.copy()
+    sdfg(A=got, N=n)
+    assert np.allclose(got, expected), f'scan value broke: got {got[:4]}, expected {expected[:4]}'
+
+
+def _build_transient_scan_writeback(n_sym=N):
+    """``c = A[0]; for i in 0..N-2: c = c + A[i]; ZP[i+1] = c`` where ``ZP`` is a TRANSIENT buffer.
+    Same prefix-scan-into-writeback shape as ``_build_scalarised_scan_writeback`` but the running
+    carry is stamped into a transient (not the folded array). 881e55d79 refused only NON-transient
+    writebacks, so this slipped through and collapsed to a ``Reduce`` -- exactly gpu_scc's vertical
+    flux double-buffer, whose ``ZPFPLSX`` carry is a transient scratch array.
+    """
+    sdfg = dace.SDFG("transient_scan_writeback")
+    sdfg.add_array("A", [n_sym], dace.float64)
+    sdfg.add_array("ZP", [n_sym], dace.float64, transient=True)
+    sdfg.add_scalar("c", dace.float64, transient=True)
+    pre = sdfg.add_state("pre", is_start_block=True)
+    pre.add_edge(pre.add_read("A"), None, pre.add_write("c"), None, mm.Memlet("A[0]"))
+    loop = LoopRegion("loop", condition_expr="i < N - 1", loop_var="i", initialize_expr="i = 0",
+                      update_expr="i = i + 1")
+    sdfg.add_node(loop)
+    sdfg.add_edge(pre, loop, dace.InterstateEdge())
+    body = loop.add_state("body", is_start_block=True)
+    t = body.add_tasklet("acc", {"cin", "ain"}, {"cout"}, "cout = cin + ain")
+    cw = body.add_write("c")
+    body.add_edge(body.add_read("c"), None, t, "cin", mm.Memlet("c[0]"))
+    body.add_edge(body.add_read("A"), None, t, "ain", mm.Memlet("A[i]"))
+    body.add_edge(t, "cout", cw, None, mm.Memlet("c[0]"))
+    body.add_edge(cw, None, body.add_write("ZP"), None, mm.Memlet("ZP[i + 1]"))  # carry -> transient buffer
+    post = sdfg.add_state("post")
+    sdfg.add_edge(loop, post, dace.InterstateEdge())
+    sdfg.validate()
+    return sdfg
+
+
+def _build_double_buffer_scan_writeback(n_sym=N):
+    """The CloudSC k-caching double-buffer: ``c = c + A[i]; ZP[(i+1)%2] = c`` where ``ZP`` is a 2-slot
+    TRANSIENT buffer and the write slot toggles per level via a loop-iedge symbol (``jkip1``). The
+    per-level carry is stamped into the ring buffer; a single ``Reduce`` drops the sequence. This is
+    the ``ZPFPLSX[jk_ip1]`` flux shape whose *moving transient* slot the plain non-transient guard
+    could not see.
+    """
+    sdfg = dace.SDFG("double_buffer_scan_writeback")
+    sdfg.add_array("A", [n_sym], dace.float64)
+    sdfg.add_array("ZP", [2], dace.float64, transient=True)
+    sdfg.add_scalar("c", dace.float64, transient=True)
+    pre = sdfg.add_state("pre", is_start_block=True)
+    pre.add_edge(pre.add_read("A"), None, pre.add_write("c"), None, mm.Memlet("A[0]"))
+    loop = LoopRegion("loop", condition_expr="i < N - 1", loop_var="i", initialize_expr="i = 0",
+                      update_expr="i = i + 1")
+    sdfg.add_node(loop)
+    sdfg.add_edge(pre, loop, dace.InterstateEdge())
+    body = loop.add_state("body", is_start_block=True)
+    t = body.add_tasklet("acc", {"cin", "ain"}, {"cout"}, "cout = cin + ain")
+    cw = body.add_write("c")
+    body.add_edge(body.add_read("c"), None, t, "cin", mm.Memlet("c[0]"))
+    body.add_edge(body.add_read("A"), None, t, "ain", mm.Memlet("A[i]"))
+    body.add_edge(t, "cout", cw, None, mm.Memlet("c[0]"))
+    body.add_edge(cw, None, body.add_write("ZP"), None, mm.Memlet("ZP[(i + 1) % 2]"))  # toggled ring slot
+    post = sdfg.add_state("post")
+    sdfg.add_edge(loop, post, dace.InterstateEdge())
+    sdfg.validate()
+    return sdfg
+
+
+def test_transient_scan_writeback_not_lifted(prefer):
+    """A prefix-scan carry stamped into a TRANSIENT buffer at a moving slot (``ZP[i+1] = c``) must NOT
+    lift to a ``Reduce`` -- the hole 881e55d79 missed (it exempted transient writebacks). gpu_scc's
+    flux double-buffer is a transient, so its scan was collapsed and the per-level flux dropped.
+    """
+    from dace.libraries.standard.nodes.reduce import Reduce
+    sdfg = _build_transient_scan_writeback()
+    assert _count_loops(sdfg) == 1
+    lifted = LoopToReduce(prefer=prefer).apply_pass(sdfg, {})
+    sdfg.validate()
+    assert not lifted, f'transient scan writeback must not lift; got {lifted}'
+    assert _count_loops(sdfg) == 1, 'the scan loop must survive for LoopToScan'
+    assert not [n for n, _ in sdfg.all_nodes_recursive() if isinstance(n, Reduce)], 'no Reduce may be emitted'
+
+
+def test_double_buffer_carry_scan_not_lifted(prefer):
+    """The CloudSC k-caching double-buffer (``ZP[(i+1)%2] = c``, toggled per level by a loop-iedge
+    symbol) must NOT lift to a ``Reduce``: it is a genuine sequential recurrence over a ring buffer,
+    not a fold. Exercises the loop-iedge-symbol arm of the moving-slot refusal.
+    """
+    from dace.libraries.standard.nodes.reduce import Reduce
+    sdfg = _build_double_buffer_scan_writeback()
+    assert _count_loops(sdfg) == 1
+    lifted = LoopToReduce(prefer=prefer).apply_pass(sdfg, {})
+    sdfg.validate()
+    assert not lifted, f'double-buffer carry must not lift; got {lifted}'
+    assert _count_loops(sdfg) == 1, 'the recurrence loop must survive'
+    assert not [n for n, _ in sdfg.all_nodes_recursive() if isinstance(n, Reduce)], 'no Reduce may be emitted'
 
 
 if __name__ == "__main__":

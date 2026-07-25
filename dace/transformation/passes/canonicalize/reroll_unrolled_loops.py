@@ -385,7 +385,10 @@ class RerollUnrolledLoops(ppl.Pass):
             # Walk each lane independently, recording which lanes reach each node.
             visited_by: Dict = {}
             for d in distinct:
-                for n in self._lane_nodes(st, per_lane_edges[d], shared[st]):
+                # sorted by node id: ``_lane_nodes`` returns a set of NODE objects (hashed by id(), so its
+                # order varies with allocation), and this insertion order decides which node ``merge_op``
+                # locks onto below -- i.e. whether the re-roll fires at all.
+                for n in sorted(self._lane_nodes(st, per_lane_edges[d], shared[st]), key=st.node_id):
                     visited_by.setdefault(n, set()).add(d)
             # Classify: a node reached by exactly one lane is part of that lane's
             # unique component; a node reached by >=2 lanes is a merge candidate
@@ -408,6 +411,12 @@ class RerollUnrolledLoops(ppl.Pass):
             lane_nodes[st] = per_lane_unique
             merge_nodes[st] = merges
             for d in distinct:
+                # Which arrays a lane reads, not just what its tasklets say. Boundary AccessNodes are
+                # excluded from a lane component by construction, so on code alone two lanes reading
+                # DIFFERENT arrays look identical and the re-roll drops a real access. ``_lane_sig``
+                # below folds in the read names for the same reason.
+                codes[d].extend(sorted(e.src.data for e in per_lane_edges[d] if isinstance(e.src, nodes.AccessNode)))
+                codes[d].extend(sorted(e.dst.data for e in per_lane_edges[d] if isinstance(e.dst, nodes.AccessNode)))
                 codes[d].extend(n.code.as_string for n in per_lane_unique[d] if isinstance(n, nodes.Tasklet))
         codes = {d: sorted(c) for d, c in codes.items()}
         if not codes[0] or any(codes[d] != codes[0] for d in distinct[1:]):
@@ -607,7 +616,10 @@ class RerollUnrolledLoops(ppl.Pass):
             from dace.sdfg.utils import dfs_topological_sort
             order = [n for n in dfs_topological_sort(state) if n in merges]
         except Exception:
-            order = list(merges)
+            # ``merges`` is a set of NODE objects -- hashed by id(), so raw iteration order varies with
+            # allocation (not even PYTHONHASHSEED-stable). Order is load-bearing here (see the comment
+            # above: a later merge must see its collapsed predecessors), so fall back to a stable key.
+            order = sorted(merges, key=state.node_id)
         for m in order:
             if m not in state.nodes():
                 continue

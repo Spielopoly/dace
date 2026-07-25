@@ -19,7 +19,7 @@ Every other combo → ``NotImplementedError``.
 """
 import copy
 import warnings
-from typing import Literal, Optional, Tuple
+from typing import Optional, Tuple
 
 import sympy
 
@@ -63,12 +63,10 @@ from dace.transformation.passes.vectorization.insert_tile_load_store import Inse
 # per user direction 2026-06-10). See the pass docstring for the 5-step algorithm.
 from dace.transformation.passes.vectorization.widen_accesses import WidenAccesses
 from dace.transformation.passes.vectorization.tasklet_preprocessing_passes import (
-    PowerOperatorExpansion,
     RemoveMathCall,
     RewriteModuloToPyMod,
     StripPowerExponentCast,
 )
-from dace.transformation.passes.relax_integer_powers import RelaxIntegerPowers
 from dace.transformation.passes.remove_views import RemoveViews
 from dace.transformation.passes.vectorization.utils.arrays import demote_connector_views
 from dace.transformation.passes.canonicalize.assume_symbols_nonnegative import (SetSymbolNonnegativeAssumptions,
@@ -90,9 +88,6 @@ from dace.transformation.passes.vectorization.split_map_for_tile_remainder impor
 # then rewrites the raw tasklets between staged tiles into TileBinop / TileITE / TileReduce.
 from dace.transformation.dataflow import MapCollapse, MapFission, WCRToAugAssign
 from dace.transformation.dataflow.lift_einsum import LiftEinsum
-from dace.transformation.interstate import (InlineMultistateSDFG, InlineSDFG, LoopToMap, RefineNestedAccess,
-                                            StateFusionExtended)
-from dace.transformation.interstate.expand_nested_sdfg_inputs import ExpandNestedSDFGInputs
 from dace.transformation.passes.pattern_matching import PatternMatchAndApplyRepeated
 from dace.transformation.passes.vectorization.split_multi_output_tasklets import SplitMultiOutputTasklets
 from dace.transformation.passes.vectorization.normalize_masked_write_tasklets import NormalizeMaskedWriteTasklets
@@ -138,17 +133,24 @@ def restore_sdfg_in_place(target: dace.SDFG, source: dace.SDFG) -> None:
     :param source: A standalone (throwaway) SDFG whose contents ``target`` adopts.
     """
     from dace.transformation.passes.fusion_inline import FixNestedSDFGReferences
-    for key, value in list(source.__dict__.items()):
-        if key in ('_parent', '_parent_sdfg', '_parent_nsdfg_node', '_cfg_list', 'guid'):
-            continue
-        setattr(target, key, value)
+    preserved = ('_parent', '_parent_sdfg', '_parent_nsdfg_node', '_cfg_list', 'guid')
+    target.__dict__.update({k: v for k, v in source.__dict__.items() if k not in preserved})
     target._parent = None
     target._parent_sdfg = None
     target._parent_nsdfg_node = None
     target._cfg_list = []
-    for block in target.nodes():
-        block._sdfg = target
-        block._parent_graph = target
+    # Re-point EVERY block, at every control-flow nesting level (loop / conditional bodies included),
+    # at ``target``. Fixing only the top-level nodes leaves blocks inside a LoopRegion pointing at the
+    # throwaway ``source``: the SDFG still behaves correctly (``source`` is an equivalent graph), but a
+    # later ``deepcopy`` cannot resolve those stale owners -- ``ControlFlowBlock.__deepcopy__`` keeps
+    # ``_sdfg`` only when the owner is already in the copy's ``memo``, and sets it to ``None`` otherwise.
+    # The result is a state whose ``sdfg`` is ``None``, which crashes type inference on the *copy*
+    # (polybench lu / gramschmidt, whose WCR bodies take this refusal path). ``all_control_flow_regions``
+    # stops at nested-SDFG boundaries, so inner SDFGs keep their own (correct) owners.
+    for region in target.all_control_flow_regions():
+        for block in region.nodes():
+            block._sdfg = target
+            block._parent_graph = region
     target.reset_cfg_list()
     FixNestedSDFGReferences().apply_pass(target, {})
 
@@ -280,6 +282,15 @@ class _RunExpandNestedSDFGInputs(ppl.Pass):
         return set()
 
     def apply_pass(self, sdfg: dace.SDFG, pipeline_results) -> Optional[int]:
+        """Widen body-NSDFG boundary memlets, then repair the widened connectors.
+
+        :returns: The number of widenings applied; ``0`` when nothing widened but the two
+                  repairs below still edited the graph; ``None`` only when the SDFG was left
+                  untouched. ``apply_pass`` returning ``None`` means "did not modify the
+                  SDFG" -- the pipeline then skips its per-stage ``validate()`` and leaves
+                  ``self._modified`` alone (stale analyses, early ``FixedPointPipeline``
+                  exit) -- and both repairs run unconditionally.
+        """
         from dace.transformation.interstate.expand_nested_sdfg_inputs import ExpandNestedSDFGInputs
         applied = sdfg.apply_transformations_repeated(ExpandNestedSDFGInputs, permissive=False, validate=False)
         # ``ExpandNestedSDFGInputs`` re-derives each widened connector descriptor by deep-copying
@@ -287,14 +298,17 @@ class _RunExpandNestedSDFGInputs(ppl.Pass):
         # ``transient`` -- so a frontend reshape/flatten ``View`` parent (e.g. ``C_0`` viewing
         # ``C``) re-introduces an invalid inner ``View`` connector (no viewing edge in the body).
         # Re-demote every connector ``View`` to a plain array so the widened bodies validate.
+        demoted = 0
         for node, _parent in sdfg.all_nodes_recursive():
             if isinstance(node, dace.nodes.NestedSDFG):
-                demote_connector_views(node)
-        self._bind_missing_free_symbols(sdfg)
-        return applied or None
+                demoted += demote_connector_views(node)
+        bound = self._bind_missing_free_symbols(sdfg)
+        if applied:
+            return applied
+        return 0 if (demoted or bound) else None
 
     @staticmethod
-    def _bind_missing_free_symbols(sdfg: dace.SDFG) -> None:
+    def _bind_missing_free_symbols(sdfg: dace.SDFG) -> int:
         """Identity-bind every body-NSDFG free symbol still absent from its ``symbol_mapping``.
 
         ``ExpandNestedSDFGInputs`` widens a per-iteration boundary memlet (``a[i]`` →
@@ -308,7 +322,9 @@ class _RunExpandNestedSDFGInputs(ppl.Pass):
         descriptor (default ``int64``).
 
         :param sdfg: The SDFG whose body NSDFGs to repair in place.
+        :returns: The number of symbols identity-bound.
         """
+        bound = 0
         for node, parent in sdfg.all_nodes_recursive():
             if not isinstance(node, dace.nodes.NestedSDFG) or node.sdfg is None:
                 continue
@@ -328,6 +344,8 @@ class _RunExpandNestedSDFGInputs(ppl.Pass):
                 if sym_name not in inner.symbols:
                     inner.add_symbol(sym_name, sym_type)
                 node.symbol_mapping[sym_name] = symbolic.pystr_to_symbolic(sym_name)
+                bound += 1
+        return bound
 
 
 class _RunWCRToAugAssign(ppl.Pass):
@@ -401,7 +419,7 @@ class _AssertNoBodyWCR(ppl.Pass):
         return None
 
 
-def _promote_read_output_connectors_to_inout(sdfg: dace.SDFG) -> None:
+def _promote_read_output_connectors_to_inout(sdfg: dace.SDFG) -> int:
     """Promote a single-state NestedSDFG output connector also read internally to a full inout.
 
     Branch lowering rewrites a same-write-set masked write ``if cond: arr[s] = f(...)`` into
@@ -421,7 +439,10 @@ def _promote_read_output_connectors_to_inout(sdfg: dace.SDFG) -> None:
     write whose fused output name/subset diverges from any live input (no in-place read; e.g.
     a per-lane rename) has no such source and is left nested — correct where its result feeds
     the checked output, else numerically stale (lane 0 only) until a general re-route lands.
+
+    :returns: The number of output connectors promoted to inout.
     """
+    promoted = 0
     for node, parent in list(sdfg.all_nodes_recursive()):
         if not isinstance(node, dace.nodes.NestedSDFG) or not isinstance(parent, dace.SDFGState):
             continue
@@ -446,6 +467,8 @@ def _promote_read_output_connectors_to_inout(sdfg: dace.SDFG) -> None:
                 continue
             node.add_in_connector(oc)
             parent.add_edge(template.src, template.src_conn, node, oc, copy.deepcopy(out_edge.data))
+            promoted += 1
+    return promoted
 
 
 class _RunInlineBranchLoweredNSDFGs(ppl.Pass):
@@ -476,12 +499,26 @@ class _RunInlineBranchLoweredNSDFGs(ppl.Pass):
         return set()
 
     def apply_pass(self, sdfg: dace.SDFG, pipeline_results) -> Optional[int]:
-        sdfg.apply_transformations_repeated(StateFusionExtended, permissive=False, validate=False)
-        _promote_read_output_connectors_to_inout(sdfg)
+        """Fuse, promote, then inline the branch-lowered body NestedSDFGs.
+
+        :returns: The number of inlines applied; ``0`` when nothing inlined but the state
+                  fusion or the inout promotion below still edited the graph; ``None`` only
+                  when the SDFG was left untouched. ``apply_pass`` returning ``None`` means
+                  "did not modify the SDFG" -- the pipeline then skips its per-stage
+                  ``validate()`` and leaves ``self._modified`` alone (stale analyses, early
+                  ``FixedPointPipeline`` exit) -- and both preprocess steps run
+                  unconditionally.
+        """
+        from dace.transformation.interstate import InlineMultistateSDFG, InlineSDFG, StateFusionExtended
+
+        fused = sdfg.apply_transformations_repeated(StateFusionExtended, permissive=False, validate=False)
+        promoted = _promote_read_output_connectors_to_inout(sdfg)
         applied = sdfg.apply_transformations_repeated([InlineSDFG, InlineMultistateSDFG],
                                                       permissive=False,
                                                       validate=False)
-        return applied or None
+        if applied:
+            return applied
+        return 0 if (fused or promoted) else None
 
 
 def _is_power_of_two(n: int) -> bool:
@@ -651,7 +688,7 @@ class VectorizeMultiDim(ppl.Pipeline):
             # ``py_mod`` for Python/NumPy modulo semantics (C ``%`` miscompiles negative
             # operands and is ill-formed for floats).
             RewriteModuloToPyMod(),
-            ConvertLengthOneArraysToScalars(recursive=True, transient_only=True),
+            ConvertLengthOneArraysToScalars(recursive=True),
             NormalizeWCRSource(),
             BypassTrivialAssignTasklets(),
             # Strip any WCR the cleaning exposed or LoopToMap minted — the tile path must
@@ -839,7 +876,10 @@ class VectorizeMultiDim(ppl.Pipeline):
             # GPU path: tile only innermost maps inside a GPU kernel (GPU_Device-scheduled,
             # or Sequential under a GPU_Device parent across NSDFG boundaries); host-side maps
             # are skipped so their half2 __device__ intrinsics never leak into host code.
-            MarkTileDims(widths=widths_t, require_gpu_resident=is_gpu_device),
+            # ``assume_even`` must match the ``SplitMapForTileRemainder`` above: the two decide
+            # independently whether a provably-short dim is tiled, and a disagreement leaves a
+            # strided map wrapped around a scalar body.
+            MarkTileDims(widths=widths_t, require_gpu_resident=is_gpu_device, assume_even=assume_even),
             StrideMapByTileWidths(widths=widths_t),
         ]
         # Walker-primary tiling: the walker stages every non-transient AccessNode inside
@@ -1004,7 +1044,7 @@ class VectorizeMultiDim(ppl.Pipeline):
         # lifting removes the map (and its WCR) from the tile path, and the node carries its
         # own fast (BLAS / ``pure``) expansion, selected in ``_finalize_lifted_library_nodes``.
         # No-op on non-contraction kernels (``LiftEinsum`` needs ≥2 tensor operands).
-        PatternMatchAndApplyRepeated([LiftEinsum()]).apply_pass(sdfg, {})
+        PatternMatchAndApplyRepeated([LiftEinsum(contraction_only=True)]).apply_pass(sdfg, {})
         # WCRToAugAssign converts every WCR memlet that isn't a recognised reduction into an
         # in-place RMW tasklet. Recognised tile-path reductions land as ``tile → scalar
         # -[wcr]→ sink`` and are left for TileReduce; everything else converts so no stray

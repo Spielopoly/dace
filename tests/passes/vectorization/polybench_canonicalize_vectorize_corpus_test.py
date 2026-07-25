@@ -26,11 +26,7 @@ import copy
 
 import pytest
 
-pytestmark = pytest.mark.skip(
-    reason=
-    "WIP corpus: run-phase at preset-S is heavy and xfails not yet populated; canon passes on ~49/54 kernels. Enable after size-cap + full sweep. See project memory."
-)
-
+from dace.libraries.tileops._dispatch import detect_host_isa
 from dace.transformation.passes.canonicalize import canonicalize
 from dace.transformation.passes.vectorization.config import VectorizeConfig
 from dace.transformation.passes.vectorization.vectorize_cpu_multi_dim import VectorizeCPUMultiDim
@@ -39,12 +35,33 @@ from tests.corpus.polybench import polybench
 _KERNELS = [k.name for k in polybench.collect()]
 _PHASES = ("canon", "canon_vec")
 
+# Genuine per-(kernel, phase) gaps, marked xfail(strict) with the tracking reason -- NOT a blanket skip:
+# a case that starts passing flips the suite red so the entry is removed. Populated from the full sweep.
+# All canon_vec-phase, all in the multidim-vectorizer (canon alone passes every polybench kernel).
+# Empty: every previously-tracked multidim-vectorize gap (adi / deriche / durbin / gramschmidt / lu)
+# now passes on the current tree, so its xfail was removed (per the policy above).
+_XFAIL: dict = {}
+
+
+def _cases():
+    out = []
+    for name in _KERNELS:
+        for phase in _PHASES:
+            marks = (pytest.mark.xfail(reason=_XFAIL[(name, phase)], strict=True), ) if (name, phase) in _XFAIL else ()
+            out.append(pytest.param(name, phase, id=f"{name}-{phase}", marks=marks))
+    return out
+
+
 # Round-robin multidim knob set (one config per kernel by index), mirroring the
-# TSVC / npbench corpus tests.
+# TSVC / npbench corpus tests. The SIMD ISA is the HOST's best runnable one
+# (``detect_host_isa`` -> AVX512 / AVX2 / ARM_SVE / ARM_NEON / SCALAR), NOT a
+# hardcoded AVX-512: vectorization enforces arch-native, so a forced non-host ISA
+# would SIGILL at runtime (see ``dace.libraries.tileops._dispatch.host_supported_isas``).
+_HOST_ISA = detect_host_isa()
 _MULTIDIM_KNOBS = [
-    dict(target_isa="AVX512", remainder_strategy="masked_tail", branch_mode="merge"),
+    dict(target_isa=_HOST_ISA, remainder_strategy="masked_tail", branch_mode="merge"),
     dict(target_isa="SCALAR", remainder_strategy="scalar_postamble", branch_mode="merge"),
-    dict(target_isa="AVX512", remainder_strategy="full_mask", branch_mode="merge"),
+    dict(target_isa=_HOST_ISA, remainder_strategy="full_mask", branch_mode="merge"),
     dict(target_isa="SCALAR", remainder_strategy="masked_tail", branch_mode="fp_factor"),
 ]
 
@@ -68,8 +85,7 @@ def _base(name):
     return _BASE[name]
 
 
-@pytest.mark.parametrize("name", _KERNELS)
-@pytest.mark.parametrize("phase", _PHASES)
+@pytest.mark.parametrize("name,phase", _cases())
 def test_polybench_corpus(name, phase):
     canon, call_arrays, psize, ref = _base(name)
     sdfg = copy.deepcopy(canon)

@@ -23,6 +23,7 @@ from dace.codegen.dispatcher import DefinedType
 from dace.codegen.prettycode import CodeIOStream
 from dace.config import Config
 from dace.frontend.python import astutils
+from dace.transformation.passes.analysis import scopes as scope_analysis
 from dace.frontend.python.astutils import ExtNodeTransformer, rname, unparse
 from dace.sdfg import nodes, graph as gr, propagation
 from dace.properties import LambdaProperty
@@ -476,8 +477,7 @@ def ndcopy_to_strided_copy(
     """
 
     # Cannot degenerate tiled copies
-    # In the case where subset is of type Indices, there are no tile_sizes
-    if hasattr(subset, 'tile_sizes') and any(ts != 1 for ts in subset.tile_sizes):
+    if isinstance(subset, subsets.Range) and any(ts != 1 for ts in subset.tile_sizes):
         return None
 
     # If the copy is contiguous, the difference between the first and last
@@ -1036,7 +1036,7 @@ def unparse_tasklet(sdfg, cfg, state_id, dfg, node, function_stream, callsite_st
             memlets[vconn] = (memlet, False, None, conntype)
 
     # To prevent variables-redefinition, build dictionary with all the previously defined symbols
-    defined_symbols = state_dfg.symbols_defined_at(node)
+    defined_symbols = scope_analysis.defined_at(codegen._frame.symbol_scopes, state_dfg, node)
 
     defined_symbols.update({
         k: v.dtype if hasattr(v, 'dtype') else dtypes.typeclass(type(v))
@@ -1249,22 +1249,15 @@ class DaCeKeywordRemover(ExtNodeTransformer):
                     else:
                         var_type, ctypedef = self.codegen._dispatcher.defined_vars.get(ptrname)
                         if var_type == DefinedType.Scalar:
-                            newnode = ast.Name(id="%s = %s;" % (
-                                ptrname,
-                                cppunparse.cppunparse(value, expr_semicolon=False),
-                            ))
+                            newnode = ast.Name(id=cppunparse.cpp_assignment(ptrname, value))
                         elif isinstance(desc, data.View):
-                            newnode = ast.Name(id="%s = %s;" % (
-                                cpp_array_expr(self.sdfg, memlet, codegen=self.codegen),
-                                cppunparse.cppunparse(value, expr_semicolon=False),
-                            ))
+                            newnode = ast.Name(id=cppunparse.cpp_assignment(
+                                cpp_array_expr(self.sdfg, memlet, codegen=self.codegen), value))
                         else:
                             array_interface_name = self.codegen.ptr(ptrname, desc, self.sdfg, memlet.dst_subset, True,
                                                                     None, None, True)
-                            newnode = ast.Name(
-                                id=f"{array_interface_name}"
-                                f"[{cpp_array_expr(self.sdfg, memlet, with_brackets=False, codegen=self.codegen._frame)}]"
-                                f" = {cppunparse.cppunparse(value, expr_semicolon=False)};")
+                            index = cpp_array_expr(self.sdfg, memlet, with_brackets=False, codegen=self.codegen._frame)
+                            newnode = ast.Name(id=cppunparse.cpp_assignment(f"{array_interface_name}[{index}]", value))
                     return self._replace_assignment(newnode, node)
             except TypeError:  # cannot determine truth value of Relational
                 pass
@@ -1283,8 +1276,7 @@ class DaCeKeywordRemover(ExtNodeTransformer):
                                                        indices=sym2cpp(subscript),
                                                        dtype=dtype) + ';')
         else:
-            newnode = ast.Name(id="%s[%s] = %s;" %
-                               (target, sym2cpp(subscript), cppunparse.cppunparse(value, expr_semicolon=False)))
+            newnode = ast.Name(id=cppunparse.cpp_assignment(f"{target}[{sym2cpp(subscript)}]", value))
 
         return self._replace_assignment(newnode, node)
 
@@ -1400,7 +1392,7 @@ class StructInitializer(ExtNodeTransformer):
 
         # Find all struct types in SDFG
         for array in sdfg.arrays.values():
-            if array is None or not hasattr(array, "dtype"):
+            if array is None:
                 continue
             if isinstance(array.dtype, dace.dtypes.struct):
                 self._structs[array.dtype.name] = array.dtype

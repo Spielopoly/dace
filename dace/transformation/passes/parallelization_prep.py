@@ -21,16 +21,20 @@ imports pull in).
 import copy
 from typing import Any, Dict, Optional
 
+import sympy
+
 from dace import properties, symbolic
+from dace.config import Config
 from dace.sdfg import SDFG
 from dace.sdfg.state import ConditionalBlock, LoopRegion, SDFGState
 from dace.transformation import pass_pipeline as ppl
 
-#: Default trip-count threshold below which a constant-trip loop is unrolled.
-DEFAULT_UNROLL_LIMIT = 8
+#: Default trip-count threshold below which a constant-trip loop is unrolled
+#: (``optimizer.canonicalization.unroll_limit``).
+DEFAULT_UNROLL_LIMIT = Config.get('optimizer', 'canonicalization', 'unroll_limit')
 #: Default maximum number of iterations peeled (per side) when searching for a
-#: peel that unblocks parallelization.
-DEFAULT_PEEL_LIMIT = 8
+#: peel that unblocks parallelization (``optimizer.canonicalization.peel_limit``).
+DEFAULT_PEEL_LIMIT = Config.get('optimizer', 'canonicalization', 'peel_limit')
 #: Names under which a (floor) modulo may be defined in a subset expression. The
 #: peel modulo-rewrite recognises all of these -- ``sympy.Mod`` (the ``%`` operator)
 #: and the equivalent helper-function spellings -- so it folds a wrap-around access
@@ -40,6 +44,30 @@ _MODULO_FUNC_NAMES = frozenset({'Mod', 'py_mod', 'Modulo', 'mod', 'floor_mod'})
 
 def _loops(sdfg: SDFG):
     return [r for r in sdfg.all_control_flow_regions() if isinstance(r, LoopRegion) and r.loop_variable]
+
+
+def _as_symbolic(expr):
+    """``expr`` as a sympy expression, skipping the print-and-reparse round trip when it already is
+    one. Subset bounds are stored symbolic, so ``pystr_to_symbolic(str(bound))`` returns the very
+    same expression after printing it -- and sympy's printer is not cheap (30% of this pass's time
+    on CloudSC). A ``SymExpr`` is NOT a ``sympy.Basic`` and still goes through the round trip, which
+    is what picks its main expression out."""
+    if isinstance(expr, sympy.Basic):
+        return expr
+    return symbolic.pystr_to_symbolic(str(expr))
+
+
+def _is_zero(expr) -> bool:
+    """Whether ``expr`` is identically zero -- the zero test the index-solving below needs.
+
+    ``sympy.expand`` is the cheap sufficient normalizer for the affine index differences tested
+    here; ``sympy.simplify`` decides the same cases but runs its full cancel/factor/powsimp
+    pipeline, costing ~13ms per distinct expression even for something as small as ``i - j``. That
+    was 8.5s of the 21s this pass spent on CloudSC, and expand agreed with simplify on every one of
+    the 53504 zero tests measured there."""
+    if not isinstance(expr, sympy.Basic):
+        return expr == 0
+    return expr == 0 or sympy.expand(expr) == 0
 
 
 def _unique_block_label(sdfg: SDFG, base: str) -> str:
@@ -53,8 +81,13 @@ def _unique_block_label(sdfg: SDFG, base: str) -> str:
 
 
 def _constant_trip_count(loop: LoopRegion, sdfg: SDFG) -> Optional[int]:
-    """The exact iteration count of ``loop`` if it is constant, else ``None``
-    (matches ``len(range(0, end - start + 1, stride))``, i.e. LoopUnroll's count)."""
+    """The exact iteration count of ``loop`` if it is constant, else ``None``.
+
+    Ascending strides only: the ``stride_val <= 0`` bail deliberately declines DESCENDING loops, which
+    this pass therefore never unrolls (they fall through to LoopToMap). ``LoopUnroll`` itself does
+    handle a negative stride; widening this gate to match is a behaviour change for the pipelines that
+    embed the pass, not part of that fix. With the bail in place the ``+ 1`` below is only ever reached
+    for a positive stride, where it is the correct inclusive-end adjustment."""
     from dace.transformation.passes.analysis import loop_analysis
     start = loop_analysis.get_init_assignment(loop)
     end = loop_analysis.get_loop_end(loop)
@@ -73,9 +106,55 @@ def _constant_trip_count(loop: LoopRegion, sdfg: SDFG) -> Optional[int]:
     return len(range(0, diff, stride_val))
 
 
+def _loop_depth(loop: LoopRegion) -> int:
+    """Nesting depth: number of enclosing control-flow regions up to the root SDFG. Used to order
+    unrolling deepest-first (bottom-up)."""
+    depth = 0
+    graph = loop.parent_graph
+    while graph is not None and not isinstance(graph, SDFG):
+        depth += 1
+        graph = graph.parent_graph
+    return depth
+
+
+def _local_state_fusion(sdfg: SDFG, region) -> int:
+    """Fuse adjacent states within ``region``'s subtree only (StateFusionExtended), leaving the rest
+    of the SDFG untouched. Interstate matching ignores ``apply_transformations``' ``states=`` filter,
+    so drive the fusion on each adjacent pair directly. Returns the number fused."""
+    from dace.transformation.interstate.state_fusion_with_happens_before import StateFusionExtended
+    fused = 0
+    changed = True
+    while changed:
+        changed = False
+        cfrs = [region] + list(region.all_control_flow_regions(recursive=True))
+        for cfr in cfrs:
+            for edge in list(cfr.edges()):
+                u, v = edge.src, edge.dst
+                if (isinstance(u, SDFGState) and isinstance(v, SDFGState)
+                        and StateFusionExtended.can_be_applied_to(sdfg, first_state=u, second_state=v)):
+                    StateFusionExtended.apply_to(sdfg,
+                                                 first_state=u,
+                                                 second_state=v,
+                                                 verify=False,
+                                                 annotate=False,
+                                                 save=False)
+                    fused += 1
+                    changed = True
+                    break
+            if changed:
+                break
+    return fused
+
+
 @properties.make_properties
 class ShortLoopUnroll(ppl.Pass):
-    """Fully unroll every constant-trip loop with at most ``unroll_limit`` iterations."""
+    """Fully unroll every constant-trip loop with at most ``unroll_limit`` iterations.
+
+    Unrolls **bottom-up** (deepest loops first) and fuses the freshly unrolled states back down right
+    after each unroll -- scoped to just the touched region, not the whole SDFG. So an enclosing loop
+    deepcopies an already-compacted, loop-free body instead of a fan-out of one-state-per-iterate
+    sub-loops: far less deepcopy volume and no intermediate blow-up (measured 6.5x faster on CloudSC vs
+    unroll-then-global-fuse), so it is unconditional."""
 
     CATEGORY: str = 'Optimization Preparation'
 
@@ -97,22 +176,51 @@ class ShortLoopUnroll(ppl.Pass):
         return set()
 
     def apply_pass(self, sdfg: SDFG, _pipeline_results: Dict[str, Any]) -> Optional[int]:
-        """Unroll short constant-trip loops; returns the number unrolled or None.
+        """Unroll short constant-trip loops.
 
         Re-collects after each unroll since unrolling rewrites the control-flow
         structure (and may expose newly-constant inner loops).
+
+        :returns: The number of loops unrolled; ``0`` when no unroll completed but one raised
+                  part-way through ``apply`` (see below), leaving a possibly half-rewritten
+                  loop; ``None`` only when the SDFG was left untouched.
+
+        ``apply_pass`` returning ``None`` means "did not modify the SDFG", and callers act
+        on it: the pipeline skips its per-stage ``validate()`` and leaves ``self._modified``
+        alone (stale analyses, early ``FixedPointPipeline`` exit). A partial rewrite reported
+        as ``None`` would therefore go unvalidated, so it reports ``0`` -- "modified, but
+        nothing of my own kind completed".
         """
         if self.unroll_limit <= 0:
             return None
         from dace.transformation.interstate.loop_unroll import LoopUnroll
         unrolled = 0
+        # Unrolls that raised part-way through ``LoopUnroll.apply``. Counted separately from
+        # ``unrolled`` so they feed the return value (the graph may be half-rewritten) without
+        # triggering the completed-unroll propagation below.
+        partial = 0
         changed = True
         while changed:
             changed = False
-            for loop in _loops(sdfg):
+            # Bottom-up: unroll the deepest loops first, so an enclosing loop is only unrolled once its
+            # inner loops are already unrolled + locally fused into a compact body.
+            for loop in sorted(_loops(sdfg), key=_loop_depth, reverse=True):
                 trip = _constant_trip_count(loop, sdfg)
                 if trip is None or trip > self.unroll_limit:
                     continue
+                parent = loop.parent_graph
+                # Applicability is decided FIRST, on its own, so a refusal is distinguishable
+                # from a failure raised part-way through ``apply``. A refusal leaves the graph
+                # untouched and must not be reported as a modification; a mid-``apply`` failure
+                # can leave the loop half-rewritten and must be. ``apply_to`` below therefore
+                # runs with ``verify=False`` -- ``can_be_applied`` still runs exactly once, so
+                # this is the same check sequence as before, just with the outcome visible here.
+                try:
+                    applicable = LoopUnroll.can_be_applied_to(sdfg=loop.sdfg, loop=loop)
+                except Exception:
+                    applicable = False
+                if not applicable:
+                    continue  # not unrollable in this context; leave it for LoopToMap
                 try:
                     # ``annotate=False``: skip the per-apply full-SDFG memlet/state
                     # propagation. The transformation framework otherwise re-runs it
@@ -122,17 +230,24 @@ class ShortLoopUnroll(ppl.Pass):
                     # re-collection below reads only loop bounds, not memlets, so
                     # the interim annotations are never observed; one propagation
                     # after the whole fixpoint (below) refreshes them.
-                    LoopUnroll().apply_to(sdfg=loop.sdfg, loop=loop, annotate=False)
+                    LoopUnroll().apply_to(sdfg=loop.sdfg, loop=loop, annotate=False, verify=False)
                 except Exception:
-                    continue  # not unrollable in this context; leave it for LoopToMap
+                    # Raised from inside ``apply``: the rewrite may be half-done, so this
+                    # counts as a modification even though no loop was fully unrolled.
+                    partial += 1
+                    continue
                 unrolled += 1
                 changed = True
+                if parent is not None:
+                    # Compact the just-unrolled region before an enclosing loop deepcopies it.
+                    _local_state_fusion(sdfg, parent)
                 break
         if unrolled:
             # Propagate once, at the end of the pass (not per-apply).
             from dace.sdfg.propagation import propagate_memlets_sdfg
             propagate_memlets_sdfg(sdfg)
-        return unrolled or None
+            return unrolled
+        return 0 if partial else None
 
 
 @properties.make_properties
@@ -323,8 +438,12 @@ class BestEffortLoopPeeling(ppl.Pass):
         is harmless.
         """
         ivar = symbolic.pystr_to_symbolic(loop.loop_variable)
-        reads: Dict[Any, list] = {}  # array -> loop-invariant single-point read subsets
-        writes: Dict[Any, list] = {}  # array -> loop-var-dependent single-point write subsets
+        # Keyed by the subset's own ranges, so the same access repeated across the body (and across
+        # the states an ENCLOSING loop re-scans) is solved once instead of once per occurrence --
+        # a dropped duplicate can only re-derive a split point already in ``values``. Insertion
+        # order is kept, so the candidate order the caller tie-breaks on is unchanged.
+        reads: Dict[Any, dict] = {}  # array -> loop-invariant single-point read subsets
+        writes: Dict[Any, dict] = {}  # array -> loop-var-dependent single-point write subsets
         for state in loop.all_states():
             if not isinstance(state, SDFGState):
                 continue
@@ -332,24 +451,35 @@ class BestEffortLoopPeeling(ppl.Pass):
                 for e in state.in_edges(node):
                     m = e.data
                     if m is not None and m.data is not None and m.subset is not None:
-                        writes.setdefault(m.data, []).append(m.subset)
+                        writes.setdefault(m.data, {}).setdefault(tuple(m.subset.ndrange()), m.subset)
                 for e in state.out_edges(node):
                     m = e.data
                     if m is not None and m.data is not None and m.subset is not None:
-                        reads.setdefault(m.data, []).append(m.subset)
+                        reads.setdefault(m.data, {}).setdefault(tuple(m.subset.ndrange()), m.subset)
         values = []
         for data in set(reads) & set(writes):
-            for rsub in reads[data]:
+            # Only a write whose index VARIES with the loop variable can collide: the solve below
+            # never assigns a solution off a loop-invariant write dimension, so such a write can
+            # only return ``None`` -- filter it out here instead of paying a solve per read.
+            wsubs = [w for w in writes[data].values() if self._varies_with(w, ivar)]
+            if not wsubs:
+                continue
+            for rsub in reads[data].values():
                 # A broadcast read touches no dimension that varies with the loop var.
-                if any(ivar in symbolic.pystr_to_symbolic(str(b)).free_symbols for (b, _e, _s) in rsub.ndrange()):
+                if self._varies_with(rsub, ivar):
                     continue
-                for wsub in writes[data]:
+                for wsub in wsubs:
                     if len(wsub) != len(rsub):
                         continue
                     x = self._solve_write_eq_read(wsub, rsub, ivar)
                     if x is not None and ivar not in x.free_symbols and x not in values:
                         values.append(x)
         return values
+
+    @staticmethod
+    def _varies_with(sub, ivar) -> bool:
+        """Whether any dimension of ``sub`` STARTS at an index depending on ``ivar``."""
+        return any(ivar in _as_symbolic(b).free_symbols for (b, _e, _s) in sub.ndrange())
 
     def _solve_write_eq_read(self, wsub, rsub, ivar):
         """Solve ``write_index(i) == read_const`` for the single ``i`` at which the
@@ -360,24 +490,24 @@ class BestEffortLoopPeeling(ppl.Pass):
         integer). Single-point accesses only."""
         sol = None
         for (wb, we, _ws), (rb, re_, _rs) in zip(wsub.ndrange(), rsub.ndrange()):
-            w = symbolic.pystr_to_symbolic(str(wb))
-            r = symbolic.pystr_to_symbolic(str(rb))
-            if symbolic.simplify(symbolic.pystr_to_symbolic(str(we)) - w) != 0:
+            w = _as_symbolic(wb)
+            r = _as_symbolic(rb)
+            if not _is_zero(_as_symbolic(we) - w):
                 return None  # multi-element write range in this dim -> not a clean point
-            if symbolic.simplify(symbolic.pystr_to_symbolic(str(re_)) - r) != 0:
+            if not _is_zero(_as_symbolic(re_) - r):
                 return None  # multi-element read range in this dim
             if ivar in w.free_symbols:
                 a = w.coeff(ivar, 1)
                 b = symbolic.simplify(w - a * ivar)
                 if ivar in a.free_symbols or ivar in b.free_symbols:
                     return None  # non-affine in the loop variable
-                if not (a.is_number and symbolic.simplify(a * a - 1) == 0):
+                if not (a.is_number and _is_zero(a * a - 1)):
                     return None  # |a| != 1 -> solution may be non-integer
                 xi = symbolic.simplify((r - b) / a)
-                if sol is not None and symbolic.simplify(xi - sol) != 0:
+                if sol is not None and not _is_zero(xi - sol):
                     return None  # inconsistent solution across dimensions
                 sol = xi
-            elif symbolic.simplify(w - r) != 0:
+            elif not _is_zero(w - r):
                 return None  # non-loop-var dimension does not match -> no collision
         return sol
 
@@ -816,11 +946,18 @@ class BestEffortLoopPeeling(ppl.Pass):
         """Every modulo subexpression of ``expr``: both the ``%`` operator
         (``sympy.Mod``) and the floor-mod helper-function spellings (see
         :data:`_MODULO_FUNC_NAMES`), so a wrap-around index is found regardless of
-        which representation introduced it."""
-        import sympy
-        mods = set(expr.atoms(sympy.Mod))
-        mods |= {f for f in expr.atoms(sympy.Function) if getattr(f.func, '__name__', None) in _MODULO_FUNC_NAMES}
-        return mods
+        which representation introduced it.
+
+        Both spellings are collected in ONE traversal: this runs over every subset expression of
+        every loop body, and a bare index expression (the overwhelming majority) holds no modulo at
+        all, so the walk itself is the cost."""
+        if not expr.args:
+            return set()  # a bare symbol / number has no subexpression to search
+        return {
+            n
+            for n in expr.atoms(sympy.Mod, sympy.Function)
+            if isinstance(n, sympy.Mod) or n.func.__name__ in _MODULO_FUNC_NAMES
+        }
 
     def _modulo_to_affine(self, mod, ranges: Dict[Any, Any]):
         """If ``mod`` is a modulo ``arg % m`` (operator or helper function) with
@@ -887,15 +1024,18 @@ class BestEffortLoopPeeling(ppl.Pass):
             return {}
         return {symbolic.pystr_to_symbolic(loop.loop_variable): (start, end)}
 
-    def _affine_body_modulos(self, loop: LoopRegion):
+    def _affine_body_modulos(self, loop: LoopRegion, ranges: Optional[Dict[Any, Any]] = None):
         """Yield ``(mod, arg, m, a, b)`` for every memlet-subset modulo ``Mod(arg,
         m)`` in ``loop``'s body whose argument ``arg = a*ivar + b`` is affine in the
         loop variable -- the only modulos a bounded peel or a band split can fold.
         Data-dependent / non-affine arguments are skipped: no bounded rewrite folds
-        them. ``a`` and ``b`` may be symbolic (e.g. a symbolic stride or offset)."""
-        import sympy
+        them. ``a`` and ``b`` may be symbolic (e.g. a symbolic stride or offset).
+
+        ``ranges`` is ``loop``'s own range box (:meth:`_loop_own_ranges`); callers that already
+        hold it pass it in, since recovering it re-reads and re-parses the loop bounds."""
         from dace import subsets
-        ranges = self._loop_own_ranges(loop)
+        if ranges is None:
+            ranges = self._loop_own_ranges(loop)
         if not ranges:
             return
         (ivar, _), = ranges.items()
@@ -931,7 +1071,7 @@ class BestEffortLoopPeeling(ppl.Pass):
         at the boundary iteration; peeling or splitting that boundary lets the band
         fold make each segment affine and floor-correct."""
         ranges = self._loop_own_ranges(loop)
-        for mod, _arg, _m, _a, _b in self._affine_body_modulos(loop):
+        for mod, _arg, _m, _a, _b in self._affine_body_modulos(loop, ranges):
             if self._modulo_to_affine(mod, ranges) is None:
                 return True  # affine but genuinely wrapping
         return False
@@ -950,14 +1090,13 @@ class BestEffortLoopPeeling(ppl.Pass):
         returned liberally -- :meth:`_best_modulo_split_for` probes each on an
         isolated copy and keeps only one whose fold actually removes the wrap, so a
         non-splitting candidate is harmless."""
-        import sympy
         ranges = self._loop_own_ranges(loop)
         if not ranges:
             return []
         (ivar, (start, end)), = ranges.items()
         points = []
-        for _mod, _arg, m, a, b in self._affine_body_modulos(loop):
-            if not (a.is_number and symbolic.simplify(a * a - 1) == 0):
+        for _mod, _arg, m, a, b in self._affine_body_modulos(loop, ranges):
+            if not (a.is_number and _is_zero(a * a - 1)):
                 continue  # |a| != 1: the crossing is not an exact integer in general
             for t in range(-(self.peel_limit + 1), self.peel_limit + 2):
                 x = symbolic.simplify((t * m - b) / a)

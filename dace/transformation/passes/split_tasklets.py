@@ -157,10 +157,20 @@ def to_ssa(code: str) -> List[str]:
     """
     Convert a single Python assignment (or expression) into single-operation SSA lines.
 
+    Only a ONE-statement body is lowered. A multi-statement body returns ``[]``, meaning "declined":
+    the splitter reads a single statement, so lowering only the first would drop the rest of the
+    tasklet on the floor. A frontend tasklet whose body is a type annotation followed by the
+    assignment (``_out: dace.float64`` / ``_out = a * b * c``) is exactly that shape, and the
+    caller must leave such a tasklet intact rather than replace it with a partial rewrite.
+
     :param code: The tasklet source, e.g. ``out = a * b + c``.
-    :returns: A list of SSA statements, each performing at most one primitive operation.
+    :returns: A list of SSA statements, each performing at most one primitive operation, or ``[]``
+              when the body is not a single lowerable statement.
     """
-    tree = ast.parse(code).body[0]
+    body = ast.parse(code).body
+    if len(body) != 1:
+        return []
+    tree = body[0]
     ssa = ASTSplitter()
     # Start the temp counter past any ``__t<N>`` already present in the input
     # so a re-split (or an input that happens to use these names) does not
@@ -342,6 +352,24 @@ class SplitTasklets(ppl.Pass):
 
     tmp_access_identifier = "_split_"
 
+    def next_split_index(self, sdfg: SDFG) -> int:
+        """First split-scalar index not already used anywhere in ``sdfg``.
+
+        Split scalars are named ``<ssa_var>_split_<index>``, which is a pure function of the
+        per-tasklet index. Restarting the index at 0 on every run therefore re-issues the
+        previous run's names for entirely unrelated intermediates -- two independent SSA
+        values aliasing one register scalar. The pipeline does run the pass twice (canonicalize
+        splits, then the vectorizer splits again), so the index continues past what is there.
+        """
+        pattern = re.compile(re.escape(self.tmp_access_identifier) + r"(\d+)$")
+        highest = -1
+        for nested in sdfg.all_sdfgs_recursive():
+            for name in nested.arrays:
+                match = pattern.search(name)
+                if match is not None:
+                    highest = max(highest, int(match.group(1)))
+        return highest + 1
+
     def token_split_variable_names(self, string_to_check: str) -> Set[str]:
         """
         Split a code string into identifier tokens, dropping whitespace and brackets.
@@ -355,23 +383,38 @@ class SplitTasklets(ppl.Pass):
         tokens = re.split(r'(\s+|[()\[\]])', string_to_check)
         return {token.strip() for token in tokens if token not in ["[", "]", "(", ")"] and token.isidentifier()}
 
-    def _add_missing_symbols(self, sdfg: SDFG):
+    def _add_missing_symbols(self, sdfg: SDFG) -> Set[str]:
         """
         Register interstate-edge assignment targets that are not yet declared symbols.
 
         The dtype is inferred from the arrays/symbols referenced on the right-hand side,
-        preferring the widest float and falling back to ``float64`` when nothing matches.
+        preferring the widest float and falling back to ``float64`` when nothing matches --
+        UNLESS the whole right-hand side is an explicit dace integer typecast
+        (``dace.int64(x)`` etc., parsed to the ``symbolic.int64`` sympy ``Function``), in which
+        case the cast's kind wins outright: a ``dace.int64(<float expr>)`` truncates to an
+        integer in C++ even though every atom in ``<float expr>`` is float64, so the atom-priority
+        heuristic below (which always prefers float64 over int64) would silently drop the cast
+        and hand back a float-typed symbol.
 
         :param sdfg: The SDFG to scan (recursively into nested SDFGs).
+        :returns: The names of the symbols that were added (empty if the symbol table was already complete).
         """
+        added: Set[str] = set()
         for state in sdfg.all_states():
             for node in state.nodes():
                 if isinstance(node, dace.nodes.NestedSDFG):
-                    self._add_missing_symbols(node.sdfg)
+                    added |= self._add_missing_symbols(node.sdfg)
         for e in sdfg.all_interstate_edges():
             for k, v in e.data.assignments.items():
                 if k not in sdfg.symbols:
                     symexpr = dace.symbolic.SymExpr(v)
+                    cast_name = getattr(getattr(symexpr, 'func', None), '__name__', None)
+                    if cast_name in dace.dtypes.TYPECLASS_STRINGS:
+                        cast_dtype = getattr(dace, cast_name)
+                        if cast_dtype in dace.dtypes.INTEGER_TYPES:
+                            sdfg.add_symbol(k, cast_dtype)
+                            added.add(k)
+                            continue
                     dtypes = set()
                     # Array accesses ``arr[i]`` are ``Subscript`` nodes; their names
                     # come from ``arrays`` (the old ``atoms(Function).name`` form no
@@ -415,6 +458,8 @@ class SplitTasklets(ppl.Pass):
                     if ktype is None:
                         ktype = dace.float64
                     sdfg.add_symbol(k, ktype)
+                    added.add(k)
+        return added
 
     def _symbol_lifted_data(self, sdfg: SDFG) -> Set[str]:
         """
@@ -676,10 +721,11 @@ class SplitTasklets(ppl.Pass):
 
         :param sdfg: The SDFG to transform in place.
         :param pipeline_results: Results of prior passes in the pipeline (unused).
-        :returns: Always ``None`` (the result map is not tracked).
+        :returns: ``{'added_symbols': <symbol names>, 'split_tasklets': <names of the tasklets that were split>}``,
+                  or ``None`` if nothing was declared and no tasklet was split.
         """
-        self._add_missing_symbols(sdfg)
-        split_access_counter = 0
+        added_symbols = self._add_missing_symbols(sdfg)
+        split_access_counter = self.next_split_index(sdfg)
 
         symbol_lifted_data = self._symbol_lifted_data(sdfg)
 
@@ -776,7 +822,12 @@ class SplitTasklets(ppl.Pass):
 
                 if c.language == dace.dtypes.Language.Python:
                     ssa_statements = to_ssa(c.as_string)
-                    if len(ssa_statements) != 1:
+                    # Strictly MORE than one statement: the rewrite below removes the tasklet first
+                    # and rebuilds it from ``ssa_statements``, so an empty list -- ``to_ssa``
+                    # declining a body it will not lower -- would delete the tasklet and every one
+                    # of its edges and put nothing back, orphaning its source access nodes
+                    # ("Isolated node"). A single statement is already split.
+                    if len(ssa_statements) > 1:
                         # Rigorously infer EACH split intermediate's type from its
                         # operands (DaCe promotion: same-kind widening, fp32->fp64,
                         # int32->int64, complex64->complex128, ...) instead of stamping
@@ -794,6 +845,9 @@ class SplitTasklets(ppl.Pass):
                             leaf_types[nm] = g.sdfg.symbols[nm] if nm in g.sdfg.symbols else dace.int64
                         inferred = _infer_ssa_intermediate_types(ssa_statements, leaf_types, input_type)
                         tasklets_to_split.append((n, g, ssa_statements, input_type, inferred))
+
+        # Names are collected here, before the rewrites below detach the tasklets from their states.
+        split_names = {t.name for t, *_ in tasklets_to_split} | {t.name for t, *_ in multi_output_to_split}
 
         # Previous tasklet:
         # i1 -> |         |
@@ -906,6 +960,9 @@ class SplitTasklets(ppl.Pass):
                                     storage=dace.dtypes.StorageType.Register,
                                     transient=True,
                                 )
+                                # Descriptor and access node are created together, so a new
+                                # descriptor means no access node exists yet. ``next_split_index``
+                                # keeps the name clear of earlier runs; without it this fires.
                                 assert array_name not in added_accesses
                                 added_accesses[array_name] = state.add_access(array_name)
                             state.add_edge(
@@ -970,4 +1027,6 @@ class SplitTasklets(ppl.Pass):
             self._apply_multi_output_split(tasklet, state, ordered)
 
         sdfg.validate()
-        return None
+        if not added_symbols and not split_names:
+            return None
+        return {'added_symbols': added_symbols, 'split_tasklets': split_names}

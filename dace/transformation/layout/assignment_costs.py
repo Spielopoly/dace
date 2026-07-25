@@ -1,23 +1,5 @@
 # Copyright 2019-2026 ETH Zurich and the DaCe authors. All rights reserved.
-"""Cost providers for the global layout assignment (GLOBAL_LAYOUT_DESIGN.md, tasks B2 + B3, lite):
-fill an :class:`~dace.transformation.layout.global_assign.AssignmentCosts` table from either the
-LogGP cost model (tier-0 counts -> tier-2 ``nest_memory_time``) or measured per-nest timings
-(:func:`~dace.transformation.layout.nest_eval.evaluate_nest`). The solver does not care which.
-
-Scoring convention (audit A1): a node cost ``(array, kernel, layout)`` is scored with every OTHER
-array at its baseline layout. The model provider attributes the nest time to the array itself (its
-own message/byte counts through the tier-2 formula); the eval provider uses the measured whole-nest
-time under that single-array wrap-mode candidate -- an offset by the constant baseline contribution
-of the other arrays, which cancels in every per-array comparison the DP makes.
-
-v1-lite scope, stated: candidate layouts are DIMENSION PERMUTATIONS (identity first -- the
-tie-break law; full enumeration up to 3-D, refused loudly above). The schedule is the nest's
-existing canonical schedule (the fixtures pin theirs by construction; MapDimShuffle-based
-re-derivation is task B2's documented extension). Blocked candidates flow through
-``evaluate_nest``'s custom-candidate path, not through this table (apply is permute-only in v1).
-Relayout edge costs default to the streaming bound ``streaming_relayout_time`` under the same LogGP
-parameters in BOTH providers -- measuring them from the arena restore is the C4-adjacent extension.
-"""
+"""Cost providers for the global layout assignment: fill an ``AssignmentCosts`` table from either the LogGP cost model or measured per-nest timings. Candidate layouts are dimension permutations (v1-lite)."""
 import itertools
 import warnings
 from typing import Dict, List, Optional
@@ -35,11 +17,10 @@ from dace.transformation.layout.cost_model.relayout import streaming_relayout_ti
 from dace.transformation.layout.externalize import externalize_nest, nest_entries
 from dace.transformation.layout.global_assign import AssignmentCosts
 from dace.transformation.layout.line_graph import KernelState
-from dace.transformation.layout.nest_eval import evaluate_nest
+from dace.transformation.layout.nest_eval import MAX_PERMUTE_NDIM, evaluate_nest
 from dace.transformation.layout.permute_dimensions import PermuteDimensions
 
-#: Illustrative CPU parameters (the design doc's example device; measured parameters replace this
-#: per box). Kept as ONE module default so both providers price relayouts identically.
+#: Illustrative CPU parameters; shared so both providers price relayouts identically.
 EXAMPLE_CPU = LogGP(L=95e-9,
                     o=0.0,
                     g=4e-9,
@@ -48,9 +29,23 @@ EXAMPLE_CPU = LogGP(L=95e-9,
                     bw_saturated=100e9,
                     bw_core=40e9)
 
-#: Full permutation enumeration is d! -- explicit v1 bound, refused loudly above (B1's
-#: stride-driven pruning is the documented extension).
-MAX_PERMUTE_NDIM = 3
+#: Illustrative NVIDIA A100-class parameters (HBM2e ~1.55 TB/s, 128B L2 line, 32B coalescing sector,
+#: ~500 ns global-memory latency, ~500 warp-slots of device MLP). Illustrative like EXAMPLE_CPU --
+#: replace with a measured microbenchmark fit (fit_message_size + validate) for a real device.
+#: ``sector_bytes=32`` is load-bearing: it is the coalescing granularity, so an uncoalesced (strided/
+#: transposed) access is counted as one sector PER element. Under the bandwidth regime that small
+#: sector makes a strided GPU read CHEAPER (relatively) than on CPU's 64B line; the real coalescing
+#: penalty lives in the LATENCY term (messages * L / concurrency) and only engages under FINITE device
+#: MLP -- see cost_model_gpu_relayout_test. Feed a finite ``concurrency`` (n_cores * core_mlp), never
+#: the parallel-schedule ``inf`` default, when pricing GPU nests.
+EXAMPLE_GPU = LogGP(L=500e-9,
+                    o=0.0,
+                    g=1e-9,
+                    G=gap_from_bandwidth(1.555e12),
+                    line_bytes=128,
+                    sector_bytes=32,
+                    bw_saturated=1.555e12,
+                    bw_core=25e9)
 
 
 def permutation_tag(perm) -> str:
@@ -71,8 +66,7 @@ def permutation_layouts(ndim: int) -> List[Layout]:
 
 
 def assignment_arrays(sdfg: SDFG, kernels: List[KernelState]) -> List[str]:
-    """The arrays the assignment optimizes: non-transient, rank >= 2 (a 1-D array has no
-    permutation freedom), touched by at least one kernel."""
+    """Arrays the assignment optimizes: non-transient, rank >= 2, touched by at least one kernel."""
     touched = set()
     for kernel in kernels:
         touched.update(n.data for n in kernel.state.data_nodes())
@@ -80,10 +74,7 @@ def assignment_arrays(sdfg: SDFG, kernels: List[KernelState]) -> List[str]:
 
 
 def liveness_facts(sdfg: SDFG, kernels: List[KernelState], arrays: List[str]):
-    """The apply-side liveness facts the objective prices, computed with the SAME predicates
-    ``apply_assignment`` decides conversions with: per array, whether a non-identity FIRST segment
-    would need its entry conversion (first touching kernel reads live-in or writes without proven
-    coverage), and the last kernel writing it (``None`` = never written, no exit conversion)."""
+    """Liveness facts the objective prices, using the same predicates ``apply_assignment`` decides conversions with."""
     entry_needed: Dict[str, bool] = {}
     last_write: Dict[str, Optional[int]] = {}
     for array in arrays:
@@ -100,8 +91,7 @@ def liveness_facts(sdfg: SDFG, kernels: List[KernelState], arrays: List[str]):
 
 
 def relayout_edge_costs(sdfg: SDFG, arrays: Dict[str, List[Layout]], symbols: Dict[str, int], p: LogGP) -> Dict:
-    """The streaming relayout bound per (array, from, to) pair -- one full-array read + write, so
-    every permute pair prices the same; the table still keys per pair (measured costs can differ)."""
+    """Streaming relayout bound per (array, from, to) pair; keyed per pair since measured costs can differ."""
     edges = {}
     for array, layouts in arrays.items():
         seconds = float(
@@ -117,11 +107,15 @@ def relayout_edge_costs(sdfg: SDFG, arrays: Dict[str, List[Layout]], symbols: Di
 def model_costs(sdfg: SDFG,
                 kernels: List[KernelState],
                 symbols: Dict[str, int],
-                p: LogGP = EXAMPLE_CPU) -> AssignmentCosts:
-    """The B2-lite provider: per (array, kernel, permutation), externalize the nest, permute the
-    array IN PLACE on the copy, run tier-0 ``count_loop_nest``, and price the array's own counts
-    with tier-2 ``nest_memory_time``. An array a kernel never touches costs 0 there under every
-    layout."""
+                p: LogGP = EXAMPLE_CPU,
+                n_cores: Optional[int] = None) -> AssignmentCosts:
+    """Model provider: externalizes each nest, permutes in place, prices with count_loop_nest/nest_memory_time.
+
+    ``n_cores`` bounds the exposed concurrency of a PARALLEL nest to ``n_cores * per-core MLP``. Left None it
+    is unbounded, which zeroes the latency term -- and the layout penalty of a strided (uncoalesced) access is
+    a LATENCY effect, so a GPU nest priced without n_cores under-values every relayout. Pass the SM count for
+    a GPU ``p``; a sequential nest is unaffected either way.
+    """
     arrays = assignment_arrays(sdfg, kernels)
     layouts = {a: permutation_layouts(len(sdfg.arrays[a].shape)) for a in arrays}
     subs = {dace.symbol(s): v for s, v in symbols.items()}
@@ -146,7 +140,7 @@ def model_costs(sdfg: SDFG,
                 own = counts.arrays[array]
                 messages = float(dace.symbolic.evaluate(own.messages_per_iter * counts.total_iters, subs))
                 moved = float(dace.symbolic.evaluate(own.bytes_moved_per_iter * counts.total_iters, subs))
-                concurrency = exposed_concurrency(state, entry, p)
+                concurrency = exposed_concurrency(state, entry, p, n_cores)
                 node_cost[key] = float(nest_memory_time(p, moved, messages, concurrency))
     entry_needed, last_write = liveness_facts(sdfg, kernels, arrays)
     return AssignmentCosts(layouts=layouts,
@@ -164,9 +158,7 @@ def eval_costs(sdfg: SDFG,
                reps: int = 10,
                warmup: int = 2,
                seed: int = 0) -> AssignmentCosts:
-    """The B3-lite provider: per kernel, run ``evaluate_nest`` over the wrap-mode permutation
-    family and put the measured compute-region medians (seconds) in the table. A candidate that
-    fails to verify or time is a hard error -- refuse, never guess a cost."""
+    """Eval provider: runs evaluate_nest per kernel, tables measured medians; a failed candidate is a hard error."""
     arrays = assignment_arrays(sdfg, kernels)
     layouts = {a: permutation_layouts(len(sdfg.arrays[a].shape)) for a in arrays}
     node_cost = {}

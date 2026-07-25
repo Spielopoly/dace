@@ -1063,6 +1063,97 @@ def test_conditional_component_fission_single_is_noop():
     assert np.allclose(x, 1.0)
 
 
+N_carried = dace.symbol('N_carried')
+
+
+@dace.program
+def map_over_carried_loop(aa: dace.float64[N_carried, N_carried], bb: dace.float64[N_carried, N_carried]):
+    for i in dace.map[0:N_carried]:
+        for j in range(1, N_carried):
+            aa[i, j] = aa[i, j - 1] + bb[i, j]
+
+
+def test_map_over_carried_loop_terminates():
+    """A map whose whole body is a loop-carried LoopRegion cannot be fissioned: there is one component
+    and it IS the nested SDFG, so fission can only rebuild the same pattern a level deeper. It used to
+    do exactly that, ~490 times, until the recursion limit (TSVC s1119); the iterator also leaked into
+    the parent's symbol mapping, where nothing defined it."""
+    sdfg = map_over_carried_loop.to_sdfg(simplify=True)
+    before = copy.deepcopy(sdfg)
+    assert sdfg.apply_transformations_repeated(MapFission) == 0
+    sdfg.validate()
+    # Rejected means untouched: same nesting depth, same node count, no leftover scaffolding.
+    assert len(list(sdfg.all_sdfgs_recursive())) == len(list(before.all_sdfgs_recursive()))
+    assert sum(len(s.nodes()) for s in sdfg.all_states()) == sum(len(s.nodes()) for s in before.all_states())
+
+
+def test_symbol_use_index_agrees_with_the_per_loop_scan():
+    """``symbol_use_sites`` indexes the whole SDFG once so a caller asking about many loops does not
+    re-walk it per loop. The batched answer must equal the unbatched one for every counter."""
+    from dace.transformation.passes.analysis import loop_analysis
+    sdfg = map_over_carried_loop.to_sdfg(simplify=True)
+    use_sites, descriptor_symbols = loop_analysis.symbol_use_sites(sdfg)
+    checked = 0
+    for nested in sdfg.all_sdfgs_recursive():
+        inner_sites, inner_descs = loop_analysis.symbol_use_sites(nested)
+        for loop in [b for b in nested.all_control_flow_blocks() if isinstance(b, dace.sdfg.state.LoopRegion)]:
+            batched = loop_analysis.counter_used_outside_loop(loop.loop_variable,
+                                                              loop,
+                                                              nested,
+                                                              use_sites=inner_sites,
+                                                              descriptor_symbols=inner_descs)
+            assert batched == loop_analysis.counter_used_outside_loop(loop.loop_variable, loop, nested)
+            checked += 1
+    assert checked
+
+
+def test_counter_read_after_its_loop_is_not_internal():
+    """A counter observed after the loop must keep its declaration and its outbound propagation. The
+    predicate that decides this is the one codegen uses before scoping a counter into its for-init."""
+    from dace.transformation.passes.analysis import loop_analysis
+    sdfg = dace.SDFG('counter_escapes')
+    sdfg.add_array('A', [1], dace.float64)
+    sdfg.add_symbol('k', dace.int64)
+    loop = dace.sdfg.state.LoopRegion('loop', 'k < 10', 'k', 'k = 0', 'k = k + 1')
+    sdfg.add_node(loop, is_start_block=True)
+    loop.add_state('body', is_start_block=True)
+    after = sdfg.add_state('after')
+    sdfg.add_edge(loop, after, dace.InterstateEdge(assignments={'kk': 'k'}))  # reads k AFTER the loop
+
+    assert loop_analysis.counter_used_outside_loop('k', loop, sdfg)
+    # and with nothing reading it, the same counter is internal
+    sdfg2 = dace.SDFG('counter_local')
+    sdfg2.add_array('A', [1], dace.float64)
+    sdfg2.add_symbol('k', dace.int64)
+    loop2 = dace.sdfg.state.LoopRegion('loop', 'k < 10', 'k', 'k = 0', 'k = k + 1')
+    sdfg2.add_node(loop2, is_start_block=True)
+    loop2.add_state('body', is_start_block=True)
+    assert not loop_analysis.counter_used_outside_loop('k', loop2, sdfg2)
+
+
+def test_nested_loop_iterator_is_not_mapped_at_the_parent():
+    """``nest_sdfg_control_flow`` wraps a LoopRegion into a nested SDFG. The loop iterator is scoped to
+    that region, so it must appear in neither the new node's symbol mapping nor the enclosing SDFG's
+    free symbols -- mapping it makes it free at a boundary nothing defines."""
+    from dace.transformation.helpers import nest_sdfg_control_flow
+    sdfg = map_over_carried_loop.to_sdfg(simplify=True)
+    nsdfg = next(n for st in sdfg.all_states() for n in st.nodes() if isinstance(n, nodes.NestedSDFG))
+    loop_vars = {
+        b.loop_variable
+        for b in nsdfg.sdfg.all_control_flow_blocks() if isinstance(b, dace.sdfg.state.LoopRegion)
+    }
+    assert loop_vars
+
+    nest_sdfg_control_flow(nsdfg.sdfg)
+    sdfg.validate()
+    for inner in nsdfg.sdfg.all_sdfgs_recursive():
+        assert not (loop_vars & {str(s) for s in inner.free_symbols})
+        for st in inner.all_states():
+            for node in st.nodes():
+                if isinstance(node, nodes.NestedSDFG):
+                    assert not (loop_vars & node.symbol_mapping.keys())
+
+
 if __name__ == '__main__':
     test_subgraph()
     test_nested_sdfg()
@@ -1093,3 +1184,7 @@ if __name__ == '__main__':
     test_conditional_component_fission_two()
     test_conditional_component_fission_three()
     test_conditional_component_fission_single_is_noop()
+    test_map_over_carried_loop_terminates()
+    test_symbol_use_index_agrees_with_the_per_loop_scan()
+    test_counter_read_after_its_loop_is_not_internal()
+    test_nested_loop_iterator_is_not_mapped_at_the_parent()

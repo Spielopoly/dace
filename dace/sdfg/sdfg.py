@@ -50,6 +50,9 @@ class NestedDict(dict):
         super(NestedDict, self).__init__(mapping)
 
     def __getitem__(self, key):
+        # Fast path: an unqualified name has no members to walk, and this is on every sdfg.arrays[...]
+        if type(key) is str and '.' not in key:
+            return super(NestedDict, self).__getitem__(key)
         tokens = key.split('.') if isinstance(key, str) else [key]
         token = tokens.pop(0)
         result = super(NestedDict, self).__getitem__(token)
@@ -64,6 +67,8 @@ class NestedDict(dict):
         super(NestedDict, self).__setitem__(key, val)
 
     def __contains__(self, key):
+        if type(key) is str and '.' not in key:  # fast path, as in __getitem__
+            return super(NestedDict, self).__contains__(key)
         tokens = key.split('.') if isinstance(key, str) else [key]
         token = tokens.pop(0)
         result = super(NestedDict, self).__contains__(token)
@@ -74,7 +79,7 @@ class NestedDict(dict):
             else:
                 desc = desc.members[token]
             token = tokens.pop(0)
-            result = hasattr(desc, 'members') and token in desc.members
+            result = isinstance(desc, dt.Structure) and token in desc.members
         return result
 
     def keys(self):
@@ -347,7 +352,11 @@ class InterstateEdge(object):
 
         if replace_keys:
             for name, new_name in repl.items():
-                _replace_dict_keys(self.assignments, name, new_name)
+                # Guard as SDFG.replace_dict does: a non-name replacement (e.g. a symbolic
+                # expression, or a Symbol carrying assumptions that maps a name to itself)
+                # must not become an assignment key -- only rename when new_name is a valid name.
+                if validate_name(new_name):
+                    _replace_dict_keys(self.assignments, name, new_name)
 
         for k, v in self.assignments.items():
             vast = ast.parse(v)
@@ -502,6 +511,9 @@ class SDFG(ControlFlowRegion):
                                            default=False,
                                            desc="Whether the SDFG contains explicit control flow constructs")
 
+    # Explicitly-set build folder, or None to derive it from the configuration
+    _build_folder = None
+
     def __init__(self,
                  name: str,
                  constants: Dict[str, Tuple[dt.Data, Any]] = None,
@@ -571,14 +583,11 @@ class SDFG(ControlFlowRegion):
         result._nodes = copy.deepcopy(self._nodes, memo)
         result._cached_start_block = copy.deepcopy(self._cached_start_block, memo)
         # Copy parent attributes
-        for k in ('_parent', '_parent_sdfg', '_parent_nsdfg_node'):
-            if id(getattr(self, k)) in memo:
-                setattr(result, k, memo[id(getattr(self, k))])
-            else:
-                setattr(result, k, None)
+        result._parent = memo.get(id(self._parent))
+        result._parent_sdfg = memo.get(id(self._parent_sdfg))
+        result._parent_nsdfg_node = memo.get(id(self._parent_nsdfg_node))
         # Copy SDFG list and transformation history
-        if hasattr(self, '_transformation_hist'):
-            setattr(result, '_transformation_hist', copy.deepcopy(self._transformation_hist, memo))
+        result._transformation_hist = copy.deepcopy(self._transformation_hist, memo)
         result._cfg_list = []
         if self._parent_sdfg is None:
             # Avoid import loops
@@ -1288,7 +1297,7 @@ class SDFG(ControlFlowRegion):
     @property
     def build_folder(self) -> str:
         """ Returns a relative path to the build cache folder for this SDFG. """
-        if hasattr(self, '_build_folder'):
+        if self._build_folder is not None:
             return self._build_folder
         cache_config = Config.get('cache')
         base_folder = Config.get('default_build_folder')
@@ -1552,9 +1561,10 @@ class SDFG(ControlFlowRegion):
 
     def read_and_write_sets(self) -> Tuple[Set[AnyStr], Set[AnyStr]]:
         """
-        Determines what data containers are read and written in this SDFG. Does
-        not include reads to subsets of containers that have previously been
-        written within the same state.
+        Determines what data containers are read and written in this SDFG.
+
+        Includes all reads including reads to subsets of containers that have
+        previously been written.
 
         :return: A two-tuple of sets of things denoting
                  ({data read}, {data written}).

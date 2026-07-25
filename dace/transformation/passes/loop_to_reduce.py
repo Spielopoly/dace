@@ -52,12 +52,12 @@ def _nested_in_sequential_loop(loop: LoopRegion) -> bool:
     """True iff ``loop`` is lexically nested inside another (sequential) ``LoopRegion``,
     crossing NestedSDFG boundaries.
 
-    Heuristic gate for the ``wcr-scalar`` lift: a scalar-accumulator reduction is lifted
-    to a parallel WCR-map (which ``LoopToMap`` then parallelizes) ONLY at a loop that is
-    not nested inside an enclosing sequential loop. Nested, the resulting parallel map is
-    re-entered once per outer iteration -- the OpenMP fork/join plus per-entry accumulator
-    privatization dominates the tiny inner reduction, so it runs far slower than the plain
-    sequential loop ``auto_optimize`` keeps. (nussinov's ``table[i,j] = max(table[i,j],
+    Gate for the ``wcr-scalar`` lift: a nested scalar-accumulator reduction is still lifted,
+    but marked ``pinned_sequential`` so the downstream ``LoopToMap`` keeps it a sequential
+    per-thread inner loop instead of a parallel WCR-map. A parallel map nested inside a
+    sequential loop is re-entered once per outer iteration -- the OpenMP fork/join plus
+    per-entry accumulator privatization dominates the tiny inner reduction, so it runs far
+    slower than the plain sequential loop ``auto_optimize`` keeps. (nussinov's ``table[i,j] = max(table[i,j],
     table[i,k] + table[k+1,j])`` k-reduction sits inside two sequential ``i``/``j`` loops and
     is re-entered O(N^2) times: lifted to a parallel WCR-map it measured ~340x slower than
     the sequential baseline.) The enclosing loop, if itself parallelizable, was already
@@ -128,30 +128,44 @@ class LoopToReduce(ppl.Pass):
         return bool(modified & ppl.Modifies.CFG)
 
     def apply_pass(self, sdfg: SDFG, _) -> Optional[int]:
+        """Lift reduction loops to ``Reduce`` library nodes.
+
+        :returns: The number of modifications made -- reductions lifted PLUS the
+                  normalization rewrites below, which edit the graph whether or not any
+                  reduction is then found. ``None`` only when the SDFG was left untouched.
+
+        ``apply_pass`` returning ``None`` means "did not modify the SDFG", and callers act
+        on it: the pipeline skips its per-stage ``validate()`` and leaves ``self._modified``
+        alone, so cached analyses are reused and a ``FixedPointPipeline`` stops iterating.
+        Counting only the lifts would report ``None`` for a run that rewrote hundreds of WCR
+        edges -- on cloudsc this pass normalizes ~400 sites while lifting nothing.
+        """
         # WCR edges -> in-body augassign so the matcher sees a uniform
         # ``acc <op>= arr[f(i)]`` tasklet. No-op if already augassign.
         from dace.transformation.dataflow.wcr_conversion import WCRToAugAssign
         from dace.transformation.passes.pattern_matching import PatternMatchAndApplyRepeated
-        PatternMatchAndApplyRepeated([WCRToAugAssign()]).apply_pass(sdfg, {})
+        normalized = 0
+        applied = PatternMatchAndApplyRepeated([WCRToAugAssign()]).apply_pass(sdfg, {})
+        normalized += sum(len(v) for v in applied.values()) if applied else 0
 
         # D4 (CleanAccessNode + CleanTasklet) deliberately NOT applied: matcher already
         # handles scalar-slice intermediates, WCRToAugAssign above covers normalization.
         # Redundant + risks the ordering pitfalls seen in LoopToScan.
 
-        # wcr-scalar mode only: a scalar-accumulator reduction is lifted to the
-        # parallelizable WCR-map form ONLY at a top-level loop. Pin every loop nested
-        # inside a sequential loop as ``pinned_sequential`` up front, so it is refused not
-        # just by the lifts below but by the downstream ``LoopToMap`` / ``LoopToScan`` too
-        # (both honor the flag) -- the ``AugAssignToWCR`` / ``TrivialTaskletElimination``
-        # normalization run here would otherwise leave the loop in a form ``LoopToMap``
-        # parallelizes as a side effect, re-forking an OpenMP region per outer iteration
-        # (see _nested_in_sequential_loop). A pinned loop keeps whatever WCR the
-        # normalization added; the pipeline's terminal ``WCRToAugAssign`` reverts it to a
-        # clean sequential accumulate -- the same sequential form ``auto_optimize`` keeps.
+        # wcr-scalar mode only: mark every loop nested inside a sequential loop as
+        # ``pinned_sequential`` up front. The lift below still runs (and carries the flag onto
+        # the lifted loop), but the flag makes the downstream ``LoopToMap`` / ``LoopToScan``
+        # keep it sequential (both honor it) -- so the nested reduction is NOT parallelized into
+        # an OpenMP region re-forked once per outer iteration (see _nested_in_sequential_loop;
+        # nussinov's k-reduction). The pipeline's terminal ``WCRToAugAssign`` then reverts the
+        # pinned WCR to a clean sequential accumulate -- the form ``auto_optimize`` keeps.
         if self.prefer == 'wcr-scalar':
             for node, _p in list(sdfg.all_nodes_recursive()):
                 if isinstance(node, LoopRegion) and node.loop_variable and _nested_in_sequential_loop(node):
-                    node.pinned_sequential = True
+                    # Only a flag that is not already set is a modification.
+                    if not node.pinned_sequential:
+                        node.pinned_sequential = True
+                        normalized += 1
 
         count = 0
         for node, parent in list(sdfg.all_nodes_recursive()):
@@ -161,8 +175,8 @@ class LoopToReduce(ppl.Pass):
             if info is None:
                 continue
             if self.prefer == 'wcr-scalar':
-                if node.pinned_sequential:  # nested in a sequential loop -> keep sequential
-                    continue
+                # Lift even a pinned (nested) reduction; ``_lift_wcr_scalar`` carries the pin
+                # onto the new loop so the downstream ``LoopToMap`` keeps it sequential.
                 _lift_wcr_scalar(parent, node, info)
             else:
                 _lift(parent, node, info)
@@ -182,21 +196,24 @@ class LoopToReduce(ppl.Pass):
             # TTE collapses the frontend's trivial ``out = in`` passthrough tasklets
             # around the accumulator load/store so ``AugAssignToWCR`` (matches the 5-node
             # ``arr -> copy_in -> tasklet -> copy_out -> arr`` shape) sees a clean pattern.
-            PatternMatchAndApplyRepeated([TrivialTaskletElimination()]).apply_pass(sdfg, {})
+            applied = PatternMatchAndApplyRepeated([TrivialTaskletElimination()]).apply_pass(sdfg, {})
+            normalized += sum(len(v) for v in applied.values()) if applied else 0
             # ``permissive=False`` required: permissive mode matches scan-shape bodies
             # (TSVC recurrence_down ``b[i] = b[i+1] + a[i]`` after ``LoopToScan``) as
             # reductions and rewrites them to WCR writes later parallelised -> carried
             # dependence lost, off-by-one. Pinned by the descending-recurrence value-
             # preservation test.
-            sdfg.apply_transformations_repeated(AugAssignToWCR, validate=False, validate_all=False, permissive=False)
+            normalized += sdfg.apply_transformations_repeated(AugAssignToWCR,
+                                                              validate=False,
+                                                              validate_all=False,
+                                                              permissive=False)
             for node, parent in list(sdfg.all_nodes_recursive()):
                 if not isinstance(node, LoopRegion):
                     continue
                 wcr_info = _extract_wcr_body(node, sdfg)
                 if wcr_info is None:
                     continue
-                if node.pinned_sequential:  # nested in a sequential loop -> keep sequential
-                    continue
+                # Retarget reuses ``node`` in place, so a pinned loop keeps its flag.
                 _lift_wcr_scalar_retarget(parent, node, *wcr_info)
                 count += 1
 
@@ -212,8 +229,7 @@ class LoopToReduce(ppl.Pass):
                 chain_info = _extract_multi_state_chain(node, sdfg)
                 if chain_info is None:
                     continue
-                if node.pinned_sequential:  # nested in a sequential loop -> keep sequential
-                    continue
+                # Reuses ``node`` in place, so a pinned loop keeps its flag.
                 _lift_multi_state_chain(parent, node, chain_info)
                 count += 1
 
@@ -223,7 +239,13 @@ class LoopToReduce(ppl.Pass):
             # range so codegen / DCE see the tight subset.
             from dace.sdfg.propagation import propagate_memlets_sdfg
             propagate_memlets_sdfg(sdfg)
-        return count or None
+        # ``count`` is the number of reductions LIFTED -- callers/tests read it as exactly that,
+        #  so it must not absorb the normalization edits. When nothing was lifted but the
+        #  normalization above still changed the graph, report ``0`` (non-None = "modified", but
+        #  zero lifts); only a wholly untouched SDFG is ``None``. Mirrors LoopToScan.
+        if count:
+            return count
+        return 0 if normalized else None
 
 
 def _one_elem(subset) -> Optional[int]:
@@ -581,14 +603,41 @@ def _extract(loop: LoopRegion, sdfg: SDFG, permissive: bool = False) -> Optional
         if carried_accum is not None and carried_accum != accum:
             accum, write_subset = carried_accum, carried_sub
 
-        # A pure reduction writes ONLY the accumulator (+ loop-local staging temps). If the
-        # body also writes a non-transient container -- e.g. per-iteration scan output
-        # ``b[i] = sum`` in ``sum = sum + a[i]; b[i] = sum`` -- the running accumulator is
-        # observed every iteration; collapsing to a single ``Reduce`` drops it. Refuse.
-        written = {an.data for st in loop.all_states() for an in st.data_nodes() if st.in_degree(an) > 0}
-        allowed = {accum, array} | ({carried_accum} if carried_accum is not None else set())
-        if any(w not in allowed and not sdfg.arrays[w].transient for w in written):
-            return None
+        # A pure reduction READS the folded array and writes ONLY the accumulator, at a slot
+        # that does not move with the loop. A write to any OTHER non-transient array -- or a
+        # write BACK into the folded ``array`` itself -- is a per-iteration output, not part of
+        # the fold: the scalarised prefix-sum ``acc = acc + a[i]; a[i+1] = acc`` writes the
+        # running value into ``a`` every step, and ``sum = sum + a[i]; b[i] = sum`` writes it
+        # into ``b``. A single ``Reduce`` emits one final value, never the running sequence, so
+        # collapsing either shape drops the scan outputs -- leave it for LoopToScan. ``array`` is
+        # deliberately NOT exempt: the writeback into the folded array is exactly the scan tell
+        # (surfaced once the pipeline stamps out intra-iteration scalar intermediates and inlines
+        # NestedSDFGs, so a non-transient writeback is always a visible AccessNode here). Only the
+        # accumulator (and its loop-local transient staging copy) may be written.
+        # A pure reduction writes ONLY the accumulator; any OTHER write is a per-iteration output, and a
+        # single ``Reduce`` (one final value) would drop the running sequence -- leave it for LoopToScan.
+        # Refuse when the body also:
+        #   (a) writes any live (non-transient) array -- the scalarised prefix ``sum = sum + a[i];
+        #       b[i] = sum`` and the writeback ``a[i+1] = c`` (881e55d79); or
+        #   (b) stamps the ACCUMULATOR itself into another container at a MOVING slot -- the hole
+        #       881e55d79 missed: gpu_scc's vertical-flux carry written into the *transient* double-buffer
+        #       ``ZPFPLSX[jk_ip1]`` (slot toggled per level by a loop-iedge symbol), which the plain
+        #       non-transient guard let through. The tell is the running carry (``accum`` /
+        #       ``carried_accum`` AccessNode) flowing to a moving slot; a staging transient written from a
+        #       TASKLET (not the accumulator) is loop-local and stays allowed, so strided reductions that
+        #       stage into a moving-slot temp are not affected.
+        allowed = {accum} | ({carried_accum} if carried_accum is not None else set())
+        for st in loop.all_states():
+            for an in st.data_nodes():
+                if st.in_degree(an) == 0 or an.data in allowed:
+                    continue
+                if not sdfg.arrays[an.data].transient:
+                    return None
+                for e in st.in_edges(an):
+                    src, sub = e.src, (e.data.subset if e.data is not None else None)
+                    if (isinstance(src, nodes.AccessNode) and src.data in allowed and sub is not None and
+                        (_uses(sub, loop_var_sym) or any(str(fs) in loop_iedge_assignees for fs in sub.free_symbols))):
+                        return None
 
         expanded = _expand_over_loop(arr_subset, loop_var_sym, start, end, stride)
         if expanded is None:
@@ -926,6 +975,9 @@ def _lift_wcr_scalar(parent: ControlFlowRegion, loop: LoopRegion, info: _Reducti
         initialize_expr=loop.init_statement.as_string,
         update_expr=loop.update_statement.as_string,
     )
+    # Carry the sequential pin forward: a nested reduction stays sequential downstream
+    # (``LoopToMap`` honors the flag) so it opens no OpenMP region per outer iteration.
+    new_loop.pinned_sequential = loop.pinned_sequential
     parent.add_node(new_loop, ensure_unique_name=True)  # derived label; wired below by object ref
 
     body = new_loop.add_state(loop.label + "_body", is_start_block=True)
@@ -1175,6 +1227,17 @@ def _extract_multi_state_chain(loop: LoopRegion, sdfg: SDFG):
                 continue
             value_in_edge = next((e for e in data_in if e is not carry_in_edge), None)
             if value_in_edge is None:
+                continue
+
+            # The chain must carry the tasklet's RESULT into the accumulator. Walking back from the
+            # sink can arrive at the tasklet over an EMPTY memlet -- a sequencing edge that carries
+            # no data -- in which case the value stored is whatever the intermediate node already
+            # held, and the tasklet only happens to be ordered before it. TSVC s255's rotation
+            # ``y = x`` reaches ``_Add_`` exactly that way (``_Add_ -[]-> x -[x[0] -> y[0]]-> y``):
+            # it looks like ``y = y + <sum>``, but ``y`` is OVERWRITTEN with ``x``. Folding that
+            # into a WCR turns a copy into an accumulation and drops ``y`` from the sum, silently
+            # computing ``(b[i] + b[i-1]) * 0.333``.
+            if first_write_edge is not data_out[0]:
                 continue
 
             return (state, final_tasklet, carry_in_edge, value_in_edge, first_write_edge, last_write_edge, src_an,

@@ -13,6 +13,8 @@ import copy
 from typing import Dict, Optional, Set
 
 import dace
+import sympy
+
 from dace import properties
 from dace.properties import CodeBlock
 from dace.sdfg import nodes
@@ -72,8 +74,8 @@ class NormalizeLoopsAndMaps(OffsetLoopsAndMaps):
             if sub is None:
                 return None
             return dace.subsets.Range([
-                (b.subs(sd) if hasattr(b, 'subs') else b, e.subs(sd) if hasattr(e, 'subs') else e,
-                 s.subs(sd) if hasattr(s, 'subs') else s) for b, e, s in sub.ndrange()
+                (b.subs(sd) if isinstance(b, sympy.Basic) else b, e.subs(sd) if isinstance(e, sympy.Basic) else e,
+                 s.subs(sd) if isinstance(s, sympy.Basic) else s) for b, e, s in sub.ndrange()
             ])
 
         m = copy.deepcopy(edge_data)
@@ -108,7 +110,7 @@ class NormalizeLoopsAndMaps(OffsetLoopsAndMaps):
         me.map.range = dace.subsets.Range(new_ranges)
 
         def _subs(x):
-            return x.subs(subsdict) if hasattr(x, 'subs') else x
+            return x.subs(subsdict) if isinstance(x, sympy.Basic) else x
 
         # Param-local: substitute only within this map's scope.
         scope = state.scope_subgraph(me, include_entry=True, include_exit=True)
@@ -120,10 +122,18 @@ class NormalizeLoopsAndMaps(OffsetLoopsAndMaps):
         self._repl_tasklets_on_node_list(state, list(scope.nodes()), repldict)
         for n in scope.nodes():
             if isinstance(n, nodes.NestedSDFG):
-                n.symbol_mapping = {
-                    k: dace.symbolic.pystr_to_symbolic(str(v)).subs(subsdict)
-                    for k, v in n.symbol_mapping.items()
-                }
+                new_mapping = {}
+                for k, v in n.symbol_mapping.items():
+                    vsym = dace.symbolic.pystr_to_symbolic(str(v))
+                    # AGENT EXPERIMENT B: identity binding of a rewritten param -> push the
+                    # ``b + s*p`` substitution INTO the nested SDFG so the strided index stays
+                    # VISIBLE in its memlets, instead of hiding it in ``symbol_mapping``.
+                    if vsym in subsdict and str(k) == str(vsym):
+                        n.sdfg.replace_dict({str(k): repldict[str(vsym)]})
+                        new_mapping[k] = vsym
+                        continue
+                    new_mapping[k] = vsym.subs(subsdict)
+                n.symbol_mapping = new_mapping
         return True
 
     def _normalize_loop(self, loop: LoopRegion) -> bool:

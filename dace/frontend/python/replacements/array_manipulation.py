@@ -214,7 +214,22 @@ def _transpose(pv: ProgramVisitor,
         outname = pv.get_target_name()
     outname, arr2 = sdfg.add_transient(outname, new_shape, restype, arr1.storage, find_new_name=True)
 
-    if axes == (1, 0):  # Special case for 2D transposition
+    if axes == (1, 0):  # 2D transposition
+        # The Transpose library node squeezes a unit axis to a vector and then rejects it as "not a
+        # matrix", so a ``(N, 1)`` / ``(1, N)`` array cannot use it. Fall back to a plain index-swap
+        # copy (``out[j, i] = in[i, j]``) whenever an extent is 1; it is general over 2D and
+        # stride-safe. Genuine matrices keep the optimized library node.
+        if 1 in arr1.shape:
+            state.add_mapped_tasklet("transpose",
+                                     map_ranges={
+                                         "__i": "0:%s" % arr1.shape[0],
+                                         "__j": "0:%s" % arr1.shape[1]
+                                     },
+                                     inputs={"__inp": Memlet("%s[__i, __j]" % inpname)},
+                                     code="__out = __inp",
+                                     outputs={"__out": Memlet("%s[__j, __i]" % outname)},
+                                     external_edges=True)
+            return outname
         acc1 = state.add_read(inpname)
         acc2 = state.add_write(outname)
         import dace.libraries.linalg  # Avoid import loop
@@ -379,9 +394,13 @@ def view(pv: ProgramVisitor, sdfg: SDFG, state: SDFGState, arr: str, dtype, type
     # Also, keep in mind that `old_size * (orig_bytes // view_bytes)` is different.
     # E.g., if `orig_bytes == 1 and view_bytes == 2`: `old_size * (1 // 2) == old_size * 0`.
     newshape = list(desc.shape)
-    newstrides = [(s * orig_bytes) // view_bytes if i != contigdim else s for i, s in enumerate(desc.strides)]
+    # int_floor, never `//`: on a symbolic stride `//` builds sympy `floor(expr / d)`, whose argument
+    # sym2cpp prints WITHOUT the floor, leaving each term of the sum to truncate on its own.
+    newstrides = [
+        symbolic.int_floor(s * orig_bytes, view_bytes) if i != contigdim else s for i, s in enumerate(desc.strides)
+    ]
     # don't use `*=`, because it will break the bracket
-    newshape[contigdim] = (newshape[contigdim] * orig_bytes) // view_bytes
+    newshape[contigdim] = symbolic.int_floor(newshape[contigdim] * orig_bytes, view_bytes)
 
     newarr, _ = sdfg.add_view(arr,
                               newshape,
@@ -389,7 +408,7 @@ def view(pv: ProgramVisitor, sdfg: SDFG, state: SDFGState, arr: str, dtype, type
                               storage=desc.storage,
                               strides=newstrides,
                               allow_conflicts=desc.allow_conflicts,
-                              total_size=(desc.total_size * orig_bytes) // view_bytes,
+                              total_size=symbolic.int_floor(desc.total_size * orig_bytes, view_bytes),
                               may_alias=desc.may_alias,
                               alignment=desc.alignment,
                               find_new_name=True)
@@ -476,12 +495,9 @@ def _make_datatype_converter(typeclass: str):
     elif typeclass in {"int", "float", "complex"}:
         dtype = dtypes.dtype_to_typeclass(eval(typeclass))
     else:
-        # Low-precision types (bfloat16 / float8_e4m3fn / float8_e5m2) have no
-        # ``numpy`` attribute -- they are ml_dtypes-backed and named verbatim as
-        # ml_dtypes names them -- so resolve them from ml_dtypes; numpy-backed
-        # types keep the numpy path.
-        scalar_type = getattr(np, typeclass, None) or getattr(ml_dtypes, typeclass)
-        dtype = dtypes.dtype_to_typeclass(scalar_type)
+        # np.dtype resolves numpy names and the ml_dtypes-registered low-precision
+        # names (bfloat16 / float8_e4m3fn / float8_e5m2) alike.
+        dtype = dtypes.dtype_to_typeclass(np.dtype(typeclass).type)
 
     @oprepo.replaces(typeclass)
     @oprepo.replaces("dace.{}".format(typeclass))

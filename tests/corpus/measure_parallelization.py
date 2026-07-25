@@ -44,8 +44,6 @@ import inspect
 import time
 from typing import Callable, Dict, List, Tuple
 
-import numpy as np
-
 import dace
 # Import canonicalize FIRST -- it is the clean entry that fully loads the
 # passes.vectorization + interstate packages in the right order. Importing
@@ -53,6 +51,10 @@ import dace
 # import through the vectorization pipeline's top-level interstate import.
 from dace.transformation.passes.canonicalize import canonicalize
 from dace.transformation.passes.canonicalize.finalize import finalize_for_target
+from dace.transformation.passes.parallelize import parallelize
+from dace.transformation.passes.vectorization.config import VectorizeConfig
+from dace.transformation.passes.vectorization.enums import ISA
+from dace.transformation.passes.vectorization.vectorize_multi_dim import VectorizeCPUMultiDim
 from dace.libraries.standard.nodes import Reduce
 from dace.libraries.standard.nodes.scan import Scan
 from dace.sdfg import nodes as nd
@@ -68,7 +70,12 @@ from tests.corpus.tsvc_2_5 import tsvc_2_5_numpy as _T25_REF
 
 #: The correct CPU canonicalize parameters (the numerical gate's ``_CPU`` set).
 #: ``peel_limit`` is overridable for the peel study; the rest are the CPU defaults.
-_TOL = 1e-9
+
+# Every corpus compares through ``polybench.outputs_match``, whose tolerance is DTYPE-AWARE:
+# integers and bools exactly, fp32 with an fp32-appropriate tolerance, fp64 tightly. A single
+# global tolerance is wrong across a corpus that mixes precisions, and skipping integer arrays --
+# which the tsvc / tsvc_2_5 checkers used to do -- drops OUTPUTS, not just gather indices: the
+# argmax and early-exit kernels exist to test index capture, and their index went unchecked.
 
 
 def cpu_params(peel_limit: int = 4) -> Dict:
@@ -147,19 +154,25 @@ def _tsvc_names() -> List[str]:
     return [k.name for k in _TS.collect()]
 
 
-def _tsvc_case(name):
+def tsvc_reference(name):
+    """``(arrays, call_kwargs, ref)`` for one tsvc kernel: the inputs, and what the numpy oracle
+    makes of them. Shared with the non-vacuity test, which asserts ``ref != arrays``."""
     k = _TS.collect(name=name)[0]
-    base = _TS.to_sdfg(k, tag='measurepar', simplify=True)
     arrays, ck = _TS.make_inputs(k, seed=1234)
     ref = {n: a.copy() for n, a in arrays.items()}
     _TS_REF[k.name](**ref, **ck)  # numpy oracle writes outputs into ref in place
+    return arrays, ck, ref
+
+
+def _tsvc_case(name):
+    k = _TS.collect(name=name)[0]
+    base = _TS.to_sdfg(k, tag='measurepar', simplify=True)
+    arrays, ck, ref = tsvc_reference(name)
 
     def check(fin):
         work = {n: a.copy() for n, a in arrays.items()}
         fin.compile()(**work, **ck)
-        return all(
-            np.allclose(work[n], ref[n], rtol=_TOL, atol=_TOL, equal_nan=True) for n, a in arrays.items()
-            if not np.issubdtype(a.dtype, np.integer))
+        return bool(_PB.outputs_match(ref, work))
 
     return base, check
 
@@ -173,14 +186,28 @@ def _tsvc25_oracle(program):
     return vars(_T25_REF)["ref_" + (base[4:] if base.startswith("ext_") else base)]
 
 
-def _tsvc25_case(name):
-    program = [p for p in _T25.collect() if p.name == name][0]
+def tsvc25_reference(program):
+    """``(arrays, scalars, ref)`` for one tsvc_2_5 kernel. Shared with the non-vacuity test."""
     arrays, scalars = _T25.make_inputs(program)
     oracle = _tsvc25_oracle(program)
-    pool = {**{n: a.copy() for n, a in arrays.items()}, **scalars,
-            **{s.lower(): v for s, v in _T25.SIZES.items()}, "n": _T25.SIZES["LEN_1D"]}
+    pool = {
+        **{
+            n: a.copy()
+            for n, a in arrays.items()
+        },
+        **scalars,
+        **{
+            s.lower(): v
+            for s, v in _T25.SIZES.items()
+        }, "n": _T25.SIZES["LEN_1D"]
+    }
     oracle(**{p: pool[p] for p in inspect.signature(oracle).parameters})
-    ref = {n: pool[n] for n in arrays}
+    return arrays, scalars, {n: pool[n] for n in arrays}
+
+
+def _tsvc25_case(name):
+    program = [p for p in _T25.collect() if p.name == name][0]
+    arrays, scalars, ref = tsvc25_reference(program)
     base = program.to_sdfg(simplify=True)
 
     def check(fin):
@@ -191,9 +218,7 @@ def _tsvc25_case(name):
         symbols = {s: _T25.SIZES[s] for s in _T25.SIZES if s in free}
         got = {n: a.copy() for n, a in arrays.items()}
         fin.compile()(**got, **scalars, **symbols)
-        return all(
-            np.allclose(ref[n], got[n], rtol=_TOL, atol=_TOL, equal_nan=True) for n, a in arrays.items()
-            if not np.issubdtype(a.dtype, np.integer))
+        return bool(_PB.outputs_match(ref, got))
 
     return base, check
 
@@ -205,8 +230,46 @@ CORPORA: Dict[str, Tuple[Callable, Callable]] = {
     'tsvc25': (_tsvc25_names, _tsvc25_case),
 }
 
+#: Pipeline configurations under measurement. Each maps an SDFG in place.
+#:
+#: * ``canon``          -- the production canonicalize recipe.
+#: * ``canon+vec``      -- canonicalize, then the multi-dimensional CPU vectorizer.
+#: * ``parallelize+vec``-- the lighter ``parallelize`` recipe, then the vectorizer.
+#:
+#: The vectorizer runs at a fixed width with the scalar ISA so the measurement
+#: is machine-independent: what is being compared is how much of each corpus
+#: each recipe leaves parallel, not the throughput of a particular target.
+CONFIGS = ('canon', 'canon+vec', 'parallelize+vec')
 
-def sweep(corpus: str, peel_limit: int = 4, check: bool = False, verbose: bool = True) -> Dict:
+
+def _vectorize(sdfg):
+    """Apply the CPU multi-dim vectorizer in place."""
+    VectorizeCPUMultiDim(VectorizeConfig(widths=(8, ), target_isa=ISA.SCALAR)).apply_pass(sdfg, {})
+    return sdfg
+
+
+def apply_config(sdfg, config: str, params: Dict):
+    """Run one pipeline configuration over ``sdfg`` in place.
+
+    :param sdfg: The SDFG to transform.
+    :param config: One of :data:`CONFIGS`.
+    :param params: Canonicalize knob set from :func:`cpu_params`.
+    :returns: The transformed SDFG.
+    """
+    if config == 'canon':
+        canonicalize(sdfg, validate=True, validate_all=False, **params)
+    elif config == 'canon+vec':
+        canonicalize(sdfg, validate=True, validate_all=False, **params)
+        _vectorize(sdfg)
+    elif config == 'parallelize+vec':
+        parallelize(sdfg, validate=True, validate_all=False, peel_limit=params.get('peel_limit', 4))
+        _vectorize(sdfg)
+    else:
+        raise ValueError(f'unknown config {config!r}')
+    return sdfg
+
+
+def sweep(corpus: str, peel_limit: int = 4, check: bool = False, verbose: bool = True, config: str = 'canon') -> Dict:
     """Measure one corpus. :returns: a result dict with per-kernel rows."""
     names_fn, case_fn = CORPORA[corpus]
     names = names_fn()
@@ -222,7 +285,7 @@ def sweep(corpus: str, peel_limit: int = 4, check: bool = False, verbose: bool =
             l2m.apply_transformations_repeated(LoopToMap, validate=False, validate_all=False)
             row['l2m'] = count(l2m)
             canon = copy.deepcopy(base)
-            canonicalize(canon, validate=True, validate_all=False, **params)
+            apply_config(canon, config, params)
             row['canon'] = count(canon)
             row['guarded'] = guarded_fallback_loops(canon)
             if check:
@@ -242,10 +305,16 @@ def sweep(corpus: str, peel_limit: int = 4, check: bool = False, verbose: bool =
         if verbose:
             flag = 'OK ' if row['correct'] else ('.. ' if row['correct'] is None and not row['error'] else
                                                  ('ERR' if row['error'] else 'BAD'))
-            print(f"[{corpus} p{peel_limit} {i:3d}/{len(names)}] {flag} {name:28s} "
-                  f"base={row['base']} l2m={row['l2m']} canon={row['canon']} g={row['guarded']} "
-                  f"{row['error'] or ''}", flush=True)
-    return dict(corpus=corpus, peel_limit=peel_limit, seconds=round(time.perf_counter() - t0, 1), rows=rows)
+            print(
+                f"[{corpus} {config} p{peel_limit} {i:3d}/{len(names)}] {flag} {name:28s} "
+                f"base={row['base']} l2m={row['l2m']} canon={row['canon']} g={row['guarded']} "
+                f"{row['error'] or ''}",
+                flush=True)
+    return dict(corpus=corpus,
+                config=config,
+                peel_limit=peel_limit,
+                seconds=round(time.perf_counter() - t0, 1),
+                rows=rows)
 
 
 def _agg(rows, key) -> List[int]:
@@ -266,9 +335,12 @@ def summarize(res: Dict) -> None:
     b, l, c = _agg(rows, 'base'), _agg(rows, 'l2m'), _agg(rows, 'canon')
     guarded = sum(r.get('guarded') or 0 for r in rows.values())
     eff = c[0] - guarded
-    print(f"\n===== {res['corpus']} peel_limit={res['peel_limit']} ({len(rows)} kernels, {res['seconds']}s) =====")
+    print(f"\n===== {res['corpus']} [{res.get('config', 'canon')}] peel_limit={res['peel_limit']} "
+          f"({len(rows)} kernels, {res['seconds']}s) =====")
     if ok or bad or err:
-        print(f"  CORRECT: {len(ok)}/{len(ok) + len(bad)}   WRONG: {len(bad)}   ERROR: {len(err)}")
+        # Errored kernels count against the denominator: a kernel that failed to build was NOT
+        # shown to be correct, and "CORRECT: 10/10, ERROR: 20" reads as full coverage.
+        print(f"  CORRECT: {len(ok)}/{len(ok) + len(bad) + len(err)}   WRONG: {len(bad)}   ERROR: {len(err)}")
         if bad:
             print(f"    WRONG: {', '.join(sorted(bad))}")
         for n in sorted(err):
@@ -276,7 +348,7 @@ def summarize(res: Dict) -> None:
     print(f"  {'strategy':14s} {'loops':>6s} {'maps':>6s} {'reduce':>7s} {'scan':>5s}")
     print(f"  {'baseline':14s} {b[0]:6d} {b[1]:6d} {b[2]:7d} {b[3]:5d}")
     print(f"  {'LoopToMap':14s} {l[0]:6d} {l[1]:6d} {l[2]:7d} {l[3]:5d}")
-    print(f"  {'canonicalize':14s} {c[0]:6d} {c[1]:6d} {c[2]:7d} {c[3]:5d}")
+    print(f"  {res.get('config', 'canon'):14s} {c[0]:6d} {c[1]:6d} {c[2]:7d} {c[3]:5d}")
     print(f"  residual sequential loops: baseline={b[0]}  L2M={l[0]}  canon={c[0]}")
     print(f"  guarded (if cond: map else: seq) fallbacks counted as parallel: {guarded}")
     print(f"  EFFECTIVE residual sequential (canon - guarded): {eff}  "
@@ -298,10 +370,16 @@ def main() -> None:
     ap.add_argument('corpus', nargs='?', choices=list(CORPORA) + ['all'], default='all')
     ap.add_argument('--peel', type=int, default=4, help='peel_limit (default 4; 0 disables peeling)')
     ap.add_argument('--check', action='store_true', help='also compile+run and assert value-preserving')
+    ap.add_argument('--config',
+                    default='canon',
+                    choices=list(CONFIGS) + ['all'],
+                    help='pipeline configuration to measure (default canon)')
     args = ap.parse_args()
     targets = list(CORPORA) if args.corpus == 'all' else [args.corpus]
-    for corpus in targets:
-        summarize(sweep(corpus, peel_limit=args.peel, check=args.check))
+    configs = list(CONFIGS) if args.config == 'all' else [args.config]
+    for config in configs:
+        for corpus in targets:
+            summarize(sweep(corpus, peel_limit=args.peel, check=args.check, config=config))
 
 
 if __name__ == '__main__':

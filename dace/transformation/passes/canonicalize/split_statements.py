@@ -31,7 +31,7 @@ whatever should recombine.
 import copy
 from typing import Any, Dict, List, Optional, Set
 
-from dace import SDFG, Memlet
+from dace import SDFG, Memlet, properties, symbolic
 from dace.sdfg import nodes
 from dace.sdfg.state import ConditionalBlock, LoopRegion, SDFGState
 from dace.transformation import pass_pipeline as ppl, transformation
@@ -77,13 +77,28 @@ def _output_dependency(sdfg: SDFG, out_name: str, input_names: Set[str]) -> Set[
 
 
 @transformation.explicit_cf_compatible
+@properties.make_properties
 class SplitStatements(ppl.Pass):
     """Split a loop/map body into one perfect nest per independent output
     statement -- including statements inside ifs and gather/scatter accesses
     (per-output NestedSDFG replication) and forward-read anti-dependences
-    (snapshot rename). Subsumes ConditionalComponentFission."""
+    (snapshot rename). Subsumes ConditionalComponentFission.
+
+    ``split_maps`` additionally fissions a STRAIGHT-LINE map that writes several
+    global outputs into one map per output (the map analogue of the loop split);
+    a shared local temp is recomputed in each, never materialized. It is OFF by
+    default so the canonicalization pipeline (which lowers maps to loops and
+    fissions there) is byte-identical; the nest-forge agent path turns it on to
+    fission at map granularity without lowering."""
 
     CATEGORY: str = 'Canonicalization'
+
+    split_maps = properties.Property(
+        dtype=bool, default=False, desc="Also fission a straight-line multi-global-output map into one map per output.")
+
+    def __init__(self, split_maps: bool = False) -> None:
+        super().__init__()
+        self.split_maps = split_maps
 
     def modifies(self) -> ppl.Modifies:
         return ppl.Modifies.Everything
@@ -99,6 +114,10 @@ class SplitStatements(ppl.Pass):
         # (1) Statements inside ifs + gather/scatter: replicate the blocking
         #     NestedSDFG once per independent output group so MapFission splits it.
         count += self._replicate_components(sdfg)
+        # (1b) Straight-line map with >=2 global outputs -> one map per output
+        #      (opt-in; leaves the canon pipeline unchanged).
+        if self.split_maps:
+            count += self._split_map_bodies(sdfg)
         # (2) Forward-read anti-dependences: snapshot-rename the read-ahead so
         #     LoopFission can distribute the loop into independent statements.
         loops = [r for r in sdfg.all_control_flow_regions() if isinstance(r, LoopRegion) and r.loop_variable]
@@ -163,9 +182,11 @@ class SplitStatements(ppl.Pass):
         out_edges = list(state.out_edges(node))
         for grp in groups:
             clone_sdfg = copy.deepcopy(node.sdfg)
+            # dicts/sorted, not sets: these become the clone's connector dicts, which are
+            # observable in validation and codegen order.
             clone = state.add_nested_sdfg(clone_sdfg,
-                                          inputs=set(node.in_connectors),
-                                          outputs=set(grp),
+                                          inputs=dict.fromkeys(node.in_connectors),
+                                          outputs=dict.fromkeys(sorted(grp)),
                                           symbol_mapping=dict(node.symbol_mapping))
             for e in in_edges:
                 state.add_edge(e.src, e.src_conn, clone, e.dst_conn, copy.deepcopy(e.data))
@@ -182,6 +203,105 @@ class SplitStatements(ppl.Pass):
         state.remove_node(node)
 
     # ------------------------------------------------------------------
+    # (1b) Straight-line map statement fission (opt-in via split_maps).
+    # ------------------------------------------------------------------
+
+    def _split_map_bodies(self, sdfg: SDFG) -> int:
+        """Map analogue of the loop statement split: fission a STRAIGHT-LINE map writing >=2 global
+        outputs into one map per output, so each is a self-contained statement.
+
+        Reuses :meth:`_split`: nest the flat body into a NestedSDFG so the map reads as
+        ``MapEntry -> NestedSDFG(out = the global outputs) -> MapExit``, then clone that NestedSDFG once
+        per output with STRICT per-output groups. ``SimplifyPass`` (inside ``_split``) drops each clone's
+        dead compute while keeping a shared local producer that still feeds the kept output -- so a temp
+        feeding two outputs is RECOMPUTED in each map, never materialized to an array (the over-split
+        MapFission would otherwise promote it). The downstream ``MapFission`` then separates the cloned
+        bodies into distinct maps.
+
+        Only PLAIN leaf maps: a body holding a NestedSDFG (a conditional / gather-scatter index symbol)
+        is left to :meth:`_replicate_components`, which already duplicates the guard / ``sym = idx[i]``
+        assignment per output. A WCR output (reduction) is never split.
+        """
+        from dace.transformation.passes.simplify import SimplifyPass
+        from dace.transformation import helpers
+        from dace.transformation.interstate import InlineSDFG
+        from dace.sdfg.graph import SubgraphView
+
+        count = 0
+        for cfg in list(sdfg.all_sdfgs_recursive()):
+            for state in list(cfg.states()):
+                entries = [n for n in state.nodes() if isinstance(n, nodes.MapEntry) and state.entry_node(n) is None]
+                for entry in entries:
+                    if entry not in state.nodes():  # a prior split in this state removed/replaced it
+                        continue
+                    if self._split_one_map(cfg, state, entry, SimplifyPass, helpers, InlineSDFG, SubgraphView):
+                        count += 1
+        return count
+
+    @staticmethod
+    def _split_one_map(cfg, state, entry, simplify_cls, helpers, inline_cls, subgraph_cls) -> bool:
+        """Split one straight-line multi-output map into one FLAT map per output; return whether it fired.
+
+        Nest the WHOLE scope (entry..exit) into a NestedSDFG, clone it per output (``_split`` duplicates a
+        shared local + prunes the dead output), then inline each clone back so the result is flat maps --
+        not maps buried in NestedSDFGs. The inline is confined to the clones this call made (captured by
+        diff), so unrelated NestedSDFGs are untouched.
+        """
+        xit = state.exit_node(entry)
+        # Global outputs = distinct arrays written through the exit; bail on a WCR (reduction) edge.
+        out_names: List[str] = []
+        for e in state.in_edges(xit):
+            if e.data is None or e.data.data is None:
+                continue
+            if e.data.wcr is not None:
+                return False
+            if e.data.data not in out_names:
+                out_names.append(e.data.data)
+        if len(out_names) < 2:
+            return False
+        # In-place read-modify-write: a GLOBAL array read into the scope is also written out of it
+        # (``t = A[i]; A[i] = t + B[i]; C[i] = t*2``). Cloning the scope per output would let one clone
+        # recompute ``t = A[i]`` AFTER another clone overwrote ``A[i]`` (the read/modify/write order is
+        # lost) and duplicate the write -- both silently wrong, and it still validates. Mirror the RMW
+        # guard SplitTasklets uses (split_tasklets.py) and leave such a map unsplit. Global
+        # (non-transient) arrays only: a shared local temp is meant to be recomputed per output.
+        read_arrays = {
+            e.data.data
+            for e in state.in_edges(entry)
+            if e.data is not None and e.data.data is not None and not cfg.arrays[e.data.data].transient
+        }
+        write_arrays = {
+            e.data.data
+            for e in state.in_edges(xit)
+            if e.data is not None and e.data.data is not None and not cfg.arrays[e.data.data].transient
+        }
+        if read_arrays & write_arrays:
+            return False
+        scope = state.scope_subgraph(entry, include_entry=True, include_exit=True)
+        inner = [n for n in scope.nodes() if n not in (entry, xit)]
+        # A PLAIN dataflow NestedSDFG body (a dependent read-after-write the frontend wrapped, e.g.
+        # ``A[i]=..; B[i]=A[i]*2``) is inlined FIRST, so the split sees flat tasklets and a shared local
+        # is duplicated like any other. A CONDITIONAL / indirection-symbol body is NOT inlined -- it
+        # cannot live directly in a map scope and is _replicate_components' job.
+        if (len(inner) == 1 and isinstance(inner[0], nodes.NestedSDFG) and not _has_conditional(inner[0].sdfg)
+                and not _has_interstate_assignments(inner[0].sdfg)):
+            inline_cls.apply_to(cfg, nested_sdfg=inner[0], save=False, verify=False)
+            scope = state.scope_subgraph(entry, include_entry=True, include_exit=True)
+            inner = [n for n in scope.nodes() if n not in (entry, xit)]
+        # PLAIN leaf map only: no nested map / NestedSDFG in the body (those go to _replicate_components).
+        if not inner or any(isinstance(n, (nodes.NestedSDFG, nodes.MapEntry, nodes.MapExit)) for n in inner):
+            return False
+        before = {n for n in state.nodes() if isinstance(n, nodes.NestedSDFG)}
+        nsdfg_node = helpers.nest_state_subgraph(cfg, state, subgraph_cls(state, list(scope.nodes())))
+        groups = [{o} for o in nsdfg_node.out_connectors if o in out_names]
+        if len(groups) < 2:  # nesting coalesced the outputs onto one connector -- nothing to split
+            return False
+        SplitStatements._split(cfg, state, nsdfg_node, groups, simplify_cls)
+        for clone in [n for n in state.nodes() if isinstance(n, nodes.NestedSDFG) and n not in before]:
+            inline_cls.apply_to(cfg, nested_sdfg=clone, save=False, verify=False)
+        return True
+
+    # ------------------------------------------------------------------
     # (2) Forward-read anti-dependence snapshot (TSVC s1244).
     # ------------------------------------------------------------------
 
@@ -194,10 +314,9 @@ class SplitStatements(ppl.Pass):
         internal_syms = oracle._loop_internal_symbols(loop)
         applied = 0
 
-        written = sorted({
-            n.data
-            for n in state.data_nodes() if state.in_degree(n) > 0 and not sdfg.arrays[n.data].transient
-        })
+        written = sorted(
+            {n.data
+             for n in state.data_nodes() if state.in_degree(n) > 0 and not sdfg.arrays[n.data].transient})
         for arr in written:
             write_subsets = []
             for n in state.data_nodes():
@@ -221,10 +340,15 @@ class SplitStatements(ppl.Pass):
                         continue
                     verdicts = [oracle._dep_class(rs, ws, ivar, loop=loop, sdfg=sdfg) for ws in write_subsets]
                     kinds = {v[0] for v in verdicts}
-                    if kinds & {'RAW', 'complex'}:
-                        continue  # a RAW read must keep its live-array value -- never move it
-                    if not (kinds & {'WAR', 'WAR_symbolic'}):
-                        continue  # only read-ahead anti-dependences are renamable
+                    # Redirect to the pre-loop snapshot ONLY when EVERY verdict is a read-ahead
+                    # (WAR / WAR_symbolic). A RAW/complex producer, OR a 'none' (offset-0, same-index
+                    # producer THIS iteration), means the read consumes a value made within the sweep
+                    # and must keep its live-array value -- moving it to the stale snapshot is a silent
+                    # miscompile. (The old gate only skipped RAW/complex and required *some* WAR, so a
+                    # read that was WAR vs one sibling write but 'none' vs another --
+                    # ``A[i]=..; A[i+1]=..; d[i]=A[i+1]`` -- slipped through and read the stale value.)
+                    if not (kinds and kinds <= {'WAR', 'WAR_symbolic'}):
+                        continue
                     guards = {p for k, p in verdicts if k == 'WAR_symbolic'}
                     if any({str(s) for s in g.free_symbols} & internal_syms for g in guards):
                         continue
@@ -245,7 +369,9 @@ class SplitStatements(ppl.Pass):
                                          find_new_name=True)
             pre = loop.parent_graph.add_state_before(loop, label=f'{arr}_split_snapshot')
             pre.add_nedge(pre.add_read(arr), pre.add_write(snap), Memlet.from_array(arr, desc))
-            for expr in sym_guards:
+            # sorted: ``sym_guards`` is a set of sympy exprs (hashed via symbol-name strings). It is iterated
+            # to EMIT tasklets into ``pre``, so its order fixes their node names/ids and the emitted C order.
+            for expr in sorted(sym_guards, key=symbolic.symstr):
                 # STRICT (>0) guard -- NOT the >=0 that BreakAntiDependence's whole-array
                 # pure-WAR rename uses. There every read of ``arr`` moves to the snapshot and
                 # a same-index read ``arr[i]`` equals the pre-loop original (only iteration i

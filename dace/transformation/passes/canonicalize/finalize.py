@@ -109,25 +109,23 @@ def libnode_is_sequential(node: nodes.LibraryNode, state, sdfg: SDFG) -> bool:
     enclosing scope, so a ``Reduce`` nested in a parallel map can carry ``CPU_Multicore`` rather than
     ``Sequential`` and would then wrongly open a nested ``#pragma omp parallel`` per outer iteration
     -- the "constant parallel reductions" catastrophe. Determine sequentiality from SCOPE instead:
-    a libnode is sequential if it has a parallel parent map, an enclosing loop (both re-enter it), or
-    lives inside a ``Sequential``-scheduled nested SDFG (itself nested in a parallel scope).
+    a libnode is sequential if it has a parallel parent map or an enclosing loop (both re-enter it).
 
-    :func:`~dace.transformation.helpers.get_parent_map_and_loop_scopes` -- now LibraryNode-aware (a
-    library node is a "special tasklet") -- yields every enclosing ``MapEntry`` / ``LoopRegion``
-    across nested-SDFG boundaries, so deep nesting is handled by the existing helper rather than a
-    bespoke climb. A genuinely top-level node (no enclosing parallel map / loop, not inside a
-    ``Sequential`` nsdfg) returns ``False`` and is free to open its own OpenMP / device-parallel region.
+    A ``NestedSDFG`` node carries no ``schedule`` property of its own (only ``Map`` /
+    ``LibraryNode`` do), so "lives inside a sequential nested SDFG" is not a distinct case to probe
+    for here: :func:`~dace.transformation.helpers.get_parent_map_and_loop_scopes` -- now
+    LibraryNode-aware (a library node is a "special tasklet") -- walks OUT across every nested-SDFG
+    boundary up to the root and yields every enclosing ``MapEntry`` / ``LoopRegion`` regardless of
+    how many nsdfg levels separate ``node`` from them, so a parallel map or loop several nsdfg levels
+    up is still found by the loop below; deep nesting is handled by the existing helper rather than a
+    bespoke climb. A genuinely top-level node (no enclosing parallel map / loop) returns ``False`` and
+    is free to open its own OpenMP / device-parallel region.
     """
     # Function-local import: ``dace.transformation.helpers`` pulls in a chain that re-enters the
     # canonicalize package, so a top-level import here would be a cycle when ``finalize`` is imported
     # as the package's first submodule.
     from dace.transformation.helpers import get_parent_map_and_loop_scopes
     if node.schedule == dtypes.ScheduleType.Sequential:
-        return True
-    # A ``Sequential`` enclosing nested SDFG (itself nested in a parallel scope) makes the libnode
-    # sequential too.
-    parent_nsdfg = state.sdfg.parent_nsdfg_node
-    if parent_nsdfg is not None and parent_nsdfg.schedule == dtypes.ScheduleType.Sequential:
         return True
     for scope in get_parent_map_and_loop_scopes(sdfg, node, state):
         if isinstance(scope, nodes.MapEntry):
@@ -197,25 +195,17 @@ def canonicalize_set_fast_implementations(sdfg: SDFG, device: dtypes.DeviceType,
             if device == dtypes.DeviceType.GPU:
                 node.implementation = 'pure' if sequential else ('CUDA' if 'CUDA' in impls else node.implementation)
                 continue
-        # ``Copy`` / ``Memset``: a top-level node -> ``Auto`` (its own size gate picks the chunked
-        # ``CPU_Multicore`` parallel transfer for large/symbolic sizes). A sequential (nested) node
-        # must run single-core: ask the node's OWN selector for the correct expansion -- which routes
-        # a non-contiguous / cross-storage transfer to ``MappedTasklet`` / ``pure`` rather than the
-        # contiguous-only ``MemcpyCPU`` / ``CPU`` that would RAISE at codegen -- then downgrade the
-        # parallel chunk-map variant to its serial sibling so a nested transfer opens no OpenMP region.
+        # ``Copy`` / ``Memset`` on CPU: a top-level node stays ``Auto`` (its own size gate routes a
+        # large/symbolic contiguous transfer to the element map, which DaCe parallelizes across
+        # OpenMP threads at top level). A sequential (nested) node asks its OWN selector for a
+        # concrete expansion -- ``MemcpyCPU`` / ``CPU`` for a small contiguous transfer, else the
+        # element map (``MappedTasklet`` / ``pure``), which DaCe schedules sequentially when nested
+        # so it opens no OpenMP region; the contiguous-only single-call forms would RAISE otherwise.
         if isinstance(node, CopyLibraryNode) and device == dtypes.DeviceType.CPU:
-            if sequential:
-                impl = select_copy_implementation(node, state)
-                node.implementation = 'MemcpyCPU' if impl == 'MemcpyParallelCPU' else impl
-            else:
-                node.implementation = 'Auto'
+            node.implementation = select_copy_implementation(node, state) if sequential else 'Auto'
             continue
         if isinstance(node, MemsetLibraryNode) and device == dtypes.DeviceType.CPU:
-            if sequential:
-                impl = select_memset_implementation(node, state)
-                node.implementation = 'CPU' if impl == 'ParallelCPU' else impl
-            else:
-                node.implementation = 'Auto'
+            node.implementation = select_memset_implementation(node, state) if sequential else 'Auto'
             continue
         if 'pure' not in impls:
             continue
@@ -237,8 +227,8 @@ def finalize_transient_storage(sdfg: SDFG, device: dtypes.DeviceType) -> None:
     vectorized the SDFG) runs to allocate temporaries well. Three steps, mirroring
     ``auto_optimize``'s storage tail:
 
-    1. **Length-1 transient arrays -> scalars** (:class:`ConvertLengthOneArraysToScalars`,
-       ``transient_only=True``): a single internal value belongs in a scalar, not a heap array.
+    1. **Length-1 transient arrays -> scalars** (:class:`ConvertLengthOneArraysToScalars`, at its
+       default -- transient only): a single internal value belongs in a scalar, not a heap array.
        Non-transient length-1 arrays (SDFG-external returns / opaque handles) are left as arrays.
     2. **Small constant-size scratch -> registers** (:func:`move_small_arrays_to_stack`).
     3. **Independent top-level transients -> ``Persistent`` lifetime**
@@ -255,7 +245,7 @@ def finalize_transient_storage(sdfg: SDFG, device: dtypes.DeviceType) -> None:
     :param sdfg: SDFG whose transient storage is finalized in place.
     :param device: codegen device type (selects GPU WCR-reset / storage rules).
     """
-    ConvertLengthOneArraysToScalars(recursive=True, transient_only=True).apply_pass(sdfg, {})
+    ConvertLengthOneArraysToScalars(recursive=True).apply_pass(sdfg, {})
     infer_types.set_default_schedule_and_storage_types(sdfg, None)
     move_small_arrays_to_stack(sdfg)
     made_persistent = make_transients_persistent(sdfg, device)
@@ -287,8 +277,8 @@ def recompute_fuse_for_gpu(sdfg: SDFG) -> int:
 
     CPU deliberately does NOT run this: there the intermediates are cache-resident and shared
     across the consumer maps, so materializing once and reading beats recomputing -- the four
-    separate maps are the CPU strategy. Run BEFORE ``offload_to_gpu`` so the fusion sees plain
-    (device-agnostic) maps and the single fused map is what gets offloaded.
+    separate maps are the CPU strategy. Called by :func:`offload_to_gpu` as its first step, so the
+    fusion sees plain (device-agnostic) maps and the single fused map is what gets offloaded.
 
     :param sdfg: The SDFG to fuse in place.
     :returns: The number of ``OTFMapFusion`` applications.
@@ -297,13 +287,19 @@ def recompute_fuse_for_gpu(sdfg: SDFG) -> int:
 
 
 def offload_to_gpu(sdfg: SDFG) -> None:
-    """Move a canonicalized SDFG onto the GPU, in place: device offload then block-size choice.
+    """Move a canonicalized SDFG onto the GPU, in place: recompute-fuse, device offload, block size.
 
-    This is the canonicalize-GPU tail the user specified -- "canon-gpu runs after finalizing to
-    GPU offloading and the block-size default pass" -- so ``canonicalize(s, target='gpu');
-    finalize_for_target(s, 'gpu')`` becomes the perf-path counterpart to ``auto_optimize(s,
-    device=GPU)``. Two steps, mirroring ``auto_optimize``'s GPU tail:
+    A SEPARATE step from :func:`finalize_for_target`, not part of canonicalization: the device move
+    is where a caller's own scheduling decisions belong, so the pipeline is
+    ``canonicalize(s, target='gpu')`` -> *(any passes the caller needs on a device-agnostic graph)*
+    -> ``offload_to_gpu(s)`` -> ``finalize_for_target(s, 'gpu')``. Callers with their own offload
+    recipe (CloudSC schedules the inner maps and keeps the nblocks map sequential) substitute it
+    here and never call this function. Three steps, mirroring ``auto_optimize``'s GPU tail:
 
+    0. **Recompute-fuse** (:func:`recompute_fuse_for_gpu`): collapse producer chains into one map
+       before the device move, so the single fused map is what lands on the device (register
+       recompute beats the global-memory round-trip of materialized intermediates). CPU keeps the
+       materialized maps, which is why this lives here and not in ``finalize_for_target``.
     1. **Full offload** (unconditional): put non-transient arrays in GPU global storage
        (:func:`apply_gpu_storage`) and run ``apply_gpu_transformations`` (host<->device copies +
        ``GPU_Device`` schedules on every eligible map). Run unconditionally -- a partially-offloaded
@@ -327,9 +323,37 @@ def offload_to_gpu(sdfg: SDFG) -> None:
     (which reads the value) emits the single-stream form.
     """
     Config.set('compiler', 'cuda', 'max_concurrent_streams', value=-1)
+    recompute_fuse_for_gpu(sdfg)
     apply_gpu_storage(sdfg)
     sdfg.apply_gpu_transformations()
     select_gpu_device_block_size(sdfg)
+
+
+def assert_offloaded(sdfg: SDFG) -> None:
+    """Raise unless ``sdfg`` has actually been moved onto the device.
+
+    :func:`finalize_for_target` with ``target='gpu'`` reads the device maps and ``GPU_Global``
+    arrays that an offload creates; on a still-host-scheduled graph every GPU-specific step below
+    it is a no-op and the result is a CPU graph wearing a GPU label. Fail loudly instead.
+
+    Either signal counts, because the two legal offloads produce different mixes: the generic
+    :func:`offload_to_gpu` sets both, while a caller-supplied recipe may schedule kernels without
+    moving every non-transient (or vice versa for an all-library graph with no maps of its own).
+
+    :param sdfg: The SDFG to check, including nested SDFGs.
+    :raises ValueError: If no ``GPU_Device`` map and no ``GPU_Global`` array is present.
+    """
+    for node, _ in sdfg.all_nodes_recursive():
+        if isinstance(node, nodes.MapEntry) and node.map.schedule == dtypes.ScheduleType.GPU_Device:
+            return
+    for nested in sdfg.all_sdfgs_recursive():
+        for desc in nested.arrays.values():
+            if desc.storage == dtypes.StorageType.GPU_Global:
+                return
+    raise ValueError(f"finalize_for_target(sdfg, 'gpu') needs an already-offloaded SDFG, but '{sdfg.name}' has no "
+                     "GPU_Device map and no GPU_Global array. Offload is a separate step so passes can run between "
+                     "canonicalization and the device move: call offload_to_gpu(sdfg), or your own offload recipe, "
+                     "before finalizing.")
 
 
 def sequentialize_nested_parallel_scopes(sdfg: SDFG, device: dtypes.DeviceType) -> None:
@@ -446,24 +470,29 @@ def finalize_for_target(sdfg: SDFG, target: str = 'cpu', validate: bool = True) 
     codegen to lower), then moves small constant-size transients to the stack and
     independent transients to persistent allocation. Operates in place.
 
-    :param sdfg: A canonicalized SDFG.
+    ``target='gpu'`` finalizes an **already-offloaded** graph; it does not offload one. The device
+    move is a separate step (:func:`offload_to_gpu`, or a caller's own recipe) so passes can run
+    between canonicalization and it -- ``canonicalize(s, target='gpu'); offload_to_gpu(s);
+    finalize_for_target(s, 'gpu')`` is the perf-path counterpart to ``auto_optimize(s,
+    device=GPU)``.
+
+    :param sdfg: A canonicalized SDFG; for ``target='gpu'``, an offloaded one.
     :param target: ``'cpu'`` or ``'gpu'`` (selects the fast-library priority).
     :param validate: Validate the SDFG once at the end.
     :returns: The same ``sdfg`` instance, finalized.
+    :raises ValueError: If ``target='gpu'`` and ``sdfg`` was never offloaded.
     """
     if target not in _TARGET_DEVICE:
         raise ValueError(f"target must be one of {sorted(_TARGET_DEVICE)}; got {target!r}")
     device = _TARGET_DEVICE[target]
 
-    # For GPU, offload to the device and choose thread-block dimensions BEFORE selecting library
-    # implementations and storage: the fast GPU library picks (cuBLAS/cuSolverDn/CUB) and the GPU
-    # storage rules must see the device maps and GPU_Global arrays the offload creates.
+    # Offload is NOT part of this tail: the caller runs it, so passes can be inserted between
+    # canonicalization and the device move (see :func:`offload_to_gpu`). Everything below still
+    # requires it to have happened -- the fast GPU library picks (cuBLAS/cuSolverDn/CUB) and the
+    # GPU storage rules read the device maps and GPU_Global arrays the offload creates -- so a
+    # host-scheduled graph is rejected here rather than quietly finalized as if it were CPU.
     if device == dtypes.DeviceType.GPU:
-        # Recompute-fuse producer chains into one map (register recompute beats the extra
-        # global-memory round-trips of materialized intermediates) BEFORE offloading, so the
-        # single fused map is what lands on the device. CPU keeps the materialized maps.
-        recompute_fuse_for_gpu(sdfg)
-        offload_to_gpu(sdfg)
+        assert_offloaded(sdfg)
 
     # Infer schedules BEFORE selecting library-node implementations so the selection can adhere to
     # each node's schedule: DaCe sets a library node nested in a parallel map (or re-entered per loop

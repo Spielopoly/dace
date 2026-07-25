@@ -47,13 +47,13 @@ def _is_assign_tasklet(t) -> bool:
     """True iff ``t`` is a tasklet with a single in / out connector and a body
     of the form ``<out_conn> = <in_conn>`` (no arithmetic, no calls).
     """
-    if not hasattr(t, "code") or not hasattr(t, "in_connectors") or not hasattr(t, "out_connectors"):
+    if not isinstance(t, dace.nodes.Tasklet):
         return False
     if len(t.in_connectors) != 1 or len(t.out_connectors) != 1:
         return False
     in_conn = next(iter(t.in_connectors))
     out_conn = next(iter(t.out_connectors))
-    body = (t.code.as_string if hasattr(t.code, "as_string") else str(t.code)).strip().rstrip(";")
+    body = t.code.as_string.strip().rstrip(";")
     return body == f"{out_conn} = {in_conn}"
 
 
@@ -258,6 +258,10 @@ class BypassTrivialAssignTasklets(ppl.Pass):
                 # endpoint that has an AccessNode side -- for Tasklet -> AN
                 # the only AccessNode endpoint is ``dst_an``, so use that.
                 for pe in list(istate.in_edges(src_an)):
+                    # LEAVE dependency edges alone -- an empty memlet only orders two nodes, so
+                    # rewriting it as dataflow would invent a copy the program never had.
+                    if pe.data is None or pe.data.is_empty():
+                        continue
                     pe_subset = subsets.Range(list(pe.data.subset.ranges)) if pe.data.subset is not None else None
                     out_subset = subsets.Range(list(
                         out_e.data.subset.ranges)) if out_e.data.subset is not None else None
@@ -308,6 +312,15 @@ class BypassTrivialAssignTasklets(ppl.Pass):
                     istate.add_edge(src_an, in_e.src_conn, dst_an, out_e.dst_conn, copy_memlet)
                     continue
                 for de in consumers:
+                    # LEAVE dependency edges alone. An empty memlet carries no data -- it only
+                    # orders two nodes -- so this pass has no business rewriting it. Rebuilding one
+                    # as a data memlet invents a copy the program never had, and when the
+                    # destination is a read-only input it becomes a WRITE to it: TSVC s471's
+                    # ordering edge into ``d`` became ``b -> d``, which validation rejects as a
+                    # write to an array the nested SDFG only takes as an input. Keeping the edge
+                    # also keeps ``dst_an`` non-isolated, so it survives the cleanup below.
+                    if de.data is None or de.data.is_empty():
+                        continue
                     in_subset = subsets.Range(list(in_e.data.subset.ranges)) if in_e.data.subset is not None else None
                     de_subset = subsets.Range(list(de.data.subset.ranges)) if de.data.subset is not None else None
                     if isinstance(de.dst, dace.nodes.AccessNode):

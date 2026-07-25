@@ -240,7 +240,7 @@ class LoopToConditionalReduce(ppl.Pass):
         # And no non-transient writes other than the accumulator.
         for n in sink_ans:
             desc = sdfg.arrays.get(n.data)
-            if desc is not None and not getattr(desc, 'transient', False) and n.data != acc_name:
+            if desc is not None and not desc.transient and n.data != acc_name:
                 return None
 
         # Walk back from the sink to find the update tasklet.
@@ -316,7 +316,7 @@ class LoopToConditionalReduce(ppl.Pass):
     # ------------------------- match helpers -------------------------
 
     def _branch_has_content(self, branch) -> bool:
-        if not hasattr(branch, 'nodes'):
+        if not isinstance(branch, ControlFlowRegion):
             return False
         for n in branch.nodes():
             if isinstance(n, SDFGState) and len(n.nodes()) > 0:
@@ -442,9 +442,12 @@ class LoopToConditionalReduce(ppl.Pass):
         acc_desc = sdfg.arrays[m.acc_name]
         masked_val, _ = sdfg.add_scalar(f'{m.acc_name}_masked_val', acc_desc.dtype, transient=True, find_new_name=True)
         mask_body = self._build_mask_body(cond_expr_resolved, m.identity_value)
+        # dict.fromkeys, not a set: ``guard_inputs`` is already in AST-walk order and add_tasklet turns
+        # the argument into the connector dict -- a set would randomize the emitted ``const T __guardN``
+        # declaration order per process.
         mask_tasklet = true_state.add_tasklet(name=f'{m.acc_name}_mask',
-                                              inputs={'__addend'} | set(guard_inputs),
-                                              outputs={'__out'},
+                                              inputs=dict.fromkeys(['__addend', *guard_inputs]),
+                                              outputs=dict.fromkeys(['__out']),
                                               code=mask_body,
                                               language=dtypes.Language.Python)
 

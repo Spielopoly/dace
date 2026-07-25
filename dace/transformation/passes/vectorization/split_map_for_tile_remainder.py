@@ -172,7 +172,7 @@ class SplitMapForTileRemainder(ppl.Pass):
             return False
 
     def _trip_class(self, lb, ub, W: int) -> str:
-        """Classify a tiled dim's extent against width ``W`` for the ``assume_even`` path.
+        """Classify a tiled dim's extent against width ``W``.
 
         ``'divisible'``   -- provably a whole number of tiles (constant OR symbolic like ``4*M``).
         ``'below'``       -- provably ``< W``: too small to tile, keep the map scalar.
@@ -223,9 +223,12 @@ class SplitMapForTileRemainder(ppl.Pass):
             for d, W in zip(tiled_dims, self.widths):
                 lb, ub, _ = map_entry.map.range[d]
                 classes.append((self._trip_class(lb, ub, W), d, W, lb, ub))
-            # A provably-too-small dim (extent < W) cannot be tiled -> keep the WHOLE map scalar.
-            # MarkTileDims refuses the same dim, so the two passes agree (no strided-map/scalar-body
-            # desync). Takes precedence over a nondivisible sibling dim: an untiled map is never wrong.
+            # A provably-too-small dim (extent < W) cannot be tiled with no remainder to cover it
+            # -> keep the WHOLE map scalar. ``MarkTileDims`` refuses the same dim under
+            # ``assume_even``, so the two passes agree (no strided-map/scalar-body desync). Takes
+            # precedence over a nondivisible sibling dim: an untiled map is never wrong. On the
+            # masked / scalar-tail paths below there IS a remainder, so a short dim is peeled into
+            # an empty interior plus one masked tile and stays tiled.
             if any(c == 'below' for c, *_ in classes):
                 return False
             for c, d, W, lb, ub in classes:
@@ -284,10 +287,12 @@ class SplitMapForTileRemainder(ppl.Pass):
         self._range_checks = []
         # Snapshot up front: splitting mutates the graph; must not re-split a
         # freshly replicated remainder map.
-        eligible = [(n, g) for n, g in sdfg.all_nodes_recursive()
-                    if isinstance(n, MapEntry) and isinstance(g, dace.SDFGState) and is_vectorizable_map(g, n, len(self.widths))
-                    and len(n.map.params) >= K and not n.map.label.endswith(TILE_MAIN_MARKER)
-                    and not n.map.label.endswith(SCALAR_TAIL_MARKER) and not n.map.label.endswith(TILE_K1_TAIL_MARKER)]
+        eligible = [
+            (n, g) for n, g in sdfg.all_nodes_recursive()
+            if isinstance(n, MapEntry) and isinstance(g, dace.SDFGState) and is_vectorizable_map(
+                g, n, len(self.widths)) and len(n.map.params) >= K and not n.map.label.endswith(TILE_MAIN_MARKER)
+            and not n.map.label.endswith(SCALAR_TAIL_MARKER) and not n.map.label.endswith(TILE_K1_TAIL_MARKER)
+        ]
         for n, g in eligible:
             if self._split(g, n, K):
                 applied += 1

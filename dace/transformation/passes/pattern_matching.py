@@ -11,10 +11,10 @@ from dace.config import Config
 from dace.sdfg import SDFG, SDFGState
 from dace.sdfg import graph as gr, nodes as nd
 from dace.sdfg.state import ControlFlowRegion
-import networkx as nx
-from networkx.algorithms import isomorphism as iso
+from dace import graphlib as nx
+from dace.graphlib import isomorphism as iso
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple, Type, Union
-from dace.sdfg.validation import InvalidSDFGError
+from dace.sdfg.validation import InvalidSDFGError, validate_state
 from dace.transformation import transformation as xf, pass_pipeline as ppl
 
 
@@ -91,13 +91,37 @@ class PatternMatchAndApply(ppl.Pass):
     def should_reapply(self, modified: ppl.Modifies) -> bool:
         return any(p.should_reapply(modified) for p in self.transformations)
 
+    def validate_after_match(self, match: xf.PatternTransformation, graph: Union[SDFG, SDFGState], sdfg: SDFG) -> None:
+        """Check what the transformation that just applied could actually have broken.
+
+        A full ``sdfg.validate()`` after EVERY match is O(whole SDFG) per application, which
+        makes ``validate_all`` cost more than the transformations it is watching. A
+        `SingleStateTransformation` rewrites one state, so that state is checked on its own;
+        anything that can move interstate edges, symbols or descriptors around still gets the
+        full check. The end-of-pass ``validate`` (on by default) stays the whole-SDFG net, so
+        a cross-state break is still caught, just at the end of the pass rather than at the
+        match that caused it.
+        """
+        if not isinstance(match, xf.SingleStateTransformation) or match.state_id < 0:
+            sdfg.validate()
+            return
+        # The match may live in a nested SDFG, and validate_state rejects a state whose .sdfg is
+        #  not the one passed in, so the owning SDFG is the one to check against -- not the root.
+        owner = graph.sdfg
+        # A single state has no cross-state context: a transient another state initialized
+        #  looks uninitialized here, which warns -- and raises outright for a Reference. Seed
+        #  every descriptor as initialized so only the state-local invariants are checked
+        #  (connectors, memlets, scopes, views, subsets), which is what a dataflow
+        #  transformation can break.
+        validate_state(graph, graph.parent_graph.node_id(graph), owner, initialized_transients=set(owner.arrays.keys()))
+
     def apply_pass(self, sdfg: SDFG, pipeline_results: Dict[str, Any]) -> Dict[str, List[Any]]:
         applied_transformations = collections.defaultdict(list)
 
         # For every transformation in the list, find first match and apply
         for xform in self.transformations:
             if sdfg.root_sdfg.using_explicit_control_flow:
-                if (not hasattr(xform, '__explicit_cf_compatible__') or xform.__explicit_cf_compatible__ == False):
+                if not xform.__explicit_cf_compatible__:
                     warnings.warn('Pattern matching is skipping transformation ' + xform.__class__.__name__ +
                                   ' due to incompatibility with experimental control flow blocks. If the ' +
                                   'SDFG does not contain experimental blocks, ensure the top level SDFG does ' +
@@ -126,7 +150,7 @@ class PatternMatchAndApply(ppl.Pass):
             result = match.apply(graph, tcfg.sdfg)
             applied_transformations[type(match).__name__].append(result)
             if self.validate_all:
-                sdfg.validate()
+                self.validate_after_match(match, graph, sdfg)
 
         if self.validate:
             sdfg.validate()
@@ -187,7 +211,7 @@ class PatternMatchAndApplyRepeated(PatternMatchAndApply):
                   end='')
         if self.validate_all:
             try:
-                sdfg.validate()
+                self.validate_after_match(match, graph, sdfg)
             except InvalidSDFGError as err:
                 raise InvalidSDFGError(
                     f'Validation failed after applying {match_name}. '
@@ -216,8 +240,7 @@ class PatternMatchAndApplyRepeated(PatternMatchAndApply):
                 applied_anything = False
                 for xform in xforms:
                     if sdfg.root_sdfg.using_explicit_control_flow:
-                        if (not hasattr(xform, '__explicit_cf_compatible__')
-                                or xform.__explicit_cf_compatible__ == False):
+                        if not xform.__explicit_cf_compatible__:
                             warnings.warn('Pattern matching is skipping transformation ' + xform.__class__.__name__ +
                                           ' due to incompatibility with experimental control flow blocks. If the ' +
                                           'SDFG does not contain experimental blocks, ensure the top level SDFG does ' +
@@ -402,7 +425,7 @@ def _try_to_match_transformation(graph: Union[ControlFlowRegion, SDFGState], col
                     setattr(match, oname, oval)
 
         if sdfg.root_sdfg.using_explicit_control_flow:
-            if (not hasattr(match, '__explicit_cf_compatible__') or match.__explicit_cf_compatible__ == False):
+            if not match.__explicit_cf_compatible__:
                 warnings.warn('Pattern matching is skipping transformation ' + match.__class__.__name__ +
                               ' due to incompatibility with experimental control flow blocks. If the ' +
                               'SDFG does not contain experimental blocks, ensure the top level SDFG does ' +

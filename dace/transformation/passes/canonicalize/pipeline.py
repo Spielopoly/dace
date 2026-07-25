@@ -13,6 +13,7 @@ from dace.transformation import pass_pipeline as ppl
 
 from dace.transformation.passes.relax_integer_powers import RelaxIntegerPowers
 from dace.transformation.passes.simplify import SimplifyPass
+from dace.transformation.passes.canonicalize.normalize_floor_division import NormalizeFloorDivision
 from dace.transformation.passes.simplification.continue_to_condition import ContinueToCondition
 from dace.transformation.passes.split_tasklets import SplitTasklets
 from dace.transformation.passes.vectorization.lower_ite_to_fp_factor import LowerITEToFpFactor
@@ -52,7 +53,7 @@ from dace.transformation.passes.clean_access_node_to_scalar_slice_to_tasklet_pat
     CleanAccessNodeToScalarSliceToTaskletPattern)
 from dace.transformation.passes.clean_tasklet_to_scalar_slice_to_access_node_pattern import (
     CleanTaskletToScalarSliceToAccessNodePattern)
-from dace.transformation.passes.scalar_fission import PrivatizeScalars, ScalarFission
+from dace.transformation.passes.scalar_fission import ArrayFission, PrivatizeArrays, PrivatizeScalars, ScalarFission
 from dace.transformation.passes.accumulator_to_map_and_reduce import AccumulatorToMapAndReduce
 from dace.transformation.passes.parallelization_prep import (BestEffortLoopPeeling, ShortLoopUnroll,
                                                              DEFAULT_UNROLL_LIMIT)
@@ -88,6 +89,8 @@ from dace.transformation.passes.canonicalize.distribute_producer_consumer import
 from dace.transformation.passes.canonicalize.assume_symbols_nonnegative import (AssumeSymbolConstraints,
                                                                                  SetSymbolNonnegativeAssumptions)
 from dace.transformation.interstate.trivial_loop_elimination import TrivialLoopElimination
+from dace.transformation.dataflow.trivial_map_elimination import TrivialMapElimination
+from dace.transformation.passes.empty_loop_elimination import EmptyLoopElimination
 
 from dace.transformation.interstate.loop_to_map import LoopToMap
 from dace.transformation.interstate.move_if_into_map import MoveIfIntoMap
@@ -130,7 +133,12 @@ def _structural_cleanup(label: str) -> List[Tuple[str, ppl.Pass]]:
     # * ``StateFusionExtended`` -- collapse adjacent states first.
     # * ``InlineMultistateSDFG`` + ``InlineSDFG`` -- flatten NestedSDFG
     #   nestings so all subsequent cleanup passes can see across the
-    #   boundary.
+    #   boundary. Both run in ONE fixpoint, not two sequential ones: in a
+    #   ``map { nsdfg { map { nsdfg { 2 states } } } }`` chain the inner
+    #   nesting is multistate, and flattening it exposes a fresh
+    #   single-state nesting that an already-converged ``InlineSDFG``
+    #   fixpoint would never revisit -- leaving the maps buried and
+    #   unfuseable.
     # * ``RemoveViews`` (PR #2335) -- folds View access nodes into the
     #   viewed array's address map: composing the view edge memlet's
     #   affine mapping into every downstream memlet (and Python
@@ -152,10 +160,63 @@ def _structural_cleanup(label: str) -> List[Tuple[str, ppl.Pass]]:
     #   form.
     # * ``EmptyStateElimination`` -- drop empty states left behind.
     return [(label, PatternMatchAndApplyRepeated([StateFusionExtended()])),
-            (label, PatternMatchAndApplyRepeated([InlineMultistateSDFG()])),
-            (label, PatternMatchAndApplyRepeated([InlineSDFG()])), (label, RemoveViews()),
+            (label, PatternMatchAndApplyRepeated([InlineMultistateSDFG(), InlineSDFG()])), (label, RemoveViews()),
             (label, CleanAccessNodeToScalarSliceToTaskletPattern()),
             (label, CleanTaskletToScalarSliceToAccessNodePattern()), (label, EmptyStateElimination())]
+
+
+def _coalesce() -> List[Tuple[str, ppl.Pass]]:
+    """Graph preparation for maximal map fusion, run after the first ``LoopToMap``.
+
+    Two maps fuse only if they share a state, so everything that keeps states
+    apart has to go first. The recipe removes each blocker in turn, cheapest
+    and most-enabling first, because every removal exposes work for the next:
+
+    1. ``CascadeInterstateEdgeAssignmentsUp`` -- an assignment-bearing
+       interstate edge blocks ``StateFusionExtended``. Sifting the assignments
+       towards the graph entry frees the edges between the compute states.
+       This must re-run *here*: the earlier invocations are all pre-parallelize,
+       and ``InlineMultistateSDFG`` lifts fresh assignments into the top-level
+       region every time it flattens a lowered map body.
+    2. ``EmptyStateElimination`` -- splices out the empty states left between
+       them, merging the assignments the cascade could not lift onto the bypass
+       edge (rather than letting a single assignment pin two maps apart).
+    3. ``TrivialMapElimination`` -- a single-iteration map is not a parallel
+       scope, only a wrapper; dropping it lifts its body to the top level where
+       it can fuse with its neighbours.
+    4. ``EmptyLoopElimination`` -- the loops those rewrites empty out.
+    5. ``MoveIfIntoMap`` -- a guard *outside* a map keeps it in its own
+       ``ConditionalBlock``, unreachable for fusion; pushing the guard in
+       co-locates the map with its siblings. (``ConditionFusion``, later, only
+       merges guards that are already adjacent -- it cannot push one inward.)
+    6. structural cleanup -- fuse the states the steps above just freed and
+       inline the nestings, so the maps genuinely share a state.
+    7. ``MinimizeStridePermutation`` then ``MapCollapse`` -- BEFORE fusing, in
+       that order, for two separate reasons. The permuter only walks chains of
+       single-parameter maps (``_collect_perfect_nest`` breaks on a multi-param
+       map and ``_reorder_nest`` needs two levels), so collapsing first would
+       hide every nest it exists to reorder. And collapsing before fusing is
+       what keeps differently-parallel statements apart: an N-dimensional map
+       no longer matches a sibling 1-D map for horizontal fusion, so a parallel
+       ``map[i, j]`` beside a carried ``map i: { loop j }`` survives instead of
+       being re-merged into one mixed-parallelism map.
+    8. ``MapFusionVertical`` / ``MapFusionHorizontal`` -- the payoff.
+    9. ``MapCollapse`` again -- fusion can leave a freshly-perfect nest; folding
+       it to one N-dimensional map is the canonical fully-parallel form.
+
+    :returns: ``(stage_label, pass)`` pairs for the phase, in order.
+    """
+    s: List[Tuple[str, ppl.Pass]] = [('coalesce', CascadeInterstateEdgeAssignmentsUp()),
+                                     ('coalesce', EmptyStateElimination()),
+                                     ('coalesce', PatternMatchAndApplyRepeated([TrivialMapElimination()])),
+                                     ('coalesce', EmptyLoopElimination()),
+                                     ('coalesce', PatternMatchAndApplyRepeated([MoveIfIntoMap()]))]
+    s += _structural_cleanup('coalesce')
+    s += [('coalesce', MinimizeStridePermutation())]
+    s += [('coalesce', PatternMatchAndApplyRepeated([MapCollapse()]))]
+    s += [('coalesce', PatternMatchAndApplyRepeated([MapFusionVertical(), MapFusionHorizontal()]))]
+    s += [('coalesce', PatternMatchAndApplyRepeated([MapCollapse()]))]
+    return s
 
 
 @properties.make_properties
@@ -179,6 +240,13 @@ class _PrivatizeScalarsStage(ppl.Pass):
     def depends_on(self):
         return set()
 
+    def privatizer(self) -> ppl.Pipeline:
+        """The privatization pipeline this stage adapts.
+
+        :returns: The self-resolving ``Pipeline`` to apply.
+        """
+        return PrivatizeScalars()
+
     def apply_pass(self, sdfg: SDFG, _pipeline_results: Dict[str, Any]) -> Optional[Any]:
         # ``PrivatizeScalars`` resolves a ``FindAccessNodes`` analysis (keyed by
         # ``cfg_id``) and a reachability analysis that calls ``reset_cfg_list`` mid-
@@ -186,7 +254,24 @@ class _PrivatizeScalarsStage(ppl.Pass):
         # then lets that reset reassign ``cfg_id`` under the cached ``FindAccessNodes``
         # result -> ``KeyError``. Refresh the list up front so both analyses agree.
         sdfg.reset_cfg_list()
-        return PrivatizeScalars().apply_pass(sdfg, {})
+        return self.privatizer().apply_pass(sdfg, {})
+
+
+@properties.make_properties
+class _PrivatizeArraysStage(_PrivatizeScalarsStage):
+    """Array sibling of :class:`_PrivatizeScalarsStage`, paired with it everywhere it runs.
+
+    A transient ARRAY reused as a per-iteration scratch buffer carries the same false
+    write/write dependence as a reused scalar, so it needs privatizing at the same points of
+    the recipe. The difference is the premise: versioning per dominating write is only
+    value-preserving when that write is a must-def of the WHOLE container, which is free for a
+    scalar and a proof obligation for an array. ``ArrayWriteShadowScopes`` discharges it and
+    reports nothing it cannot prove, so the scalar path never becomes a fallback for an
+    unproven array.
+    """
+
+    def privatizer(self) -> ppl.Pipeline:
+        return PrivatizeArrays()
 
 
 # Per-target knob presets. ``canonicalize(..., target='cpu'|'gpu')`` picks one
@@ -482,6 +567,15 @@ def _build_stages(unroll_limit: int = DEFAULT_UNROLL_LIMIT,
     # bare loop -> MoveIfIntoLoop's clean single-loop path applies.
     s += [('lower', EmptyStateElimination())]
 
+    # NormalizeNegativeStride again, now that every map is a LoopRegion. The
+    # pass only ever rewrites LoopRegions, so the earlier 'clean' invocation
+    # reached the loops the frontend emitted but not the maps -- a negative-
+    # stride Map became a negative-stride loop here, after its only chance to
+    # be normalized. Downstream (RerollUnrolledLoops, LoopToScan's stride != 1
+    # refusal, LoopToMap's affine subset classifier) all run past this point
+    # and do rely on the positive-stride invariant.
+    s += [('lower', NormalizeNegativeStride())]
+
     # reroll: re-roll a hand-unrolled lane chain (a step-``S`` loop whose body is
     # ``m`` lanes at equally-spaced offsets ``{0, g, ..., (m-1)g}``) back to a
     # step-``g`` loop, so the lanes do not survive normalization as a strided
@@ -523,7 +617,7 @@ def _build_stages(unroll_limit: int = DEFAULT_UNROLL_LIMIT,
     # adapted (_PrivatizeScalarsStage) so its analysis dependencies resolve.
     s += [('reduce', PatternMatchAndApplyRepeated([TrivialTaskletElimination()])),
           ('reduce', PatternMatchAndApplyRepeated([WCRToAugAssign()])), ('reduce', _PrivatizeScalarsStage()),
-          ('reduce', SymbolPropagation()), ('reduce', ConstantPropagation())]
+          ('reduce', _PrivatizeArraysStage()), ('reduce', SymbolPropagation()), ('reduce', ConstantPropagation())]
     # UntileLoops (BEFORE ShortLoopUnroll): collapse manually-tiled two-level
     # nests (``for i in range(0, N, K): for ii in range(0, K): body[i+ii]`` or
     # ``for ii in range(i, i+K): body[ii]``) back to a single ``for k in
@@ -542,6 +636,14 @@ def _build_stages(unroll_limit: int = DEFAULT_UNROLL_LIMIT,
     # confuses later value analyses. Wrapped in a Pipeline so its
     # ``ScalarWriteShadowScopes`` analysis dependency is resolved.
     s += [('reduce', ppl.Pipeline([ScalarFission()]))]
+    # array fission, immediately after: the same false write/write dependence exists on a
+    # transient ARRAY reused as a per-iteration scratch buffer (``Tz = np.zeros(...)`` at the top
+    # of a loop body). Versioning it is only value-preserving when the dominating write covers the
+    # WHOLE array -- for a scalar that is free, for an array it is a proof obligation that
+    # ``ArrayWriteShadowScopes`` discharges; anything it cannot prove is left alone. Kept a
+    # separate stage rather than widening ``ScalarFission``, so the scalar path never becomes a
+    # fallback for an unproven array.
+    s += [('reduce', ppl.Pipeline([ArrayFission()]))]
     # PromoteConstantIndexAccess + BufferExpansion: both privatize loop-carried
     # false dependences that block ``LoopToMap``. PCIA promotes ``arr[c]``
     # constant-index slot writes-then-reads on a SHARED array to a per-iteration
@@ -566,16 +668,11 @@ def _build_stages(unroll_limit: int = DEFAULT_UNROLL_LIMIT,
     # Reduce PREP only (the loop-lifting LoopTo* passes moved AFTER fission +
     # LoopStridePermutation -- see 'loop_to_x' below -- so the pipeline shape is
     # LoopFission -> LoopStridePermutation -> LoopToX -> LoopToMap).
-    # PromoteConstInputs runs FIRST: a read-only integer scalar argument used
-    # purely for indexing (e.g. a loop-stride ``inc``) is a non-transient scalar
-    # the default promotion skips. Promoting it to a symbol -- and unwrapping the
-    # frontend's defensive ``k + dace.int64(inc)`` cast -- lets the following
-    # SimplifyPass collapse the secondary-IV update into a clean symbolic
+    # PromoteConstInputs runs FIRST so any promotable secondary-IV scalar becomes
+    # a symbol before the following SimplifyPass collapses the update into a clean
     # ``k := k + inc`` iedge, which InductionVariableSubstitution then closes to
-    # ``a[k + (i-1)*inc]`` so the strided argmax (TSVC s318) becomes liftable.
+    # ``a[k + (i-1)*inc]`` (the strided-argmax lift).
     _promote_const_inputs = ScalarToSymbolPromotion()
-    _promote_const_inputs.readonly_inputs = True
-    _promote_const_inputs.unwrap_integer_casts = True
     s += [('reduce', _promote_const_inputs), ('reduce', SimplifyPass()), ('reduce', HoistInductionVariableUpdates()),
           ('reduce', InductionVariableSubstitution()), ('reduce', MaterializeLoopExitSymbols()),
           ('reduce', LoopInvariantCodeMotion()), ('reduce', SimplifyPass())]
@@ -622,10 +719,11 @@ def _build_stages(unroll_limit: int = DEFAULT_UNROLL_LIMIT,
     # Re-prep the freshly-unblocked loops: peel/break-antidep PROBE mappability with
     # the prep recipe but only APPLY the peel / snapshot-rename, so the peeled
     # remainder (and any body-assigned range symbol the peel introduced) still needs
-    # scalar fission + symbol/constant propagation -- the same prep the reduce stage
-    # ran -- before LoopToMap can map it. Only runs when a knob is enabled.
+    # scalar + array fission and symbol/constant propagation -- the same prep the reduce
+    # stage ran -- before LoopToMap can map it. Only runs when a knob is enabled.
     if peel_limit > 0 or break_anti_dependence:
-        s += [('peel', _PrivatizeScalarsStage()), ('peel', SymbolPropagation()), ('peel', ConstantPropagation())]
+        s += [('peel', _PrivatizeScalarsStage()), ('peel', _PrivatizeArraysStage()), ('peel', SymbolPropagation()),
+              ('peel', ConstantPropagation())]
 
     # move_if_into_loop: push guarding conditionals into loop bodies. The genuine
     # inner imperfect nest (a bare tasklet beside an inner loop) takes the
@@ -655,6 +753,21 @@ def _build_stages(unroll_limit: int = DEFAULT_UNROLL_LIMIT,
     if break_anti_dependence:
         s += [('fission', BreakAntiDependence())]
     s += [('fission', PerfectLoopNesting()), ('fission', _uniq_fis)]
+
+    # untrivialize: splice out the single-iteration trivial-loop scaffold (the
+    # wrappers MoveIfIntoLoop put around bare siblings) *while still a LoopRegion*,
+    # before LoopToMap turns it into a sticky NestedSDFG.
+    #
+    # Runs HERE, right after fission, not just before LoopToMap: every matcher
+    # between this point and LoopToMap expects a loop body to be one SDFGState
+    # and refuses a body that is a LoopRegion. ``LoopStridePermutation``'s
+    # ``_perfect_nests`` would absorb the wrapper as a real nest level and
+    # bubble it as if it were an axis; ``AssignmentAndCopyKernelToMemsetAndMemcpy``
+    # and the ``LoopTo*`` lifts refuse outright on ``not isinstance(blocks[0],
+    # SDFGState)``. Leaving the scaffold in place through those stages silently
+    # disabled them. Fission runs first because ``PerfectLoopNesting`` needs the
+    # uniform all-siblings-are-loops shape the scaffold provides.
+    s += [('untrivialize', PatternMatchAndApplyRepeated([TrivialLoopElimination()]))]
 
     # normalize: dropped from the pipeline. ``NormalizeLoopsAndMaps`` rewrites
     # ``for i in b:e:s`` into ``for j in 0:(e-b)//s:1`` with body
@@ -726,11 +839,6 @@ def _build_stages(unroll_limit: int = DEFAULT_UNROLL_LIMIT,
     s += [('loop_to_x', LoopToEinsum()), ('loop_to_x', LoopToReduce()),
           ('loop_to_x', LoopToScan(interchange_carry_with_map=interchange_carry_with_map)), ('loop_to_x', ArgMaxLift()),
           ('loop_to_x', LoopToConditionalReduce())]
-
-    # untrivialize: splice out the single-iteration trivial-loop scaffold (the
-    # wrappers MoveIfIntoLoop put around bare siblings) *while still a LoopRegion*,
-    # before LoopToMap turns it into a sticky NestedSDFG.
-    s += [('untrivialize', PatternMatchAndApplyRepeated([TrivialLoopElimination()]))]
 
     # cascade_iedges_up (pre-parallelize): re-run after fission / normalize rewrite
     # the CFG; MUST precede LoopToMap. Re-unique the iterators (ssa) so the
@@ -808,7 +916,8 @@ def _build_stages(unroll_limit: int = DEFAULT_UNROLL_LIMIT,
         # transient so the downstream structural cleanup's same-name candidate
         # list is short -- defence-in-depth for the StateFusionExtended same-
         # name writer-merge guard.
-        s += [('reduction_to_wcr_map', _PrivatizeScalarsStage())]
+        s += [('reduction_to_wcr_map', _PrivatizeScalarsStage()),
+              ('reduction_to_wcr_map', _PrivatizeArraysStage())]
         s += _structural_cleanup('reduction_to_wcr_map')
 
     # scatter: ``ScatterToGuardedMaps`` inserts a runtime ``IntegerSort + WCR-summed
@@ -831,6 +940,10 @@ def _build_stages(unroll_limit: int = DEFAULT_UNROLL_LIMIT,
     # cleanup (state fusion + inline SDFG) -- after LoopToMap.
     s += [('post_l2m', InsertAssignTaskletsAtMapBoundary())]
     s += _structural_cleanup('post_l2m')
+
+    # coalesce: prepare the graph for maximal map fusion now that the DOALL
+    # loops have become maps -- see ``_coalesce`` for the per-step rationale.
+    s += _coalesce()
 
     # loop_fuse (post-parallelize recovery): every DOALL loop is now a Map, so the
     # remaining LoopRegions are exactly the sequential residue LoopToMap refused.
@@ -966,8 +1079,7 @@ def _build_stages(unroll_limit: int = DEFAULT_UNROLL_LIMIT,
     # licm: hoist loop-invariant code (after LoopToMap, on maps).
     s += [('licm', LoopInvariantCodeMotion())]
 
-    # hoist_guards (terminal): hoist any still-invariant guard out past every
-    # enclosing loop (all-or-nothing upward, ``require_full_hoist=True``). Run
+    # hoist_guards (terminal): hoist any still-invariant guard outward. Run
     # AFTER fuse -- the dual ``MoveIfIntoLoop`` (prep stage) has already pushed
     # guards in to enable sibling fusion, so a terminal hoist of a guard that
     # is STILL invariant w.r.t. the whole remaining loop nest does not undo
@@ -975,7 +1087,16 @@ def _build_stages(unroll_limit: int = DEFAULT_UNROLL_LIMIT,
     # 1``, cloudsc ``IWARMRAIN`` etc.) to the cheapest scope. MoveLoopInvariantIfUp's
     # dead-outside-branch match lifts past per-iteration iedge assignments
     # (``start = jb // 4``), which stay in the now-guarded loop body.
-    s += [('hoist_guards', MoveLoopInvariantIfUp(require_full_hoist=True))]
+    #
+    # Target-gated. On CPU a guard is hoisted as far as it will go: every level
+    # it clears removes a re-evaluation from an enclosing iteration, and a guard
+    # that stalls partway is still strictly cheaper than one left innermost. On
+    # GPU a partial hoist is not a win but a hazard -- a guard stalled between
+    # two levels of a map chain splits the nest at that level, so what would
+    # have been one kernel becomes a branch around several launches. There the
+    # hoist is all-or-nothing (``require_full_hoist``): take it only when the
+    # guard clears the complete chain and the whole nest stays one kernel.
+    s += [('hoist_guards', MoveLoopInvariantIfUp(require_full_hoist=(target == 'gpu')))]
 
     # By this point fully-parallel guarded nests are collapsed maps, so the
     # surviving invariant guard sits inside a map body (not a loop) where
@@ -984,7 +1105,10 @@ def _build_stages(unroll_limit: int = DEFAULT_UNROLL_LIMIT,
     # depend on the map parameters is lifted out of the map, one map copy per
     # branch (``map[i, j]: { if c: A else B }`` -> ``if c: { map[i, j]: A } else
     # { map[i, j]: B }``), so each branch is a clean unconditional parallel map.
-    s += [('hoist_guards', MoveMapInvariantIfUp())]
+    # Same target gate as the loop-side hoist above: on GPU a guard that stalls
+    # between two levels of a map chain splits the nest there, so take the
+    # hoist only when it clears the whole chain and the nest stays one kernel.
+    s += [('hoist_guards', MoveMapInvariantIfUp(require_full_hoist=(target == 'gpu')))]
 
     # normalize_wcr: WCR edges sourced from a Tasklet/NestedSDFG get an intermediate
     # private AccessNode inserted, so every WCR edge sources from an AccessNode (the
@@ -1113,6 +1237,9 @@ def _build_stages(unroll_limit: int = DEFAULT_UNROLL_LIMIT,
         s += [('end', AssumeSymbolConstraints())]
     else:
         s += [('end', SetSymbolNonnegativeAssumptions())]
+    # Normalize symbolic floor division last so no distributed floor expression reaches codegen.
+    s += [('end', NormalizeFloorDivision())]
+
     return s
 
 
@@ -1120,13 +1247,36 @@ def _build_stages(unroll_limit: int = DEFAULT_UNROLL_LIMIT,
 StageFactory = Callable[[], List[ppl.Pass]]
 
 
-def _stage_factory(label: str) -> StageFactory:
-    """Return a factory yielding fresh passes for the named stage.
+def _stage_runs() -> List[Tuple[str, int, int]]:
+    """Split the flat recipe into contiguous runs of one stage label.
 
-    :param label: The stage label to filter the recipe by.
-    :returns: A factory that builds that stage's passes in order.
+    A label may appear in several places in the recipe (``clean``,
+    ``cascade_iedges_up`` and ``peel`` all do). Grouping by label alone would
+    gather those separated occurrences at the position of the first one and so
+    reorder the recipe -- which silently breaks documented constraints, e.g.
+    ``LiftInv`` must run before ``LowerITEToFpFactor`` rewrites the identity
+    tasklet it matches on, but both are ``clean`` passes on opposite sides of
+    the ``lift_inv`` stage. Runs preserve the real order.
+
+    :returns: ``(label, start, stop)`` index ranges into the flat recipe.
     """
-    return lambda: [p for lbl, p in _build_stages() if lbl == label]
+    runs: List[List] = []
+    for i, (lbl, _p) in enumerate(_build_stages()):
+        if runs and runs[-1][0] == lbl and runs[-1][2] == i:
+            runs[-1][2] = i + 1
+        else:
+            runs.append([lbl, i, i + 1])
+    return [(lbl, a, b) for lbl, a, b in runs]
+
+
+def _stage_factory(start: int, stop: int) -> StageFactory:
+    """Return a factory yielding fresh passes for one run of the recipe.
+
+    :param start: Index of the run's first pass in the flat recipe.
+    :param stop: Index one past the run's last pass.
+    :returns: A factory that builds that run's passes in order.
+    """
+    return lambda: [p for _lbl, p in _build_stages()[start:stop]]
 
 
 #: Grouped view of :func:`_build_stages`: ``(label,
@@ -1135,8 +1285,8 @@ def _stage_factory(label: str) -> StageFactory:
 #: truth used by the pipeline; this view exists for callers that iterate
 #: stage-by-stage (``for name, factory in CANONICALIZE_STAGES:
 #: for unit in factory(): ...``).
-CANONICALIZE_STAGES: List[Tuple[str, StageFactory]] = [(label, _stage_factory(label))
-                                                       for label in dict.fromkeys(lbl for lbl, _ in _build_stages())]
+CANONICALIZE_STAGES: List[Tuple[str, StageFactory]] = [(label, _stage_factory(start, stop))
+                                                       for label, start, stop in _stage_runs()]
 
 
 def _assert_self_contained(unit: ppl.Pass):
@@ -1200,14 +1350,14 @@ class CanonicalizationPipeline(ppl.Pass):
 
     CATEGORY: str = 'Canonicalization'
 
-    validate = properties.Property(dtype=bool, default=False, desc='Validate the SDFG at the end.')
+    validate = properties.Property(dtype=bool, default=True, desc='Validate the SDFG at the end.')
     validate_all = properties.Property(
         dtype=bool,
-        default=False,
-        desc='Validate the SDFG after EVERY stage (a debugging bisect aid: it pinpoints which stage '
-        'produced an invalid SDFG). Off by default -- the final ``validate`` still catches an invalid '
-        'result, and re-validating the whole SDFG after each of ~140 stages is a large cost on a big '
-        'kernel (channel_flow: ~45s). Set True while debugging a pass regression.')
+        default=True,
+        desc='Validate the SDFG after EVERY stage that reported a modification, which pinpoints the '
+        'stage that produced an invalid SDFG instead of only catching it at the end. Affordable by '
+        'default because it is scoped: a stage returning None is skipped, and a Pipeline validates '
+        'its own sub-passes rather than re-walking the whole SDFG here. Set False to skip it.')
     unroll_limit = properties.Property(dtype=int,
                                        default=DEFAULT_UNROLL_LIMIT,
                                        desc='Unroll constant-trip loops <= this many iterations (0 disables).')
@@ -1266,8 +1416,8 @@ class CanonicalizationPipeline(ppl.Pass):
         'tile vectorizer refuses WCR inside a body NSDFG and lifts reductions itself.')
 
     def __init__(self,
-                 validate: bool = False,
-                 validate_all: bool = False,
+                 validate: bool = True,
+                 validate_all: bool = True,
                  unroll_limit: int = DEFAULT_UNROLL_LIMIT,
                  peel_limit: Optional[int] = None,
                  break_anti_dependence: Optional[bool] = None,
@@ -1353,8 +1503,15 @@ class CanonicalizationPipeline(ppl.Pass):
                                reduction_to_wcr_map=self.reduction_to_wcr_map)
         for _label, unit in stages:
             _assert_self_contained(unit)
-            unit.apply_pass(sdfg, {})
-            if self.validate_all:
+            # A Pipeline validates its own members when asked, so scope validation to the
+            # sub-pass that actually changed something instead of re-walking the whole SDFG here.
+            is_pipeline = isinstance(unit, ppl.Pipeline)
+            if self.validate_all and is_pipeline:
+                unit.validate_subpasses = True
+            result = unit.apply_pass(sdfg, {})
+            # apply_pass returns non-None iff it modified the SDFG, so an unchanged SDFG needs no
+            # re-validation -- that is what makes validate_all affordable by default.
+            if self.validate_all and result is not None and not is_pipeline:
                 sdfg.validate()
         if self.validate:
             sdfg.validate()
@@ -1363,7 +1520,7 @@ class CanonicalizationPipeline(ppl.Pass):
 
 def canonicalize(sdfg: SDFG,
                  validate: bool = True,
-                 validate_all: bool = False,
+                 validate_all: bool = True,
                  unroll_limit: int = DEFAULT_UNROLL_LIMIT,
                  peel_limit: Optional[int] = None,
                  break_anti_dependence: Optional[bool] = None,

@@ -5,6 +5,7 @@ import ast
 from copy import deepcopy as dcpy
 import dace
 import functools
+import numpy
 import platform
 import dace.serialize
 import dace.library
@@ -290,7 +291,15 @@ class ExpandReducePureSequentialDim(pm.ExpandTransformation):
         nstate.add_memlet_path(r, ome, ime, t, dst_conn='b', memlet=inmm)
         nstate.add_memlet_path(accread, ime, t, dst_conn='a', memlet=dace.Memlet('acc[0]'))
         nstate.add_memlet_path(t, imx, accwrite, src_conn='o', memlet=dace.Memlet('acc[0]', wcr=node.wcr))
-        nstate.add_memlet_path(accwrite, omx, w, memlet=outm)
+        if nsdfg.arrays['acc'].dtype == nsdfg.arrays['_out'].dtype:
+            nstate.add_memlet_path(accwrite, omx, w, memlet=outm)
+        else:
+            # The accumulator keeps the input type so partial results are not truncated; a
+            # mixed-type reduction (summing an integer array into a real) then needs a tasklet to
+            # carry the cast, since an access-to-access edge copies raw bytes.
+            cast = nstate.add_tasklet('store', {'a'}, {'o'}, 'o = a')
+            nstate.add_edge(accwrite, None, cast, 'a', dace.Memlet('acc[0]'))
+            nstate.add_memlet_path(cast, omx, w, src_conn='o', memlet=outm)
 
         # Rename outer connectors and add to node
         inedge._dst_conn = '_in'
@@ -304,6 +313,70 @@ class ExpandReducePureSequentialDim(pm.ExpandTransformation):
         return nsdfg
 
 
+def stage_gpu_reduction_output(node: 'Reduce', state: SDFGState, sdfg: SDFG):
+    """Route a GPU reduction whose destination is not device-resident through a device transient.
+
+    The device expansions write through a device pointer, so a host destination -- typically a
+    scalar reduced over every axis -- reaches codegen as an illegal copy. Reduce into a one-element
+    GPU_Global transient instead and let the edge out of it lower to the device-to-host copy.
+    """
+    outedge = state.out_edges(node)[0]
+    desc = sdfg.arrays[outedge.data.data]
+    if desc.storage in (dtypes.StorageType.GPU_Global, dtypes.StorageType.GPU_Shared):
+        return
+
+    name, _ = sdfg.add_array(f'{node.label}_gpu_out', [1],
+                             desc.dtype,
+                             storage=dtypes.StorageType.GPU_Global,
+                             transient=True,
+                             find_new_name=True)
+    staged = state.add_access(name)
+    state.add_edge(node, outedge.src_conn, staged, None, dace.Memlet(f'{name}[0:1]'))
+    state.add_edge(staged, None, outedge.dst, outedge.dst_conn, dcpy(outedge.data))
+    state.remove_edge(outedge)
+
+
+@dace.library.expansion
+class ExpandReduceAuto(pm.ExpandTransformation):
+    """
+        Dispatches to one of the existing expansions based on the node's schedule, which
+        ``set_default_schedule_and_storage_types`` assigns before expansion:
+
+        * ``Sequential`` (the node is nested in a parallel map) -> the sequential accumulator,
+          whose combination order is fixed and therefore independent of the thread count. It needs
+          an identity to seed the accumulator, so a node without one goes the parallel way.
+        * a GPU schedule -> ``ExpandReduceGPUAuto``, which plans the device schedule itself and
+          falls back to the pure expansion when it cannot.
+        * anything else, including a schedule nobody inferred -> OpenMP, which emits a real
+          ``reduction()`` clause instead of a per-element atomic. It reassociates, so it is not
+          reproducible across thread counts; that is the accepted cost of a parallel reduction.
+    """
+    environments = []
+
+    @staticmethod
+    def expansion(node: 'Reduce', state: SDFGState, sdfg: SDFG):
+        ExpandReduceAuto.environments = []
+        if node.schedule == dtypes.ScheduleType.Sequential and node.identity is not None:
+            return ExpandReducePureSequentialDim.expansion(node, state, sdfg)
+        if node.schedule in dtypes.GPU_SCHEDULES:
+            stage_gpu_reduction_output(node, state, sdfg)
+            expanded = ExpandReduceGPUAuto.expansion(node, state, sdfg)
+            # The GPU expansion picks its own environments when it delegates to CUB
+            ExpandReduceAuto.environments = list(ExpandReduceGPUAuto.environments)
+            return expanded
+        return ExpandReduceOpenMP.expansion(node, state, sdfg)
+
+
+#: Connector names for the OpenMP reduce tasklet.  Deliberately NOT the ``_in`` / ``_out`` that the
+#: other expansions use: those return a nested SDFG or a library node, both of which validation
+#: exempts from the connector-vs-array-name check, whereas this expansion drops a bare Tasklet into
+#: the parent state.  A tasklet connector that collides with an array in the same SDFG is rejected --
+#: and ``AllNode`` / ``AnyNode`` declare exactly such an ``_out`` array, since that is their own
+#: output connector name.
+_IN = '_reduce_in'
+_OUT = '_reduce_out'
+
+
 @dace.library.expansion
 class ExpandReduceOpenMP(pm.ExpandTransformation):
     """
@@ -311,9 +384,23 @@ class ExpandReduceOpenMP(pm.ExpandTransformation):
     """
     environments = []
 
+    #: ReductionType -> (OpenMP reduction-identifier, loop-body expression).
+    #:
+    #: Every identifier here is one OpenMP actually accepts: the grammar is
+    #: ``+ - * & | ^ && || min max``. ``Sub``'s ``-`` is valid but deprecated in
+    #: OpenMP 5.0; note its combiner is a SUM of the per-thread negated copies,
+    #: giving ``initial - sum(x)``.
+    #:
+    #: ``Div`` is absent on purpose -- ``/`` is not in the grammar and
+    #: ``reduction(/: x)`` is rejected for every type, ``float`` included. It is
+    #: handled by ``DIV_ACCUMULATOR`` below instead of being emitted directly.
     _REDUCTION_TYPE_TO_OPENMP = {
-        dtypes.ReductionType.Max: ('max', '{o} = max({o}, {i});'),
-        dtypes.ReductionType.Min: ('min', '{o} = min({o}, {i});'),
+        # The clause identifier stays lower-case (``reduction(min: ...)`` is the OpenMP spelling);
+        # the BODY calls the runtime's variadic ``Min`` / ``Max`` from ``pyinterop.h``, which is what
+        # codegen emits for min/max elsewhere.  Bare ``min`` / ``max`` do not resolve to a function
+        # in the generated scope, so this only compiled while OpenMP was not the default expansion.
+        dtypes.ReductionType.Max: ('max', '{o} = Max({o}, {i});'),
+        dtypes.ReductionType.Min: ('min', '{o} = Min({o}, {i});'),
         dtypes.ReductionType.Sum: ('+', '{o} += {i};'),
         dtypes.ReductionType.Product: ('*', '{o} *= {i};'),
         dtypes.ReductionType.Bitwise_And: ('&', '{o} &= {i};'),
@@ -322,8 +409,35 @@ class ExpandReduceOpenMP(pm.ExpandTransformation):
         dtypes.ReductionType.Logical_Or: ('||', '{o} = {o} || {i};'),
         dtypes.ReductionType.Bitwise_Xor: ('^', '{o} ^= {i};'),
         dtypes.ReductionType.Sub: ('-', '{o} -= {i};'),
-        dtypes.ReductionType.Div: ('/', '{o} /= {i};'),
     }
+
+    #: Reductions with no direct OpenMP identifier that are still parallelizable by
+    #: accumulating an associative operation and applying the real one once at the end.
+    #:
+    #: Division is neither associative nor commutative, so ``reduction(/: x)`` cannot
+    #: exist -- but ``a / b / c / d == a / (b * c * d)``, and the sequential meaning of
+    #: a Div Reduce node is exactly ``out = initial; for x: out /= x``, i.e.
+    #: ``out = initial / prod(x)``. So reduce the divisors with ``*`` into a local
+    #: accumulator and divide once. Maps ReductionType -> (accumulator identity,
+    #: OpenMP identifier used to accumulate, body expression, final application).
+    #:
+    #: This rounds once per multiply rather than once per divide, and the product can
+    #: overflow where repeated division would not; both are inherent to parallelizing a
+    #: non-associative operation and match what the sequential form converges to.
+    DIV_ACCUMULATOR = {
+        dtypes.ReductionType.Div: ('1', '*', '{a} *= {i};', '{o} = {o} / {a};'),
+    }
+
+    #: Bitwise reductions are integer-only. C++ has no ``&`` / ``|`` / ``^`` on a
+    #: floating-point operand, and OpenMP rejects those identifiers for ``float`` and
+    #: ``double`` as well ("user defined reduction not found"). Reaching codegen with
+    #: this combination produced a confusing C++ error at build time, so it is refused
+    #: up front instead.
+    BITWISE_REDUCTIONS = (
+        dtypes.ReductionType.Bitwise_And,
+        dtypes.ReductionType.Bitwise_Or,
+        dtypes.ReductionType.Bitwise_Xor,
+    )
 
     @staticmethod
     def expansion(node: 'Reduce', state: SDFGState, sdfg: SDFG):
@@ -344,10 +458,29 @@ class ExpandReduceOpenMP(pm.ExpandTransformation):
 
         # Get reduction type for OpenMP
         redtype = detect_reduction_type(node.wcr, openmp=True)
-        if redtype not in ExpandReduceOpenMP._REDUCTION_TYPE_TO_OPENMP:
-            warnings.warn('Reduction type not supported for "%s"' % node.wcr)
-            return ExpandReducePure.expansion(node, state, sdfg)
-        omptype, expr = ExpandReduceOpenMP._REDUCTION_TYPE_TO_OPENMP[redtype]
+
+        # A bitwise reduction over a floating-point (or complex) dtype has no meaning in
+        # C++ and no OpenMP reduction identifier. Refuse loudly here: falling through to
+        # the pure expansion only moves the same invalid ``&``/``|``/``^`` on a float into
+        # a tasklet, and emitting the pragma produced "user defined reduction not found"
+        # from the C++ compiler with no hint of the real cause.
+        if redtype in ExpandReduceOpenMP.BITWISE_REDUCTIONS:
+            elemtype = sdfg.arrays[outedge.data.data].dtype
+            if not numpy.issubdtype(elemtype.type, numpy.integer) and elemtype != dtypes.bool_:
+                raise ValueError('Bitwise reduction "%s" is not defined for non-integral data type %s '
+                                 '(reducing into "%s"). Bitwise operators do not exist for floating-point '
+                                 'or complex operands in C++, and OpenMP has no reduction for them either. '
+                                 'Use a logical reduction (&&, ||) or an integer dtype.' %
+                                 (node.wcr, elemtype, outedge.data.data))
+
+        div_accum = ExpandReduceOpenMP.DIV_ACCUMULATOR.get(redtype)
+        if div_accum is None:
+            if redtype not in ExpandReduceOpenMP._REDUCTION_TYPE_TO_OPENMP:
+                warnings.warn('Reduction type not supported for "%s"' % node.wcr)
+                return ExpandReducePure.expansion(node, state, sdfg)
+            omptype, expr = ExpandReduceOpenMP._REDUCTION_TYPE_TO_OPENMP[redtype]
+        else:
+            accum_identity, omptype, expr, apply_expr = div_accum
 
         # Standardize axes
         axes = node.axes if node.axes is not None else [i for i in range(input_dims)]
@@ -379,15 +512,24 @@ class ExpandReduceOpenMP(pm.ExpandTransformation):
         else:
             out_offset.append('0')
 
-        outexpr = '_out[%s]' % ' + '.join(out_offset)
+        outexpr = '%s[%s]' % (_OUT, ' + '.join(out_offset))
 
         # Write identity value first
         if node.identity is not None:
             code += '%s = %s;\n' % (outexpr, sym2cpp(node.identity))
 
+        # For a Div reduction the clause target is a local product accumulator rather than
+        # the output element; the output is divided by it once, after the loops. Declared
+        # inside the output loops (when there are any) so each output element gets its own.
+        if div_accum is None:
+            clause_target = outexpr
+        else:
+            clause_target = '_red_acc'
+            code += '%s %s = %s;\n' % (output_data.dtype.ctype, clause_target, accum_identity)
+
         # Reduction OpenMP clause (``collapse(1)`` is the no-op default, so drop it for a single axis)
         code += ('#pragma omp parallel for ' + collapse_clause(len(axes)) +
-                 'reduction({rtype}: {oexpr})\n'.format(rtype=omptype, oexpr=outexpr))
+                 'reduction({rtype}: {oexpr})\n'.format(rtype=omptype, oexpr=clause_target))
 
         # Reduction loops
         for i, axis in enumerate(sorted(axes)):
@@ -409,25 +551,31 @@ class ExpandReduceOpenMP(pm.ExpandTransformation):
         in_offset = ' + '.join(in_offset)
 
         # Reduction expression
-        code += expr.format(i='_in[%s]' % in_offset, o=outexpr)
+        code += expr.format(i='%s[%s]' % (_IN, in_offset), o=outexpr, a=clause_target)
         code += '\n'
 
         # Closing braces
         code += '}\n' * len(axes)
+
+        # Apply the accumulated value once (Div: divide the output by the product of the
+        # divisors). Inside the output loops, after the reduction loops have closed.
+        if div_accum is not None:
+            code += apply_expr.format(o=outexpr, a=clause_target) + '\n'
+
         if outer_loops:
             code += '}\n' * output_dims
 
         # Make tasklet
-        tnode = dace.nodes.Tasklet('reduce', {'_in': dace.pointer(input_data.dtype)},
-                                   {'_out': dace.pointer(output_data.dtype)},
+        tnode = dace.nodes.Tasklet('reduce', {_IN: dace.pointer(input_data.dtype)},
+                                   {_OUT: dace.pointer(output_data.dtype)},
                                    code,
                                    language=dace.Language.CPP)
 
         # Rename outer connectors and add to node
-        inedge._dst_conn = '_in'
-        outedge._src_conn = '_out'
-        node.add_in_connector('_in')
-        node.add_out_connector('_out')
+        inedge._dst_conn = _IN
+        outedge._src_conn = _OUT
+        node.add_in_connector(_IN)
+        node.add_out_connector(_OUT)
 
         return tnode
 
@@ -1715,6 +1863,7 @@ class Reduce(dace.sdfg.nodes.LibraryNode):
 
     # Global properties
     implementations = {
+        'auto': ExpandReduceAuto,
         'pure': ExpandReducePure,
         'pure-seq': ExpandReducePureSequentialDim,
         'OpenMP': ExpandReduceOpenMP,
@@ -1728,7 +1877,7 @@ class Reduce(dace.sdfg.nodes.LibraryNode):
         # 'CUDA (warp allreduce)': ExpandReduceCUDAWarpAll
     }
 
-    default_implementation = 'pure'
+    default_implementation = 'auto'
 
     # Properties
     axes = ListProperty(element_type=int, allow_none=True)

@@ -38,6 +38,9 @@ except (subprocess.CalledProcessError, OSError, IndexError, ValueError):
     # Any failure in getting the CMake version counts as "not found"
     pass
 
+# Ninja generates the build for generated code (see dace/codegen/compiler.py). Any version will do.
+ninja_requires = [] if shutil.which('ninja') else ['ninja']
+
 with open("README.md", "r") as fp:
     long_description = fp.read()
 
@@ -68,8 +71,9 @@ setup(
     },
     include_package_data=True,
     install_requires=[
-        'numpy', 'ml_dtypes', 'networkx >= 2.5, <= 3.5', 'astunparse', 'sympy >= 1.9', 'pyyaml', 'ply', 'fparser >= 0.1.3, != 0.2.3',
-        'dill', 'pyreadline;platform_system=="Windows"', 'packaging', 'typing-extensions'
+        'numpy', 'networkx >= 2.5, <= 3.5', 'astunparse', 'sympy >= 1.9', 'pyyaml', 'ply', 'fparser >= 0.1.3, != 0.2.3',
+        'dill', 'pyreadline;platform_system=="Windows"', 'packaging', 'typing-extensions', 'ml_dtypes',
+        'ordered-set >= 4.0.0'
     ] + cmake_requires,
     extras_require={
         'ml': ['onnx', 'torch', 'onnxsim', 'onnxscript', 'onnxruntime', 'protobuf', 'ninja'],
@@ -94,6 +98,7 @@ setup(
         ],
         'docs': ['jinja2<3.2.0', 'sphinx-autodoc-typehints', 'sphinx-rtd-theme>=0.5.1'],
         'linting': ['pre-commit==4.1.0', 'yapf==0.43.0'],
+        'fastgraph': ['rustworkx'],
     },
     entry_points={
         'console_scripts': [

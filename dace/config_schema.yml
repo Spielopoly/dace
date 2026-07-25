@@ -109,6 +109,30 @@ required:
                     When an exception is raised in a transformation "can_be_applied"
                     function, if True the exception is raised further. Otherwise
                     the exception is printed as a warning.
+
+            canonicalization:
+                type: dict
+                title: Canonicalization pipeline defaults
+                description: >
+                    Default limits for the canonicalization / parallelization loop
+                    passes. Each seeds the matching pass Property default (read once
+                    at import); an explicit constructor argument still overrides.
+                required:
+                    unroll_limit:
+                        type: int
+                        default: 8
+                        title: Short-loop unroll limit
+                        description: >
+                            Fully unroll constant-trip loops with at most this many
+                            iterations (0 disables). Seeds ``ShortLoopUnroll.unroll_limit``.
+
+                    peel_limit:
+                        type: int
+                        default: 8
+                        title: Best-effort loop peel limit
+                        description: >
+                            Bounds the wrapping-modulo peel to 1..peel_limit iterations
+                            (0 disables). Seeds ``BestEffortLoopPeeling.peel_limit``.
     compiler:
         type: dict
         title: Compiler
@@ -170,6 +194,15 @@ required:
                 description: >
                     Number of spaces used when indenting generated code.
 
+            command_cache:
+                type: bool
+                default: true
+                title: Replay a recorded build instead of running CMake
+                description: >
+                    Record the first build of a shape (``ninja -t compdb``) and replay its commands
+                    for later SDFGs, skipping CMake. An optimization: a missing or mismatched entry
+                    falls back to a full build.
+
             build_type:
                 type: str
                 default: Release
@@ -193,26 +226,60 @@ required:
                     Linux-only and CUDA-only for GPU (no HIP); it errors clearly on
                     anything it cannot resolve without cmake.
 
+            precompiled_header:
+                type: bool
+                default: true
+                title: Precompile the DaCe runtime header
+                description: >
+                    Precompile ``<dace/dace.h>`` once per (compiler, flags) into a
+                    machine-global cache and force-include it into generated host
+                    sources. The runtime umbrella header is most of the compile time
+                    of a small kernel, so this roughly halves it -- but only because
+                    the result is cached across SDFGs: building the header costs more
+                    than it saves for a single translation unit.
+
+                    Purely an optimization. If the cached header does not match the
+                    flags a translation unit is compiled with, the compiler ignores it
+                    and compiles normally, producing the same object.
+
+                    The cache lives in ``/dev/shm`` (falling back to the user cache
+                    directory); override the root with ``DACE_BUILD_CACHE_DIR``.
+
+            configure_cache:
+                type: bool
+                default: true
+                title: Reuse CMake configure results across builds
+                description: >
+                    Seed each fresh build folder with the CMake compiler/ABI detection
+                    and ``find_package`` results of an earlier build configured the
+                    same way, instead of rediscovering them for every SDFG. Turns a
+                    full configure into a reconfigure.
+
+                    Purely an optimization: with no cached entry, or a stale one, CMake
+                    simply does the full job again. Shares ``DACE_BUILD_CACHE_DIR``
+                    with ``precompiled_header``. Applies to ``build_mode: cmake``.
+
+            static_archive:
+                type: bool
+                default: false
+                title: Also emit a static archive
+                description: >
+                    When true, the build additionally emits ``lib<name>.a`` (the
+                    compiled object files archived with ``ar rcs``) next to the
+                    runnable ``lib<name>.so``. The ``.so`` is untouched -- the SDFG
+                    still loads and runs exactly as before -- so this only ADDS an
+                    artifact. Used to link an offloaded loop-nest into a parent
+                    SDFG's shared library as a static member instead of a second
+                    dlopen. Off by default; supported in both ``native`` and
+                    ``cmake`` build modes.
+
             build_jobs:
                 type: int
                 default: 4
                 title: Parallel compile jobs for the CMake build
                 description: >
-                    How many source files the CMake build may compile concurrently
-                    (passed as ``cmake --build . --parallel <N>``). Applies to
-                    ``build_mode: cmake``.
-
-                    Deliberately a SMALL default rather than the core count: builds
-                    often share a machine, and each concurrent C++ compile of a
-                    generated file can take a lot of memory, so an unbounded build is
-                    a good way to run a box out of RAM. Raise it on a machine you own.
-
-                    This is what makes
-                    ``compiler.cpu.codegen_params.split_nsdfg_translation_units``
-                    pay off: that knob turns one huge translation unit into several,
-                    and this one lets them compile at the same time. With the Ninja
-                    generator (used automatically when ``ninja`` is on PATH) the bound
-                    is also what keeps Ninja from defaulting to every core.
+                    Translation units compiled concurrently. Small by default: builds share
+                    machines, and each generated-source compile can use a lot of memory.
 
             allow_shadowing:
                 type: bool
@@ -346,9 +413,13 @@ required:
                     args:
                         type: str
                         title: Arguments
-                        description: Compiler argument flags
-                        default: '-fPIC -Wall -Wextra -march=native -ffast-math -Wno-unused-parameter -Wno-unused-label'
-                        default_Windows: '/O2 /fp:fast /arch:AVX2 /D_USRDLL /D_WINDLL /D__restrict__=__restrict'
+                        description: >
+                            Flags on top of the build type; no ``-O`` (that comes from
+                            ``compiler.build_type``). ``default_<family>`` applies for that
+                            host compiler, since nvc++ rejects several switches below.
+                        default: '-fPIC -Wall -Wextra -march=native -fno-math-errno -fno-trapping-math -fno-signed-zeros -freciprocal-math -Wno-unused-parameter -Wno-unused-label'
+                        default_nvhpc: '-fPIC -Wall -Wextra -march=native -fno-signed-zeros -Mfprelaxed=recip -Wno-unused-parameter'
+                        default_Windows: '/fp:precise /arch:AVX2 /D_USRDLL /D_WINDLL /D__restrict__=__restrict'
 
                     libs:
                         type: str
@@ -365,9 +436,21 @@ required:
                             generate "#pragma omp parallel sections" code around
                             them.
 
+                    parallel_transfer_min_elements:
+                        type: int
+                        default: 1024
+                        title: Parallel copy/memset element threshold
+                        description: >
+                            A contiguous CPU copy or memset (CopyLibraryNode /
+                            MemsetLibraryNode) whose element count is a compile-time
+                            constant at or above this value expands to an OpenMP element
+                            map (parallel across threads at top level); a smaller -- or a
+                            symbolic, unknown-at-compile-time -- size expands to a single
+                            std::memcpy / std::memset.
+
                     implementation:
                         type: str
-                        default: legacy
+                        default: experimental_readable
                         title: CPU code generator implementation
                         description: >
                             Selects the CPU code generator. ``legacy`` uses the classic
@@ -518,6 +601,65 @@ required:
                                     both generators: every split path is gated on this key, so when it
                                     is off the nest bodies are written inline into the single frame
                                     ``.cpp`` exactly as before.
+                            external_translation_units:
+                                type: bool
+                                default: false
+                                title: Emit each top-level GPU nest as its own standalone SDFG + translation unit
+                                description: >
+                                    Applies to: legacy AND experimental cuda backends.
+
+                                    Model 2 of the per-translation-unit split, for GPU. Where
+                                    ``split_nsdfg_translation_units`` relocates a CPU-only nest's function
+                                    into its own ``.cpp`` (still one codegen pass, one ``.cu`` for the whole
+                                    program), THIS key lifts each top-level nest that contains GPU work into a
+                                    STANDALONE SDFG that is code-generated on its OWN -- a separate codegen
+                                    pass, hence its OWN ``.cu`` with only that nest's kernels. Both cuda
+                                    generators emit exactly one ``.cu`` per generate_code invocation, so one
+                                    ``.cu`` per top-level GPU kernel is only reachable this way; it needs no
+                                    change to either cuda backend.
+
+                                    The parent calls each child through the child SDFG's PUBLIC extern-C
+                                    handle ABI -- ``__dace_init_<child>`` / ``__program_<child>`` /
+                                    ``__dace_exit_<child>`` -- forward-declared and resolved in-binary by the
+                                    static linker (the same one-``.so`` contract as
+                                    ``split_nsdfg_translation_units``; NOT a separate library, NOT
+                                    ``dlopen``). Device pointers are passed straight through: parent and
+                                    child share the process's CUDA context, so a device allocation is valid
+                                    across the call.
+
+                                    DEPTH 1: a child is generated with this key forced off, so a nest inside
+                                    a child is not itself lifted again.
+
+                                    Default ``false`` reproduces today's output byte-identically: the lift
+                                    and the recursive per-child codegen are both gated on this key.
+                            inline_full_array_nsdfg:
+                                type: bool
+                                default: false
+                                title: Inline a full-array nested SDFG as a __restrict__ pointer alias
+                                description: >
+                                    Applies to: legacy AND experimental_readable.
+
+                                    A nested SDFG (e.g. an outlined map nest) is normally emitted as its own
+                                    C++ function that the parent calls with the connector arrays as
+                                    arguments. When this key is on, a nested SDFG whose EVERY connector binds
+                                    a WHOLE outer array -- full range, offset 0, and the nested array has the
+                                    same shape and strides -- is instead emitted INLINE at the call site: no
+                                    function, no argument marshaling, just one pointer alias per connector,
+
+                                        T* __restrict__ <connector> = <outer array>;
+
+                                    (and nothing at all when the connector already has the same name as the
+                                    outer array). ``__restrict__`` records that the alias does not overlap the
+                                    other connectors -- the no-alias hint the function-argument form gets for
+                                    free -- so the optimizer keeps vectorizing across the (now inlined) body.
+
+                                    Only whole-array connectors qualify: a sub-range needs offset/stride math,
+                                    a scalar is passed by value, and a WCR output must go through the atomic
+                                    resolve path -- each of those keeps the function form. Because it inlines,
+                                    it shares ``inline_sdfgs``' constraint that a nested transient must not
+                                    shadow a name already live in the parent scope.
+
+                                    Default ``false`` keeps the function form, byte-identical to today.
                             index_fn_qualifier:
                                 type: str
                                 default: inline_constexpr
@@ -723,7 +865,7 @@ required:
                                     backend sinks a dead declaration to first use regardless.
                             scalar_init_style:
                                 type: str
-                                default: fused
+                                default: split
                                 title: Mutable scalar declaration / first-write fusion
                                 description: >
                                     Applies to: experimental_readable ONLY (legacy always declares a scope
@@ -776,8 +918,8 @@ required:
                                     ``off`` skips it, so every such transient stays a mutable buffer filled
                                     at runtime.
 
-                                    NOTE the default is ``on``, not ``off`` as with ``ssa_loop_scalars``:
-                                    this pass ALREADY runs today, so ``on`` is what reproduces today's
+                                    NOTE the default is ``on``: this pass ALREADY runs today, so ``on``
+                                    is what reproduces today's
                                     output byte-for-byte. The key exists to take it OUT, which is what
                                     makes the readable generator's two const forms separable from the rest
                                     of the group when sweeping -- a compile-time fill (``constexpr T x[N] =
@@ -791,27 +933,89 @@ required:
                                     a promise to the backend whose value is not fixed -- it can unlock
                                     constant folding and hoisting, or merely bloat the initializer.
 
-                            ssa_loop_scalars:
+                                    The ``const T x = expr;`` binding follows the same emission-time rule
+                                    as ``scalar_init_style = fused`` below: a binding folded into a tasklet
+                                    that turns out to need its own ``{ ... }`` block would be scoped to that
+                                    block and invisible to later readers, so a candidate whose writing
+                                    tasklet is braced falls back to a plain ``T x;`` line immediately ahead
+                                    of that tasklet, with the write kept inside.
+
+                            explicit_copy:
                                 type: str
-                                default: 'off'
-                                title: Single-assignment versioning of reassigned scope scalars
+                                default: 'on'
+                                title: Lower implicit copies through explicit CopyLibraryNodes
                                 description: >
                                     Applies to: experimental_readable ONLY (this runs an SDFG rewrite
                                     inside the readable-generator pipeline in ``codegen.py``; legacy never
                                     enters that block, so its output stays byte-identical for every value).
 
-                                    Whether a transient scalar that is REASSIGNED several times in a scope
-                                    / loop nest is versioned into single-assignment names before codegen:
-                                    ``off`` (the default) leaves it as one mutable variable; ``on`` runs
-                                    the existing :class:`~dace.transformation.passes.scalar_fission.
-                                    PrivatizeScalars` (``ScalarFission``) pass so each dominating write
-                                    becomes its own container (``nx``, ``nx_0``, ``nx_1`` ...), each
-                                    written exactly once. A single-assignment version is then a write-once
-                                    value, which ``MarkConstInit`` marks and the generator emits as
-                                    ``const T nx_0 = expr;`` -- shorter live ranges and a ``const`` per
-                                    version. This is a semantics-preserving SSA renaming (the same pass
-                                    ``simplify`` uses to unblock ``LoopToMap``), applied here purely for
-                                    the readable form; ``off`` reproduces today's output byte-for-byte.
+                                    Whether an implicit copy is lifted to an explicit
+                                    :class:`~dace.libraries.standard.nodes.copy_node.CopyLibraryNode`
+                                    before emission: ``on`` (the default) runs
+                                    :class:`~dace.transformation.passes.insert_explicit_copies.InsertExplicitCopies`
+                                    and then expands the nodes it inserted; ``off`` leaves every copy to the
+                                    generator's implicit path.
+
+                                    WHY IT IS ON. The implicit path emits the ``dace::CopyND`` template for
+                                    the general case. Going through the library node lets ``ExpandAuto``
+                                    pick per copy instead: a single-element copy becomes a plain ``=``
+                                    tasklet and a contiguous same-layout multi-element copy becomes
+                                    ``std::memcpy`` -- both faster than instantiating ``dace::CopyND``, and
+                                    the readable generator then inlines the ``=`` tasklet's connectors like
+                                    any other. Only a GPU_Shared copy still needs ``dace::CopyND``.
+
+                                    NOTE this default DEVIATES from the rule the rest of this group follows,
+                                    that a new key's default reproduces today's output: the pass does NOT
+                                    run in ``codegen.py`` today, so ``on`` deliberately CHANGES the readable
+                                    generator's output. That is the point of the key, and it is safe to do
+                                    here because the deviation is bounded by the ``Applies to`` line above --
+                                    the absolute invariant is that LEGACY stays byte-identical, and gating
+                                    this inside the readable-only block keeps it so for both values. Set
+                                    ``off`` to recover the readable generator's previous copy lowering.
+
+                                    The pass itself is shared, and its other callers
+                                    (``transformation/layout/prepare.py``, the GPU-specialization pipeline)
+                                    need the ``CopyLibraryNode`` LEFT UNEXPANDED -- ``RewriteCopyForLayout``
+                                    rewrites it to a ``TensorTranspose``. So the expansion belongs to this
+                                    key's block in ``codegen.py``, not to the pass.
+
+                            scalar_emission_type:
+                                type: str
+                                default: scalar
+                                title: Normalize single-value transients to Scalar or length-1 Array
+                                description: >
+                                    Applies to: experimental_readable ONLY (this runs an SDFG rewrite
+                                    inside the readable-generator pipeline in ``codegen.py``; legacy never
+                                    enters that block, so its output stays byte-identical for every value).
+
+                                    Which C++ form a single-value TRANSIENT is emitted in: a by-value
+                                    ``Scalar`` (``T x;``) or a length-1 ``Array`` (``T x[1];``, indexed
+                                    ``x[0]``). A frontend leaves a mix of both; this normalizes it.
+
+                                    ``scalar`` (the default) is the readable form: a single value reads as
+                                    ``x``, not ``x[0]``. ``keep`` runs neither conversion, so the
+                                    descriptors and the emitted code are byte-identical to the legacy
+                                    generator's -- use it to bisect a suspected scalarization
+                                    regression. ``scalar`` runs
+                                    :class:`~dace.transformation.passes.length_one_array_scalar_conversion.
+                                    ConvertLengthOneArraysToScalars` to turn every length-1 array into a
+                                    Scalar; ``len1_array`` runs the inverse
+                                    :class:`~dace.transformation.passes.length_one_array_scalar_conversion.
+                                    ConvertScalarsToLengthOneArrays`.
+
+                                    BOTH conversions are ``transient_only`` -- a non-transient descriptor is
+                                    part of the SDFG signature (the caller binds a Python scalar to a
+                                    ``Scalar`` and a 1-element buffer to an ``Array``), so rewriting it would
+                                    change the call contract. The signature is therefore never touched.
+
+                                    ``scalar`` additionally CHAINS
+                                    :class:`~dace.transformation.passes.promote_gpu_scalars_to_arrays.
+                                    PromoteGPUScalarsToArrays` after the scalarization: a GPU kernel output
+                                    (a length-1 array in GPU_Global storage, or one written by a device
+                                    map's exit) is scalarized by the first pass but immediately widened back
+                                    to a length-1 array by the second, because a by-value Scalar cannot live
+                                    in device global memory. So GPU kernel outputs stay length-1 arrays under
+                                    every value of this key; only host-side transients become Scalars.
 
             #############################################
             # GPU (CUDA/HIP) compiler
@@ -836,15 +1040,19 @@ required:
                     args:
                         type: str
                         title: nvcc Arguments
-                        description: Compiler argument flags for CUDA
-                        default: '-lineinfo -Xcompiler -march=native --use_fast_math -Xcompiler -Wno-unused-parameter'
-                        default_Windows: '-O3 --use_fast_math'
+                        description: >
+                            nvcc flags on top of the build type; no ``-O`` (that comes from
+                            ``compiler.build_type``).
+                        default: '-lineinfo -Xcompiler -march=native -Xcompiler -fno-math-errno -Xcompiler -fno-trapping-math -Xcompiler -fno-signed-zeros -Xcompiler -freciprocal-math -Xcompiler -Wno-unused-parameter'
+                        default_Windows: ''
 
                     hip_args:
                         type: str
                         title: hipcc Arguments
-                        description: Compiler argument flags for HIP
-                        default: '-fPIC -O3 -ffast-math -Wno-unused-parameter'
+                        description: >
+                            hipcc flags on top of the build type; no ``-O`` (that comes from
+                            ``compiler.build_type``).
+                        default: '-fPIC -fno-math-errno -fno-trapping-math -fno-signed-zeros -freciprocal-math -Wno-unused-parameter'
 
                     cuda_arch:
                         type: str
@@ -1170,7 +1378,8 @@ required:
                         title: Enable vectorization check
                         default: false
                         description: >
-                            Enables analysis of gcc vectorization information. Only gcc/g++ is supported.
+                            Report which loops the compiler vectorized. Flag chosen per compiler in
+                            CMake; only GCC writes ``perf/vecreport.txt``, others use stderr.
 
     #############################################
     # Python frontend settings
@@ -1420,6 +1629,29 @@ required:
                 description: >
                     If False (default), saving an SDFG keeps only the modified non-default properties. If True,
                     saves all fields.
+
+    #############################################
+    # Graph backend
+
+    graph:
+        type: dict
+        title: Graph
+        description: Settings for DaCe's internal graph representation and algorithms.
+        required:
+            backend:
+                type: str
+                default: 'networkx'
+                title: Graph backend
+                description: >
+                    Backend used for DaCe's internal graph data structures and algorithms
+                    ('networkx' for the reference/safe implementation, or 'rustworkx' for
+                    an accelerated, opt-in implementation -- requires the 'fastgraph' extra).
+                    Applies uniformly: algorithm calls made through an SDFG's or state's
+                    '.nx'/'._nx' escape hatch are also accelerated under 'rustworkx' (via an
+                    on-the-fly, currently uncached conversion), except for the couple of
+                    algorithms rustworkx has no implementation of at all (transitive closure,
+                    max-flow/min-cut), which always use networkx regardless of this setting;
+                    see dace/graphlib for details.
 
     #############################################
     # DaCe library settings

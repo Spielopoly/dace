@@ -7,6 +7,7 @@ import numpy
 import pytest
 import ast
 from dace.transformation.passes.split_tasklets import SplitTasklets
+from dace.transformation.passes.canonicalize import canonicalize
 
 # Format: (expression, expected_num_statements_after_split)
 example_expressions = [
@@ -1067,7 +1068,109 @@ def test_split_function_call_intermediate_uses_operand_type():
         f"function-call intermediate not typed from its float32 operand: {split_dtypes}"
 
 
+def test_second_run_does_not_reuse_first_runs_split_scalars():
+    """A later run must not re-issue the earlier run's split-scalar names.
+
+    The names are ``<ssa_var>_split_<index>`` with the index restarting per run, so a second
+    run over the same SDFG used to hand an unrelated intermediate the first run's descriptor:
+    one register scalar aliased by two independent SSA values (here also with the wrong dtype,
+    and -- since the two live in different map scopes -- an outright codegen failure).
+    """
+    sdfg = dace.SDFG('split_rerun')
+    sdfg.add_array('a', [4], dace.float64)
+    sdfg.add_array('c', [4], dace.float64)
+    state = sdfg.add_state()
+    entry, exit_node = state.add_map('m', dict(i='0:4'))
+    tasklet = state.add_tasklet('t', {'inp'}, {'out'}, 'out = inp * 2.0 + 3.0')
+    state.add_memlet_path(state.add_access('a'), entry, tasklet, dst_conn='inp', memlet=dace.Memlet('a[i]'))
+    state.add_memlet_path(tasklet, exit_node, state.add_access('c'), src_conn='out', memlet=dace.Memlet('c[i]'))
+
+    SplitTasklets().apply_pass(sdfg, {})
+    first_run = {name for name in sdfg.arrays if SplitTasklets.tmp_access_identifier in name}
+    assert first_run, 'the first run is expected to introduce split scalars'
+
+    # A second splittable tasklet in the SAME state, over a different dtype -- exactly what the
+    # vectorizer produces after canonicalize has already run the pass once.
+    sdfg.add_array('ai', [4], dace.int64)
+    sdfg.add_array('ci', [4], dace.int64)
+    entry2, exit2 = state.add_map('m2', dict(j='0:4'))
+    tasklet2 = state.add_tasklet('t2', {'inp'}, {'out'}, 'out = inp * 2 + 3')
+    state.add_memlet_path(state.add_access('ai'), entry2, tasklet2, dst_conn='inp', memlet=dace.Memlet('ai[j]'))
+    state.add_memlet_path(tasklet2, exit2, state.add_access('ci'), src_conn='out', memlet=dace.Memlet('ci[j]'))
+
+    SplitTasklets().apply_pass(sdfg, {})
+    second_run = {name for name in sdfg.arrays if SplitTasklets.tmp_access_identifier in name} - first_run
+    assert second_run, 'the second run is expected to introduce split scalars of its own'
+
+    for name in first_run:
+        occurrences = [n for n in state.nodes() if isinstance(n, dace.nodes.AccessNode) and n.data == name]
+        assert len(occurrences) == 1, f'{name} reused by the second run: {len(occurrences)} access nodes'
+    for name in second_run:
+        assert sdfg.arrays[name].dtype == dace.int64, f'{name} inherited the first run dtype {sdfg.arrays[name].dtype}'
+
+    sdfg.validate()
+    a = numpy.arange(4, dtype=numpy.float64)
+    c = numpy.zeros(4, dtype=numpy.float64)
+    ai = numpy.arange(4, dtype=numpy.int64)
+    ci = numpy.zeros(4, dtype=numpy.int64)
+    sdfg(a=a, c=c, ai=ai, ci=ci)
+    assert numpy.allclose(c, a * 2.0 + 3.0)
+    assert numpy.array_equal(ci, ai * 2 + 3)
+
+
+#: Tasklet bodies the splitter must DECLINE: more than one statement, so lowering only the first
+#: would drop the rest. The annotated form is what the Fortran frontend emits for a typed local.
+declined_bodies = [
+    "_out: dace.float64\n_out = ((_in_a * _in_b) * _in_c)",
+    "_tmp = (_in_a * _in_b)\n_out = (_tmp * _in_c)",
+]
+
+
+@pytest.mark.parametrize("body", declined_bodies)
+def test_to_ssa_declines_multi_statement_body(body: str):
+    """``to_ssa`` reads a single statement, so a multi-statement body must return ``[]`` ("declined")
+    rather than the SSA of its first statement only -- which the caller would then substitute for the
+    WHOLE tasklet, silently dropping the remaining statements."""
+    from dace.transformation.passes.split_tasklets import to_ssa
+
+    assert to_ssa(body) == [], f"{body!r} must be declined, got {to_ssa(body)}"
+
+
+@pytest.mark.parametrize("body", declined_bodies)
+def test_split_keeps_tasklet_the_splitter_declines(body: str):
+    """A tasklet whose body ``to_ssa`` declines must be left INTACT.
+
+    Regression: ``apply_pass`` gated on ``len(ssa_statements) != 1``, which an empty list also
+    satisfies. The tasklet was removed (with all of its edges) and the rebuild loop then iterated
+    over nothing, so the tasklet vanished and every access node that fed only it was orphaned --
+    ``InvalidSDFGNodeError: Isolated node``. Seen on CloudSC (gpu_scc / multistep, canon_cpu and
+    canon_gpu) on a frontend tasklet whose body is a type annotation plus the assignment.
+    """
+    sdfg = dace.SDFG(f"declined_{abs(hash(body))}")
+    state = sdfg.add_state("main", is_start_block=True)
+    for name in ("_in_a", "_in_b", "_in_c", "_out"):
+        sdfg.add_array(f"{name}_ARR", shape=(1, ), dtype=dace.float64)
+    t = state.add_tasklet(name="declined", inputs={"_in_a", "_in_b", "_in_c"}, outputs={"_out"}, code=body)
+    for conn in ("_in_a", "_in_b", "_in_c"):
+        state.add_edge(state.add_access(f"{conn}_ARR"), None, t, conn, dace.Memlet(f"{conn}_ARR[0]"))
+    state.add_edge(t, "_out", state.add_access("_out_ARR"), None, dace.Memlet("_out_ARR[0]"))
+    sdfg.validate()
+
+    SplitTasklets().apply_pass(sdfg, {})
+
+    tasklets = [n for n in state.nodes() if isinstance(n, dace.nodes.Tasklet)]
+    assert len(tasklets) == 1, f"declined tasklet was rewritten into {[t.label for t in tasklets]}"
+    assert tasklets[0].code.as_string == body
+    # No source access node was orphaned.
+    for node in state.nodes():
+        assert state.in_degree(node) + state.out_degree(node) > 0, f"{node} was left isolated"
+    sdfg.validate()
+
+
 if __name__ == "__main__":
+    for _body in declined_bodies:
+        test_to_ssa_declines_multi_statement_body(_body)
+        test_split_keeps_tasklet_the_splitter_declines(_body)
     test_split_infers_complex_intermediate_with_int_symbol()
     test_split_function_call_intermediate_uses_operand_type()
     for _dt in [dace.float16, dace.int8, dace.uint8, dace.int16, dace.complex64]:
@@ -1178,3 +1281,58 @@ def test_split_anchors_symbol_only_substatement_into_map_scope():
         if isinstance(n, dace.nodes.Tasklet):
             assert state.in_degree(n) >= 1, f"sub-tasklet {n.label!r} has no incoming edge (floats outside map)"
             assert scope[n] is me, f"sub-tasklet {n.label!r} is not inside the map scope"
+
+
+def test_add_missing_symbols_honors_integer_cast():
+    """A scalar defined as ``dace.int64(<float expr>)`` (a whole-statement integer typecast,
+    e.g. the azimint_hist ``compute_bin`` histogram-bin index) gets lifted to an SDFG symbol by
+    ``SplitTasklets._add_missing_symbols`` when canonicalize's interstate-edge fission leaves it
+    undeclared. Every atom in ``<float expr>`` is float64, so the atom-priority dtype heuristic
+    (which always prefers float64 over int64) used to hand back a FLOAT-typed symbol despite the
+    explicit int64 cast wrapping the whole right-hand side. That symbol then reaches
+    ``min(int64_symbol, BINS - 1)`` as a histogram index: codegen emits ``Min(double, int64_t)``,
+    which trips the ``dace::Min`` static_assert (mixing floating-point and integer arguments) at
+    COMPILE time -- this is a compile-time regression, not just a numeric one.
+
+    Regression test for the ``compute_bin``/``histogram`` shape in
+    ``tests/corpus/npbench/map_reduce/azimint_hist.py``, reduced to its essentials: a
+    single-argument int64 cast of a float expression, called through a nested ``@dace.program``,
+    then min'd against an integer symbol and used to index+increment an array.
+    """
+    N = dace.symbol('N', dtype=dace.int64)
+    BINS = dace.symbol('BINS', dtype=dace.int64)
+
+    @dace.program
+    def _compute_bin(x: dace.float64, lo: dace.float64, hi: dace.float64):
+        return dace.int64(BINS * (x - lo) / (hi - lo))
+
+    @dace.program
+    def cast_min_index_kernel(a: dace.float64[N], lo: dace.float64, hi: dace.float64, hist: dace.int64[BINS]):
+        hist[:] = 0
+        for i in dace.map[0:N]:
+            b = min(_compute_bin(a[i], lo, hi, BINS=BINS), BINS - 1)
+            hist[b] += 1
+
+    n, bins = 200, 10
+    lo, hi = 0.0, 1.0
+    rng = numpy.random.default_rng(0)
+    a = rng.random(n)
+
+    sdfg = cast_min_index_kernel.to_sdfg(simplify=True)
+    canonicalize(sdfg, validate=True)
+
+    # The promoted symbol carrying the ``int64(...)`` cast must be integer-typed, not
+    # float64 -- this is the direct regression assertion (compilation below would also
+    # catch it, via the C++ static_assert, but this pins the root cause).
+    for nsdfg in sdfg.all_sdfgs_recursive():
+        for name, dtype in nsdfg.symbols.items():
+            if name.lower().startswith('int64_'):
+                assert dtype in dace.dtypes.INTEGER_TYPES, \
+                    f"symbol {name!r} promoted from an int64(...) cast has non-integer dtype {dtype}"
+
+    hist = numpy.zeros(bins, dtype=numpy.int64)
+    sdfg(a=a.copy(), lo=lo, hi=hi, hist=hist, N=n, BINS=bins)
+
+    idx = numpy.minimum((bins * (a - lo) / (hi - lo)).astype(numpy.int64), bins - 1)
+    ref = numpy.bincount(idx, minlength=bins).astype(numpy.int64)
+    assert numpy.array_equal(hist, ref), f"hist={hist} ref={ref}"

@@ -10,7 +10,7 @@ from dace.sdfg import nodes, graph as gr
 from dace.sdfg import utils as sdutil
 from dace.sdfg.propagation import propagate_memlets_state, propagate_subset
 from dace.sdfg.state import ConditionalBlock, LoopRegion
-from dace.symbolic import pystr_to_symbolic
+from dace.symbolic import int_floor, pystr_to_symbolic
 from dace.transformation import transformation, helpers
 from typing import List, Optional, Tuple
 
@@ -259,7 +259,31 @@ class MapFission(transformation.SingleStateTransformation):
                             if e.dst.data in not_subgraph:
                                 return False
 
+        if expr_index == 1 and not self.fission_makes_progress(total_components):
+            return False
+
         return True
+
+    @staticmethod
+    def fission_makes_progress(total_components) -> bool:
+        """Whether fissioning a nested SDFG would yield anything other than its input.
+
+        Fission replicates the map around each component. Two shapes produce no change, and both then
+        re-match on the result, so ``apply_transformations_repeated`` never reaches a fixpoint:
+
+        * NO component -- there is nothing to replicate the map around.
+        * exactly ONE component which is itself a nested SDFG. That is what
+          ``nest_sdfg_control_flow`` makes of a control-flow region, so apply rebuilds the same
+          map-around-nested-SDFG one nesting level deeper (TSVC s1119 renested ~490 times before
+          hitting the recursion limit).
+
+        One component of real dataflow is NOT this case: apply pushes the map inside, which is progress
+        and does not re-match.
+        """
+        flat = [component for components in total_components for component in components]
+        if not flat:
+            return False
+        return not (len(flat) == 1 and all(isinstance(n, nodes.NestedSDFG) for n in flat[0]))
 
     def apply(self, graph: sd.SDFGState, sdfg: sd.SDFG):
         map_entry = self.map_entry
@@ -283,11 +307,17 @@ class MapFission(transformation.SingleStateTransformation):
         outer_map: nodes.Map = map_entry.map
         # Border-transient extent equals the iteration count per dimension.
         # Memlets that index border transients are normalized to
-        # `(p - iMin) / step` so the squeezed array remains in-bounds for
-        # strided maps. Symbolic steps are assumed non-negative.
+        # `int_floor(p - iMin, step)` so the squeezed array remains in-bounds
+        # for strided maps. Symbolic steps are assumed non-negative.
+        # `/` would be RATIONAL division: sympy distributes `(p - 1)/2` into
+        # `p/2 - 1/2`, and the surviving `1/2` both makes the index non-integer
+        # (C: "array subscript is not an integer") and shifts it by half an
+        # element. int_floor stays integral and agrees on every iterated value.
         mapsize = outer_map.range.size()
-        squeezed_idx = [(pystr_to_symbolic(p) - iMin) / step
-                        for p, (iMin, _iMax, step) in zip(outer_map.params, outer_map.range.ranges)]
+        squeezed_idx = [
+            int_floor(pystr_to_symbolic(p) - iMin, step)
+            for p, (iMin, _iMax, step) in zip(outer_map.params, outer_map.range.ranges)
+        ]
 
         # Add new symbols from outer map to nested SDFG
         # Add new symbols also from the adjacent edge subsets and the data descriptors they carry.
@@ -303,13 +333,24 @@ class MapFission(transformation.SingleStateTransformation):
                     map_syms.update(edge.data.subset.free_symbols)
                 if edge.data.data in parent_sdfg.arrays:
                     map_syms.update(parent_sdfg.arrays[edge.data.data].free_symbols)
+            # Only symbols the ENCLOSING scope actually defines can be mapped in. A map parameter is
+            # scope-defined: it exists inside its own map and nowhere else, so once a map has been
+            # pushed into a nested SDFG its iterator must appear in neither the free symbols nor the
+            # symbol mapping of anything outside it. Mapping one anyway makes it free at the parent
+            # boundary, whose mapping nothing then fills in -- an invalid SDFG that MapFission
+            # re-creates on every reapplication (TSVC s1119: 491 applications, ~490 levels deep).
+            # Indexing symbols_defined_at directly also raised KeyError for exactly this case
+            # (TSVC s114: `KeyError: '_loop_it_0'`).
+            defined_at_node = graph.symbols_defined_at(nsdfg_node)
             for sym in map_syms:
                 symname = str(sym)
                 if symname in outer_map.params:
                     continue
                 if symname not in nsdfg_node.symbol_mapping.keys():
+                    if symname not in defined_at_node:
+                        continue
                     nsdfg_node.symbol_mapping[symname] = sym
-                    nsdfg_node.sdfg.symbols[symname] = graph.symbols_defined_at(nsdfg_node)[symname]
+                    nsdfg_node.sdfg.symbols[symname] = defined_at_node[symname]
 
             # Remove map symbols from nested mapping
             for name in outer_map.params:

@@ -8,7 +8,6 @@ overlapping-but-not-identical write sets unsupported (``NotImplementedError``).
 No ``ConditionalBlock`` remains afterwards.
 """
 import copy
-import re
 from typing import Dict, Optional, Set
 
 import dace
@@ -20,37 +19,11 @@ from dace.sdfg.construction_utils import (
 )
 from dace.sdfg.state import ConditionalBlock, ControlFlowRegion
 from dace.transformation import pass_pipeline as ppl
-from dace.transformation.passes.vectorization.same_write_set_if_else_to_ite_cfg import condition_guards_iteration_symbol
+from dace.transformation.passes.vectorization.same_write_set_if_else_to_ite_cfg import (
+    arm_accesses_are_in_range_unguarded, condition_guards_iteration_symbol)
 from dace.transformation.passes.vectorization.utils.symbolic_polymorphism import free_symbol_names
 
 
-def splice_condition_snapshot(cb: ConditionalBlock, cond_text: str, prefix: str) -> str:
-    """Snapshot ``cond_text`` into a fresh bool symbol evaluated BEFORE ``cb``.
-
-    Splices an empty state in front of ``cb`` whose outgoing interstate edge
-    assigns ``sym = (cond_text)``. Any serialization of an if/else into
-    sequential single-arm blocks must test the NEGATED arm against this
-    snapshot: re-evaluating the condition live after the if-arm ran is unsound
-    when the arm writes a condition operand (crc16's ``if c: crc = f(crc)``
-    followed by ``if not c: ...`` fired BOTH arms).
-
-    :param cb: The conditional block about to be serialized.
-    :param cond_text: The condition expression text.
-    :param prefix: Symbol-name prefix (e.g. ``"__bn"``).
-    :returns: The fresh symbol name.
-    """
-    parent = cb.parent_graph
-    sdfg = parent.sdfg
-    sym = sdfg.find_new_symbol(re.sub(r"\W", "_", f"{prefix}_{cb.label}"))
-    sdfg.add_symbol(sym, dace.bool_)
-    in_edges = list(parent.in_edges(cb))
-    snap = parent.add_state(f"{cb.label}_condsnap", is_start_block=(len(in_edges) == 0))
-    for ie in in_edges:
-        parent.remove_edge(ie)
-        parent.add_edge(ie.src, snap, ie.data)
-    parent.add_edge(snap, cb, dace.InterstateEdge(assignments={sym: f"({cond_text})"}))
-    parent.reset_cfg_list()
-    return sym
 
 
 def compute_arm_escape_writes(sdfg: dace.SDFG, cb: ConditionalBlock) -> Dict[int, Set[str]]:
@@ -379,29 +352,124 @@ class BranchNormalization(ppl.Pass):
             return True
         return len(self._substantive_states(body0)) != 1 or len(self._substantive_states(body1)) != 1
 
+    @staticmethod
+    def arm_written_arrays(cb: ConditionalBlock) -> Set[str]:
+        """Array names written anywhere inside any arm of ``cb``.
+
+        :param cb: conditional block whose arms are scanned.
+        :returns: set of written data names (transient and non-transient alike).
+        """
+        written: Set[str] = set()
+        for _cond, body in cb.branches:
+            if not isinstance(body, ControlFlowRegion):
+                continue
+            for blk in body.all_control_flow_blocks():
+                if isinstance(blk, dace.SDFGState):
+                    written |= blk.read_and_write_sets()[1]
+        return written
+
+    def representative_write_subset(self, cb: ConditionalBlock) -> Optional[str]:
+        """First element-write subset found in ``cb``'s arms, or ``None`` if there is none.
+
+        Only used to SIZE a lifted per-lane transient (the guard's own reads carry their own
+        captured subsets), so any one arm write is representative.
+
+        :param cb: conditional block whose arms are scanned.
+        :returns: printed subset string, or ``None``.
+        """
+        for _cond, body in cb.branches:
+            if not isinstance(body, ControlFlowRegion):
+                continue
+            for blk in body.all_control_flow_blocks():
+                if not isinstance(blk, dace.SDFGState):
+                    continue
+                write_subsets = self._collect_write_subsets(blk)
+                if write_subsets:
+                    return str(next(iter(write_subsets.values())))
+        return None
+
+    def freeze_guard_for_serialization(self, cb: ConditionalBlock, cond_text: str) -> Optional[str]:
+        """Guard expression that still holds when re-tested AFTER one arm has run.
+
+        Serializing ``if c: A else: B`` into ``if c: A`` then ``if not c: B`` re-evaluates
+        ``c`` once ``A`` has already executed. That is value-preserving only while no arm
+        writes data ``c`` reads. TSVC s2710's ``if a[i] > b[i]: a[i] = a[i] + b[i]*d[i]``
+        violates it: the second half re-reads the just-updated ``a``, so every lane whose
+        update flipped the comparison takes BOTH arms and the else-arm stores land on
+        if-arm lanes. Snapshot the guard instead — evaluate it once into a per-lane bool
+        transient in a state inserted before ``cb`` (dominating both halves, and written
+        nowhere else), and hand both halves a read of that transient.
+
+        :param cb: two-arm conditional about to be serialized.
+        :param cond_text: the if-arm condition as written.
+        :returns: guard text for both halves (``cond_text`` unchanged when no arm writes
+            guard-read data), or ``None`` when the guard cannot be snapshotted and
+            serializing would therefore be unsound.
+        """
+        from dace.transformation.passes.vectorization.same_write_set_if_else_to_ite_cfg import (
+            SameWriteSetIfElseToITECFG, )  # local import: avoids an import cycle at module load
+
+        local_sdfg: dace.SDFG = cb.sdfg
+        lifter = SameWriteSetIfElseToITECFG()
+        # The guard usually names interstate symbols staging element reads (``a_index = a[i]``);
+        # expand them so the array dependence is visible. Read-only — nothing is pruned here.
+        expanded, _ = lifter._inline_interstate_scalar_symbols(local_sdfg, cond_text, exclude=set())
+        try:
+            names = set(symbolic.arrays(expanded)) | set(symbolic.free_symbols_and_functions(expanded))
+        except Exception:  # noqa: BLE001 -- unparsable guard: no provable dependence, leave as-is
+            return cond_text
+        guard_arrays = {n for n in names if n in local_sdfg.arrays}
+        if not (guard_arrays & self.arm_written_arrays(cb)):
+            return cond_text
+        # A gather guard (``w[idx[i]] > 0``) has no memlet form, so it cannot be snapshotted;
+        # refuse the serialization rather than emit the re-read that miscompiles.
+        if lifter._has_nested_subscript(local_sdfg, expanded):
+            return None
+        subset_str = self.representative_write_subset(cb)
+        if subset_str is None:
+            return None
+
+        parent = cb.parent_graph
+        guard_state = parent.add_state_before(cb, label=f"{cb.label}_guard", is_start_block=parent.start_block is cb)
+        cond_name, _producer = self._resolve_arm_cond(local_sdfg, guard_state, cond_text, subset_str, skip_cb=cb)
+        if cond_name is None:
+            raise NotImplementedError(f"BranchNormalization: cannot snapshot the guard of {cb.label!r} "
+                                      f"({cond_text!r}) although its arms write {sorted(guard_arrays)}; "
+                                      f"serializing the arms would re-test a mutated guard")
+        parent.reset_cfg_list()
+        snapshot_subset = "0" if local_sdfg.arrays[cond_name].total_size == 1 else subset_str
+        return f"{cond_name}[{snapshot_subset}]"
+
     def _serialize_two_arm(self, cb: ConditionalBlock, cond0: CodeBlock, body0: ControlFlowRegion,
                            body1: ControlFlowRegion) -> bool:
         """Serialize ``if c: A else: B`` into ``if c: A`` then ``if not c: B``.
 
-        Pure CFG rewrite: ``cb`` keeps the if-arm; a new negated single-arm
+        Mostly a CFG rewrite: ``cb`` keeps the if-arm; a new negated single-arm
         block holds the else-arm, stitched sequentially after ``cb``. Later
-        cycles normalize each single-arm form. The negated block tests a
-        PRE-``cb`` snapshot of the condition (see
-        :func:`splice_condition_snapshot`): the if-arm may mutate a condition
-        operand, and re-evaluating live would then fire both arms.
+        cycles normalize each single-arm form. Exactly one arm's writes take
+        effect — identical to the original if/else — PROVIDED the guard still
+        reads what it read before ``cb``, which
+        :meth:`freeze_guard_for_serialization` guarantees.
 
         :param cb: two-arm conditional (becomes the if-arm only).
         :param cond0: if condition.
         :param body0: if-arm body (kept on ``cb``).
         :param body1: else-arm body (moved to the negated block).
-        :returns: ``True`` (always serializes).
+        :returns: ``True`` if serialized, ``False`` if the guard is not snapshottable.
         """
         parent = cb.parent_graph
         cond_text = cond0.as_string if isinstance(cond0, CodeBlock) else str(cond0)
-        snap_sym = splice_condition_snapshot(cb, cond_text, "__bn")
+        frozen = self.freeze_guard_for_serialization(cb, cond_text)
+        if frozen is None:
+            return False
         cb.remove_branch(body1)
+        if frozen != cond_text:
+            # The snapshot consumed the guard's interstate symbols, so cb's own condition
+            # must move to the transient too or it would name symbols that no longer exist.
+            cb.remove_branch(body0)
+            cb.add_branch(CodeBlock(frozen), body0)
         neg_block = ConditionalBlock(label=f"{cb.label}_negated", sdfg=parent.sdfg, parent=parent)
-        neg_block.add_branch(CodeBlock(f"not {snap_sym}"), body1)
+        neg_block.add_branch(CodeBlock(f"not ({frozen})"), body1)
         parent.add_node(neg_block)
         out_edges = list(parent.out_edges(cb))
         for oe in out_edges:
@@ -431,7 +499,7 @@ class BranchNormalization(ppl.Pass):
         # fabricate the out-of-range read (lane ``i = N-1`` reading ``a[N]``). Masking, not
         # if-conversion, is the correct lowering, so leave the block for the masking path -- the
         # same refusal SameWriteSetIfElseToITECFG applies before us (shared detector).
-        if condition_guards_iteration_symbol(cb):
+        if condition_guards_iteration_symbol(cb) and not arm_accesses_are_in_range_unguarded(cb):
             return False
         # Arm may be a linear chain: empty entry states + one substantive compute
         # state. Wholesale lift keeps structure, gates only escaping writes via ITE
@@ -448,8 +516,16 @@ class BranchNormalization(ppl.Pass):
             # Each assigned symbol must be arm-local (all reads inside body);
             # else the lift breaks downstream consumers.
             non_local = []
-            for sym in e.data.assignments.keys():
-                if not self._symbol_is_arm_local(local_sdfg_for_arm, body, sym):
+            for sym, rhs in e.data.assignments.items():
+                # AGENT FIX: a SELF-REFERENTIAL binding (``k = k + 1``) is a recurrence
+                # across arm EXECUTIONS. Every read may sit textually inside the arm
+                # (TSVC s343's compaction counter reads ``k`` only in ``k + 1`` and
+                # ``flat_2d_array[k]``, both in-arm) yet the value still crosses the
+                # enclosing loop's back edge, so an unconditional lift turns the
+                # compaction counter into a dense iteration counter.
+                if sym in symbolic.symbols_in_code(str(rhs)):
+                    non_local.append(sym)
+                elif not self._symbol_is_arm_local(local_sdfg_for_arm, body, sym):
                     non_local.append(sym)
             if non_local:
                 # Arm conditionally binds a symbol read OUTSIDE it (loop-carried
@@ -625,7 +701,7 @@ class BranchNormalization(ppl.Pass):
         # Refuse to even split an index-guarded ``if/else`` (see _normalize_single_arm): the
         # negated-else halves this produces would be flattened just the same, fabricating the
         # out-of-range read. Leave it whole for the masking path.
-        if condition_guards_iteration_symbol(cb):
+        if condition_guards_iteration_symbol(cb) and not arm_accesses_are_in_range_unguarded(cb):
             return False
         if len(body0.nodes()) != 1 or len(body1.nodes()) != 1:
             return False
@@ -652,27 +728,10 @@ class BranchNormalization(ppl.Pass):
                 f"write subsets {sorted(truly_overlapping)} that M3.1b did not normalize; this pass "
                 f"cannot flatten it without dropping or duplicating writes")
 
-        # Split into two single-arm conditionals: else-body -> new
-        # ``if not <snapshot>: body1`` block after ``cb`` (now if-arm only);
-        # later cycles rewrite each single-arm form. The negation tests a
-        # pre-``cb`` snapshot (splice_condition_snapshot): the if-arm may
-        # mutate a condition operand.
-        parent = cb.parent_graph
-        cond_text = cond0.as_string if isinstance(cond0, CodeBlock) else str(cond0)
-        snap_sym = splice_condition_snapshot(cb, cond_text, "__bn")
-        cb.remove_branch(body1)
-        neg_block = ConditionalBlock(label=f"{cb.label}_negated", sdfg=parent.sdfg, parent=parent)
-        neg_block.add_branch(CodeBlock(f"not {snap_sym}"), body1)
-        parent.add_node(neg_block)
-
-        # Rewire cb's out-edges to flow through neg_block.
-        out_edges = list(parent.out_edges(cb))
-        for oe in out_edges:
-            parent.remove_edge(oe)
-            parent.add_edge(neg_block, oe.dst, copy.deepcopy(oe.data))
-        parent.add_edge(cb, neg_block, dace.InterstateEdge())
-        parent.reset_cfg_list()
-        return True
+        # Split into two single-arm conditionals: else-body -> new ``if not cond0: body1``
+        # block after ``cb`` (now if-arm only); later cycles rewrite each single-arm form.
+        # Same serialization the asymmetric-arm path uses, guard snapshot included.
+        return self._serialize_two_arm(cb, cond0, body0, body1)
 
     def _collect_write_subsets(self, state: dace.SDFGState):
         from dace.transformation.passes.vectorization.utils.queries import collect_element_write_subsets
@@ -702,7 +761,7 @@ class BranchNormalization(ppl.Pass):
         :returns: ``(cond_array_name, cond_producer)``.
         """
         from dace.transformation.passes.vectorization.same_write_set_if_else_to_ite_cfg import (
-            SameWriteSetIfElseToITECFG, )  # noqa: avoid import cycle at module load
+            SameWriteSetIfElseToITECFG, )  # local import: avoids an import cycle at module load
         resolved = SameWriteSetIfElseToITECFG()._resolve_cond_to_array(sdfg,
                                                                        state,
                                                                        cond_text,

@@ -400,8 +400,8 @@ def no_strided_map_param_in_surviving_condition(sdfg: SDFG, K: int) -> Optional[
     :param K: number of tiled (innermost) dims.
     :returns: an error string, or ``None`` when the invariant holds.
     """
-    from dace.transformation.passes.vectorization.utils.map_predicates import (
-        map_body_has_tiled_param_dependent_branch)
+    from dace.transformation.passes.vectorization.utils.map_predicates import (map_body_has_tiled_param_dependent_branch
+                                                                               )
     for sd in sdfg.all_sdfgs_recursive():
         for state in sd.states():
             for node in state.nodes():

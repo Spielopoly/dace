@@ -87,6 +87,13 @@ from dace.sdfg import type_inference
 # We unparse those infinities to INFSTR.
 INFSTR = "1e" + repr(sys.float_info.max_10_exp + 1)
 
+#: Write-only conditional write: ``out = IT(cond, value)`` assigns ``value`` only where ``cond``
+#: holds and leaves ``out`` untouched otherwise. Sibling of the ``ITE(c, t, e)`` blend, but with
+#: NO else arm -- so it has no value to return when the predicate is false and cannot be a
+#: function like ``ITE`` (see ``runtime/include/dace/ITE.h``). It is unparsed as a guarded
+#: statement instead; see :meth:`CPPUnparser._conditional_write_parts`.
+CONDITIONAL_WRITE_FUNC = "IT"
+
 _py2c_nameconst = {True: "true", False: "false", None: "nullptr"}
 
 _py2c_reserved = {"True": "true", "False": "false", "None": "nullptr", "inf": "INFINITY", "nan": "NAN"}
@@ -116,6 +123,29 @@ def interleave(inter, f, seq, **kwargs):
         for x in seq:
             inter()
             f(x, **kwargs)
+
+
+def numeric_literal_value(node: ast.AST):
+    """The numeric value of a literal operand (``2``, ``2.5``, ``2.5j``) including a unary sign
+    (``-1.5``), or ``None`` if ``node`` is not one.
+
+    A negative literal reaches the unparser as ``UnaryOp(USub, Constant)`` rather than a signed
+    ``Constant``, so a caller inspecting ``ast.Constant`` alone misses exactly the negative half of
+    the cases. ``bool`` is excluded (an ``int`` subclass, but not a numeric literal here). Unlike
+    :func:`numeric_power_value` -- which serves the ``**`` lowering and is therefore real-only and
+    also folds ``abs`` / ``sqrt`` / dtype casts -- this recognizes COMPLEX literals and nothing but
+    literals.
+    """
+    if isinstance(node, ast.Constant):
+        if isinstance(node.value, bool):
+            return None
+        return node.value if isinstance(node.value, (int, float, complex)) else None
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+        inner = numeric_literal_value(node.operand)
+        if inner is None:
+            return None
+        return -inner if isinstance(node.op, ast.USub) else inner
+    return None
 
 
 def numeric_power_value(node: ast.AST):
@@ -354,6 +384,25 @@ class CPPUnparser:
     def _Assign(self, t):
         self.fill()
 
+        # ``out = IT(cond, value)`` -- the write-only conditional write. Unlike ``ITE(c, t, e)``
+        # this has NO else arm, so it cannot be a function: there is no value to return when the
+        # predicate is false, and the destination must keep whatever it already held. It is
+        # inherently a STATEMENT, so lower it as one -- exactly the guarded assignment the Python
+        # frontend emits for a masked assignment ``A[mask] = value``, and what the tile path turns
+        # into a masked ``TileStore``. Emitting it here makes ``IT`` a first-class primitive
+        # everywhere (like ``ITE``), so a masked write no longer has to stay tile-only.
+        conditional_write = self._conditional_write_parts(t)
+        if conditional_write is not None:
+            target, cond, value = conditional_write
+            self.write("if (")
+            self.dispatch(cond)
+            self.write(") { ")
+            self.dispatch(target)
+            self.write(" = ")
+            self.dispatch(value)
+            self.write("; }")
+            return
+
         # Handle the case of a tuple output
         if len(t.targets) > 1:
             self.dispatch_lhs_tuple(t.targets)
@@ -397,6 +446,37 @@ class CPPUnparser:
         self.dispatch(t.value)
         #self.dtype = inferred_type
         self.write(';')
+
+    def _conditional_write_parts(self, t):
+        """Match a lone ``<target> = IT(<cond>, <value>)`` assignment.
+
+        The target is never declared here, only assigned: ``IT`` writes a destination that already
+        exists -- a tasklet OUT connector declared by the tasklet preamble, or, once the write is a
+        dynamic memlet, the destination the connector was substituted with (a scalar the codegen
+        allocated at function scope). Declaring it under the guard (``if (c) { auto x = v; }``)
+        would scope it to the branch and leave the false path referring to nothing.
+
+        This deliberately does not verify that the target is declared. ``self.locals`` only tracks
+        declarations this unparser emitted, so it cannot see the function-scope allocation behind a
+        substituted connector -- and treating "unknown" as "do not lower" is not a safe fallback:
+        ``IT`` is not a C++ function, so anything that reaches the ordinary assignment path fails to
+        compile regardless. Lowering unconditionally turns a would-be ``'IT' was not declared``
+        error into correct code where the destination exists, and into a plain undeclared-identifier
+        error on the destination itself where it does not.
+
+        :param t: The ``ast.Assign`` node being unparsed.
+        :returns: ``(target, cond, value)`` AST nodes, or ``None`` if this is an ordinary assign.
+        """
+        value = t.value
+        if not (isinstance(value, ast.Call) and isinstance(value.func, ast.Name)
+                and value.func.id == CONDITIONAL_WRITE_FUNC and len(value.args) == 2):
+            return None
+        if len(t.targets) != 1:
+            return None
+        target = t.targets[0]
+        if not isinstance(target, (ast.Subscript, ast.Attribute, ast.Name)):
+            return None
+        return target, value.args[0], value.args[1]
 
     def _AugAssign(self, t):
         self.fill()
@@ -927,7 +1007,50 @@ class CPPUnparser:
     }
     funcops = {"FloorDiv": (" /", "dace::math::ifloor"), "MatMult": (",", "dace::gemm")}
 
+    #: Arithmetic ops folded over two complex literal operands (see _BinOp).
+    binop_lambda = {
+        'Add': (lambda a, b: a + b),
+        'Sub': (lambda a, b: a - b),
+        'Mult': (lambda a, b: a * b),
+        'Div': (lambda a, b: a / b),
+    }
+
+    def _complex_literal_fold(self, t) -> bool:
+        """Folds ``<num literal> op <num literal>`` into ONE constant when the result is complex,
+        dispatches it, and returns True; returns False to leave ``t`` to the general path.
+
+        A complex value round-trips through :func:`~dace.symbolic.symstr` as PYTHON source
+        (``1.5-2.5j``, ``-0-6.283185307179586j``), which re-parses here as arithmetic between a real
+        and an imaginary literal. Python's numeric tower promotes the real operand implicitly;
+        ``std::complex<T>`` does NOT -- its operators take exactly ``T`` or ``complex<T>``, so an
+        integer-valued real part emits ``0 - dace::complex128(0.0, 6.28)`` and fails to compile with
+        "no match for 'operator-' (operand types are 'int' and 'dace::complex128')" (stockham_fft).
+        Folding the pair back into the single complex it came from emits one well-typed
+        ``dace::complex128(re, im)`` construction, so no mixed-type arithmetic is generated at all.
+
+        Restricted to a complex RESULT: real literal arithmetic keeps its existing spelling.
+        """
+        op = t.op.__class__.__name__
+        if op not in self.binop_lambda:
+            return False
+        lv = numeric_literal_value(t.left)
+        rv = numeric_literal_value(t.right)
+        if lv is None or rv is None:
+            return False
+        if not isinstance(lv, complex) and not isinstance(rv, complex):
+            return False
+        try:
+            folded = self.binop_lambda[op](lv, rv)
+        except (ArithmeticError, ValueError):  # e.g. division by zero -- leave it to the general path
+            return False
+        self.dispatch(ast.Constant(value=folded))
+        return True
+
     def _BinOp(self, t):
+        # Two numeric literals whose result is complex fold to one complex constant, so that no
+        # int/complex mixed arithmetic (illegal for std::complex) is emitted.
+        if self._complex_literal_fold(t):
+            return
         # Operations that require a function call
         if t.op.__class__.__name__ in self.funcops:
             separator, func = self.funcops[t.op.__class__.__name__]
@@ -1245,6 +1368,29 @@ def cppunparse(node, expr_semicolon=True, locals=None, defined_symbols=None):
     strio = StringIO()
     CPPUnparser(node, 0, locals or CPPLocals(), strio, expr_semicolon=expr_semicolon, defined_symbols=defined_symbols)
     return strio.getvalue().strip()
+
+
+def cpp_assignment(target: str, value, defined_symbols=None) -> str:
+    """A C++ statement assigning ``value`` to the already-rendered ``target`` expression.
+
+    For callers that cannot go through :meth:`CPPUnparser._Assign` because the assignment target is
+    a C++ expression they built themselves (a pointer name, an array-interface subscript) rather
+    than a Python AST node -- codegen's dynamic-memlet writes, chiefly. Unparsing only the value
+    and gluing ``"%s = %s;"`` around it would lose every rewrite the assignment unparser performs,
+    of which the conditional write is one: ``IT(cond, v)`` is not a C++ function and must become a
+    guarded statement, so it has to be handled where the target is known.
+
+    :param target: The assignment destination, already rendered as C++.
+    :param value: The right-hand side, as a Python AST node.
+    :param defined_symbols: Symbols with known types, forwarded to the unparser.
+    :returns: The C++ statement, terminated with a semicolon.
+    """
+    if (isinstance(value, ast.Call) and isinstance(value.func, ast.Name) and value.func.id == CONDITIONAL_WRITE_FUNC
+            and len(value.args) == 2):
+        cond, written = value.args
+        return (f"if ({cppunparse(cond, expr_semicolon=False, defined_symbols=defined_symbols)}) "
+                f"{{ {target} = {cppunparse(written, expr_semicolon=False, defined_symbols=defined_symbols)}; }}")
+    return f"{target} = {cppunparse(value, expr_semicolon=False, defined_symbols=defined_symbols)};"
 
 
 # Code can either be a string or a function

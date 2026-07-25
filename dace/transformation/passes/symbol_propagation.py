@@ -56,6 +56,27 @@ def _mutated_scalar_names(sdfg: SDFG) -> Set[str]:
     return mutated
 
 
+def _is_array_access(value: Optional[str]) -> bool:
+    """True iff an assignment RHS reads a data container (``tbl[i]``) rather than being a
+    pure symbolic expression.
+
+    Such an RHS is never propagated. Two reasons, both load-bearing:
+
+    * parsing it through sympy turns ``tbl[i]`` into ``tbl(i)`` and loses the ``[`` that the
+      downstream filters key on;
+    * substituting it into a DESCRIPTOR makes the shape data-dependent -- spmv's ``vals`` becomes
+      ``A_indptr[i + 1] - A_indptr[i]`` instead of ``stop_0 - start_0``. A descriptor's shape must
+      be a function of SYMBOLS; a data read there is only evaluable where that container's pointer
+      happens to be in scope, so codegen cannot lift the extent (it emitted a free-standing
+      ``__tmp0_size(i)`` whose body named an out-of-scope ``A_indptr``). The kernel already stages
+      the bound through ``dc.define_local_scalar``; folding it back defeats exactly that.
+
+    :param value: The assignment RHS string, or ``None``.
+    :returns: Whether the RHS contains a subscripted data access.
+    """
+    return value is not None and ("[" in value or "]" in value)
+
+
 def _resolve(value, table: Dict[str, Any]):
     """Substitute known symbol values from ``table`` into an assignment RHS.
 
@@ -73,10 +94,8 @@ def _resolve(value, table: Dict[str, Any]):
     """
     if value is None:
         return None
-    # Leave array-access values (``tbl[i]``) untouched: parsing them through
-    # sympy would turn ``tbl[i]`` into ``tbl(i)`` and lose the ``[`` that the
-    # downstream filter uses to drop non-propagatable nested-array accesses.
-    if "[" in value or "]" in value:
+    # Leave array-access values (``tbl[i]``) untouched (see :func:`_is_array_access`).
+    if _is_array_access(value):
         return value
     try:
         expr = pystr_to_symbolic(value)
@@ -85,7 +104,7 @@ def _resolve(value, table: Dict[str, Any]):
             name = str(s)
             known = table.get(name)
             # Skip substituting array-access values for the same reason.
-            if known is not None and "[" not in known and "]" not in known:
+            if known is not None and not _is_array_access(known):
                 repl[s] = pystr_to_symbolic(known)
         if repl:
             expr = expr.subs(repl)
@@ -251,7 +270,14 @@ class SymbolPropagation(ppl.Pass):
                         bindings[lhs] = rhs
                     elif bindings[lhs] is not None and bindings[lhs] != rhs:
                         bindings[lhs] = None
-            safe_subs = {sym: rhs for sym, rhs in bindings.items() if rhs is not None}
+            # An array-access RHS is excluded here just as it is everywhere else in the pass: this
+            # substitution reaches into DESCRIPTORS, and a data read in a shape is not a legal
+            # descriptor (see :func:`_is_array_access`). The symbol stays live, which correctly
+            # pins its defining iedge instead of eliminating it.
+            safe_subs = {
+                sym: rhs
+                for sym, rhs in bindings.items() if rhs is not None and not _is_array_access(rhs)
+            }
 
             # Substitute every propagatable LHS into the SDFG's descriptors. Symbols
             # whose value was already substituted everywhere will have no live shape
@@ -353,7 +379,7 @@ class SymbolPropagation(ppl.Pass):
             sym_table.update(resolved)
 
             # Filter out symbols containing arrays accesses as they cannot be safely propagated (nested array accesses are not supported)
-            sym_table = {k: v for k, v in sym_table.items() if v is None or ("[" not in v and "]" not in v)}
+            sym_table = {k: v for k, v in sym_table.items() if not _is_array_access(v)}
 
             # Also filter out symbols containing views as they cannot be safely propagated (they are seen as pointers)
             sym_table = {
@@ -551,8 +577,19 @@ class SymbolPropagation(ppl.Pass):
         # The candidate symbols that are no longer read here were propagated.
         return candidates & (free_before - self._block_free_symbols(cfg_blk, parent))
 
-    # Combines two symbol dictionaries, setting the value to None if they don't agree. Directly modifies sym1
     def _combine_syms(self, sym1: Dict[str, Any], sym2: Dict[str, Any]) -> None:
+        """Meet of two symbol tables at a control-flow join; modifies ``sym1`` in place.
+
+        A symbol keeps its value only when BOTH sides agree. A key present on one side and absent
+        from the other carries no shared guarantee -- absence means "no value known on that path",
+        not "unchanged" -- so it becomes live (``None``). Without the second loop a branch whose
+        binding the array-access / View / mutated-scalar filters in :meth:`_get_in_syms` dropped
+        lets the other branch's value escape the join: cloudsc's ``then: fac = 1.0`` vs
+        ``else: fac = zfokoop[jl]`` folded every post-join use of ``fac`` to the literal ``1.0``.
+        """
         for sym, val in sym2.items():
             if sym not in sym1 or sym1[sym] != val:
+                sym1[sym] = None
+        for sym in sym1:
+            if sym not in sym2:
                 sym1[sym] = None

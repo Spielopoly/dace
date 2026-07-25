@@ -1,32 +1,11 @@
 # Copyright 2019-2026 ETH Zurich and the DaCe authors. All rights reserved.
-"""Layout algebra: the mixed-radix DIGIT-tuple DSL and its optimizer.
-
-A layout is an ordered tuple of **digits**. A digit ``(dim, stride, extent)`` denotes the
-coordinate ``(index[dim] // stride) % extent``. The digits of one logical dimension form a
-mixed-radix decomposition of that dimension's index. The identity (packed-C) layout of an
-array with shape ``[N0, N1, ...]`` is ``[(0,1,N0), (1,1,N1), ...]`` -- one digit per dim, in
-C order; the laid-out array is packed-C with shape ``tuple(extent for each digit)``.
-
-A layout change is a sequence of ops applied to the digit tuple:
-
-  * ``Permute(perm)``    -- reorder digit-tuple positions
-  * ``Block(dim, b)``    -- refine: split ``dim``'s finest digit into outer + inner (appended)
-  * ``Unblock(dim, b)``  -- coarsen: merge ``dim``'s inner digit back into its outer partner
-  * ``Pad(dim, p)``      -- grow the padded extent of ``dim``'s coarsest digit
-  * ``Shuffle(dim, s)``  -- attach a value-permutation to ``dim`` (opaque token)
-  * ``Zip(fields)`` / ``Unzip(fields)`` -- element-type product / projection (a boundary op)
-
-This module is OUR OWN tiny algebra -- closed over these seven ops. Composition and
-cancellation are structural tuple operations; sympy is only used to carry symbolic
-strides/extents and to emit the final index expression at lowering (``physical_index_exprs``),
-never to decide the rewrite rules. ``simplify_ops`` normalizes an op sequence to a minimal
-form (``Block(d,b) ∘ Unblock(d,b) = id``, ``Permute(τ) ∘ Permute(τ⁻¹) = id``,
-``Pad + Pad = Pad``, ...); ``is_identity`` reports whether a sequence is a no-op.
-"""
+"""Layout algebra: mixed-radix digit-tuple DSL (Permute/Block/Unblock/Pad/Shuffle/Zip/Unzip) and its optimizer."""
 from dataclasses import dataclass, replace
 from typing import Dict, List, Optional, Tuple
 
 import sympy
+
+from dace import symbolic
 
 
 def _sym(x):
@@ -40,8 +19,8 @@ def _ceil_div(e, b):
     """Ceiling division ``ceil(e / b)`` for int or symbolic ``e`` and integer ``b``."""
     e = _sym(e)
     if e.is_Integer:
-        return sympy.Integer(-(-int(e) // int(b)))
-    return sympy.ceiling(e / b)
+        return sympy.Integer(-(-int(e) // int(b)))  # plain ints here: ordinary integer ceil
+    return symbolic.int_ceil(e, b)
 
 
 @dataclass(frozen=True)
@@ -58,13 +37,7 @@ class Digit:
 
 @dataclass(frozen=True)
 class LayoutMap:
-    """A materialized layout: an ordered digit tuple plus per-dim annotations.
-
-    ``dim_sizes`` maps a logical dim id to its (padded) size. ``digits`` is the ordered tuple
-    whose extents are the laid-out (packed-C) array shape. ``shuffles`` maps a dim to a tuple
-    of ``(name, inverted)`` value-permutation tokens. ``element`` is the zipped struct's field
-    tuple (``None`` for a plain scalar element).
-    """
+    """A materialized layout: ordered digit tuple plus per-dim annotations (dim_sizes, shuffles, element)."""
     dim_sizes: Dict[int, object]
     digits: Tuple[Digit, ...]
     shuffles: Tuple[Tuple[int, Tuple[Tuple[str, bool], ...]], ...] = ()
@@ -83,9 +56,7 @@ def identity_map(shape, dims: Optional[List[int]] = None) -> LayoutMap:
     return LayoutMap(dim_sizes=dim_sizes, digits=digits)
 
 
-# --------------------------------------------------------------------------- #
-#  Ops
-# --------------------------------------------------------------------------- #
+# Ops
 @dataclass(frozen=True)
 class Permute:
     """Reorder digit-tuple positions: ``new[i] = old[perm[i]]``."""
@@ -105,8 +76,7 @@ class Permute:
 
 @dataclass(frozen=True)
 class Block:
-    """Split ``dim``'s finest digit ``(d,s,e)`` into outer ``(d,s*b,ceil(e/b))`` (in place)
-    plus inner ``(d,s,b)`` (appended)."""
+    """Split ``dim``'s finest digit ``(d,s,e)`` into outer ``(d,s*b,ceil(e/b))`` + inner ``(d,s,b)`` (appended)."""
     dim: int
     factor: int
 
@@ -132,8 +102,7 @@ class Block:
 
 @dataclass(frozen=True)
 class Unblock:
-    """Merge ``dim``'s inner digit ``(d,s,b)`` with its outer partner ``(d,s*b,eo)`` back into
-    ``(d,s,eo*b)`` -- the inverse of ``Block(dim, b)``."""
+    """Merge ``dim``'s inner digit ``(d,s,b)`` with partner ``(d,s*b,eo)`` into ``(d,s,eo*b)``; inverse of Block."""
     dim: int
     factor: int
 
@@ -151,7 +120,7 @@ class Unblock:
                 outer = m.digits[op]
                 merged = Digit(self.dim, inner.stride, outer.extent * self.factor)
                 digits = [dg for i, dg in enumerate(m.digits) if i != ip]
-                op2 = op if op < ip else op - 1  # index shift after removing inner
+                op2 = op if op < ip else op - 1  # shift index after removing the inner digit
                 digits[op2] = merged
                 return replace(m, digits=tuple(digits))
         raise ValueError(f"Unblock: no outer partner for dim {self.dim} factor {self.factor}")
@@ -230,9 +199,7 @@ class Unzip:
         return Zip(self.fields)
 
 
-# --------------------------------------------------------------------------- #
-#  Optimizer: compose + simplify
-# --------------------------------------------------------------------------- #
+# Optimizer: compose + simplify
 def compose_ops(ops: List, base: Optional[LayoutMap] = None, shape=None) -> LayoutMap:
     """Apply ``ops`` in order to ``base`` (or ``identity_map(shape)``), returning one LayoutMap."""
     if base is None:
@@ -246,12 +213,7 @@ def compose_ops(ops: List, base: Optional[LayoutMap] = None, shape=None) -> Layo
 
 
 def _fuse_pair(a, b):
-    """Fuse two adjacent ops into a shorter list, or return None if no rule applies.
-
-    Returns ``[]`` (both cancel), ``[op]`` (fused to one), or ``None`` (leave as-is).
-    """
-    # Inverse pair -> cancel (Block∘Unblock, Permute∘Permute⁻¹, Pad∘-Pad, Shuffle∘Shuffle⁻¹,
-    # Zip∘Unzip, ...).
+    """Fuse two adjacent ops: ``[]`` cancels both, ``[op]`` fuses to one, ``None`` leaves as-is."""
     if a.inverse() == b:
         return []
     # Same-type fusion.
@@ -307,14 +269,11 @@ def physical_index_exprs(m: LayoutMap) -> List:
     exprs = []
     for dg in m.digits:
         idx = sympy.Symbol(f"__i{dg.dim}", nonnegative=True, integer=True)
-        exprs.append((idx // dg.stride) % dg.extent)
+        exprs.append(symbolic.int_floor(idx, dg.stride) % dg.extent)
     return exprs
 
 
-# --------------------------------------------------------------------------- #
-#  Serialization: op sequence <-> JSON-safe list of dicts
-#  (so a LayoutChange library node can carry the op sequence in a Property).
-# --------------------------------------------------------------------------- #
+# Serialization: op sequence <-> JSON-safe list of dicts.
 def op_to_dict(op) -> Dict:
     """Encode one op as a JSON-safe dict ``{'op': <name>, ...fields}``."""
     if isinstance(op, Permute):

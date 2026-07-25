@@ -50,7 +50,7 @@ def _is_negative(value) -> bool:
         s = symbolic.simplify(value)
     except Exception:
         return False
-    return getattr(s, 'is_number', False) and getattr(s, 'is_negative', False)
+    return s.is_number and s.is_negative
 
 
 def _next_id(sdfg: SDFG) -> int:
@@ -110,7 +110,7 @@ class NormalizeNegativeStride(ppl.Pass):
         if start is None or end is None:
             return False
         try:
-            trip = symbolic.simplify((start - end) // (-stride) + 1)
+            trip = symbolic.simplify(symbolic.int_floor(start - end, -stride) + 1)
         except Exception:
             return False
 

@@ -1,17 +1,5 @@
 # Copyright 2019-2026 ETH Zurich and the DaCe authors. All rights reserved.
-"""
-SplitArray Pass
-===============
-Splits arrays along dimensions whose extent is a known compile-time symbol.
-
-Example: ``iphase[0:nclv]`` with ``nclv=3`` and a dimension name list `di, dq, dq` becomes ``iphase_di, iphase_dq, iphase_ds``.
-
-When the index is data-dependent (e.g. ``iphase[idx[i]]``), the pass generates
-a ConditionalBlock with one branch per possible value.
-
-Prerequisites: Loops/maps over the split dimension must be unrollable.
-Follow-up: Runnign simplify might be good after this pass
-"""
+"""Splits arrays along dimensions whose extent is a known compile-time symbol."""
 
 import copy
 import itertools
@@ -30,10 +18,7 @@ from dace.transformation.passes.analysis import loop_analysis
 
 
 def reverse_bfs_assignments(cfg: ControlFlowRegion, start_node) -> Dict[str, str]:
-    """Walk backward from ``start_node`` collecting interstate-edge assignments.
-
-    Returns the first (closest) assignment found for each symbol key.
-    """
+    """Walk backward from ``start_node``, keeping the closest assignment per symbol key."""
     result = {}
     visited = set()
     queue = deque([start_node])
@@ -43,7 +28,7 @@ def reverse_bfs_assignments(cfg: ControlFlowRegion, start_node) -> Dict[str, str
         node = queue.popleft()
         for edge in cfg.in_edges(node):
             for key, val in edge.data.assignments.items():
-                # Keep only the closest assignment (first encountered in BFS)
+                # first (closest) assignment wins
                 if key not in result:
                     result[key] = val
             if edge.src not in visited:
@@ -57,12 +42,7 @@ def resolve_aliases(
     data_dependent_dims: List[Optional[dace.symbolic.SymExpr]],
     iedge_assignments: Dict[str, str],
 ) -> List[Optional[dace.symbolic.SymExpr]]:
-    """Deduplicate aliased symbols in data-dependent index expressions.
-
-    DaCe can generate multiple symbols mapping to the same value
-    (e.g. ``imelt_index_0 = imelt[0], imelt_index_1 = imelt[0]``).
-    This picks the first key per value as canonical and substitutes the rest.
-    """
+    """Deduplicate symbols in data-dependent index expressions that alias the same value."""
     val_to_canonical = {}
     alias_map = {}
     for k, v in iedge_assignments.items():
@@ -84,10 +64,7 @@ def resolve_aliases(
 
 
 def copy_state_contents(old_state: SDFGState, new_state: SDFGState) -> Dict[dace.nodes.Node, dace.nodes.Node]:
-    """Deep-copy all nodes and edges from ``old_state`` into ``new_state``.
-
-    Returns a mapping from original nodes to their copies.
-    """
+    """Deep-copy all nodes/edges from ``old_state`` into ``new_state``; returns old->new node map."""
     node_map = {}
 
     for n in old_state.nodes():
@@ -112,22 +89,20 @@ def copy_state_contents(old_state: SDFGState, new_state: SDFGState) -> Dict[dace
 class SplitArray(ppl.Pass):
     """Splits arrays along dimensions whose extent matches a known symbol.
 
-    Args:
-        symbol_map: Maps symbol names to their integer extents (e.g. ``{"nclv": 5}``).
-        name_map: Maps symbol names to per-index name suffixes
-                  (e.g. ``{"nclv": ["rain", "ice", "snow", "graupel", "hail"]}``).
+    :param symbol_map: Symbol name -> integer extent (e.g. ``{"nclv": 5}``).
+    :param name_map: Symbol name -> per-index name suffixes (e.g. ``{"nclv": ["rain", "ice", ...]}``).
     """
 
     CATEGORY: str = "Layout"
 
-    # Class-level counter for unique ConditionalBlock labels
+    # unique ConditionalBlock label counter
     c = 0
 
     def __init__(self, symbol_map: Dict[str, int], name_map: Dict[str, List[str]]):
         super().__init__()
         self._symbol_map = symbol_map
         self._name_map = name_map
-        # Snapshot of array shapes before symbol replacement (symbols still symbolic)
+        # shapes before symbol replacement (still symbolic)
         self._array_dim_map: Dict[str, tuple] = {}
 
     def modifies(self) -> ppl.Modifies:
@@ -139,15 +114,16 @@ class SplitArray(ppl.Pass):
     # ------------------------------------------------------------------ #
     #  Phase 0: Unroll loops/maps over split dimensions
     # ------------------------------------------------------------------ #
-    def _unroll_loops_that_depend_only_on_split_dimensions(self, sdfg: dace.SDFG):
-        """Unroll maps and loops whose iteration range matches a split-dimension extent.
-        After ``replace_dict``, extents that depended only on split symbols become
-        concrete integers. We unroll one at a time and rescan, because each
-        unroll mutates the graph and invalidates node references.
+    def _unroll_loops_that_depend_only_on_split_dimensions(self, sdfg: dace.SDFG) -> int:
+        """Unroll maps/loops whose range matches a split extent, one at a time (unrolling invalidates node refs).
+
+        :param sdfg: The SDFG to specialize and unroll in place.
+        :returns: Number of maps/loops unrolled.
         """
         assert self._array_dim_map, "Expected _array_dim_map to be populated before unrolling loops/maps"
         sdfg.replace_dict(self._symbol_map)
         potential_ranges = set(self._symbol_map.values())
+        unrolled = 0
 
         while True:
             target = None
@@ -157,7 +133,7 @@ class SplitArray(ppl.Pass):
                 if isinstance(n, dace.nodes.MapEntry):
                     has_split_dim = False
                     for _, r in zip(n.map.params, n.map.range):
-                        extent = ((r[1] + 1) - r[0]) // r[2]
+                        extent = dace.symbolic.int_floor((r[1] + 1) - r[0], r[2])
                         if extent.free_symbols:
                             continue
                         try:
@@ -178,7 +154,7 @@ class SplitArray(ppl.Pass):
                     step = loop_analysis.get_loop_stride(n)
                     if beg is None or end is None or step is None:
                         continue
-                    extent = ((end + 1) - beg) // step
+                    extent = dace.symbolic.int_floor((end + 1) - beg, step)  # int_floor, never `//`
                     if extent.free_symbols:
                         continue
                     try:
@@ -198,24 +174,23 @@ class SplitArray(ppl.Pass):
                 MapUnroll().apply_to(sdfg=g.sdfg, options={}, map_entry=n)
             else:
                 LoopUnroll().apply_to(sdfg=n.sdfg, options={"inline_iterations": True}, loop=n)
+            unrolled += 1
+
+        return unrolled
 
     # ------------------------------------------------------------------ #
     #  Phase 1: Identify which arrays/dimensions to split
     # ------------------------------------------------------------------ #
 
     def _collect_arrays_to_split(self, sdfg: dace.SDFG) -> Dict[str, List[Optional[str]]]:
-        """Build a map from array name to per-dimension split config.
-
-        Each entry is ``None`` (keep dimension) or a symbol name (split along it).
-        Arrays with no split dimensions are omitted.
-        """
+        """Map each array to a per-dim split config: None (keep) or symbol name (split); omits unsplit arrays."""
         if not self._array_dim_map:
             for arr, desc in sdfg.arrays.items():
                 self._array_dim_map[arr] = copy.deepcopy(desc.shape)
 
         split_map = {}
         for arrname in sdfg.arrays:
-            # If not in present (added due to loop/map unroll, we cant split)
+            # skip arrays added post-snapshot (unroll) -- can't split those
             if arrname in self._array_dim_map:
                 desc_shape = self._array_dim_map[arrname]
                 split_list = [None] * len(desc_shape)
@@ -231,11 +206,7 @@ class SplitArray(ppl.Pass):
     # ------------------------------------------------------------------ #
 
     def _split_data_descriptors(self, sdfg: dace.SDFG, split_map: Dict[str, List[Optional[str]]]):
-        """Create one new array descriptor per Cartesian-product combination of split indices.
-
-        For ``arr[a, kept, b]`` with ``a`` split into 4 and ``b`` into 3,
-        this creates 12 new arrays of shape ``[kept]``.
-        """
+        """Create one new array descriptor per Cartesian-product combination of split indices."""
         new_descs = {}
 
         for arr, desc in sdfg.arrays.items():
@@ -247,16 +218,14 @@ class SplitArray(ppl.Pass):
 
             assert desc.is_packed_c_strides() or desc.is_packed_fortran_strides()
 
-            # Non-split dimensions form the shape of each new array
+            # shape of the new array = non-split dims
             filtered_shape = [dim for dim, split in zip(desc.shape, split_config) if split is None]
 
-            # A fully-split element keeps no dimensions; represent it as a
-            # length-1 array so it stays a writable pointer (a by-value scalar
-            # would be read-only), accessed at index 0.
+            # fully-split element: length-1 array (not scalar) so it stays writable, at index 0
             if not filtered_shape:
                 filtered_shape = [1]
 
-            # Recompute packed strides for the reduced shape
+            # recompute packed strides for the reduced shape
             if desc.is_packed_c_strides():
                 filtered_strides = [1] * len(filtered_shape)
                 for i in range(len(filtered_shape) - 2, -1, -1):
@@ -266,7 +235,7 @@ class SplitArray(ppl.Pass):
                 for i in range(1, len(filtered_shape)):
                     filtered_strides[i] = filtered_strides[i - 1] * filtered_shape[i - 1]
 
-            # Map positional index in split dims to their symbol name
+            # positional index -> split symbol name
             split_dims = [(dname, dim) for dname, dim in zip(split_config, desc.shape) if dname is not None]
             array_name_map = {}
             idx = 0
@@ -275,8 +244,7 @@ class SplitArray(ppl.Pass):
                     array_name_map[idx] = d
                     idx += 1
 
-            # Generate all combinations even if not all are accessed,
-            # because the full array may be passed to nested SDFGs
+            # generate all combinations; unaccessed ones may still be passed to nested SDFGs
             ranges = [range(extent) for _, extent in split_dims]
             for indices in itertools.product(*ranges):
                 suffix = "_".join(str(self._name_map[array_name_map[i]][int(idx)]) for i, idx in enumerate(indices))
@@ -302,12 +270,7 @@ class SplitArray(ppl.Pass):
         split_map: Dict[str, List[Optional[str]]],
         access_mapping: Optional[Dict[str, int]] = None,
     ) -> Tuple[str, dace.subsets.Range]:
-        """Compute the new array name and subset for a memlet after splitting.
-
-        For compile-time-known indices, the index is folded into the array name.
-        For data-dependent indices, ``access_mapping`` must provide the concrete
-        value (used inside ConditionalBlock branches).
-        """
+        """Compute the new split-array name and subset for a memlet; access_mapping resolves data-dependent indices."""
         if edge.data.data not in split_map:
             return edge.data.data, edge.data.subset
 
@@ -319,7 +282,7 @@ class SplitArray(ppl.Pass):
             b, e, s = access_expr
             if splitd is not None:
                 # Split dimensions must be single-element accesses
-                assert ((e + 1) - b) // s == 1
+                assert dace.symbolic.int_floor((e + 1) - b, s) == 1
                 try:
                     access_offset = int(b)
                     new_name_expr.append(self._name_map[splitd][access_offset])
@@ -343,11 +306,7 @@ class SplitArray(ppl.Pass):
         edge: MultiConnectorEdge[dace.Memlet],
         split_map: Dict[str, List[Optional[str]]],
     ) -> Tuple[List[Optional[dace.symbolic.SymExpr]], List[Optional[dace.symbolic.SymExpr]]]:
-        """Identify split-dimension indices that cannot be resolved at compile time.
-
-        Returns two lists (one alias-resolved, one raw) with ``None`` for
-        non-split or compile-time-known dims, and the symbolic expression otherwise.
-        """
+        """Identify split-dim indices unresolved at compile time; returns (alias-resolved, raw) lists, None for the rest."""
         if edge.data.data not in split_map:
             return edge.data.data, edge.data.subset
 
@@ -357,15 +316,15 @@ class SplitArray(ppl.Pass):
         for i, (splitd, access_expr) in enumerate(zip(dim_filter, edge.data.subset)):
             b, e, s = access_expr
             if splitd is not None:
-                assert ((e + 1) - b) // s == 1
+                assert dace.symbolic.int_floor((e + 1) - b, s) == 1
                 try:
-                    int(b)  # Compile-time resolvable — not data-dependent
+                    int(b)  # compile-time resolvable, not data-dependent
                 except Exception:
                     data_dependent_dims.append(b)
             else:
                 data_dependent_dims.append(None)
 
-        # Resolve symbol aliases introduced by DaCe's interstate assignments
+        # resolve DaCe-introduced symbol aliases
         iedge_assignments = reverse_bfs_assignments(state.parent_graph, state)
         all_exprs = copy.deepcopy(data_dependent_dims)
         data_dependent_dims = resolve_aliases(data_dependent_dims, iedge_assignments)
@@ -378,10 +337,7 @@ class SplitArray(ppl.Pass):
         state: SDFGState,
         split_map: Dict[str, List[Optional[str]]],
     ) -> Tuple[Optional[str], Optional[Set[str]]]:
-        """Check if ``state`` has any data-dependent accesses on split dimensions.
-
-        Returns ``(canonical_symbol, all_alias_expressions)`` or ``(None, None)``.
-        """
+        """Check state for data-dependent accesses on split dims; returns (canonical_symbol, alias_exprs) or (None, None)."""
         all_data_dependent_dims: Set[str] = set()
         all_access_exprs: Set[str] = set()
 
@@ -418,7 +374,7 @@ class SplitArray(ppl.Pass):
             for i, (splitd, access_expr) in enumerate(zip(dim_filter, edge.data.subset)):
                 b, e, s = access_expr
                 if splitd is not None:
-                    assert ((e + 1) - b) // s == 1
+                    assert dace.symbolic.int_floor((e + 1) - b, s) == 1
                     try:
                         int(b)
                     except Exception:
@@ -433,12 +389,7 @@ class SplitArray(ppl.Pass):
     # ------------------------------------------------------------------ #
 
     def _replace_memlets(self, sdfg: dace.SDFG, split_map: Dict[str, List[Optional[str]]]):
-        """Rewrite memlets to point to the new split arrays.
-
-        For states with data-dependent accesses, a ConditionalBlock is inserted
-        with one branch per possible index value, each containing a copy of the
-        original state with the appropriate concrete array substituted.
-        """
+        """Rewrite memlets to the new split arrays; data-dependent accesses get a ConditionalBlock per index value."""
         for state in sdfg.all_states():
             canonical_access, all_access_exprs = self._has_non_integer_access(sdfg, state, split_map)
 
@@ -448,9 +399,7 @@ class SplitArray(ppl.Pass):
                 dim = dims.pop()
                 extent = self._symbol_map[dim]
 
-                # Replace the state with a ConditionalBlock that branches on the
-                # data-dependent index. Each branch gets a full copy of the state
-                # with the split-dimension access resolved to a concrete array.
+                # replace state with a ConditionalBlock; each branch is a full state copy with a concrete array
                 cb = ConditionalBlock(
                     label=f"extent_check_{SplitArray.c}",
                     sdfg=sdfg,
@@ -458,11 +407,7 @@ class SplitArray(ppl.Pass):
                 )
                 g = state.parent_graph
 
-                # Splice cb into the CFG in place of the original state. The
-                # incident interstate edges are preserved verbatim: the in-edge
-                # carries the assignment that defines the data-dependent index
-                # (e.g. ``imelt_index = imelt[2]``) which the branch conditions
-                # test, so dropping it would leave that symbol unbound.
+                # splice cb in place of state; interstate edges preserved verbatim (in-edge defines the branch symbol)
                 g.add_node(cb, g.start_block == state)
                 for ie in g.in_edges(state):
                     g.add_edge(ie.src, cb, copy.deepcopy(ie.data))
@@ -482,13 +427,12 @@ class SplitArray(ppl.Pass):
                         condition=properties.CodeBlock(f"{canonical_access} == {i}"),
                         branch=cfg,
                     )
-                    # Map all alias expressions to the same concrete index
+                    # alias expressions -> same concrete index
                     access_mapping = {k: i for k in all_access_exprs}
                     for edge in ns.edges():
                         mapped_data, new_subset = self._get_corresponding_array(edge, split_map, access_mapping)
                         if mapped_data != edge.data.data:
-                            # Same as the static case below: keep wcr/other_subset/dynamic, or a
-                            # reduction silently becomes an overwrite.
+                            # keep wcr/other_subset/dynamic (dropping wcr turns a reduction into an overwrite)
                             edge.data = dace.memlet.Memlet(data=mapped_data,
                                                            subset=new_subset,
                                                            other_subset=copy.deepcopy(edge.data.other_subset),
@@ -498,15 +442,11 @@ class SplitArray(ppl.Pass):
 
                 SplitArray.c += 1
             else:
-                # Static case: every split-dimension index is a compile-time constant
+                # static case: every split-dim index is a compile-time constant
                 for edge in state.edges():
                     mapped_data, new_subset = self._get_corresponding_array(edge, split_map)
                     if mapped_data != edge.data.data:
-                        # Rebuild, carrying everything the old memlet held: dropping wcr would turn a
-                        # reduction into a plain overwrite (a WCR collapsing a full dimension is
-                        # exactly the legal case), and dropping other_subset/dynamic breaks copies
-                        # and dynamic-range edges. other_subset is deep-copied -- a subset object is
-                        # never shared between edges.
+                        # keep wcr/other_subset/dynamic -- dropping any breaks reductions, copies, or dynamic edges
                         edge.data = dace.memlet.Memlet(data=mapped_data,
                                                        subset=new_subset,
                                                        other_subset=copy.deepcopy(edge.data.other_subset),
@@ -519,15 +459,10 @@ class SplitArray(ppl.Pass):
     # ------------------------------------------------------------------ #
 
     def _replace_iedges(self, sdfg: dace.SDFG, split_map: Dict[str, List[Optional[str]]]):
-        """Rewrite array-as-function calls in interstate-edge assignments.
-
-        DaCe represents array accesses in interstate edges as SymPy function
-        applications (e.g. ``zsolqa(4, 2, j)``). This rewrites them to reference
-        the split array (e.g. ``zsolqa_rain_snow(j)``).
-        """
+        """Rewrite interstate-edge array accesses to the split name (handles both AppliedUndef and Subscript SymPy shapes)."""
 
         def _rewrite_expr(expr):
-            """Recursively rewrite SymPy expr, folding split-dim args into the name."""
+            """Recursively rewrite SymPy expr, folding split-dim indices into the name."""
             if not expr.args:
                 return expr
 
@@ -536,18 +471,25 @@ class SplitArray(ppl.Pass):
             if not expr.is_Function:
                 return expr.func(*new_args)
 
+            # normalize both shapes to (array name, indices)
             fname = type(expr).__name__
+            if fname == 'Subscript':
+                base, index_args = new_args[0], new_args[1:]
+                fname = str(base)
+            else:
+                index_args = new_args
+
             if fname not in split_map:
-                # Preserve argument order with non-commutative function
-                return sp.Function(fname, commutative=False)(*new_args)
+                # expr.func (not sp.Function(fname)) preserves the class so the name doesn't leak into free_symbols
+                return expr.func(*new_args)
 
             dim_filter = split_map[fname]
-            assert len(dim_filter) == len(new_args), (f"{fname}: split_config has {len(dim_filter)} dims "
-                                                      f"but call has {len(new_args)} args: {expr}")
+            assert len(dim_filter) == len(index_args), (f"{fname}: split_config has {len(dim_filter)} dims "
+                                                        f"but access has {len(index_args)} indices: {expr}")
 
             name_parts = []
             kept_args = []
-            for splitd, arg in zip(dim_filter, new_args):
+            for splitd, arg in zip(dim_filter, index_args):
                 if splitd is not None:
                     name_parts.append(str(self._name_map[splitd][int(arg)]))
                 else:
@@ -558,9 +500,7 @@ class SplitArray(ppl.Pass):
             if kept_args:
                 return sp.Function(new_name, commutative=False)(*kept_args)
             else:
-                # All dims split — the element is a length-1 array (see
-                # _split_data_descriptors). Read element 0 so the interstate edge
-                # dereferences the pointer instead of assigning it.
+                # all dims split: length-1 array (see _split_data_descriptors); index 0 dereferences it
                 return sp.Function(new_name, commutative=False)(sp.Integer(0))
 
         for iedge in sdfg.all_interstate_edges():
@@ -576,11 +516,7 @@ class SplitArray(ppl.Pass):
                 iedge.data.assignments = new_assignments
 
     def _replace_access_nodes(self, sdfg: dace.SDFG, split_map: Dict[str, List[Optional[str]]]):
-        """Point access nodes to the new split arrays.
-        If an access node has different input and output array names (read from
-        one split variant, write to another), the node is duplicated so each
-        variant gets its own access node.
-        """
+        """Point access nodes to the new split arrays; duplicates a node when in/out names differ."""
         for state in sdfg.all_states():
             for dnode in list(state.data_nodes()):
                 if dnode.data not in split_map:
@@ -623,7 +559,7 @@ class SplitArray(ppl.Pass):
                     state.remove_node(dnode)
 
     def _remove_split_arrays(self, sdfg: dace.SDFG, split_map: Dict[str, List[Optional[str]]]):
-        """Remove original (pre-split) array descriptors from the SDFG."""
+        """Remove original pre-split array descriptors."""
         for arr in split_map:
             sdfg.remove_data(arr)
 
@@ -642,31 +578,34 @@ class SplitArray(ppl.Pass):
     # ------------------------------------------------------------------ #
 
     def apply_pass(self, sdfg: SDFG, _) -> Optional[int]:
-        """Run the SplitArray pass.
+        """Split every array whose shape carries a mapped symbol into one array per index.
 
-        Pipeline:
-          1. Unroll loops/maps over split dimensions (requires symbol replacement).
-          2. Create new per-index array descriptors.
-          3. Rewrite memlets, access nodes, and interstate edges.
-          4. Propagate to nested SDFGs (TODO).
-          5. Remove original arrays.
+        :param sdfg: The SDFG to transform in place.
+        :param _: Pipeline results (unused).
+        :returns: Number of changes made (arrays split + symbols specialized + maps/loops unrolled), or ``None``
+                  if the SDFG uses none of the mapped symbols.
         """
-        # Collect split config before symbol replacement (needs symbolic shapes)
+        # needs symbolic shapes, before symbol replacement
         split_map = self._collect_arrays_to_split(sdfg)
+        # Phase 0 specializes ``_symbol_map`` into the SDFG, so it modifies the graph even when no
+        # array ends up being split. Count the symbols it will substitute before they disappear.
+        specialized = sum(1 for sym in self._symbol_map if sym in sdfg.symbols)
 
-        # Phase 0: Replace symbols with constants and unroll
-        self._unroll_loops_that_depend_only_on_split_dimensions(sdfg)
+        # Phase 0
+        unrolled = self._unroll_loops_that_depend_only_on_split_dimensions(sdfg)
         sdfg.validate()
 
-        # Phase 2: Create split array descriptors
+        # Phase 2
         self._split_data_descriptors(sdfg, split_map)
 
-        # Phase 3: Rewrite all references to split arrays
+        # Phase 3
         self._replace_memlets(sdfg, split_map)
         self._replace_access_nodes(sdfg, split_map)
         self._replace_iedges(sdfg, split_map)
 
-        # Phase 4: Nested SDFG propagation (currently raises not-implemented error)
+        # Phase 4 (not yet implemented, raises)
         self._pass_to_nsdfgs(sdfg, split_map)
-        # Phase 5: Cleanup
+        # Phase 5
         self._remove_split_arrays(sdfg, split_map)
+
+        return (len(split_map) + specialized + unrolled) or None
