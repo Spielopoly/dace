@@ -78,7 +78,13 @@ def _assert_lifted_with_wcr(sdfg: dace.SDFG, prefer: str, expected_wcr: str):
         assert len(reduces) == 1, reduces
         (red, ) = reduces
         assert red.wcr == expected_wcr, red.wcr
-        assert red.identity is None
+        assert red.identity is not None
+        combines = [(node, state) for node, state in sdfg.all_nodes_recursive()
+                    if isinstance(node, dace.nodes.Tasklet) and node.label.startswith('combine_')]
+        assert len(combines) == 1
+        combine, state = combines[0]
+        seed_edges = [edge for edge in state.in_edges(combine) if edge.dst_conn == '__seed']
+        assert len(seed_edges) == 1 and isinstance(seed_edges[0].src, dace.nodes.AccessNode)
     else:
         # wcr-scalar emit: exactly one WCR-on-transient-Scalar memlet.
         assert _count_wcr_scalar_targets(
@@ -87,7 +93,18 @@ def _assert_lifted_with_wcr(sdfg: dace.SDFG, prefer: str, expected_wcr: str):
                                  f'sdfg has {_count_wcr_scalar_targets(sdfg, expected_wcr)}')
 
 
-def _assert_single_sum_reduce_identity_none(sdfg: dace.SDFG, prefer: str = 'reduce-libnode'):
+def _combine_output_edge(sdfg: dace.SDFG, target: str) -> object:
+    """Return the unique explicit carried-seed combine output for ``target``."""
+    outputs = [
+        edge for node, state in sdfg.all_nodes_recursive()
+        if isinstance(node, dace.nodes.Tasklet) and node.label.startswith('combine_') for edge in state.out_edges(node)
+        if edge.data.data == target
+    ]
+    assert len(outputs) == 1
+    return outputs[0]
+
+
+def _assert_single_sum_reduce(sdfg: dace.SDFG, prefer: str = 'reduce-libnode'):
     """Backward-compat wrapper: a single ``sum`` reduction was lifted."""
     _assert_lifted_with_wcr(sdfg, prefer, 'lambda a, b: a + b')
 
@@ -117,7 +134,7 @@ def test_sdfg_api_sum_reduction_is_lifted(prefer):
 
     assert lifted == 1
     assert _count_loops(sdfg) == _expected_loop_count_after_lift(prefer, 0, 1)
-    _assert_single_sum_reduce_identity_none(sdfg, prefer)
+    _assert_single_sum_reduce(sdfg, prefer)
 
 
 @dace.program
@@ -135,7 +152,7 @@ def test_frontend_augassign_length1_array_is_lifted(prefer):
     sdfg.validate()
 
     assert lifted and lifted >= 1
-    _assert_single_sum_reduce_identity_none(sdfg, prefer)
+    _assert_single_sum_reduce(sdfg, prefer)
 
 
 @dace.program
@@ -158,13 +175,10 @@ def test_frontend_augassign_array_slice_is_lifted(prefer):
     sdfg.validate()
 
     assert lifted and lifted >= 1
-    _assert_single_sum_reduce_identity_none(sdfg, prefer)
+    _assert_single_sum_reduce(sdfg, prefer)
 
     if prefer == 'reduce-libnode':
-        reduces = [(n, g) for n, g in sdfg.all_nodes_recursive() if isinstance(n, Reduce)]
-        (red, state) = reduces[0]
-        (out_edge, ) = state.out_edges(red)
-        assert out_edge.data.data == "C"
+        out_edge = _combine_output_edge(sdfg, "C")
         assert str(out_edge.data.subset) in {"3", "3:4", "3:3"}
 
 
@@ -190,16 +204,13 @@ def test_per_row_inner_reduction_multidim_is_lifted(prefer):
     sdfg.validate()
 
     assert lifted and lifted >= 1
-    _assert_single_sum_reduce_identity_none(sdfg, prefer)
+    _assert_single_sum_reduce(sdfg, prefer)
     # The inner jm loop is gone (or replaced by a wcr-scalar inner loop); the
     # per-row outer jl loop survives around the lifted reduction.
     assert _count_loops(sdfg) == _expected_loop_count_after_lift(prefer, 1, 2)
 
     if prefer == 'reduce-libnode':
-        reduces = [(n, g) for n, g in sdfg.all_nodes_recursive() if isinstance(n, Reduce)]
-        (red, state) = reduces[0]
-        (out_edge, ) = state.out_edges(red)
-        assert out_edge.data.data == "acc"
+        _combine_output_edge(sdfg, "acc")
 
     # Value-preserving: acc[jl] = sum_jm B[jl, jm].
     n, m = 6, 4
@@ -270,7 +281,7 @@ def _assert_single_reduce_with_wcr(sdfg: dace.SDFG, expected_wcr: str):
     assert len(reduces) == 1, reduces
     (red, ) = reduces
     assert red.wcr == expected_wcr, red.wcr
-    assert red.identity is None
+    assert red.identity is not None
 
 
 def test_conditional_interstate_gt_lifts_to_max(prefer):
@@ -469,7 +480,6 @@ def test_any_pattern_symbol_bridge_via_tmp_scalar(prefer):
     bridge scalar (``_red_tmp_<sym>`` for reduce-libnode, ``_priv_<sym>``
     for wcr-scalar), seeds it from the symbol, and assigns the symbol back
     on the outgoing interstate edge."""
-    from dace.libraries.standard.nodes.reduce import Reduce as _Reduce
     sdfg = _build_any_pattern_sdfg()
     LoopToReduce(permissive=True, prefer=prefer).apply_pass(sdfg, {})
     sdfg.validate()
@@ -481,12 +491,8 @@ def test_any_pattern_symbol_bridge_via_tmp_scalar(prefer):
     assert sdfg.arrays[bridge_names[0]].transient
 
     if prefer == 'reduce-libnode':
-        # Reduce writes to the bridge scalar.
-        reduces = [(n, g) for n, g in sdfg.all_nodes_recursive() if isinstance(n, _Reduce)]
-        assert len(reduces) == 1
-        red, state = reduces[0]
-        (out_edge, ) = state.out_edges(red)
-        assert out_edge.data.data == bridge_names[0]
+        # The explicit combine writes to the bridge scalar.
+        _combine_output_edge(sdfg, bridge_names[0])
 
     # Outgoing interstate edge assigns the original symbol from the bridge.
     for e in sdfg.all_interstate_edges():
@@ -544,7 +550,7 @@ def test_array_slot_sum_reduction_is_lifted(prefer):
     sdfg.validate()
 
     assert lifted >= 1
-    _assert_single_sum_reduce_identity_none(sdfg, prefer)
+    _assert_single_sum_reduce(sdfg, prefer)
 
 
 # ---- s313 / vdotr: array-slot dot-product (compute-then-accumulate) ------
@@ -1122,7 +1128,10 @@ def _build_transient_scan_writeback(n_sym=N):
     sdfg.add_scalar("c", dace.float64, transient=True)
     pre = sdfg.add_state("pre", is_start_block=True)
     pre.add_edge(pre.add_read("A"), None, pre.add_write("c"), None, mm.Memlet("A[0]"))
-    loop = LoopRegion("loop", condition_expr="i < N - 1", loop_var="i", initialize_expr="i = 0",
+    loop = LoopRegion("loop",
+                      condition_expr="i < N - 1",
+                      loop_var="i",
+                      initialize_expr="i = 0",
                       update_expr="i = i + 1")
     sdfg.add_node(loop)
     sdfg.add_edge(pre, loop, dace.InterstateEdge())
@@ -1152,7 +1161,10 @@ def _build_double_buffer_scan_writeback(n_sym=N):
     sdfg.add_scalar("c", dace.float64, transient=True)
     pre = sdfg.add_state("pre", is_start_block=True)
     pre.add_edge(pre.add_read("A"), None, pre.add_write("c"), None, mm.Memlet("A[0]"))
-    loop = LoopRegion("loop", condition_expr="i < N - 1", loop_var="i", initialize_expr="i = 0",
+    loop = LoopRegion("loop",
+                      condition_expr="i < N - 1",
+                      loop_var="i",
+                      initialize_expr="i = 0",
                       update_expr="i = i + 1")
     sdfg.add_node(loop)
     sdfg.add_edge(pre, loop, dace.InterstateEdge())

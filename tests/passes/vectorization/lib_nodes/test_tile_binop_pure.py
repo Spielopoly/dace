@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 
 import dace
-from dace.libraries.tileops import TileBinop
+from dace.libraries.tileops import TileBinop, TileFMA, TileITE, TileUnop
 
 _OP_TAG = {
     "+": "add",
@@ -28,6 +28,45 @@ _OP_TAG = {
     "&&": "land",
     "||": "lor"
 }
+
+
+@pytest.mark.parametrize(
+    "node",
+    [
+        TileUnop(name="unop", widths=(8, ), op="neg", kind_a="Symbol", expr_a="N + 6.25j"),
+        TileBinop(name="binop", widths=(8, ), op="+", kind_a="Tile", kind_b="Symbol", expr_b="N + 6.25j"),
+        TileFMA(name="fma", widths=(8, ), kind_a="Tile", kind_b="Symbol", expr_b="N + 6.25j"),
+        TileITE(name="ite", widths=(8, ), kind_t="Symbol", expr_t="N + 6.25j"),
+    ],
+)
+def test_symbol_operand_complex_literal_is_not_a_free_symbol(node):
+    """Python imaginary literals do not create a spurious runtime ``I`` argument."""
+    assert node.free_symbols == {"N"}
+
+
+def test_symbol_operand_mapping_is_replaced_in_expression():
+    """Nested inlining substitutes mappings inside string-valued tile operands."""
+    sdfg = dace.SDFG("replace_tile_operand")
+    state = sdfg.add_state("main")
+    node = TileBinop(
+        name="binop",
+        widths=(8, ),
+        op="+",
+        kind_a="Tile",
+        kind_b="Symbol",
+        expr_b="maxiter_minus_1 + 6.25j",
+    )
+    state.add_node(node)
+    sdfg.replace_dict({"maxiter_minus_1": "maxiter - 1"}, replace_keys=False)
+    assert node.free_symbols == {"maxiter"}
+    assert "maxiter_minus_1" not in node.expr_b
+    assert "6.25j" in node.expr_b
+
+
+def test_symbol_operand_named_i_remains_a_free_symbol():
+    """A genuine name ``I`` remains distinguishable from a ``1j`` literal."""
+    node = TileUnop(name="unop", widths=(8, ), op="neg", kind_a="Symbol", expr_a="I")
+    assert node.free_symbols == {"I"}
 
 
 def _build_binop_sdfg(widths, op, has_mask, dtype):

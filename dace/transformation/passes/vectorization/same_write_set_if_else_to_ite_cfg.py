@@ -27,6 +27,18 @@ from dace.transformation import pass_pipeline as ppl
 from dace.transformation.helpers import get_parent_map_and_loop_scopes
 
 
+def _singleton_zero_subset(desc: dace.data.Data) -> str:
+    """Return an all-zero element subset with the descriptor's rank.
+
+    Singleton arrays are not necessarily one-dimensional. A shape ``(1, 1)``
+    still requires the rank-two subset ``0, 0`` during SDFG validation.
+
+    :param desc: Singleton data descriptor being accessed.
+    :returns: A comma-separated zero index for every descriptor dimension.
+    """
+    return ", ".join("0" for _ in desc.shape)
+
+
 def free_names_outside_subscript_indices(code: str) -> set:
     """Names in ``code`` occurring at least once OUTSIDE every array-subscript index.
 
@@ -845,7 +857,8 @@ class SameWriteSetIfElseToITECFG(ppl.Pass):
                 outputs={"_o"},
                 code="_o = ITE(_c, _t, _e)",
             )
-            cond_subset = "0" if sdfg.arrays[cond_array_name].total_size == 1 else subset_str
+            cond_desc = sdfg.arrays[cond_array_name]
+            cond_subset = _singleton_zero_subset(cond_desc) if cond_desc.total_size == 1 else subset_str
             state.add_edge(cond_access, None, t, "_c", dace.Memlet(expr=f"{cond_array_name}[{cond_subset}]"))
         else:
             t = state.add_tasklet(
@@ -1185,19 +1198,40 @@ class SameWriteSetIfElseToITECFG(ppl.Pass):
         """Walk the CFG for an interstate-edge assignment to ``cond_sym``. If found, emit
         a tasklet in ``state`` computing RHS via array-read in-connectors, writing a fresh
         transient. Returns transient name, or ``None`` if no assignment found."""
-        rhs = None
-        def_edge = None
-        for cfg in sdfg.all_control_flow_regions(recursive=True):
-            for e in cfg.edges():
-                assigns = e.data.assignments
-                if cond_sym in assigns:
-                    rhs = assigns[cond_sym]
-                    def_edge = e
-                    break
-            if rhs is not None:
-                break
-        if rhs is None:
+        # A frontend temporary may be rebound before several sequential
+        # conditionals (``flag = I[0]`` then ``flag = I_1[0]``). Use the
+        # definitions that actually reach this merge state; taking the first
+        # assignment in graph order makes every conditional read ``I`` and
+        # leaves ``I_1`` disconnected from dataflow.
+        region = state.parent_graph
+        if region is None:
             return None
+        undefined = object()
+        region_edges = list(region.edges())
+        reaching = {block: set() for block in region.nodes()}
+        changed = True
+        while changed:
+            changed = False
+            for block in region.nodes():
+                # The symbol's incoming/external value reaches the region entry.
+                # Keep it distinct from the empty set, which means unreachable.
+                new_defs = {undefined} if block is region.start_block else set()
+                for edge in region.in_edges(block):
+                    if cond_sym in (edge.data.assignments or {}):
+                        new_defs.add(edge)
+                    else:
+                        new_defs |= reaching[edge.src]
+                if new_defs != reaching[block]:
+                    reaching[block] = new_defs
+                    changed = True
+        state_defs = reaching[state]
+        if not state_defs or undefined in state_defs:
+            return None
+        def_edges = [edge for edge in region_edges if edge in state_defs]
+        rhs_values = {str(edge.data.assignments[cond_sym]) for edge in def_edges}
+        if len(rhs_values) != 1:
+            return None
+        rhs = next(iter(rhs_values))
         # Cond RHS may reference OTHER interstate-defined scalar symbols (staged element
         # reads like ``a_index_0 = a[_loop_it_1]``). Inline them into their array-read
         # definitions so the lifted tasklet stages them through connectors instead of
@@ -1223,7 +1257,7 @@ class SameWriteSetIfElseToITECFG(ppl.Pass):
         # interstate INTEGER symbol (``_gidx = idx[i]`` on the edge feeding this state), so the
         # staged read becomes a symbolic-indexed memlet ``w[_gidx, k]`` -- the same shape a body
         # gather carries, which the tile machinery vectorizes. No-op when the RHS is not indirect.
-        rhs = self._promote_gather_indices(sdfg, [def_edge], rhs)
+        rhs = self._promote_gather_indices(sdfg, def_edges, rhs)
         # An un-promotable gather (no def edge, or an out-of-scope index) cannot be staged as a
         # memlet -- refuse the lift rather than emit a bare-pointer read that miscompiles.
         if self._has_nested_subscript(sdfg, rhs):
@@ -1301,14 +1335,15 @@ class SameWriteSetIfElseToITECFG(ppl.Pass):
         for arr, conn in in_conn_names.items():
             an = state.add_access(arr)
             # length-1 / Scalar operand = loop-invariant value (non-transient scalar
-            # source like kernel arg ``c`` in ``a[i, j] > c``): must stay a 1-element
-            # ``[0]`` read so the vectorizer broadcasts it (array-op-scalar); captured /
+            # source like kernel arg ``c`` in ``a[i, j] > c``): must stay an all-zero
+            # single-element read so the vectorizer broadcasts it (array-op-scalar); captured /
             # W-wide subset would OOB-read the 1-element source, can't be reshaped
             # (parent-fed connector). Else prefer the subset RHS wrote (``arr[i, j]`` ->
             # ``[i, j]``), else ``subset_str``.
             captured = extracted_subsets.get(arr)
-            if sdfg.arrays[arr].total_size == 1:
-                arr_subset = "0"
+            desc = sdfg.arrays[arr]
+            if desc.total_size == 1:
+                arr_subset = _singleton_zero_subset(desc)
             elif captured:
                 arr_subset = captured.strip("[]")
             else:
@@ -1418,8 +1453,9 @@ class SameWriteSetIfElseToITECFG(ppl.Pass):
         for arr, conn in in_conn_names.items():
             an = state.add_access(arr)
             captured = extracted_subsets.get(arr)
-            if sdfg.arrays[arr].total_size == 1:
-                arr_subset = "0"
+            desc = sdfg.arrays[arr]
+            if desc.total_size == 1:
+                arr_subset = _singleton_zero_subset(desc)
             elif captured:
                 arr_subset = captured.strip("[]")
             else:

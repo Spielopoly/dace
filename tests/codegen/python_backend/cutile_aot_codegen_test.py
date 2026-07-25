@@ -321,9 +321,10 @@ def test_build_aot_spec_unit_cases():
     assert _build_aot_spec(sdfg, 'k', ['s'], ['s'], [], {}) == [
         ('array', 'float64', 1, (1, )),
     ]
-    # Complex device-staged symbol -> raise.
-    with pytest.raises(CodegenError, match='complex'):
-        _build_aot_spec(sdfg, 'k', [], [], ['z'], {'z': 'complex128'})
+    # Complex symbols use the same device-staged array convention.
+    assert _build_aot_spec(sdfg, 'k', [], [], ['z'], {'z': 'complex128'}) == [
+        ('array', 'complex128', 1, (1, )),
+    ]
     # Symbol that is neither device-staged nor a declared bool -> raise.
     with pytest.raises(CodegenError, match='aot_compile'):
         _build_aot_spec(sdfg, 'k', [], [], ['w'], {})

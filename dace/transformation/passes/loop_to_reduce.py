@@ -1,7 +1,8 @@
 # Copyright 2019-2026 ETH Zurich and the DaCe authors. All rights reserved.
 """Detect scalar-accumulator loops -> ``Reduce`` nodes.
 
-Emitted ``Reduce`` uses ``identity=None`` so the pre-loop accumulator seeds the fold.
+The emitted ``Reduce`` folds from the operation identity, then an explicit
+combine tasklet folds in the pre-loop accumulator seed.
 
 Three shapes:
 
@@ -923,11 +924,21 @@ def _lift(parent: ControlFlowRegion, loop: LoopRegion, info: _Reduction):
         parent.add_edge(red_state, e.dst, dace.InterstateEdge(condition=cond, assignments=assigns))
     parent.remove_node(loop)
 
+    from dace.transformation.passes.accumulator_to_map_and_reduce import (_emit_reduce_into, _reduction_identity_for,
+                                                                          _wcr_combine_code)
     arr = red_state.add_read(info.array)
     dst = red_state.add_write(dest_name)
-    red = red_state.add_reduce(info.wcr, axes=list(range(len(info.array_subset))), identity=None)
-    red_state.add_edge(arr, None, red, None, mm.Memlet(data=info.array, subset=info.array_subset))
-    red_state.add_edge(red, None, dst, None, mm.Memlet(data=dest_name, subset=dest_subset))
+    src_memlet = mm.Memlet(data=info.array, subset=info.array_subset)
+    op_identity = _reduction_identity_for(info.wcr, root.arrays[dest_name].dtype)
+    combine_code = _wcr_combine_code(info.wcr)
+    if op_identity is not None and combine_code is not None:
+        seed = red_state.add_read(dest_name)
+        _emit_reduce_into(red_state, root, arr, src_memlet, info.wcr, len(info.array_subset), dest_name, dest_subset,
+                          dst, op_identity, True, combine_code, seed)
+    else:
+        red = red_state.add_reduce(info.wcr, axes=list(range(len(info.array_subset))), identity=None)
+        red_state.add_edge(arr, None, red, None, src_memlet)
+        red_state.add_edge(red, None, dst, None, mm.Memlet(data=dest_name, subset=dest_subset))
 
 
 def _lift_wcr_scalar(parent: ControlFlowRegion, loop: LoopRegion, info: _Reduction):

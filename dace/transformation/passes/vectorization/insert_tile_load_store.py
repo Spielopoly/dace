@@ -17,7 +17,7 @@ AccessNode survives mid-body dataflow.
 """
 from typing import Any, Dict, List, Optional, Tuple
 
-from dace import data, dtypes, properties, subsets
+from dace import data, dtypes, properties, subsets, symbolic
 from dace.libraries.tileops import TileLoad, TileStore
 from dace.memlet import Memlet
 from dace.sdfg import SDFG
@@ -656,6 +656,20 @@ class InsertTileLoadStore(ppl.Pass):
                 continue  # No write to stage (pure source -- the read phase owns it).
             if any(isinstance(e.src, (TileLoad, TileStore)) for e in pre_stage_in_edges):
                 continue  # Already staged by phase 1's bridge->output insertion.
+            # A widened transient may feed the global output directly even when this AccessNode
+            # is also read in the state. Route that copy straight through a TileStore before the
+            # in-place read gate below; otherwise it survives into cuTile code generation as an
+            # unsupported AccessNode-to-AccessNode copy.
+            for edge in list(pre_stage_in_edges):
+                if (isinstance(edge.src, AccessNode)
+                        and self._maybe_stage_tilestore_to_output(inner_state, edge.src, an, iter_vars, edge)):
+                    inner_state.remove_edge(edge)
+                    staged += 1
+            pre_stage_in_edges = list(inner_state.in_edges(an))
+            if not pre_stage_in_edges:
+                continue
+            if any(isinstance(e.src, (TileLoad, TileStore)) for e in pre_stage_in_edges):
+                continue  # The direct-copy path above just staged this write.
             # Pure sink (writes, no reads) is common. Other staged shape = in-place RMW
             # intermediate (user 2026-06-15): non-transient WRITTEN + re-READ in the SAME state
             # (cloudsc ``zqx_v = zqx_v + zqx_l`` then ``zqx_v = zqx_v + zqx_i``). Phase 1
@@ -1206,6 +1220,31 @@ class InsertTileLoadStore(ppl.Pass):
                 continue
             bridge_an = shared_bridge_an or inner_state.add_access(bridge_name)
             new_memlet = Memlet.from_memlet(bridge_memlet_template)
+            if isinstance(old_edge.src, AccessNode):
+                src_desc = inner_state.sdfg.arrays.get(old_edge.src.data)
+                try:
+                    src_is_singleton = (src_desc is not None and symbolic.simplify(src_desc.total_size - 1) == 0)
+                except (TypeError, ValueError):
+                    src_is_singleton = False
+                if src_is_singleton:
+                    # A singleton Array feeding a tile store is a broadcast, not a CopyND.
+                    # Materialize the splat with TileLoad so no AN -> AN copy reaches cuTile.
+                    mask_name = self._find_inner_mask_name(inner_state.sdfg)
+                    mask_an = self._mask_an(inner_state, mask_name)
+                    load = TileLoad(name=f"load_{old_edge.src.data}_to_{bridge_name}",
+                                    widths=tuple(self.widths),
+                                    has_mask=mask_an is not None,
+                                    src_kind="Scalar")
+                    inner_state.add_node(load)
+                    src_subset = an_side_subset(old_edge, old_edge.src, inner_state.sdfg, inner_state)
+                    src_memlet = Memlet(data=old_edge.src.data, subset=src_subset)
+                    inner_state.add_edge(old_edge.src, old_edge.src_conn, load, "_src", src_memlet)
+                    if mask_an is not None:
+                        mask_subset = ", ".join(f"0:{w}" for w in self.widths)
+                        inner_state.add_edge(mask_an, None, load, "_mask", Memlet(f"{mask_an.data}[{mask_subset}]"))
+                    inner_state.add_edge(load, "_dst", bridge_an, old_edge.dst_conn, new_memlet)
+                    inner_state.remove_edge(old_edge)
+                    continue
             # Per 3.8.3 row 1: AN -> AN edges survive only when the destination is a
             # Scalar bridge (CONSTANT staging output). For Array tile bridges the
             # consumer reads the FULL tile — bridge_memlet_template encodes that and
@@ -1255,8 +1294,15 @@ class InsertTileLoadStore(ppl.Pass):
             return False
         if consumer_desc.transient is True:
             return False
-        K = len(iter_vars)
         widths = tuple(self.widths)
+        try:
+            bridge_is_tile = (len(bridge_desc.shape) == len(widths) and all(
+                symbolic.simplify(size - width) == 0 for size, width in zip(bridge_desc.shape, widths)))
+        except (TypeError, ValueError):
+            bridge_is_tile = False
+        if not bridge_is_tile:
+            return False
+        K = len(iter_vars)
         consumer_shape = tuple(consumer_desc.shape)
         D = len(consumer_shape)
         if D < K:

@@ -18,7 +18,7 @@ Each pass calls checkers directly from ``apply_pass``:
                          "WidenAccesses", "memlet dim consistent")
         return result
 """
-from typing import Optional, Tuple
+from typing import Iterable, Optional, Tuple
 
 import dace
 from dace.sdfg import SDFG, SDFGState
@@ -336,33 +336,26 @@ def no_wcr_inside_nested_sdfgs(scope) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 
-def lane_dep_transients_widened(sdfg: SDFG, K: int, widths: Tuple[int, ...]) -> Optional[str]:
-    """Every lane-dependent transient in a tile-tagged body NSDFG is at tile shape ``widths`` OR an
-    exempt bridge name (gather idx tile / ITE materialised tile / cond broadcast tile / Scalar
-    bridge). Per user example 2026-06-12: all non-scalar non-gather dims widened.
+def lane_dep_transients_widened(inner_sdfg: SDFG, names: Iterable[str], widths: Tuple[int, ...]) -> Optional[str]:
+    """Every transient classified as lane-dependent has tile shape ``widths``.
+
+    Only ``names`` returned by :class:`WidenAccesses`' dependency propagation are checked. Other
+    body-local containers may legitimately have unrelated fixed or symbolic shapes; in particular,
+    an :class:`~dace.data.ArrayView` retains the logical shape of the slice it aliases.
+
+    :param inner_sdfg: Tile-map body containing the transient descriptors.
+    :param names: Names classified as lane-dependent by ``WidenAccesses``.
+    :param widths: Expected per-lane tile shape.
+    :returns: A violation description, or ``None`` if every classified transient was widened.
     """
-    import dace.data as _dd
-    for _state, nsdfg_node, _map_entry in _tile_tagged_bodies(sdfg, K):
-        inner_sdfg = nsdfg_node.sdfg
-        for name, desc in inner_sdfg.arrays.items():
-            if not desc.transient:
-                continue
-            if name.startswith("_idx_") or name.startswith("_ite_sym_tile") or name.startswith("_cond_bcast"):
-                continue
-            if isinstance(desc, _dd.Scalar):
-                continue
-            if not isinstance(desc, _dd.Array):
-                continue
-            shape = tuple(desc.shape)
-            if shape == tuple(widths):
-                continue
-            try:
-                if all(bool(dace.symbolic.simplify(s - 1) == 0) for s in shape):
-                    continue
-            except Exception:  # noqa: BLE001
-                pass
-            return (f"{inner_sdfg.name}: lane-dep transient ``{name}`` has shape {shape} "
-                    f"!= widths {tuple(widths)} (expected widened or Scalar bridge)")
+    for name in sorted(names):
+        desc = inner_sdfg.arrays.get(name)
+        if desc is None:
+            return f"{inner_sdfg.name}: lane-dependent transient ``{name}`` has no descriptor"
+        shape = tuple(desc.shape)
+        if shape != tuple(widths):
+            return (f"{inner_sdfg.name}: lane-dependent transient ``{name}`` has shape {shape} "
+                    f"!= widths {tuple(widths)} (expected widened tile)")
     return None
 
 

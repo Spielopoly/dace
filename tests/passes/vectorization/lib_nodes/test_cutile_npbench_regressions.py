@@ -231,6 +231,28 @@ def test_reduce_cupy_device_resident_no_host_roundtrip():
 
 
 @dace.program
+def _lane_id_add(A: dace.float64[N], B: dace.float64[N]):
+    for i in dace.map[0:N]:
+        B[i] = A[i] + i
+
+
+@pytest.mark.gpu
+def test_lane_id_cutile_e2e():
+    """A symbolic, non-divisible lane-ID kernel lowers and runs via TileIota."""
+    n = 37
+    rng = np.random.default_rng(5)
+    a = rng.random(n)
+    b = np.zeros(n)
+    sdfg = _lane_id_add.to_sdfg(simplify=False)
+    sdfg.simplify()
+    VectorizeCuTile(widths=(32, )).apply_pass(sdfg, {})
+    code = "\n".join(obj.code for obj in sdfg.generate_code())
+    assert "ct.arange(32, dtype=ct.int64)" in code
+    sdfg.compile()(A=a.copy(), B=b, N=n)
+    np.testing.assert_allclose(b, a + np.arange(n), rtol=1e-12, atol=1e-12)
+
+
+@dace.program
 def _chol_plus_one(A: dace.float64[N, N], B: dace.float64[N, N]):
     B[:] = np.linalg.cholesky(A) + 1.0
 

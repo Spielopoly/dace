@@ -151,7 +151,7 @@ def test_icon_pattern_K2_vec_K3_src_gather_dims_0_and_2():
     _add_one_constant(sdfg)
     sdfg.add_array("Src", (32, 32, 64), dace.float64, transient=False)
     sdfg.add_array("Dst", (4, 8), dace.float64, transient=True)
-    sdfg.add_array("Idx0", (4, ONE), dace.int64, transient=True)
+    sdfg.add_array("Idx0", (4, ONE), dace.uint32, transient=True)
     sdfg.add_array("Idx2", (4, ONE), dace.int64, transient=True)
     state = sdfg.add_state("s")
     src = state.add_access("Src")
@@ -171,11 +171,19 @@ def test_icon_pattern_K2_vec_K3_src_gather_dims_0_and_2():
     assert "_idx_1" not in node.in_connectors
 
 
+@pytest.mark.parametrize(
+    "idx_dtype", [dace.int8, dace.int16, dace.int32, dace.int64, dace.uint8, dace.uint16, dace.uint32, dace.uint64])
+def test_integer_index_dtypes_validate(idx_dtype):
+    """Signed and unsigned integer tiles are valid gather indices."""
+    sdfg, state, node = _build_load(widths=(4, 8), gather_dims=(0, ), idx_shapes=[(4, ONE)], idx_dtype=idx_dtype)
+    node.validate(sdfg, state)
+
+
 def test_refuse_wrong_index_dtype():
-    """Index dtype must be int32 or int64 (design section 10.4). Uses a VALID
+    """Index dtype must be integral. Uses a valid
     full-K-dim shape so the dtype check (not the shape check) is the failure."""
     sdfg, state, node = _build_load(widths=(4, 8), gather_dims=(0, ), idx_shapes=[(4, ONE)], idx_dtype=dace.float64)
-    with pytest.raises(ValueError, match="dtype.*not in"):
+    with pytest.raises(ValueError, match="dtype.*not an integer"):
         node.validate(sdfg, state)
 
 
@@ -185,7 +193,7 @@ def test_tilestore_gather_dims_symmetric():
     _add_one_constant(sdfg)
     sdfg.add_array("Src", (4, 8), dace.float64, transient=True)
     sdfg.add_array("Dst", (64, 64), dace.float64, transient=False)
-    sdfg.add_array("Idx0", (4, ONE), dace.int64, transient=True)
+    sdfg.add_array("Idx0", (4, ONE), dace.uint32, transient=True)
     state = sdfg.add_state("s")
     src = state.add_access("Src")
     dst = state.add_access("Dst")

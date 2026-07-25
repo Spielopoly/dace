@@ -5,8 +5,9 @@ The pure expansion emits a CPP tasklet whose body walks the K-fold
 nested index space using the source array's strides (which DaCe
 codegen passes via ``__<arr>_strides`` from the surrounding scope).
 """
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
+import numpy as np
 import sympy
 
 import dace
@@ -18,6 +19,7 @@ from .._pure_codegen import (ct_dtype_name, cutile_bid_lines, cutile_grid_dim_of
                              cutile_offset_is_nonzero, cutile_tile_dim_bids, cutile_tile_dim_offsets,
                              gather_lane_offset, nested_loops, offset_via_strides, resolve_gather_deps, tile_offset)
 from .. import _isa_codegen
+from .tile_binop import _replace_symbol_operand, _symbol_operand_free_symbols
 
 
 def _enclosing_map_params(parent_state: dace.SDFGState, node: nodes.Node) -> List[str]:
@@ -794,6 +796,18 @@ class TileLoad(nodes.LibraryNode):
         self.replicate_factor_per_dim = (list(replicate_factor_per_dim) if replicate_factor_per_dim else [1] *
                                          len(widths))
 
+    @property
+    def free_symbols(self) -> Set[str]:
+        """Runtime symbols used by :attr:`src_expr`."""
+        result = super().free_symbols
+        if self.src_expr is not None:
+            result |= _symbol_operand_free_symbols(self.src_expr)
+        return result
+
+    def replace_dict(self, repl: Dict[str, str]) -> None:
+        """Replace runtime symbols in :attr:`src_expr`."""
+        self.src_expr = _replace_symbol_operand(self.src_expr, repl)
+
     def validate(self, sdfg: dace.SDFG, state: dace.SDFGState) -> None:
         """Check connectors + index-tile shape contract (design section 9.4).
 
@@ -801,7 +815,7 @@ class TileLoad(nodes.LibraryNode):
         :param state: State that owns ``self``.
         :raises ValueError: If a required connector is unconnected, an index
             tile's descriptor shape is not a Cartesian product of widths, or
-            the dtype is not in ``{int32, int64}``.
+            the dtype is not an integer type.
         """
         in_e = {e.dst_conn: e for e in state.in_edges(self) if e.dst_conn is not None}
         out_e = {e.src_conn: e for e in state.out_edges(self) if e.src_conn is not None}
@@ -822,7 +836,6 @@ class TileLoad(nodes.LibraryNode):
             validate_packed_layout(self.label, "_src", src_arr)
         # gather_dims source-dim upper bound + per-dim index-tile shape contract (design section 9.4).
         widths = tuple(self.widths)
-        allowed_dtypes = {dace.int32, dace.int64}
         if self.gather_dims and self.src_kind == "Tile":
             src_arr = sdfg.arrays[in_e["_src"].data.data]
             src_ndim = len(src_arr.shape)
@@ -840,6 +853,5 @@ class TileLoad(nodes.LibraryNode):
                 raise ValueError(f"{self.label}: '_idx_{d}' descriptor shape {shape} is not a Cartesian "
                                  f"product of widths {widths} for any sorted subset of tile dims "
                                  f"(design section 9.2)")
-            if desc.dtype not in allowed_dtypes:
-                raise ValueError(f"{self.label}: '_idx_{d}' dtype {desc.dtype} not in "
-                                 f"{{int32, int64}} (design section 10.4)")
+            if not np.issubdtype(desc.dtype.type, np.integer):
+                raise ValueError(f"{self.label}: '_idx_{d}' dtype {desc.dtype} is not an integer type")

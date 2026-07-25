@@ -625,7 +625,19 @@ class WidenAccesses(ppl.Pass):
         )
         for state in inner_sdfg.states():
             for edge in state.edges():
-                if edge.data is None or edge.data.data != name:
+                if edge.data is None:
+                    continue
+                name_is_other_endpoint = (edge.data.data != name
+                                          and ((isinstance(edge.src, AccessNode) and edge.src.data == name) or
+                                               (isinstance(edge.dst, AccessNode) and edge.dst.data == name)))
+                if name_is_other_endpoint:
+                    # AN -> AN memlets may name the opposite endpoint in ``data``. In that
+                    # orientation this transient owns ``other_subset``, not ``subset``.
+                    if edge.data.other_subset is not None:
+                        edge.data.other_subset = subsets.Range(list(target_range.ranges))
+                    edge.data.volume = target_range.num_elements()
+                    continue
+                if edge.data.data != name:
                     continue
                 new_sub = subsets.Range(list(target_range.ranges))
                 edge.data.subset = new_sub
@@ -792,6 +804,9 @@ class WidenAccesses(ppl.Pass):
             for name in to_widen:
                 if self._widen_transient(inner_sdfg, name, to_widen):
                     total += 1
+            assert_invariant(lane_dep_transients_widened(inner_sdfg, to_widen, tuple(self.widths)), "WidenAccesses",
+                             "transients classified as lane-dependent widened to "
+                             "(W_0,...,W_{K-1})")
             # Step 5: seed per-lane symbols for Bypass-form gathers. Idempotent;
             # InsertTileLoadStore/materialiser consume them. Pass per-iter-var ub
             # for the remainder OOB-clamp.
@@ -799,6 +814,4 @@ class WidenAccesses(ppl.Pass):
         # Post-conditions (always run).
         assert_invariant(no_memlet_dim_mismatch(sdfg), "WidenAccesses",
                          "memlet subset and other_subset have matching dimensionality")
-        assert_invariant(lane_dep_transients_widened(sdfg, K, tuple(self.widths)), "WidenAccesses",
-                         "lane-dep transients widened to (W_0,...,W_{K-1}) or kept as Scalar bridge")
         return total if total else None

@@ -91,13 +91,13 @@ from dace.transformation.dataflow.lift_einsum import LiftEinsum
 from dace.transformation.passes.pattern_matching import PatternMatchAndApplyRepeated
 from dace.transformation.passes.vectorization.split_multi_output_tasklets import SplitMultiOutputTasklets
 from dace.transformation.passes.vectorization.normalize_masked_write_tasklets import NormalizeMaskedWriteTasklets
-from dace.libraries.tileops.nodes import (TileBinop, TileFMA, TileLoad, TileMaskGen, TileITE, TileReduce, TileStore,
-                                          TileUnop)
+from dace.libraries.tileops.nodes import (TileBinop, TileFMA, TileIota, TileLoad, TileMaskGen, TileITE, TileReduce,
+                                          TileStore, TileUnop)
 from dace.libraries.tileops._dispatch import select_tile_implementation
 from dace.transformation.passes.vectorization.fuse_multiply_add import FuseMultiplyAdd
 
 #: Tile lib-node types -- all of them, used by the implementation selector.
-_TILE_NODE_TYPES = (TileBinop, TileFMA, TileLoad, TileMaskGen, TileITE, TileReduce, TileStore, TileUnop)
+_TILE_NODE_TYPES = (TileBinop, TileFMA, TileIota, TileLoad, TileMaskGen, TileITE, TileReduce, TileStore, TileUnop)
 
 
 class VectorizeUnsupported(Exception):
@@ -465,7 +465,9 @@ def _promote_read_output_connectors_to_inout(sdfg: dace.SDFG) -> int:
                             None)
             if template is None:
                 continue
-            node.add_in_connector(oc)
+            # An inout connector deliberately has the same name in both connector
+            # dictionaries. The default rejects that cross-direction collision.
+            node.add_in_connector(oc, force=True)
             parent.add_edge(template.src, template.src_conn, node, oc, copy.deepcopy(out_edge.data))
             promoted += 1
     return promoted

@@ -13,6 +13,7 @@ from typing import List, Sequence
 
 import sympy
 
+
 def ct_dtype_name(dtype) -> str:
     """``cuda.tile`` dtype attribute name for a DaCe typeclass.
 
@@ -302,7 +303,7 @@ def cutile_tile_dim_bids(node, parent_state, parent_sdfg, used_dimensions: Seque
         sd = used_dimensions[d] if d < len(used_dimensions) else None
         pos = None
         has_symbols = False
-        if sd is not None and sd < len(src_begins):
+        if sd is not None and 0 <= sd < len(src_begins):
             try:
                 syms = {str(s) for s in _sym.pystr_to_symbolic(str(src_begins[sd])).free_symbols}
             except Exception:  # noqa: BLE001 - non-symbolic begin -> use the raw string
@@ -395,7 +396,7 @@ def cutile_tile_dim_offsets(node, parent_state, parent_sdfg, used_dimensions: Se
     offsets = []
     for d in range(K):
         sd = used_dimensions[d] if d < len(used_dimensions) else None
-        if sd is None or sd >= len(begins):
+        if sd is None or sd < 0 or sd >= len(begins):
             offsets.append(0)
             continue
         try:

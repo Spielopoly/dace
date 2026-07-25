@@ -82,8 +82,45 @@ def test_map_param_colliding_with_loop_variable_not_a_kernel_symbol():
     assert 'jj' not in syms
 
 
+def test_nested_runtime_symbols_exclude_locally_assigned_mapping():
+    """An identity mapping must not turn an interstate-defined name into a call argument."""
+    from dace.codegen.py.cutile_target import CuTilePythonCodeGen
+
+    outer = dace.SDFG("outer")
+    outer.add_symbol("outer_n", dace.int64)
+    outer.add_symbol("local_start", dace.int64)
+    outer_state = outer.add_state("main")
+
+    inner = dace.SDFG("inner")
+    inner.add_symbol("outer_n", dace.int64)
+    inner.add_symbol("local_start", dace.int64)
+    init = inner.add_state("init", is_start_block=True)
+    body = inner.add_state("body")
+    inner.add_edge(init, body, dace.InterstateEdge(assignments={"local_start": "1"}))
+    body.add_map("uses_symbols", {"i": "0:outer_n + local_start"})
+
+    nested = outer_state.add_nested_sdfg(
+        inner,
+        {},
+        {},
+        symbol_mapping={
+            "outer_n": "outer_n",
+            "local_start": "local_start"
+        },
+    )
+    assert CuTilePythonCodeGen._nsdfg_runtime_symbols(nested) == ["outer_n"]
+
+
+def test_nested_control_flow_array_read_uses_scalar_load():
+    """An interstate scalar read inside a cuTile helper uses ``ct.load``."""
+    from dace.codegen.py.cutile_target import _rewrite_cutile_control_flow_expr
+
+    expr = _rewrite_cutile_control_flow_expr("A_row[i + 1]", {"A_row": dace.data.Array(dace.uint32, [4])})
+    assert expr.replace(" ", "") == "ct.astype(ct.load(A_row,(i+1,),shape=()),ct.int64).item()"
+
+
 # ---------------------------------------------------------------------------
-# 2: numeric Scalar in input AND output -> NotImplementedError
+# 2: numeric Scalar in input AND output; bool remains unsupported
 # ---------------------------------------------------------------------------
 
 
@@ -103,26 +140,42 @@ def _inout_scalar_sdfg(dtype) -> dace.SDFG:
     return sdfg
 
 
-def test_float_scalar_inout_raises_not_implemented():
-    sdfg = _inout_scalar_sdfg(dace.float64)
-    with pytest.raises(NotImplementedError, match='both a kernel input and a kernel output'):
-        sdfg.generate_code()
+def _output_scalar_sdfg(dtype) -> dace.SDFG:
+    """A CuTile map writing, but not reading, a Scalar."""
+    sdfg = dace.SDFG(f"output_scalar_{dtype.to_string()}")
+    sdfg.backend = dtypes.BackendLanguage.Python
+    sdfg.add_scalar("s", dtype, storage=StorageType.GPU_Global)
+    state = sdfg.add_state("main")
+    me, mx = state.add_map("cutile_map", {"tile_i": "0:1"}, schedule=ScheduleType.CuTile)
+    tasklet = state.add_tasklet("set", {}, {"out"}, "out = True", language=Language.Python)
+    state.add_nedge(me, tasklet, Memlet())
+    state.add_memlet_path(tasklet, mx, state.add_write("s"), src_conn="out", memlet=Memlet("s[0]"))
+    sdfg.fill_scope_connectors()
+    return sdfg
 
 
-def test_int_scalar_inout_raises_not_implemented():
-    """Integer scalars ride the device-memory convention too, so in/out
-    integer scalars are rejected the same way as floats."""
-    sdfg = _inout_scalar_sdfg(dace.int64)
-    with pytest.raises(NotImplementedError, match='both a kernel input and a kernel output'):
-        sdfg.generate_code()
+def test_float_scalar_inout_loads_and_stores():
+    code = _inout_scalar_sdfg(dace.float64).generate_code()[0].code.replace(" ", "")
+    assert "inp=ct.load(s,(0,),shape=()).item()" in code
+    assert "ct.store(s,index=(0,),tile=out)" in code
+
+
+def test_int_scalar_inout_loads_and_stores():
+    code = _inout_scalar_sdfg(dace.int64).generate_code()[0].code.replace(" ", "")
+    assert "inp=ct.load(s,(0,),shape=()).item()" in code
+    assert "ct.store(s,index=(0,),tile=out)" in code
+
+
+def test_bool_scalar_output_only_raises_not_implemented():
+    """Bool output-only scalars also lack a device store/writeback convention."""
+    with pytest.raises(NotImplementedError, match="bool Scalar .* kernel output"):
+        _output_scalar_sdfg(dace.bool).generate_code()
 
 
 def test_bool_scalar_inout_raises_not_implemented():
-    """Bool in/out scalars are rejected too: a raw bool in/out Scalar is a 0-d
-    host buffer that ``ct.launch`` rejects at runtime (probed: ``RuntimeError:
-    NumPy only supports stream=None``), with no writeback path either."""
+    """Bool in/out scalars have no launch/writeback convention."""
     sdfg = _inout_scalar_sdfg(dace.bool)
-    with pytest.raises(NotImplementedError, match='both a kernel input and a kernel output'):
+    with pytest.raises(NotImplementedError, match="bool Scalar .* kernel output"):
         sdfg.generate_code()
 
 

@@ -16,7 +16,7 @@ directive: "K-dim path can only emit tile ops or python single-element")
 is satisfied at the IR level — the emitter / promoter places a
 ``TileIota`` lib node, not a raw CPP tasklet.
 """
-from typing import Optional, Sequence, Tuple
+from typing import Dict, Optional, Sequence, Set, Tuple
 
 import dace
 from dace import library, properties
@@ -24,6 +24,7 @@ from dace.sdfg import nodes
 from dace.transformation.transformation import ExpandTransformation
 
 from .._pure_codegen import nested_loops, tile_offset
+from .tile_binop import _replace_symbol_operand, _symbol_operand_free_symbols
 
 
 @library.expansion
@@ -255,6 +256,24 @@ class TileIota(nodes.LibraryNode):
         self.widths = list(widths)
         self.expr = expr
         self.extra_inputs = list(extra_inputs)
+
+    @property
+    def free_symbols(self) -> Set[str]:
+        """Runtime symbols used by :attr:`expr`.
+
+        Lane placeholders and extra-input connectors are local to the
+        expanded tasklet and therefore are not SDFG symbols.
+        """
+        local_names = set(self.extra_inputs)
+        local_names.update(f"__l{d}" for d in range(len(self.widths)))
+        return (super().free_symbols | _symbol_operand_free_symbols(self.expr)) - local_names
+
+    def replace_dict(self, repl: Dict[str, str]) -> None:
+        """Replace runtime symbols in :attr:`expr`."""
+        local_names = set(self.extra_inputs)
+        local_names.update(f"__l{d}" for d in range(len(self.widths)))
+        symbol_repl = {key: value for key, value in repl.items() if key not in local_names}
+        self.expr = _replace_symbol_operand(self.expr, symbol_repl)
 
     def validate(self, sdfg: dace.SDFG, state: dace.SDFGState) -> None:
         """Confirm ``_dst`` and every declared extra input are connected.

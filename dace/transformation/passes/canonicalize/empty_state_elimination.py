@@ -21,7 +21,6 @@ pass. The merge is only performed when it is provably value-preserving (see
 from typing import Any, Dict, Optional, Set
 
 from dace import SDFG, symbolic
-from dace.sdfg.graph import Edge
 from dace.sdfg.sdfg import InterstateEdge
 from dace.sdfg.state import ControlFlowRegion, SDFGState
 from dace.transformation import pass_pipeline as ppl
@@ -38,9 +37,11 @@ def _merge_assignments(first: Dict[str, str], second: Dict[str, str]) -> Optiona
     ``second`` reads a symbol ``first`` assigns; otherwise that read would
     silently change from the updated value to the stale one.
 
-    A left-hand-side collision needs no guard: ``second`` overwrites ``first``
-    both when run in sequence and in the merged dict, so the resulting value is
-    the same either way.
+    The reverse dependency also matters to DaCe's interstate-edge contract:
+    a surviving right-hand side from ``first`` may not read a symbol written by
+    ``second``. Although both expressions would see the old value, such a merged
+    edge is rejected as an assignment race. A left-hand-side collision needs no
+    guard when ``second`` overwrites that first assignment completely.
 
     :param first: Assignments of the edge entering the empty state.
     :param second: Assignments of the edge leaving it.
@@ -53,6 +54,12 @@ def _merge_assignments(first: Dict[str, str], second: Dict[str, str]) -> Optiona
         for rhs in second.values():
             if written & {str(s) for s in symbolic.pystr_to_symbolic(rhs).free_symbols}:
                 return None
+    second_written = set(second.keys())
+    for name, rhs in first.items():
+        if name in second_written:
+            continue
+        if second_written & {str(s) for s in symbolic.pystr_to_symbolic(rhs).free_symbols}:
+            return None
     merged = dict(first)
     merged.update(second)
     return merged

@@ -21,7 +21,7 @@ import pytest
 import dace
 from dace.dtypes import ScheduleType
 from dace.libraries.tileops import TileLoad
-from dace.libraries.tileops._pure_codegen import cutile_tile_dim_offsets
+from dace.libraries.tileops._pure_codegen import cutile_tile_dim_bids, cutile_tile_dim_offsets
 
 
 def _node_in_cutile_map(map_ranges: dict) -> tuple:
@@ -119,6 +119,20 @@ def test_scaled_own_param_offset_recovered():
     node, state, sdfg = _node_in_cutile_map({"__i0": "0:64:8"})
     offs = cutile_tile_dim_offsets(node, state, sdfg, (0, ), ["2*__i0 + 1"], 1)
     assert len(offs) == 1 and int(offs[0]) == 1
+
+
+def test_broadcast_sentinel_dimensions_have_no_offset():
+    """Negative source dimensions denote broadcast-only tile axes."""
+    node, state, sdfg = _node_in_cutile_map({
+        "__i0": "0:64:8",
+        "__i1": "0:64:8",
+        "__i2": "0:64:8",
+    })
+    used_dimensions = (-2, -1, 0)
+    begins = ["__i2"]
+    assert cutile_tile_dim_bids(node, state, sdfg, used_dimensions, begins, 3) == [0, 1, 2]
+    offsets = cutile_tile_dim_offsets(node, state, sdfg, used_dimensions, begins, 3)
+    assert [int(offset) for offset in offsets] == [0, 0, 0]
 
 
 if __name__ == "__main__":

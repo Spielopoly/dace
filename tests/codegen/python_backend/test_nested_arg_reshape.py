@@ -153,6 +153,36 @@ def test_matching_shapes_unchanged():
     assert np.allclose(Y, 2 * X)
 
 
+def test_connector_shape_uses_nested_symbol_mapping():
+    """Connector shapes and strides are compared in the parent symbol scope."""
+    N = dace.symbol('N')
+    M = dace.symbol('M')
+    sdfg = dace.SDFG('nested_symbol_mapping')
+    sdfg.add_symbol('N', dace.int64)
+    state = sdfg.add_state()
+    sdfg.add_array('X', (2, N), dace.float64)
+    sdfg.add_array('Y', (2, N), dace.float64)
+
+    nsdfg = dace.SDFG('nested_symbol_mapping_inner')
+    nsdfg.add_symbol('M', dace.int64)
+    nstate = nsdfg.add_state()
+    nsdfg.add_array('_x', (2, M), dace.float64)
+    nsdfg.add_array('_y', (2, M), dace.float64)
+    tasklet = nstate.add_tasklet('scale', {'__i'}, {'__o'}, '__o = 2 * __i')
+    nstate.add_edge(nstate.add_read('_x'), None, tasklet, '__i', Memlet.from_array('_x', nsdfg.arrays['_x']))
+    nstate.add_edge(tasklet, '__o', nstate.add_write('_y'), None, Memlet.from_array('_y', nsdfg.arrays['_y']))
+
+    node = state.add_nested_sdfg(nsdfg, {'_x'}, {'_y'}, {'M': N})
+    state.add_edge(state.add_read('X'), None, node, '_x', Memlet.from_array('X', sdfg.arrays['X']))
+    state.add_edge(node, '_y', state.add_write('Y'), None, Memlet.from_array('Y', sdfg.arrays['Y']))
+    sdfg.backend = dtypes.BackendLanguage.Python
+
+    X = np.random.rand(2, 7)
+    Y = np.zeros_like(X)
+    sdfg(X=X, Y=Y, N=7)
+    assert np.allclose(Y, 2 * X)
+
+
 def test_inout_connector_flat_reshape():
     """An in/out connector with a flat reshape mismatch reads AND writes back.
 

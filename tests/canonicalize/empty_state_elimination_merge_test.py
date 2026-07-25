@@ -43,6 +43,14 @@ def test_dependent_assignment_blocks_merge():
     assert empty in sdfg.nodes()
 
 
+def test_reverse_dependency_blocks_invalid_merged_edge():
+    """A first-edge RHS may not read a symbol the second edge writes."""
+    sdfg, empty = _chain({"k": "m + 1"}, {"m": "2"})
+    assert EmptyStateElimination().apply_pass(sdfg, {}) is None
+    assert empty in sdfg.nodes()
+    sdfg.validate()
+
+
 def test_lhs_collision_merges_to_second():
     """Both edges write ``m``; the later write wins either way."""
     sdfg, empty = _chain({'m': '1'}, {'m': '2'})
