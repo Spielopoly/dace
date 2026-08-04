@@ -14,11 +14,13 @@ import numpy as np
 
 import dace
 from dace import properties
-from dace.libraries.tileops import TileBinop, TileITE, TileLoad, TileMaskGen, TileReduce, TileStore, TileUnop
+from dace.libraries.tileops import (TileBinop, TileIota, TileITE, TileLoad, TileMaskGen, TileReduce, TileStore,
+                                    TileUnop)
 from dace.sdfg import SDFG
 from dace.sdfg.nodes import CodeBlock, MapEntry, NestedSDFG, Tasklet
 from dace.sdfg.state import SDFGState
 from dace.transformation import pass_pipeline as ppl, transformation
+from dace.transformation.passes.vectorization.utils.errors import VectorizeUnsupported
 from dace.transformation.passes.vectorization.utils.map_predicates import is_vectorizable_map
 from dace.transformation.passes.vectorization.utils.pass_invariants import (assert_invariant, logical_binops_are_bool,
                                                                             mask_connectors_are_bool,
@@ -27,9 +29,9 @@ from dace.transformation.passes.vectorization.utils.pass_invariants import (asse
 
 #: Binary ops → :class:`TileBinop`. Comparisons (``< <= > >= == !=``) produce bool tile
 #: outputs → :class:`TileITE` cond input (design 7.5). Powers arrive as the function-form
-#: ``pow`` / ``ipow`` (``PowerOperatorExpansion`` rewrites every ``**`` to ``pow`` or an
+#: ``pow`` / ``ipow`` (``PowerOperatorExpansion`` rewrites a LITERAL integer exponent > 1 to an
 #: unrolled product; ``RelaxIntegerPowers`` relaxes an integer-exponent ``pow`` → ``ipow``).
-#: ``**`` is retained for robustness against a residual bare operator.
+#: ``**`` is retained: every exponent the expansion does not take stays a bare operator.
 _SUPPORTED_BINOPS = {
     "+", "-", "*", "/", "%", "py_mod", "**", "pow", "ipow", "min", "max", "atan2", "hypot", "fmod", "<", "<=", ">",
     ">=", "==", "!=", "&&", "||", "&", "|", "^"
@@ -230,6 +232,49 @@ def _normalize_python_tasklet_body(body: str) -> Optional[str]:
     return out
 
 
+def free_symbol_names(expr: str) -> list:
+    """Free-symbol names of ``expr``, empty when it does not parse. Sorted: the caller reports
+    the first hit in a message, and a set of strings iterates by ``PYTHONHASHSEED``."""
+    try:
+        return sorted(str(s) for s in dace.symbolic.pystr_to_symbolic(expr).free_symbols)
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def lane_dependent_through_interstate_assignment(inner_state: SDFGState, expr: str,
+                                                 iter_vars: Tuple[str, ...]) -> Optional[str]:
+    """Name of the symbol in ``expr`` whose interstate definition ties it to a tile iter_var,
+    or ``None`` when every symbol in ``expr`` is genuinely tile-invariant.
+
+    :meth:`ConvertTaskletsToTileOps._is_lane_id_dependent` only sees the names SPELLED in
+    ``expr``. The frontend routes an array element into a tasklet through an interstate
+    assignment (``b_index = b[i]``), so the body reads a bare ``b_index`` that names no
+    iter_var yet holds a different value in every lane. "Does not mention an iter_var" is
+    not "is loop-invariant": resolve the assignment chain before believing it.
+    """
+    names = free_symbol_names(expr)
+    if not names:
+        return None  # a literal operand -- no need to walk the edges
+    assignments = {
+        sym: rhs
+        for edge in inner_state.sdfg.all_interstate_edges()
+        for sym, rhs in edge.data.assignments.items()
+    }
+    pending = [s for s in names if s in assignments]
+    seen = set()
+    while pending:
+        name = pending.pop(0)
+        if name in seen:
+            continue
+        seen.add(name)
+        for sym in free_symbol_names(assignments[name]):
+            if sym in iter_vars:
+                return name
+            if sym in assignments:
+                pending.append(sym)
+    return None
+
+
 @properties.make_properties
 @transformation.explicit_cf_compatible
 class ConvertTaskletsToTileOps(ppl.Pass):
@@ -299,9 +344,23 @@ class ConvertTaskletsToTileOps(ppl.Pass):
         ``idx[...]`` into an index tile (lane offset IS ``__l``). Do not conflate.
         """
         if not iter_vars or not self._is_lane_id_dependent(expr, iter_vars):
+            if iter_vars:
+                hidden = lane_dependent_through_interstate_assignment(inner_state, expr, iter_vars)
+                if hidden is not None:
+                    raise VectorizeUnsupported(f"symbol operand {expr!r} varies per lane through the interstate "
+                                               f"assignment defining {hidden!r}; inlining it as an invariant Symbol "
+                                               f"would broadcast lane 0 across the tile")
             return "Symbol", expr, None
         an_name = self._materialise_lane_id_tile(inner_state, expr, iter_vars)
         return "Tile", None, an_name
+
+    @staticmethod
+    def _per_lane_expr(expr: str, iter_vars: Tuple[str, ...]) -> str:
+        """C++ spelling of ``expr`` with each tile iter-var ``v`` expanded to ``v + __l<k>``."""
+        from dace import symbolic
+        from dace.codegen.common import sym2cpp
+        subs = {symbolic.symbol(v): symbolic.symbol(v) + symbolic.symbol(f"__l{k}") for k, v in enumerate(iter_vars)}
+        return sym2cpp(symbolic.pystr_to_symbolic(expr).subs(subs))
 
     def _materialise_lane_id_tile(self, inner_state: SDFGState, expr: str, iter_vars: Tuple[str, ...]) -> str:
         """Mint a per-lane int64 tile = ``expr`` at ``(iter_var_k -> iter_var_k + __l_k)``.
@@ -464,8 +523,8 @@ class ConvertTaskletsToTileOps(ppl.Pass):
             return None
         # Try every op against both operand orderings. DaCe wraps the RHS in parens
         # (``_o = (_a + _b)``); accept both. Function-form ops use ``op(a, b)`` (this
-        # covers ``pow`` / ``ipow``); ``**`` keeps the bare-operator infix case for a
-        # residual power PowerOperatorExpansion did not rewrite.
+        # covers ``pow`` / ``ipow``); ``**`` keeps the bare-operator infix case for the
+        # non-literal-integer exponents PowerOperatorExpansion deliberately leaves alone.
         for op in _SUPPORTED_BINOPS:
             for a, b in (in_conns, list(reversed(in_conns))):
                 if op in _FUNCTION_FORM_BINOPS:
@@ -620,9 +679,6 @@ class ConvertTaskletsToTileOps(ppl.Pass):
         for fn in ("min(", "max(", "pow(", "ipow(", "ITE("):
             if rhs.startswith(fn):
                 return None
-        # Reject leading minus (handled by _detect_unop_with_symbol negation case).
-        if rhs.startswith("-") and not rhs.startswith("-"):  # never triggers; placeholder
-            return None
         return out_conn, rhs
 
     def _reads_scalar_operand_inline(self, node) -> bool:
@@ -653,11 +709,24 @@ class ConvertTaskletsToTileOps(ppl.Pass):
         fill, no intermediate transient, no AN→AN copy (user 2026-06-15: const/symbol→tile
         broadcast is a tile op). Symbol-source ``TileLoad`` declares no ``_src``; the
         expansion embeds ``src_expr`` inline. A non-tile (true scalar) output stays a
-        single-statement python scalar tasklet — scalar→scalar needs no tile op."""
+        single-statement python scalar tasklet — scalar→scalar needs no tile op.
+
+        "0 in-connectors" does NOT imply "loop-invariant": the RHS can name a tile iter_var,
+        or a symbol an interstate assignment ties to one (``b_index = b[i]``). Broadcasting
+        either splats lane 0 across the tile, so refuse instead of assuming."""
         out_conn, expr = detected
         out_edges = data_out_edges(inner_state, tasklet)
         if not out_edges:
             return False
+        if iter_vars:
+            if self._is_lane_id_dependent(str(expr), iter_vars):
+                raise VectorizeUnsupported(f"broadcast source {expr!r} names a tile iter_var, so it differs per "
+                                           f"lane; splatting it across the tile would write lane 0's value")
+            hidden = lane_dependent_through_interstate_assignment(inner_state, str(expr), iter_vars)
+            if hidden is not None:
+                raise VectorizeUnsupported(f"broadcast source {expr!r} varies per lane through the interstate "
+                                           f"assignment defining {hidden!r}; splatting it across the tile would "
+                                           f"write lane 0's value")
         out_edge = out_edges[0]
         # A pure SAME-DOMAIN compile-time constant (fp literal into an fp scalar, int into an
         # int scalar) is a narrowed constant, not a produced per-lane value: keep it a Scalar
@@ -689,7 +758,8 @@ class ConvertTaskletsToTileOps(ppl.Pass):
             # ``TileLoad(src_kind='Symbol')`` broadcast fill below (which splats the identity
             # across every lane).
             out_is_tile = (isinstance(const_desc, dace.data.Array) and tuple(const_desc.shape) == tuple(self.widths))
-            consumers = [e.dst for e in inner_state.out_edges(const_dst)]
+            # An ordering edge's dst is not a consumer; counting it only ever loses the shortcut.
+            consumers = [e.dst for e in data_out_edges(inner_state, const_dst)]
             if (const_desc is not None and not out_is_tile and is_same_domain_constant(str(expr), const_desc.dtype)
                     and consumers and all(self._reads_scalar_operand_inline(c) for c in consumers)):
                 return False  # same-domain constant -> stays a scalar broadcast operand
@@ -707,10 +777,18 @@ class ConvertTaskletsToTileOps(ppl.Pass):
                        and tuple(out_desc.shape) == tuple(self.widths))
         if not is_tile_out:
             return False  # scalar const store -- keep the single-statement python tasklet
-        tl = TileLoad(name=f"{tasklet.label}_const_bcast",
-                      widths=tuple(self.widths),
-                      src_kind="Symbol",
-                      src_expr=str(expr))
+        # A tile iter-var in the expression makes the value LANE-VARYING (``Yi[:, j] = j``,
+        # npbench mandelbrot2): broadcasting the tile base would write ``j`` to all W lanes.
+        # Expand ``v -> v + __l<k>`` per lane and fill with a TileIota instead.
+        if self._is_lane_id_dependent(str(expr), iter_vars):
+            tl = TileIota(name=f"{tasklet.label}_lane_iota",
+                          widths=tuple(self.widths),
+                          expr=self._per_lane_expr(str(expr), iter_vars))
+        else:
+            tl = TileLoad(name=f"{tasklet.label}_const_bcast",
+                          widths=tuple(self.widths),
+                          src_kind="Symbol",
+                          src_expr=str(expr))
         inner_state.add_node(tl)
         subset = ", ".join(f"0:{w}" for w in self.widths)
         inner_state.add_edge(tl, "_dst", out_edge.dst, out_edge.dst_conn, dace.Memlet(f"{out_edge.dst.data}[{subset}]"))
@@ -1699,7 +1777,6 @@ class ConvertTaskletsToTileOps(ppl.Pass):
         out_subset = ", ".join(f"0:{w}" for w in widths)
         inner_state.add_edge(tasklet, "_out", out_an, None, _Memlet(f"{arr_name}[{out_subset}]"))
         return arr_name
-        return True
 
     def _convert_binop(self, inner_state: SDFGState, tasklet: Tasklet, detected) -> bool:
         out_conn, a_conn, b_conn, op = detected

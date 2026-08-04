@@ -105,7 +105,8 @@ class InlineMultistateSDFG(transformation.SingleStateTransformation):
             #  for that. Clone the descriptor because the operation is inplace.
             inner_desc = nested_sdfg.sdfg.arrays[edge.dst_conn].clone()
             symbolic.safe_replace(nested_sdfg.symbol_mapping, lambda m: replace_properties_dict(inner_desc, m))
-            if (outer_desc.shape != inner_desc.shape or outer_desc.strides != inner_desc.strides):
+            if (not symbolic.same_value(outer_desc.shape, inner_desc.shape)
+                    or not symbolic.same_value(outer_desc.strides, inner_desc.strides)):
                 return False
 
         for edge in state.out_edges(nested_sdfg):
@@ -124,7 +125,8 @@ class InlineMultistateSDFG(transformation.SingleStateTransformation):
 
             inner_desc = nested_sdfg.sdfg.arrays[edge.src_conn].clone()
             symbolic.safe_replace(nested_sdfg.symbol_mapping, lambda m: replace_properties_dict(inner_desc, m))
-            if (outer_desc.shape != inner_desc.shape or outer_desc.strides != inner_desc.strides):
+            if (not symbolic.same_value(outer_desc.shape, inner_desc.shape)
+                    or not symbolic.same_value(outer_desc.strides, inner_desc.strides)):
                 return False
 
         if not helpers.isolate_nested_sdfg(state, nsdfg_node=nested_sdfg, test_if_applicable=True):
@@ -251,12 +253,23 @@ class InlineMultistateSDFG(transformation.SingleStateTransformation):
 
         allnames = set(outer_symbols.keys()) | set(sdfg.arrays.keys())
         assignments_to_replace = inner_assignments & (outer_assignments | allnames)
+        # Inner symbols that received their value from an IDENTITY symbol-mapping entry
+        # (outer ``K`` -> inner ``K``, lowered above via ``safe_replace`` as a no-op rename).
+        # Renaming such a symbol on collision (below) severs that implicit outer->inner link.
+        identity_names = {str(k) for k in identity_mapping}
         sym_replacements: Dict[str, str] = {}
         for assign in assignments_to_replace:
             newname = data.find_new_name(assign, allnames)
             allnames.add(newname)
             outer_symbols[newname] = nsdfg.symbols.get(assign, None)
             sym_replacements[assign] = newname
+            # ``assign`` was inner == outer (identity map) but is now renamed to ``newname``; the
+            # outer value no longer reaches the inlined region. Re-establish it as a non-identity
+            # assignment ``newname = assign`` (planted on the entry edge below) so the inlined
+            # region is initialized from the outer symbol -- otherwise ``newname`` is undefined
+            # (e.g. an external loop-init symbol whose inner name collides with the outer one).
+            if assign in identity_names:
+                non_identity_mapping[assign] = assign
         nsdfg.replace_dict(sym_replacements)
 
         #######################################################

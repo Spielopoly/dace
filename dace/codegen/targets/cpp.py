@@ -9,11 +9,12 @@ import functools
 import itertools
 import math
 import numbers
+import re
 import warnings
 
 import sympy as sp
 from io import StringIO
-from typing import IO, TYPE_CHECKING, Optional, Tuple, Union
+from typing import IO, TYPE_CHECKING, List, Optional, Sequence, Tuple, Union
 
 import dace
 from dace import data, subsets, symbolic, dtypes, memlet as mmlt, nodes
@@ -416,9 +417,11 @@ def emit_memlet_reference(dispatcher: 'TargetDispatcher',
     # Register defined variable
     dispatcher.defined_vars.add(pointer_name, defined_type, typedef, allow_shadowing=True)
 
-    # NOTE: `expr` may only be a name or a sequence of names and dots. The latter indicates nested data and structures.
-    # NOTE: Since structures are implemented as pointers, we replace dots with arrows.
-    expr = expr.replace('.', '->')
+    # NOTE: A dot separating names indicates nested data and structures, and structures are
+    # implemented as pointers, so it becomes an arrow. Only a dot BETWEEN NAMES qualifies: `expr`
+    # ends in an index expression, so a decimal literal there was rewritten too, e.g.
+    # `&A[(0.5 * j)]` -> `&A[(0->5 * j)]`, which does not compile.
+    expr = re.sub(r'\.(?=[A-Za-z_])', '->', expr)
 
     return (typedef + ref, pointer_name, expr)
 
@@ -689,14 +692,7 @@ def _check_range_conflicts(subset, a, itersym, b, step):
 
 
 def _check_map_conflicts(map, edge):
-    for itervar, (_, _, mapskip) in zip(map.params, map.range):
-        itersym = symbolic.pystr_to_symbolic(itervar)
-        a = sp.Wild('a', exclude=[itersym])
-        b = sp.Wild('b', exclude=[itersym])
-        if not _check_range_conflicts(edge.data.subset, a, itersym, b, mapskip):
-            return False
-    # If matches all map params, good to go
-    return True
+    return not write_conflicted_map_params(map, edge)
 
 
 def _check_neighbor_conflicts(dfg, edge):
@@ -726,8 +722,10 @@ def _check_neighbor_conflicts(dfg, edge):
 
 def write_conflicted_map_params(map, edge):
     result = []
+    # Symbol identity includes the dtype, so the iterator must be the instance the subset carries.
+    itersyms = symbolic.symbols_in([edge.data.subset])
     for itervar, (_, _, mapskip) in zip(map.params, map.range):
-        itersym = symbolic.pystr_to_symbolic(itervar)
+        itersym = symbolic.resolve_symbol(itervar, itersyms)
         a = sp.Wild('a', exclude=[itersym])
         b = sp.Wild('b', exclude=[itersym])
         if not _check_range_conflicts(edge.data.subset, a, itersym, b, mapskip):
@@ -1115,6 +1113,21 @@ class InterstateEdgeUnparser(cppunparse.CPPUnparser):
         self.write(cpp_array_expr(self.sdfg, memlet, framecode=self.framecode))
 
 
+def is_lowered_target_code(node: ast.AST) -> bool:
+    """
+    Checks whether a (partially) visited tasklet subtree already carries generated target code.
+
+    The tasklet visitors splice emitted C++ back into the Python AST as an ``ast.Name`` holding a whole
+    expression (``A->indices[A_indices_idx(idx)]``, ``(*__walk_A)``, ...). A parsed ``ast.Name.id`` is
+    always an identifier, so a non-identifier id marks such a spliced node -- and marks a subtree that
+    can no longer be re-parsed as Python, i.e. that must not re-enter the symbolic layer.
+
+    :param node: The AST node to inspect, including its descendants.
+    :return: True if any node in the subtree holds already-generated target code.
+    """
+    return any(isinstance(n, ast.Name) and not n.id.isidentifier() for n in ast.walk(node))
+
+
 class DaCeKeywordRemover(ExtNodeTransformer):
     """ Removes memlets and other DaCe keywords from a Python AST, and
         converts array accesses to C++ methods that can be generated.
@@ -1157,7 +1170,34 @@ class DaCeKeywordRemover(ExtNodeTransformer):
         # More than one target, i.e., x = y = z
         return ast.copy_location(ast.Assign(targets=node.targets[:-1], value=locfix), node)
 
-    def _subscript_expr(self, slicenode: ast.AST, target: str) -> symbolic.SymbolicType:
+    def index_offset(self, elts: Sequence[ast.AST],
+                     strides: Sequence[symbolic.SymbolicType]) -> Union[symbolic.SymbolicType, str]:
+        """
+        Builds the flat offset ``sum(index * stride)`` of a subscript from its per-dimension indices.
+
+        The offset stays symbolic while every index is still a Python expression. An index the visitor
+        already lowered to target code -- an indirection such as ``A->indices[A_indices_idx(idx)]``,
+        which is C++ and not Python -- cannot round-trip through ``pystr_to_symbolic``, so the offset is
+        then composed as C++ text instead. ``sym2cpp`` passes such a string through unchanged.
+
+        :param elts: Visited index expression per dimension.
+        :param strides: Stride per dimension, matching ``elts``.
+        :return: The offset as a symbolic expression, or as a C++ string for an already-lowered index.
+        """
+        if not any(is_lowered_target_code(elt) for elt in elts):
+            return sum(symbolic.pystr_to_symbolic(unparse(elt)) * s for elt, s in zip(elts, strides))
+
+        terms: List[str] = []
+        for elt, stride in zip(elts, strides):
+            if not is_lowered_target_code(elt):
+                terms.append(sym2cpp(symbolic.pystr_to_symbolic(unparse(elt)) * stride))
+            elif stride == 1:
+                terms.append(unparse(elt))
+            else:
+                terms.append('(%s) * %s' % (unparse(elt), sym2cpp(stride)))
+        return ' + '.join(terms)
+
+    def _subscript_expr(self, slicenode: ast.AST, target: str) -> Union[symbolic.SymbolicType, str]:
         visited_slice = self.visit(slicenode)
 
         if isinstance(visited_slice, ast.Index):
@@ -1201,10 +1241,13 @@ class DaCeKeywordRemover(ExtNodeTransformer):
                 raise SyntaxError('Invalid number of dimensions in expression (expected %d, '
                                   'got %d)' % (len(strides), len(elts)))
 
-            return sum(symbolic.pystr_to_symbolic(unparse(elt)) * s for elt, s in zip(elts, strides))
+            return self.index_offset(elts, strides)
 
         if len(strides) != 1:
             raise SyntaxError('Missing dimensions in expression (expected one, got %d)' % len(strides))
+
+        if is_lowered_target_code(visited_slice):
+            return self.index_offset([visited_slice], strides)
 
         try:
             return symbolic.pystr_to_symbolic(unparse(visited_slice)) * strides[0]
@@ -1437,6 +1480,20 @@ def presynchronize_streams(sdfg: SDFG, cfg: ControlFlowRegion, dfg: StateSubgrap
                 enclosing_state_id,
                 [e.src, e.dst],
             )
+
+
+def gpu_alloc_check(call: str, nodedesc: data.Data) -> str:
+    """
+    Wraps a GPU allocation call in the error check that stops at the failure instead of running on.
+
+    :param call: The backend allocation call, without a trailing semicolon.
+    :param nodedesc: Descriptor of the data being allocated.
+    :return: A C++ statement, newline-terminated.
+    """
+    # Persistent allocations are emitted into ``__dace_init_<name>``, which hands back the state pointer.
+    if nodedesc.lifetime == dtypes.AllocationLifetime.Persistent:
+        return f'DACE_GPU_CHECK_RETURN_VAL({call}, nullptr);\n'
+    return f'DACE_GPU_CHECK_RETURN({call});\n'
 
 
 # TODO: This should be in the CUDA code generator. Add appropriate conditions to node dispatch predicate

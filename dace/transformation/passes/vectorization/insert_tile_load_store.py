@@ -50,7 +50,8 @@ def _assert_post_stage_invariants(state: SDFGState) -> None:
     sdfg = state.sdfg
     for edge in state.edges():
         mem = edge.data
-        if mem is None:
+        # An empty memlet is an ordering edge, not a copy; identity checks miss it.
+        if mem is None or mem.is_empty():
             continue
         src_is_libnode = isinstance(edge.src, (TileLoad, TileStore))
         dst_is_libnode = isinstance(edge.dst, (TileLoad, TileStore))
@@ -459,6 +460,10 @@ class InsertTileLoadStore(ppl.Pass):
             pre_stage_out_edges = list(inner_state.out_edges(an))
             if not pre_stage_out_edges:
                 continue  # No reads -- sink AN handled by phase 2.
+            # An empty out-edge has no subset, so it reports the full array and hides a gather read.
+            pre_stage_out_edges = [e for e in pre_stage_out_edges if not e.data.is_empty()]
+            if not pre_stage_out_edges:
+                continue
             try:
                 src_data, src_subset, _dst_data, _dst_subset = infer_edge_endpoints(pre_stage_out_edges[0], inner_sdfg,
                                                                                     inner_state)
@@ -654,6 +659,10 @@ class InsertTileLoadStore(ppl.Pass):
             pre_stage_out_edges = list(inner_state.out_edges(an))
             if not pre_stage_in_edges:
                 continue  # No write to stage (pure source -- the read phase owns it).
+            # An empty in-edge has no subset, so it reports the full array and hides a per-tile write.
+            pre_stage_in_edges = [e for e in pre_stage_in_edges if not e.data.is_empty()]
+            if not pre_stage_in_edges:
+                continue
             if any(isinstance(e.src, (TileLoad, TileStore)) for e in pre_stage_in_edges):
                 continue  # Already staged by phase 1's bridge->output insertion.
             # A widened transient may feed the global output directly even when this AccessNode
@@ -1400,6 +1409,9 @@ class InsertTileLoadStore(ppl.Pass):
                 # Walk downstream of this AN: capture all out-edges, queue any
                 # further tasklets so we resize THEIR scalar outputs too.
                 for downstream in inner_state.out_edges(e.dst):
+                    # Ordering edge, not part of the tile-shape chain: forcing a subset malforms it.
+                    if downstream.data.is_empty():
+                        continue
                     memlets_to_update.append(downstream)
                     if isinstance(downstream.dst, Tasklet) and id(downstream.dst) not in seen_tasklets:
                         seen_tasklets.add(id(downstream.dst))

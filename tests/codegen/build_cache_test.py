@@ -6,6 +6,7 @@ correct build save for wall-clock time.
 import contextlib
 import json
 import os
+import shutil
 import subprocess
 
 import numpy as np
@@ -120,6 +121,28 @@ def test_precompiled_header_is_actually_used(tmp_path):
     assert result.returncode == 0, f'the compiler refused the precompiled header:\n{result.stderr}'
 
 
+@pytest.mark.skipif(os.name != 'posix', reason='precompiled headers are only wired up for GCC/Clang')
+def test_precompiled_header_separates_source_trees(tmp_path, monkeypatch):
+    """Two checkouts sharing a compiler must not share one .gch. The mtime guard cannot catch it: it
+    walks THIS tree's runtime and compares against a header built from the other's, so a stale header
+    passes while the TU compiles against foreign declarations."""
+    monkeypatch.setattr(compiler, 'build_cache_root', lambda: str(tmp_path / 'cache'))
+    mine = compiler.prepare_precompiled_header({'cpu'})
+    assert mine, 'no precompiled header was produced'
+
+    clone = tmp_path / 'clone' / 'dace'
+    real = os.path.dirname(os.path.dirname(os.path.abspath(compiler.__file__)))
+    shutil.copytree(os.path.join(real, 'runtime', 'include'), clone / 'runtime' / 'include')
+    shutil.copytree(os.path.join(real, 'external'), clone / 'external')  # stream.h reaches into it
+    # The runtime path is derived from this module's location, so relocating it is what a second
+    # checkout looks like.
+    monkeypatch.setattr(compiler, '__file__', str(clone / 'codegen' / 'compiler.py'))
+    theirs = compiler.prepare_precompiled_header({'cpu'})
+
+    assert theirs, 'no precompiled header was produced for the second tree'
+    assert mine != theirs, 'both trees were handed the same precompiled header'
+
+
 def test_caches_disabled_still_builds(tmp_path):
     """With every cache off the build must still work -- they are optimizations, not requirements."""
     with dace.config.set_temporary('compiler', 'precompiled_header', value=False):
@@ -181,3 +204,23 @@ def test_distributed_and_local_builds_interleave(tmp_path, private_cache):
 
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
+
+
+def test_cache_key_separates_hosts(monkeypatch):
+    """The caches above are reachable from more than one machine -- ``DACE_BUILD_CACHE_DIR`` on shared
+    scratch, or the ``default_build_folder`` fallback on a cluster file system. The default cpu args
+    carry ``-march=native``, which the key can only see as a literal string, so identical inputs on
+    two different CPUs would otherwise collide and hand one host artifacts built for the other's
+    instruction set. The host identity in the key is what turns that into a miss."""
+    monkeypatch.setattr(compiler, 'host_isa_id', lambda: 'cpu-a')
+    on_a = compiler.cache_key('same', 'parts')
+    monkeypatch.setattr(compiler, 'host_isa_id', lambda: 'cpu-b')
+    assert compiler.cache_key('same', 'parts') != on_a
+
+
+def test_host_isa_id_is_stable_and_nonempty():
+    """A blank or drifting identity silently restores the collision above -- on every host at once,
+    since they would then all agree."""
+    first = compiler.host_isa_id()
+    assert first, 'no host identity derived; every CPU would share one cache key'
+    assert compiler.host_isa_id() == first, 'host identity is not stable within a process'

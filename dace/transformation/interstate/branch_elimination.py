@@ -1015,7 +1015,7 @@ class BranchElimination(transformation.MultiStateTransformation):
                     code = sympy.nsimplify(rhs_expr)
                     # Use rational until the very end and then call evalf to get rational to flaot to avoid accumulating errors
                     code = sympy.nsimplify(code.subs(ie.dst_conn, rhs_str)).evalf()
-                    new_code_str = lhs + " = " + pycode(code)
+                    new_code_str = lhs + " = " + pycode(code, allow_unknown_functions=True)
                     node.code = CodeBlock(new_code_str)
 
                     state.remove_edge(ie)
@@ -2206,6 +2206,9 @@ class BranchElimination(transformation.MultiStateTransformation):
         assert {e for e in g.out_edges(state1) if e.dst == state2}.pop().data.assignments == dict()
 
         node_map = dict()
+        # One memo for the fused-in state: a scope's entry and exit share a single Map object, and a
+        # per-node deepcopy would hand them one copy each.
+        memo = {}
         for n in state2.nodes():
             if n in state2_src_nodes:
                 if n.data in state1_sink_data:
@@ -2213,11 +2216,11 @@ class BranchElimination(transformation.MultiStateTransformation):
                     assert len(sink_nodes) == 1
                     node_map[n] = sink_nodes.pop()
                 else:
-                    cpnode = copy.deepcopy(n)
+                    cpnode = copy.deepcopy(n, memo)
                     state1.add_node(cpnode)
                     node_map[n] = cpnode
             else:
-                cpnode = copy.deepcopy(n)
+                cpnode = copy.deepcopy(n, memo)
                 state1.add_node(cpnode)
                 node_map[n] = cpnode
 

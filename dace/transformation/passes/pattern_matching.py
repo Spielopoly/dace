@@ -213,9 +213,13 @@ class PatternMatchAndApplyRepeated(PatternMatchAndApply):
             try:
                 self.validate_after_match(match, graph, sdfg)
             except InvalidSDFGError as err:
+                # ``match.state_id`` indexes ``tcfg``, not the SDFG.
                 raise InvalidSDFGError(
                     f'Validation failed after applying {match_name}. '
-                    f'{type(err).__name__}: {err}', sdfg, match.state_id) from err
+                    f'{type(err).__name__}: {err}',
+                    sdfg,
+                    match.state_id,
+                    cfg=tcfg) from err
 
     def _apply_pass(self, sdfg: SDFG, pipeline_results: Dict[str, Any], apply_once: bool) -> Dict[str, List[Any]]:
         """
@@ -285,8 +289,12 @@ class PatternMatchAndApplyRepeated(PatternMatchAndApply):
                 sdfg.validate()
             except InvalidSDFGError as err:
                 if applied and match is not None:
-                    raise InvalidSDFGError(f"Validation failed after applying {match.print_match(self)}.", self,
-                                           match.state_id) from err
+                    # Defensive: unreachable -- ``applied`` is always False here -- but kept correct.
+                    tcfg = sdfg.cfg_list[match.cfg_id]
+                    raise InvalidSDFGError(f'Validation failed after applying {match.print_match(tcfg)}.',
+                                           sdfg,
+                                           match.state_id,
+                                           cfg=tcfg) from err
                 else:
                     raise err
 

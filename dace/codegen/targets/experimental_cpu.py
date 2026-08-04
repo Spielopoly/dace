@@ -25,8 +25,8 @@ from dace.codegen.common import sym2cpp
 from dace.config import Config
 from dace.codegen.dispatcher import DefinedType
 from dace.codegen.targets import cpp
-from dace.codegen.targets.cpu import (CPUCodeGen, decl_placement, hoist_loop_decls, map_schedule_is_sequential,
-                                      scalar_init_style)
+from dace.codegen.targets.cpu import (CPUCodeGen, aligned_new_value, decl_placement, hoist_loop_decls,
+                                      map_schedule_is_sequential, scalar_init_style, use_aligned_operator_new)
 from dace.frontend.python import astutils
 from dace.frontend.python.astutils import rname
 from dace.properties import CodeBlock
@@ -50,6 +50,11 @@ SIZE_CONSTEVAL_QUALIFIER = 'static DACE_HDFI consteval'
 # (a C++ tasklet body, a library node's code property): over-matching costs a refusal, missing a
 # token costs a miscompile, so the tokenizer is deliberately the crude one.
 IDENTIFIER_TOKENS = re.compile(r'[A-Za-z_]\w*')
+# Punctuation a C++ declarator may carry between its type and its name (``double *p``, ``T &r``,
+# ``std::vector<double> v``). _declared_identifiers looks THROUGH these when deciding whether the
+# token before an identifier introduced it, so the same tokens used as operators (``a * b``,
+# ``a > b``) read as declarations too -- the safe direction, see that method.
+DECLARATOR_TOKENS = frozenset({'*', '&', '>'})
 
 
 def code_blocks_of(value) -> Tuple[CodeBlock, ...]:
@@ -114,6 +119,17 @@ def format_index_access(ptrname: str, fnname: str, indices: List[str], extra: Li
     return '%s[%s(%s)]' % (ptrname, fnname, ', '.join(call_args))
 
 
+def parenthesized_ptr(expr: str) -> str:
+    """A base-pointer expression safe to substitute for a connector name in a tasklet body.
+
+    The expression replaces the connector TEXTUALLY, so the body decides how it is used -- and a
+    library body such as ``Scan``'s writes ``<conn>[_i]``. An offset pointer ``a + 1`` then reads as
+    ``a + 1[_i]``, which C++ parses as ``a + (1[_i])`` and rejects with ``invalid types 'int[int]'
+    for array subscript``. Wrapping binds the base first; the same parentheses are equally correct
+    where the body dereferences it or passes it on. A bare name needs none."""
+    return expr if expr.isidentifier() else f'({expr})'
+
+
 def loop_access_form() -> str:
     """How arrays indexed at a sequential loop counter are accessed, per
     ``compiler.cpu.codegen_params.loop_access_form``: ``indexed`` (the default, recompute the flat
@@ -166,6 +182,8 @@ class ExperimentalCPUCodeGen(CPUCodeGen):
         self._size_sig_to_name: Dict[tuple, str] = {}
         # Per-tasklet cache of identifiers appearing in the (rewritten) body.
         self._body_identifiers: Dict[int, Set[str]] = {}
+        # Per-native-tasklet cache of identifiers the C++ body DECLARES (see _declared_identifiers).
+        self._body_declarations: Dict[int, Set[str]] = {}
         # Per-native-tasklet cache: id(node) -> {connector_name: cpp_access}. An entry means the
         # connector is accessed directly (scalar index / base pointer) instead of via a copy-in/out.
         self._cpp_inline: Dict[int, Dict[str, str]] = {}
@@ -602,13 +620,15 @@ class ExperimentalCPUCodeGen(CPUCodeGen):
         # classic connector for both sides. (Mirrors InlineTaskletConnectors.)
         inout = set(node.in_connectors) & set(node.out_connectors)
         inline: Dict[str, str] = {}
-        for name in set(in_map) | set(out_map):
+        for name in dict.fromkeys((*in_map, *out_map)):
             if name in inout:
                 if name in in_map and name in out_map and in_map[name] == out_map[name]:
                     inline[name] = in_map[name]
                 # else: keep the connector for both sides
             else:
                 inline[name] = in_map.get(name, out_map.get(name))
+
+        self._drop_captured_inlines(node, inline)
 
         # Inlining an edge skips its copy dispatch (see _connector_needs_copy),
         # which is also what registers the edge's copy target as "used" -- and
@@ -622,6 +642,72 @@ class ExperimentalCPUCodeGen(CPUCodeGen):
             if name in out_edges:
                 self._register_inlined_copy_target(sdfg, state_dfg, node, out_edges[name], is_output=True)
         return inline
+
+    def _drop_captured_inlines(self, node, inline: Dict[str, str]) -> None:
+        """
+        Removes from ``inline`` every connector whose access text would be CAPTURED by the tasklet
+        body, i.e. whose access text names an identifier the body DECLARES as a local.
+
+        The access text is spliced into a raw C++ body that this generator does not parse, so it lands
+        inside whatever scope the body declares. If the body declares that identifier (``tblis_tensor
+        A, B, C;`` in the TBLIS ``TensorDot`` expansion, with the contracted array also named ``A``),
+        the inlined name binds to the body's local instead of the array -- a wrong program, not a
+        compile error, whenever the local happens to have a compatible type.
+
+        Only a *declaration* shadows. A body that merely READS a name the access text also names is
+        reading the very same variable -- the enclosing map parameter in ``arr[arr_idx(i)]`` spliced
+        into ``_out = (i < 2) ? 0.0 : _inp;`` is the loop's own ``i`` -- so refusing on any occurrence
+        would refuse almost every scalar connector under a map.
+
+        Connectors that stay inlined vanish from the body, so they cannot capture anything; dropping
+        one puts its name back into the body, hence the fixpoint.
+        """
+        if not inline:
+            return
+        declared = self._declared_identifiers(node)
+        while True:
+            occupied = declared - set(inline)
+            captured = [c for c, access in inline.items() if not occupied.isdisjoint(IDENTIFIER_TOKENS.findall(access))]
+            if not captured:
+                return
+            for conn in captured:
+                del inline[conn]
+
+    def _declared_identifiers(self, node) -> Set[str]:
+        """
+        Names the C++ tasklet body declares as its own, over-approximated from the pygments token
+        stream: an identifier is taken as declared when the previous significant token is a keyword
+        (``int``, ``auto``, ``const``, ...) or another identifier (a user type -- ``tblis_tensor A``),
+        or when it continues that declarator's comma list (``, B, C``). ``DECLARATOR_TOKENS`` are
+        skipped over rather than ended on, so ``double *p`` and ``std::vector<double> v`` still read
+        as declarations of ``p`` and ``v``.
+
+        C++ cannot be disambiguated without a parser, so ``a * b`` and ``a > b`` also read as
+        declarations. Erring towards "declared" only costs a refusal (the classic connector
+        copy-in/out, always correct); missing a declaration costs a miscompile.
+        """
+        key = id(node)
+        cached = self._body_declarations.get(key)
+        if cached is not None:
+            return cached
+        declared: Set[str] = set()
+        previous = None  # last significant token, with the declarator punctuation skipped
+        in_declarator_list = False
+        for token_type, value in CppLexer().get_tokens(node.code.as_string):
+            if token_type in Token.Text or token_type in Token.Comment or value in DECLARATOR_TOKENS:
+                continue
+            if token_type in Token.Name:
+                if previous is not None and (previous[0] in Token.Keyword or previous[0] in Token.Name or
+                                             (in_declarator_list and previous[1] == ',')):
+                    declared.add(value)
+                    in_declarator_list = True
+                else:
+                    in_declarator_list = False
+            elif value != ',':
+                in_declarator_list = False
+            previous = (token_type, value)
+        self._body_declarations[key] = declared
+        return declared
 
     def _register_inlined_copy_target(self, sdfg, state_dfg, node, edge, is_output: bool) -> None:
         """
@@ -682,10 +768,10 @@ class ExperimentalCPUCodeGen(CPUCodeGen):
             except KeyError:
                 defined_type = None
             if defined_type is not None:
-                return cpp.cpp_ptr_expr(sdfg, memlet, defined_type, codegen=self)
+                return parenthesized_ptr(cpp.cpp_ptr_expr(sdfg, memlet, defined_type, codegen=self))
             # Fallback: base pointer + offset to the subset start.
             offset = cpp.cpp_offset_expr(desc, subset)
-            return ptrname if offset == '0' else '%s + %s' % (ptrname, offset)
+            return ptrname if offset == '0' else parenthesized_ptr('%s + %s' % (ptrname, offset))
 
         # Scalar connector (single element): a direct indexed access through the
         # generated <array>_idx function -- mirrors ReadableKeywordRemover._bare_access.
@@ -747,7 +833,7 @@ class ExperimentalCPUCodeGen(CPUCodeGen):
         DaCe deliberately routes the declaration and the allocation to two streams so a transient's
         DECLARATION can be hoisted to an outer scope while its ALLOCATION stays in an inner one.
         Fusing is a purely textual merge of two writes, so it is sound only when both land in the
-        same scope with nothing in between. All three of these must hold:
+        same scope with nothing in between. Both of these must hold:
 
         * ``not declared`` -- otherwise ``declare_array`` already emitted ``T *p = nullptr;`` in an
           enclosing scope (a transient whose size depends on a non-free symbol) and registered it in
@@ -761,26 +847,21 @@ class ExperimentalCPUCodeGen(CPUCodeGen):
           unallocated member. For every other lifetime the dispatcher passes ONE stream for both
           (``declaration_stream = callsite_stream``) and the base writes the declaration immediately
           before the allocation, so merging them changes nothing but the text.
-        * ``arrsize`` is a RUNTIME extent -- a compile-time constant one keeps the split form because
-          GCC rejects the fused spelling. ``heap_alloc_stmt`` emits the element type carrying
-          ``DACE_ALIGN(64)`` (== ``__attribute__((aligned(64)))``), which is load-bearing: it makes
-          ``new`` call the over-aligned ``operator new[](size_t, align_val_t)``. With a constant
-          bound the new-type-id in a DECLARATION names the fixed array type ``double[1]``, whose
-          elements would each need 64-byte alignment at 8 bytes of size -- "error: alignment of array
-          elements is greater than element size". The very same ``new`` expression is accepted as a
-          bare assignment (the split form), and with a runtime bound no fixed array type is formed,
-          so both of those stay legal. No fused spelling avoids this (``::new``, a cast, an aligned
-          type alias and brace-init were all tried), and dropping ``DACE_ALIGN`` would silently
-          de-align the allocation, so a constant-extent heap array stays split.
+
+        A COMPILE-TIME-CONSTANT extent used to be excluded as well, because ``heap_alloc_stmt`` put
+        the alignment on the ELEMENT TYPE (``new double DACE_ALIGN(64)[1]``): in a declaration that
+        new-type-id names the fixed array type ``double[1]``, whose elements would each need 64-byte
+        alignment at 8 bytes of size, which GCC rejects ("alignment of array elements is greater than
+        element size"). Aligned ``operator new[]`` (upstream #2438) moved the alignment out of the
+        type and into a placement argument, so no over-aligned element type is formed and
+        ``double* p = new (std::align_val_t(64)) double[1];`` is well-formed. The exclusion is gone
+        with the constraint that motivated it.
 
         Registration is untouched: the caller still runs ``define_var(...)`` after this, so
         ``defined_vars`` (and ``declared_arrays``, which only ``declare_array`` populates) resolve
         later accesses exactly as before.
         """
         if declared or declaration_stream is not allocation_stream:
-            return None
-        # The same test the base uses to route a variable-length Register array to the heap.
-        if not symbolic.issymbolic(arrsize, sdfg.constants):
             return None
         return self.array_pointer_declarator(name, nodedesc)
 
@@ -808,7 +889,8 @@ class ExperimentalCPUCodeGen(CPUCodeGen):
                         sdfg: Optional['SDFG'] = None,
                         nodedesc: Optional[dt.Data] = None,
                         data_name: Optional[str] = None) -> str:
-        # Same aligned ``new[]`` as the base generator (paired with the base ``delete[]``), but
+        # Same aligned ``operator new[]`` as the base generator (paired with the base aligned
+        # ``delete[]``), but
         # route the element count through a generated ``<array>_size(...)`` helper when worthwhile
         # (see _register_size_function) so the allocation extent reads as a named function; fall back
         # to the classic ``sym2cpp(total_size)`` string (``arrsize``) otherwise.
@@ -818,7 +900,10 @@ class ExperimentalCPUCodeGen(CPUCodeGen):
             if registered is not None:
                 fnname, call_args = registered
                 count = '%s(%s)' % (fnname, ', '.join(call_args))
-        return '%s = new %s DACE_ALIGN(64)[%s];\n' % (alloc_name, ctype, count)
+        placement = ''
+        if nodedesc is not None and use_aligned_operator_new(nodedesc):
+            placement = ' (std::align_val_t(%d))' % aligned_new_value(nodedesc)
+        return '%s = new%s %s[%s];\n' % (alloc_name, placement, ctype, count)
 
     def _flush_generated_functions(self, function_stream, cfg, state_id, node) -> None:
         # Emit each registered index / size helper once per OUTPUT FILE. A non-inline nested-SDFG

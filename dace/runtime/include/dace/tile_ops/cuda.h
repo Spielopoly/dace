@@ -215,6 +215,62 @@ DACE_DFI constexpr bool _is_half2_reduce() {
 // the ``__low2half`` / ``__high2half`` unpack (two extracts + two 16-bit stores).
 DACE_DFI __half2 _load_half2(const __half* __restrict__ p) { return *reinterpret_cast<const __half2*>(p); }
 DACE_DFI void _store_half2(__half* __restrict__ p, __half2 v) { *reinterpret_cast<__half2*>(p) = v; }
+
+// Contiguous ``__half`` block copy between a tile and an array, widened to the largest chunk
+// both ends are known to support: 16 B (LDG/STG.E.128), 8 B (.64), 4 B (half2), else per element.
+//
+// ALIGN is the byte alignment of the ARRAY-side pointer, which only the CALLER can know -- the
+// codegen passes what it can prove from the memlet (dace/libraries/tileops/_isa_codegen.py). The
+// tile side needs no test: the vectorizer stages every tile as DACE_ALIGN(64), and a chunk starts
+// at element i*C of it, so its address is 64 B aligned at C <= 8.
+//
+// The choice is entirely ``if constexpr``: exactly ONE chunk width is emitted, with no runtime
+// address test and no scalar fallback left behind. Testing alignment at runtime instead would
+// keep every branch alive in the SASS -- measured at 3.5x the instruction count of the scalar
+// loop, with the 16-bit loads still there -- which is the opposite of the point.
+//
+// Callers must have already excluded a mask and a non-unit stride: this copies VLEN CONTIGUOUS
+// elements unconditionally.
+template <int VLEN, int ALIGN>
+DACE_DFI void half_copy_aligned(__half* __restrict__ dst, const __half* __restrict__ src) {
+  if constexpr (ALIGN >= 16 && VLEN % 8 == 0) {
+#pragma unroll
+    for (int i = 0; i < VLEN; i += 8) *reinterpret_cast<uint4*>(dst + i) = *reinterpret_cast<const uint4*>(src + i);
+  } else if constexpr (ALIGN >= 8 && VLEN % 4 == 0) {
+#pragma unroll
+    for (int i = 0; i < VLEN; i += 4) *reinterpret_cast<uint2*>(dst + i) = *reinterpret_cast<const uint2*>(src + i);
+  } else if constexpr (ALIGN >= 4 && VLEN % 2 == 0) {
+#pragma unroll
+    for (int i = 0; i < VLEN; i += 2) _store_half2(&dst[i], _load_half2(&src[i]));
+  } else {
+#pragma unroll
+    for (int i = 0; i < VLEN; ++i) dst[i] = src[i];
+  }
+}
+
+// Contiguous ``__half`` block read whose FIRST element sits SHIFT elements above an aligned
+// 32-bit word -- a +-1 stencil neighbour is the whole motivation. A 32-bit load must start on a
+// 4-byte boundary (an unaligned LDG.E is invalid on NVIDIA, not merely slow), so the aligned
+// window BELOW the access is read instead and the wanted elements are cut out of the register
+// pair with PRMT. Two aligned words cover any SHIFT < 4/sizeof(__half) plus two elements.
+//
+// PRMT here is not the cost -- the per-element LDG.E.U16 swarm it replaces is. Neighbouring
+// accesses in the same row round DOWN to the same words, so the loads CSE away and a 3-point
+// stencil ends up reading each word once.
+//
+// Read-only: the window covers elements the caller does not own, which a store would clobber.
+// The caller has proven the window stays inside the allocation; below element 0 is impossible
+// because the base is ``src - SHIFT`` with the access offset >= SHIFT by construction.
+template <int VLEN, int SHIFT>
+DACE_DFI void half_read_shifted(__half* __restrict__ dst, const __half* __restrict__ src) {
+  static_assert(VLEN % 2 == 0 && SHIFT > 0 && SHIFT * sizeof(__half) < 4, "shifted half read needs 0 < SHIFT < 2");
+  // Byte selector picking bytes [SHIFT*2, SHIFT*2+4) out of the {hi,lo} 8-byte pair.
+  constexpr unsigned sel = 0x3210u + 0x1111u * (SHIFT * sizeof(__half));
+  const unsigned* base = reinterpret_cast<const unsigned*>(src - SHIFT);
+#pragma unroll
+  for (int i = 0; i < VLEN; i += 2)
+    *reinterpret_cast<unsigned*>(dst + i) = __byte_perm(base[i / 2], base[i / 2 + 1], sel);
+}
 #endif
 
 // ----------------------------- tile_binop -----------------------------
@@ -327,9 +383,26 @@ DACE_DFI void tile_ite(T* __restrict__ out, const CondT* __restrict__ cond, cons
 }
 
 // ----------------------------- tile_load ------------------------------
-template <typename T, int VLEN, bool Masked>
+// ``Align`` is the byte alignment of the ARRAY side that the caller can prove; it defaults to the
+// element alignment, which selects the per-element loop below -- so a caller that does not supply
+// it gets exactly the code this template emitted before the parameter existed. ``Shift`` is how
+// many elements ``src`` sits ABOVE that aligned address: 0 means ``src`` itself is aligned,
+// nonzero routes to the aligned-window read (``half_read_shifted``).
+template <typename T, int VLEN, bool Masked, int Align = alignof(T), int Shift = 0>
 DACE_DFI void tile_load(T* __restrict__ dst, const T* __restrict__ src, const bool* __restrict__ mask,
                         std::int64_t stride = 1) {
+#if defined(__CUDACC__)
+  // A mask makes the lanes divergent and a non-unit stride is not contiguous; both keep the loop.
+  if constexpr (__is_same(T, __half) && !Masked && Align >= 4 && VLEN % 2 == 0) {
+    if (stride == 1) {
+      if constexpr (Shift == 0)
+        half_copy_aligned<VLEN, Align>(dst, src);
+      else
+        half_read_shifted<VLEN, Shift>(dst, src);
+      return;
+    }
+  }
+#endif
 #pragma unroll
   for (int i = 0; i < VLEN; ++i) {
     if constexpr (Masked)
@@ -340,9 +413,19 @@ DACE_DFI void tile_load(T* __restrict__ dst, const T* __restrict__ src, const bo
 }
 
 // ----------------------------- tile_store -----------------------------
-template <typename T, int VLEN, bool Masked>
+// Mirror of ``tile_load``: here the ARRAY side ``Align`` describes is ``dst``.
+template <typename T, int VLEN, bool Masked, int Align = alignof(T)>
 DACE_DFI void tile_store(T* __restrict__ dst, const T* __restrict__ src, const bool* __restrict__ mask,
                          std::int64_t stride = 1) {
+#if defined(__CUDACC__)
+  // A masked store must skip its off lanes one at a time, and a non-unit stride is not contiguous.
+  if constexpr (__is_same(T, __half) && !Masked && Align >= 4 && VLEN % 2 == 0) {
+    if (stride == 1) {
+      half_copy_aligned<VLEN, Align>(dst, src);
+      return;
+    }
+  }
+#endif
 #pragma unroll
   for (int i = 0; i < VLEN; ++i) {
     if constexpr (Masked) {
@@ -379,10 +462,11 @@ DACE_DFI void tile_scatter(T* __restrict__ dst, const T* __restrict__ src, const
 }
 
 // ---------------------------- tile_mask_gen ----------------------------
+// ``stride`` mirrors tile_load's: 1 per thread, the lane count under CUDA_WARP.
 template <typename IdxT, int VLEN>
-DACE_DFI void tile_mask_gen(bool* __restrict__ out, IdxT base, IdxT ub) {
+DACE_DFI void tile_mask_gen(bool* __restrict__ out, IdxT base, IdxT ub, IdxT stride = 1) {
 #pragma unroll
-  for (int i = 0; i < VLEN; ++i) out[i] = (base + IdxT(i)) < ub;
+  for (int i = 0; i < VLEN; ++i) out[i] = (base + IdxT(i) * stride) < ub;
 }
 
 // ----------------------------- tile_reduce ----------------------------

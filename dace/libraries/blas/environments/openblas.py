@@ -63,7 +63,7 @@ def _resolve_lib_dir(soname_or_path):
     return None
 
 
-def _single_libopenblas():
+def _standalone_libopenblas():
     """``(lib_path, include_dir)`` for a single-library OpenBLAS install, or ``(None, None)``.
 
     spack and conda ship OpenBLAS as one ``libopenblas`` that provides BLAS, CBLAS, LAPACK
@@ -95,18 +95,24 @@ def _single_libopenblas():
     return None, None
 
 
-def _reference_blas_libs():
-    """Reference/update-alternatives BLAS shared libs (``liblapacke``/``libcblas``/
-    ``libblas``) that are on the loader path, or ``[]``."""
+def _openblas_present() -> bool:
+    """Whether a ``libopenblas`` exists at all. The ldconfig cache counts: ``BLA_VENDOR=OpenBLAS``
+    makes FindBLAS search the standard link paths, so it needs no resolvable directory."""
+    return bool(ctypes.util.find_library('openblas')) or bool(_standalone_libopenblas()[0])
+
+
+def _system_blas_libs():
+    """Generic distro BLAS shared libs (``liblapacke``/``libcblas``/``libblas``) on the loader
+    path, or ``[]``. These are update-alternatives symlinks and may point at ANY implementation."""
     return [p for p in (ctypes.util.find_library(l) for l in ('lapacke', 'cblas', 'blas')) if p]
 
 
 @dace.library.environment
 class OpenBLAS:
 
-    # Works both with a reference/update-alternatives BLAS (liblapacke/libcblas/libblas all
-    # pointing at OpenBLAS) and with a single-library OpenBLAS as shipped by spack/conda
-    # (libopenblas only, headers under its own include dir).
+    # Two install shapes: distro alternatives (liblapacke/libcblas/libblas pointing at OpenBLAS,
+    # headers on the default path) and a lone libopenblas from spack/conda (headers under its
+    # own include dir). The mode names say who locates the library, which is what the build needs.
 
     cmake_minimum_version = "3.6"
     cmake_compile_flags = []
@@ -120,43 +126,51 @@ class OpenBLAS:
 
     @staticmethod
     def _mode():
-        """``'reference'`` if reference-BLAS libs are on the loader path (let CMake's
-        FindBLAS locate them); else ``'single'`` if a lone ``libopenblas`` is (link it
-        directly); else ``None`` (not installed)."""
-        if _reference_blas_libs():
-            return 'reference'
-        lib, _ = _single_libopenblas()
-        return 'single' if lib else None
+        """Who locates the library: ``'find_package'`` (CMake's FindBLAS does), ``'direct_link'``
+        (we pass the full path), or ``None`` (no OpenBLAS).
+
+        ``find_package`` pins ``BLA_VENDOR=OpenBLAS``, so FindBLAS searches for ``libopenblas``
+        specifically. The distro alternatives resolving is NOT sufficient evidence -- they point
+        at any implementation -- so an OpenBLAS must exist too, or configure fails with
+        "Could NOT find BLAS". Existence is the ldconfig-aware check, not the path-resolving one:
+        FindBLAS searches the standard link paths, while a full path is needed only to link one
+        directly.
+        """
+        if _system_blas_libs() and _openblas_present():
+            return 'find_package'
+        return 'direct_link' if _standalone_libopenblas()[0] else None
 
     @staticmethod
     def cmake_packages():
-        # A single libopenblas is passed as a full library path below, so requiring
-        # find_package(BLAS REQUIRED) -- which CMake can't satisfy for an off-default-path
-        # spack/conda install -- would only make configure fail. Only the reference path
-        # relies on FindBLAS/FindLAPACK.
-        return ["LAPACK", "BLAS"] if OpenBLAS._mode() == 'reference' else []
+        # direct_link passes a full library path below, and find_package(BLAS REQUIRED) cannot
+        # be satisfied for an off-default-path spack/conda install -- asking would only fail.
+        return ["LAPACK", "BLAS"] if OpenBLAS._mode() == 'find_package' else []
 
     @staticmethod
     def cmake_variables():
-        return {"BLA_VENDOR": "OpenBLAS"} if OpenBLAS._mode() == 'reference' else {}
+        return {"BLA_VENDOR": "OpenBLAS"} if OpenBLAS._mode() == 'find_package' else {}
 
     @staticmethod
     def cmake_link_flags():
-        # These vars are only defined once find_package(LAPACK/BLAS) has run (reference path).
-        return ["${LAPACK_LINKER_FLAGS} ${BLAS_LINKER_FLAGS}"] if OpenBLAS._mode() == 'reference' else []
+        # These vars only exist once find_package(LAPACK/BLAS) has run.
+        return ["${LAPACK_LINKER_FLAGS} ${BLAS_LINKER_FLAGS}"] if OpenBLAS._mode() == 'find_package' else []
 
     @staticmethod
     def cmake_includes():
-        _, inc = _single_libopenblas()
+        _, inc = _standalone_libopenblas()
         return [inc] if inc else []
 
     @staticmethod
     def cmake_libraries():
-        ref = _reference_blas_libs()
-        if ref:
-            return ref
-        lib, _ = _single_libopenblas()
-        return [lib] if lib else []
+        # Driven by _mode() like the other four, so is_installed() cannot report an OpenBLAS
+        # the mode has already rejected.
+        mode = OpenBLAS._mode()
+        if mode == 'find_package':
+            return _system_blas_libs()
+        if mode == 'direct_link':
+            lib, _ = _standalone_libopenblas()
+            return [lib]
+        return []
 
     @staticmethod
     def is_installed():

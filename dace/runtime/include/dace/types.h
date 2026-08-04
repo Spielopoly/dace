@@ -15,10 +15,36 @@
     #undef __out
     #define DACE_EXPORTED extern "C" __declspec(dllexport)
     #define DACE_PRAGMA(x) __pragma(x)
+    // A symbol is not exported from a DLL unless it is explicitly dllexport'ed, so
+    // "hidden" is already the default and the attribute has no MSVC equivalent.
+    #define DACE_HIDDEN
 #else
     #define DACE_ALIGN(N) __attribute__((aligned(N)))
     #define DACE_EXPORTED extern "C"
     #define DACE_PRAGMA(x) _Pragma(#x)
+    // Internal linkage-visibility for a definition that is shared ACROSS generated
+    // translation units but must not appear in the shared library's public ABI --
+    // specifically a nested-SDFG function emitted to its own .cpp under
+    // ``compiler.cpu.codegen_params.split_nsdfg_translation_units``. The function
+    // keeps EXTERNAL linkage (so the static linker resolves the call from the frame
+    // object), while hidden visibility keeps it out of the dynamic symbol table and
+    // lets the linker/ThinLTO re-inline it. Applied per-declaration on purpose: a
+    // global -fvisibility=hidden would also hide __dace_init_* / __dace_exit_* (only
+    // ``extern "C"`` via DACE_EXPORTED on Linux, not dllexport-annotated) and break
+    // loading the program.
+    #define DACE_HIDDEN __attribute__((visibility("hidden")))
+#endif
+
+// Portable full-unroll hint for fixed-width (constexpr-bounded) lane loops in
+// vectorized intrinsics. Clang / NVCC accept a bare ``#pragma unroll``; GCC
+// needs an explicit factor (64 covers every vector width we emit and fully
+// unrolls any shorter constexpr-bounded loop); MSVC has no equivalent.
+#if defined(__clang__) || defined(__CUDACC__) || defined(__INTEL_LLVM_COMPILER)
+    #define DACE_UNROLL DACE_PRAGMA(unroll)
+#elif defined(__GNUC__)
+    #define DACE_UNROLL DACE_PRAGMA(GCC unroll 64)
+#else
+    #define DACE_UNROLL
 #endif
 
 // Visual Studio (<=2017) + CUDA support
@@ -135,13 +161,20 @@ namespace dace
 
     // Native _Float16 for the float<->half CONVERSIONS only -- confined to the two routines below,
     // never a member/signature/operand, so ABI and mangling are untouched; arithmetic still runs in
-    // float. Gate on the ISA that has a hardware convert (any compiler advertising it also provides
-    // _Float16), so NVHPC / Intel LLVM / GCC / Clang are all covered; everything else stays on the
-    // (correct) emulation. x86: AVX512-FP16 (not plain F16C, whose _Float16 lowers to a slow libcall).
+    // float. Gate on the ISA that has a hardware convert; everything else stays on the (correct)
+    // emulation, because without one _Float16 lowers to a libgcc call (__truncsfhf2 /
+    // __extendhfsf2) that is slower than the inline emulation.
+    // x86: F16C (VCVTPS2PH/VCVTPH2PS, Ivy Bridge+) or AVX512-FP16 -- verified on GCC 15 that -mf16c
+    // emits the instructions rather than the libcall, and measured ~1.8x on half->float.
+    // The compiler-version guard is required: __F16C__ says nothing about _Float16 being usable,
+    // which x86 GCC only gained in 12 and Clang in 15.
     // AArch64: FCVT is base ARMv8-A. Override with -DDACE_HALF_FORCE_NATIVE / -DDACE_HALF_NO_NATIVE.
-    #if !defined(DACE_HALF_NO_NATIVE) &&                                            \
-        (defined(DACE_HALF_FORCE_NATIVE) ||                                         \
-         ((defined(__x86_64__) || defined(__i386__)) && defined(__AVX512FP16__)) || \
+    #if !defined(DACE_HALF_NO_NATIVE) &&                                                     \
+        (defined(DACE_HALF_FORCE_NATIVE) ||                                                  \
+         ((defined(__x86_64__) || defined(__i386__)) && defined(__SSE2__) &&                 \
+          (defined(__F16C__) || defined(__AVX512FP16__)) &&                                  \
+          ((defined(__clang__) && __clang_major__ >= 15) ||                                  \
+           (!defined(__clang__) && defined(__GNUC__) && __GNUC__ >= 12))) ||                 \
          (defined(__aarch64__) && defined(__ARM_FP16_FORMAT_IEEE)))
     #define DACE_HALF_NATIVE_T _Float16
     #endif

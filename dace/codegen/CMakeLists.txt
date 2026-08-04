@@ -89,9 +89,14 @@ if(DACE_ENABLE_CUDA)
 
   find_package(CUDAToolkit REQUIRED)
   # Match the CUDA C++ standard to the CPU one (DACE_CPP_STANDARD): it governs both the
-  # device compile and the nvcc host pass, so device code gets the same dialect.
+  # device compile and the nvcc host pass, so device code gets the same dialect. The two share
+  # headers, so a mismatch is an ODR violation -- require it rather than let CMake decay.
   set(CMAKE_CUDA_STANDARD ${DACE_CPP_STANDARD})
+  set(CMAKE_CUDA_STANDARD_REQUIRED ON)
   set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)
+  # Device code calls host constexpr functions (std::numeric_limits and friends). Here rather than in
+  # the configurable nvcc arguments, since overriding those must not turn it off.
+  string(APPEND CMAKE_CUDA_FLAGS " --expt-relaxed-constexpr")
 
   # CMake 3.24: set_property(TARGET tgt PROPERTY CUDA_ARCHITECTURES native)
   if (NOT DEFINED LOCAL_CUDA_ARCHITECTURES)
@@ -230,6 +235,11 @@ set(CMAKE_MODULE_LINKER_FLAGS "${CMAKE_MODULE_LINKER_FLAGS} ${DACE_ENV_LINK_FLAG
 if(DACE_ENABLE_HIP)
   enable_language(HIP)
 
+  # As for CUDA above: device and host share headers, so they must agree on the standard. hipcc would
+  # otherwise fall back to its own default, currently gnu++17.
+  set(CMAKE_HIP_STANDARD ${DACE_CPP_STANDARD})
+  set(CMAKE_HIP_STANDARD_REQUIRED ON)
+
   # Get local AMD architectures
   if (NOT DEFINED LOCAL_HIP_ARCHITECTURES)
     # Compile and run a test program
@@ -301,11 +311,22 @@ target_link_libraries(${DACE_PROGRAM_NAME} PUBLIC ${DACE_LIBS})
 # Standard C++, not the GNU dialect: CXX_STANDARD on its own emits -std=gnu++NN, which accepts
 # extensions that Clang then rejects.
 set_property(TARGET ${DACE_PROGRAM_NAME} PROPERTY CXX_STANDARD ${DACE_CPP_STANDARD})
-# CXX_STANDARD alone is a decay-permitted request: CMake may silently fall back to an older
-# standard (e.g. the compiler's default gnu++17) if it can't satisfy the requested one.
-# STANDARD_REQUIRED forbids that fallback outright.
+# Forbids silent decay below the required standard (e.g. falling back to an older compiler default).
 set_property(TARGET ${DACE_PROGRAM_NAME} PROPERTY CXX_STANDARD_REQUIRED ON)
 set_property(TARGET ${DACE_PROGRAM_NAME} PROPERTY CXX_EXTENSIONS OFF)
+
+# Optional additive static archive (lib<name>.a) built from the same sources as the shared library.
+# Opt-in via compiler.static_archive; the .so is untouched.
+if (DACE_STATIC_ARCHIVE)
+    add_library(${DACE_PROGRAM_NAME}_static STATIC ${DACE_CPP_FILES} ${DACE_OBJECTS})
+    target_link_libraries(${DACE_PROGRAM_NAME}_static PUBLIC ${DACE_LIBS})
+    # The archive is meant to be linked INTO a shared library, so it must be position-independent.
+    set_property(TARGET ${DACE_PROGRAM_NAME}_static PROPERTY POSITION_INDEPENDENT_CODE ON)
+    set_property(TARGET ${DACE_PROGRAM_NAME}_static PROPERTY OUTPUT_NAME ${DACE_PROGRAM_NAME})
+    set_property(TARGET ${DACE_PROGRAM_NAME}_static PROPERTY CXX_STANDARD ${DACE_CPP_STANDARD})
+    set_property(TARGET ${DACE_PROGRAM_NAME}_static PROPERTY CXX_STANDARD_REQUIRED ON)
+    set_property(TARGET ${DACE_PROGRAM_NAME}_static PROPERTY CXX_EXTENSIONS OFF)
+endif()
 
 # Create DaCe loader stub
 add_library(dacestub_${DACE_PROGRAM_NAME} SHARED "${CMAKE_SOURCE_DIR}/tools/dacestub.cpp")

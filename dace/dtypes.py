@@ -7,9 +7,10 @@ import inspect
 import numpy
 import ml_dtypes
 import re
+import types
 from sympy import Float, Integer
 from collections import OrderedDict
-from functools import wraps
+from functools import lru_cache, wraps
 from typing import Any, Dict, TYPE_CHECKING
 
 from dace.config import Config
@@ -573,8 +574,9 @@ def result_type_of(lhs, *rhs):
 
     # Extract the type if symbolic or data
     from dace.data import Data
-    lhs = lhs.dtype if (type(lhs).__name__ == 'symbol' or isinstance(lhs, Data)) else lhs
-    rhs = rhs.dtype if (type(rhs).__name__ == 'symbol' or isinstance(rhs, Data)) else rhs
+    from dace.symbolic import is_symbol_leaf
+    lhs = lhs.dtype if (is_symbol_leaf(lhs) or isinstance(lhs, Data)) else lhs
+    rhs = rhs.dtype if (is_symbol_leaf(rhs) or isinstance(rhs, Data)) else rhs
 
     if lhs == rhs:
         return lhs  # Types are the same, return either
@@ -1332,8 +1334,13 @@ else:
 _bool = bool
 
 
-def dtype_to_typeclass(dtype=None):
-    DTYPE_TO_TYPECLASS = {
+@lru_cache(maxsize=1, typed=True)
+def _dtype_to_typeclass_map() -> types.MappingProxyType:
+    """Built once. It was rebuilt -- 24 entries, 4 fresh `typeclass` objects -- on every call, which
+    measured 35.5k calls / 1.17s in one CloudSC load and 41% of every `symbol()` construction.
+    Handed out read-only, so the shared instance cannot be poisoned by a caller.
+    """
+    return types.MappingProxyType({
         _bool: typeclass(_bool),
         int: typeclass(int),
         float: typeclass(float),
@@ -1360,10 +1367,14 @@ def dtype_to_typeclass(dtype=None):
         # FIXME
         numpy.longlong: int64,
         numpy.ulonglong: uint64
-    }
+    })
+
+
+def dtype_to_typeclass(dtype=None):
+    mapping = _dtype_to_typeclass_map()
     if dtype is None:
-        return DTYPE_TO_TYPECLASS
-    return DTYPE_TO_TYPECLASS[dtype]
+        return mapping
+    return mapping[dtype]
 
 
 FLOAT_TYPES = {float64, float32, float16, bfloat16, float8_e4m3fn, float8_e5m2}
@@ -1746,9 +1757,9 @@ def is_gpu_array(obj: Any) -> bool:
         return False
 
     try:
-        if hasattr(obj, 'data') and hasattr(obj.data, 'ptr'):  # CuPy special case with HIP
-            if hasattr(obj, 'device') and getattr(obj.device, 'id', -1) >= 0:
-                return True
+        if hasattr(obj, 'data') and hasattr(obj.data, 'ptr') and hasattr(obj, 'device') and getattr(
+                obj.device, 'id', -1) >= 0:  # CuPy special case with HIP
+            return True
     except (ValueError, TypeError):
         # numpy arrays of extension dtypes (ml_dtypes bf16/fp8) raise when building a
         # buffer for .data; they are host arrays, so fall through to the False below.

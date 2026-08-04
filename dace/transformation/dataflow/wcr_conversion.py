@@ -56,6 +56,49 @@ def _index_syms_across_nesting(sdfg: SDFG, write_subset) -> set:
     return syms
 
 
+def boundary_write_index_syms(sdfg: SDFG, data_name: str) -> set:
+    """Symbol NAMES the write index depends on in the PARENT namespace, for a write leaving
+    ``sdfg`` through the nested-SDFG output connector ``data_name``.
+
+    ``nest_state_subgraph`` rebases a boundary connector's descriptor onto the crossing memlet, so
+    the INNER subset of a write to it (``__tmp[0]`` on a shape-(1,) connector) can NEVER mention
+    the enclosing map's parameters -- even when the outer memlet that connector maps to
+    (``A[i, j]``) varies with every one of them. ``_index_syms_across_nesting`` follows the
+    ``symbol_mapping`` chain, which covers a renamed ITERATOR but not this DATA boundary; without
+    the outer subset the parent-map guard reads every conflict-free through-connector WCR as an
+    invariant reduction and keeps it (``A[i, j] += 2.0`` under ``dace.map[0:N, 0:N]``).
+
+    Only the NSDFG node's OWN out-edge is read: its subset is the precise parent-namespace image of
+    the connector. Edges further out are propagated over the enclosing map and have the map
+    parameters unioned away, so they could only drop symbols, never add one. A connector that fans
+    out to several writes stops the walk: the symbols are only sound per write path, and unioning
+    them would let one injective path vouch for an invariant sibling.
+
+    :param sdfg: The nested SDFG the write lives in.
+    :param data_name: The written data descriptor's name inside ``sdfg``.
+    :returns: The set of symbol names the outer write index depends on (empty if not a boundary).
+    """
+    syms = set()
+    cur, conn = sdfg, data_name
+    while cur.parent_nsdfg_node is not None and cur.parent is not None:
+        node = cur.parent_nsdfg_node
+        if conn not in node.out_connectors:
+            break
+        state = cur.parent
+        edges = [e for e in state.out_edges_by_connector(node, conn) if e.data is not None and not e.data.is_empty()]
+        if len(edges) != 1 or edges[0].data.data is None:
+            break
+        edge = edges[0]
+        subset = edge.data.get_dst_subset(edge, state)
+        if subset is None:
+            subset = edge.data.subset
+        if subset is None:
+            break
+        syms |= {str(s) for s in subset.free_symbols}
+        cur, conn = cur.parent_sdfg, edge.data.data
+    return syms
+
+
 def _wcr_write_is_injective(write_subset, params: List[str]) -> bool:
     """Write at ``write_subset`` hits a DISTINCT element per distinct enclosing-map ``params``
     value → conflict-free → WCR droppable for explicit RMW without cross-lane race.
@@ -116,6 +159,62 @@ def _wcr_augassign_body(wcr_str: str) -> str:
             return node
 
     return astutils.unparse(_Rename().visit(lam.body))
+
+
+def _same_extent(shape_a, shape_b) -> bool:
+    """Two symbolic shapes are provably the same extent, dim by dim."""
+    if len(shape_a) != len(shape_b):
+        return False
+    try:
+        return all(symbolic.simplify(a - b) == 0 for a, b in zip(shape_a, shape_b))
+    except (TypeError, ValueError):
+        return False
+
+
+def nested_connector_subset(nsdfg_node: nodes.NestedSDFG, conn: str, writes: bool, boundary_subset=None):
+    """The PRECISE subset a NestedSDFG accesses through connector ``conn``, in the PARENT namespace.
+
+    Union of the inner memlets touching ``conn``, with the node's ``symbol_mapping`` applied so the
+    parent's iterators name the same dimensions. The boundary memlet on a ``NestedSDFG -> MapExit``
+    edge is over-approximated -- memlet propagation unions the connector's reads and writes into one
+    bounding box -- so it cannot decide whether a write is a fixed reduction slot or an injective
+    per-iteration store. The inner edges carry the real per-iteration slice.
+
+    ``nest_state_subgraph`` sizes the inner descriptor to the boundary memlet and re-bases the inner
+    subsets to ITS origin, so those coordinates are the parent's only after adding the origin back.
+    Pass ``boundary_subset`` (the boundary memlet's subset) to have the re-basing undone; when the
+    inner descriptor instead keeps the outer array's full shape, the origin is zero and nothing moves.
+
+    :param nsdfg_node: The NestedSDFG node owning the connector.
+    :param conn: The connector name (also the inner descriptor's name).
+    :param writes: ``True`` for the written subset, ``False`` for the read subset.
+    :param boundary_subset: The outer boundary memlet's subset, for the re-basing above.
+    :returns: The union subset, or ``None`` if any access is unanalysable or a rank mismatch shows
+        the inner descriptor is a reshaped view (then the subsets are not comparable across the
+        boundary).
+    """
+    inner = nsdfg_node.sdfg
+    idesc = inner.arrays.get(conn)
+    if idesc is None:
+        return None
+    acc = None
+    for st in inner.states():
+        for node in st.data_nodes():
+            if node.data != conn:
+                continue
+            for e in (st.in_edges(node) if writes else st.out_edges(node)):
+                if e.data is None or e.data.data is None:
+                    return None
+                sub = e.data.subset if e.data.data == conn else e.data.other_subset
+                if sub is None or len(sub.size()) != len(idesc.shape):
+                    return None
+                acc = copy.deepcopy(sub) if acc is None else subsets.union(acc, sub)
+    if acc is None:
+        return None
+    acc.replace({k: symbolic.pystr_to_symbolic(str(v)) for k, v in nsdfg_node.symbol_mapping.items()})
+    if boundary_subset is not None and _same_extent(boundary_subset.size(), idesc.shape):
+        acc.offset(boundary_subset, negative=False)
+    return acc
 
 
 def _multi_element_dims(subset):
@@ -947,6 +1046,7 @@ class WCRToAugAssign(transformation.SingleStateTransformation):
     output = transformation.PatternNode(nodes.AccessNode)
     map_exit = transformation.PatternNode(nodes.MapExit)
     inp = transformation.PatternNode(nodes.AccessNode)
+    nested = transformation.PatternNode(nodes.NestedSDFG)
 
     _EXPRESSIONS = ['+', '-', '*', '^', '%']  #, '/']
     _EXPR_MAP = {'-': ('+', '-({expr})'), '/': ('*', '((decltype({expr}))1)/({expr})')}
@@ -976,6 +1076,11 @@ class WCRToAugAssign(transformation.SingleStateTransformation):
             # conflict-free store -- and reverts to a plain indexed write. Same node topology as
             # expr 1; distinguished by which edge holds the WCR (see ``_matched_wcr_edge``).
             sdutil.node_path_graph(cls.tasklet, cls.map_exit, cls.output),
+            # ``NestedSDFG -[wcr]-> MapExit -> AccessNode``: expr 4 with the RMW materialised
+            # inside a body NestedSDFG instead of a bare tasklet (gramschmidt's
+            # ``A[:, j] -= Q[:, k] * R[k, j]``). The boundary memlet is over-approximated to the
+            # whole array there, so injectivity is decided on the PRECISE inner write subset.
+            sdutil.node_path_graph(cls.nested, cls.map_exit, cls.output),
         ]
 
     def _matched_wcr_edge(self, graph, expr_index):
@@ -988,13 +1093,16 @@ class WCRToAugAssign(transformation.SingleStateTransformation):
             edges = graph.edges_between(self.inp, self.output)
         elif expr_index == 3:
             edges = graph.edges_between(self.inp, self.map_exit)
-        else:
+        elif expr_index == 4:
             # expr 4: WCR on the OUTER map_exit->output edge (inner tasklet->map_exit WCR-free,
             # else it is expr 1's match).
             inner = graph.edges_between(self.tasklet, self.map_exit)
             if len(inner) != 1 or inner[0].data.wcr is not None:
                 return None
             edges = graph.edges_between(self.map_exit, self.output)
+        else:
+            # expr 5: WCR on the NestedSDFG -> MapExit edge (the whole boundary chain carries it).
+            edges = [e for e in graph.edges_between(self.nested, self.map_exit) if e.data.wcr is not None]
         if len(edges) != 1 or edges[0].data.wcr is None:
             return None
         return edges[0]
@@ -1032,6 +1140,7 @@ class WCRToAugAssign(transformation.SingleStateTransformation):
                     outer_map_params |= set(scope.map.params)
             outer_map_params -= set(params)
             index_syms = _index_syms_across_nesting(sdfg, sub)
+            index_syms |= boundary_write_index_syms(sdfg, self.output.data)
             if any(str(it) not in index_syms for it in outer_map_params):
                 return False
         # The tasklet must already READ BACK the destination element (same data, same subset), so
@@ -1047,9 +1156,39 @@ class WCRToAugAssign(transformation.SingleStateTransformation):
                 return True
         return False
 
+    def _can_revert_nested_boundary_wcr(self, graph, sdfg):
+        """expr 5: the WCR on a body NestedSDFG's ``-> MapExit -> AccessNode`` boundary is spurious.
+
+        Same reasoning as :meth:`_can_revert_mapexit_wcr`, one nesting level down: the read-modify-
+        write is already materialised INSIDE the NestedSDFG (it reads the destination slice back and
+        writes the combined value), and the write is injective over the enclosing map, so the atomic
+        buys nothing. Decided on the precise inner subsets, because the boundary memlet is
+        over-approximated to the whole array.
+        """
+        edge = self._matched_wcr_edge(graph, 5)
+        if edge is None or edge.data.dynamic is True:
+            return False
+        conn = edge.src_conn
+        if conn is None or conn not in self.nested.out_connectors or conn not in self.nested.in_connectors:
+            return False
+        if edge.data.data != self.output.data:
+            return False
+        write = nested_connector_subset(self.nested, conn, writes=True, boundary_subset=edge.data.subset)
+        if write is None:
+            return False
+        # Injective over the enclosing map: distinct iteration -> distinct element, no reduction.
+        if not _wcr_write_is_injective(write, _enclosing_map_params(graph, self.nested)):
+            return False
+        # The RMW must already be materialised inside: the body reads back exactly what it writes,
+        # so the written value already equals ``dest <op> incoming`` and a plain store is equivalent.
+        read = nested_connector_subset(self.nested, conn, writes=False, boundary_subset=edge.data.subset)
+        return read is not None and str(read) == str(write)
+
     def can_be_applied(self, graph, expr_index, sdfg, permissive=False):
         if expr_index == 4:
             return self._can_revert_mapexit_wcr(graph, sdfg)
+        if expr_index == 5:
+            return self._can_revert_nested_boundary_wcr(graph, sdfg)
         edge = self._matched_wcr_edge(graph, expr_index)
         if edge is None:
             return False
@@ -1142,6 +1281,7 @@ class WCRToAugAssign(transformation.SingleStateTransformation):
             # (an injective per-element in-place RMW like s212 ``b[i] += a[i+1]*d[i]``), not a
             # cross-iteration reduction that must keep its WCR.
             index_syms = _index_syms_across_nesting(sdfg, edge.data.subset)
+            index_syms |= boundary_write_index_syms(sdfg, edge.data.data)
             if any(str(it) not in index_syms for it in outer_map_params):
                 return False
 
@@ -1151,11 +1291,11 @@ class WCRToAugAssign(transformation.SingleStateTransformation):
         # WCR convention ``lambda acc, new``: ``__in1`` = existing dest value (read back),
         # ``__in2`` = incoming value the edge writes. ``_wcr_augassign_body`` binds by arg name
         # so non-commutative ops (``a - b``) stay correct.
-        if self.expr_index == 4:
-            # Spurious reduction on the outer boundary: the RMW is already materialised in the
-            # tasklet (it reads the destination back) and the write is injective over the map, so
+        if self.expr_index in (4, 5):
+            # Spurious reduction on the outer boundary: the RMW is already materialised by the
+            # producer (it reads the destination back) and the write is injective over the map, so
             # the conflict-free store needs no atomic. Drop the WCR along the whole memlet path.
-            edge = self._matched_wcr_edge(state, 4)
+            edge = self._matched_wcr_edge(state, self.expr_index)
             for pe in state.memlet_path(edge):
                 pe.data.wcr = None
             return

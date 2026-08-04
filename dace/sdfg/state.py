@@ -3,7 +3,7 @@
 
 import ast
 import abc
-import collections
+import collections.abc
 import copy
 import inspect
 import itertools
@@ -904,6 +904,7 @@ class DataflowGraphView(BlockGraphView, abc.ABC):
 
         # Add data arguments from memlets, if do not appear in any of the nodes (i.e., originate externally)
         #  TODO: Investigate is scanning the adjacent edges of the input and output connectors is better.
+        graph = self.graph if isinstance(self, SubgraphView) else self
         for edge in self.edges():
             if edge.data.is_empty():
                 continue
@@ -920,7 +921,7 @@ class DataflowGraphView(BlockGraphView, abc.ABC):
                 #  to where it originates from.
                 # NOTE: We have to use a memlet path, because we have to go "against the flow"
                 #   Furthermore, in a valid SDFG the data will only come from one source anyway.
-                top_source_edge = self.graph.memlet_path(edge)[0]
+                top_source_edge = graph.memlet_path(edge)[0]
                 if not isinstance(top_source_edge.src, nd.AccessNode):
                     continue
                 additional_descs = ({
@@ -928,20 +929,16 @@ class DataflowGraphView(BlockGraphView, abc.ABC):
                 } if top_source_edge.src.data not in descs else {})
 
             elif isinstance(edge.dst, nd.ExitNode) and isinstance(edge.src, (nd.AccessNode, nd.CodeNode)):
-                # Same case as above, but for outgoing Memlets. The Memlet leaving the
-                # scope may be source-relative (naming the inner transient rather than
-                # the external array), so resolve the written array from the memlet
-                # tree's root -- the outermost-scope node, i.e. the destination the
-                # data fans out to (fall back to the Memlet's data otherwise).
-                additional_descs = {}
-                connector_to_look = "OUT_" + edge.dst_conn[3:]
-                for oedge in self.graph.out_edges_by_connector(edge.dst, connector_to_look):
-                    if oedge.data.is_empty():
-                        continue
-                    root_dst = self.graph.memlet_tree(oedge).root().edge.dst
-                    dst_name = root_dst.data if isinstance(root_dst, nd.AccessNode) else oedge.data.data
-                    if dst_name not in descs and dst_name not in additional_descs:
-                        additional_descs[dst_name] = sdfg.arrays[dst_name]
+                # Same case as above, but for outgoing Memlets. The whole tree, not one hop out of
+                # the exit: with a nested scope (an inserted thread-block map) the next hop still
+                # carries the inner Memlet, and only the edge leaving the outermost exit names the
+                # data. Branches are why this is the tree and not the path -- one write can leave
+                # through several exits.
+                additional_descs = {
+                    oedge.data.data: sdfg.arrays[oedge.data.data]
+                    for oedge in graph.memlet_tree(edge) if not isinstance(oedge.dst, nd.ExitNode)
+                    and not oedge.data.is_empty() and oedge.data.data not in descs
+                }
 
             else:
                 # Case is ignored.
@@ -1236,8 +1233,13 @@ class ControlGraphView(BlockGraphView, abc.ABC):
                 edge.data.replace_dict(repl, replace_keys=replace_keys)
 
             # Replace in states
-            for state in self.nodes():
-                state.replace_dict(repl, symrepl)
+            for block in self.nodes():
+                # A nested region owns interstate edges of its own, so ``replace_keys`` must reach it:
+                # dropping it renames an assignment's uses but not its target, splitting one symbol in two.
+                if isinstance(block, AbstractControlFlowRegion):
+                    block.replace_dict(repl, symrepl, replace_in_graph, replace_keys)
+                else:
+                    block.replace_dict(repl, symrepl)
 
 
 @make_properties
@@ -1995,9 +1997,9 @@ class SDFGState(OrderedMultiDiConnectorGraph[nd.Node, mm.Memlet], ControlFlowBlo
         tinputs = {k: None for k, v in inputs.items()}
         toutputs = {k: None for k, v in outputs.items()}
 
-        if isinstance(input_nodes, (list, set)):
+        if isinstance(input_nodes, (list, collections.abc.Set)):
             input_nodes = {input_node.data: input_node for input_node in input_nodes}
-        if isinstance(output_nodes, (list, set)):
+        if isinstance(output_nodes, (list, collections.abc.Set)):
             output_nodes = {output_node.data: output_node for output_node in output_nodes}
 
         tasklet = nd.Tasklet(
@@ -2698,7 +2700,9 @@ class AbstractControlFlowRegion(OrderedDiGraph[ControlFlowBlock, 'dace.sdfg.Inte
         ControlFlowBlock.__init__(self, label, sdfg, parent)
 
         self._labels: Set[str] = set()
-        self._start_block: Optional[int] = None
+        # Held as the block itself, not its position: removing a node shifts every position after it,
+        # which would silently re-point the start block at a different block.
+        self._start_block: Optional[ControlFlowBlock] = None
         self._cached_start_block: Optional[ControlFlowBlock] = None
         self._cfg_list: List['ControlFlowRegion'] = [self]
 
@@ -2921,8 +2925,11 @@ class AbstractControlFlowRegion(OrderedDiGraph[ControlFlowBlock, 'dace.sdfg.Inte
         return super().add_edge(src, dst, data)
 
     def _ensure_unique_block_name(self, proposed: Optional[str] = None) -> str:
-        if self._labels is None or len(self._labels) != self.number_of_nodes():
-            self._labels = set(s.label for s in self.nodes())
+        # Ledger of every name ever issued, unioned with the live labels on each call. Staleness cannot
+        # be inferred from the node COUNT -- inlining renames blocks in place and leaves the count
+        # untouched -- and a plain rebuild from the live nodes forgets names a removed block once
+        # carried, which an inlined reference may still point at. The union never reissues either.
+        self._labels = (self._labels or set()) | {s.label for s in self.nodes()}
         return dt.find_new_name(proposed or 'block', self._labels)
 
     def add_node(self,
@@ -2954,8 +2961,16 @@ class AbstractControlFlowRegion(OrderedDiGraph[ControlFlowBlock, 'dace.sdfg.Inte
             start_block = is_start_state
 
         if start_block:
-            self.start_block = len(self.nodes()) - 1
+            self._start_block = node
             self._cached_start_block = node
+
+    def remove_node(self, node: ControlFlowBlock):
+        # The region owns this invariant, so callers never have to re-pin the start block by hand.
+        if node is self._start_block:
+            self._start_block = None
+        if node is self._cached_start_block:
+            self._cached_start_block = None
+        super().remove_node(node)
 
     def add_state(self, label=None, is_start_block=False, *, is_start_state: Optional[bool] = None) -> SDFGState:
         label = self._ensure_unique_block_name(label)
@@ -3148,7 +3163,7 @@ class AbstractControlFlowRegion(OrderedDiGraph[ControlFlowBlock, 'dace.sdfg.Inte
         graph_json.update(block_json)
 
         graph_json['cfg_list_id'] = int(self.cfg_id)
-        graph_json['start_block'] = self._start_block
+        graph_json['start_block'] = self.node_id(self._start_block) if self._start_block is not None else None
 
         return graph_json
 
@@ -3179,8 +3194,8 @@ class AbstractControlFlowRegion(OrderedDiGraph[ControlFlowBlock, 'dace.sdfg.Inte
             e = dace.serialize.from_json(e, context=context)
             ret.add_edge(nodelist[int(e.src)], nodelist[int(e.dst)], e.data)
 
-        if 'start_block' in json_obj:
-            ret._start_block = json_obj['start_block']
+        if json_obj.get('start_block') is not None:
+            ret._start_block = nodelist[int(json_obj['start_block'])]
 
         return ret
 
@@ -3217,7 +3232,7 @@ class AbstractControlFlowRegion(OrderedDiGraph[ControlFlowBlock, 'dace.sdfg.Inte
             return source_nodes[0]
         # If the starting block is ambiguous allow manual override.
         if self._start_block is not None:
-            self._cached_start_block = self.node(self._start_block)
+            self._cached_start_block = self._start_block
             return self._cached_start_block
         raise ValueError('Ambiguous or undefined starting block for ControlFlowGraph, '
                          'please use "is_start_block=True" when adding the '
@@ -3231,7 +3246,7 @@ class AbstractControlFlowRegion(OrderedDiGraph[ControlFlowBlock, 'dace.sdfg.Inte
         """
         if block_id < 0 or block_id >= self.number_of_nodes():
             raise ValueError('Invalid state ID')
-        self._start_block = block_id
+        self._start_block = self.node(block_id)
         self._cached_start_block = None
 
 
@@ -3646,6 +3661,15 @@ class LoopRegion(ControlFlowRegion):
             read_memlets.extend(memlets_in_ast(self.update_statement.code[0], arrays, include_scalars=include_scalars))
         return read_memlets
 
+    def read_and_write_sets(self) -> Tuple[Set[AnyStr], Set[AnyStr]]:
+        read_set, write_set = super().read_and_write_sets()
+        if self.sdfg is not None:
+            # Init / condition / update are the loop's own reads, invisible to nodes()/edges() below.
+            arrays = self.sdfg.arrays.keys()
+            for code in self.get_meta_codeblocks():
+                read_set |= code.get_free_symbols() & arrays
+        return read_set, write_set
+
     def replace_meta_accesses(self, replacements):
         if self.loop_variable in replacements:
             self.loop_variable = replacements[self.loop_variable]
@@ -3819,7 +3843,7 @@ class LoopRegion(ControlFlowRegion):
         from dace.sdfg.replace import replace_properties_dict
         replace_properties_dict(self, repl, symrepl)
 
-        super().replace_dict(repl, symrepl, replace_in_graph)
+        super().replace_dict(repl, symrepl, replace_in_graph, replace_keys)
 
     def add_break(self, label=None) -> BreakBlock:
         label = self._ensure_unique_block_name(label)
@@ -3887,9 +3911,19 @@ class ConditionalBlock(AbstractControlFlowRegion):
     def add_branch(self, condition: Optional[Union[CodeBlock, str]], branch: ControlFlowRegion):
         if condition is not None and not isinstance(condition, CodeBlock):
             condition = CodeBlock(condition)
+        # Same check ``add_node`` makes, for the same reason: a branch reached only through this list
+        # is never type-checked anywhere else, so a wrong object here would surface as a failure in
+        # some later pass instead of at the point that accepted it.
+        if not isinstance(branch, ControlFlowRegion):
+            raise TypeError('Expected ControlFlowRegion, got ' + str(type(branch)))
         self._branches.append([condition, branch])
         branch.parent_graph = self
         branch.sdfg = self.sdfg
+        # Same subtree repair ``add_node`` performs: a branch is routinely a deep copy, and
+        # ``ControlFlowBlock.__deepcopy__`` resolves ``_sdfg`` through the memo, so every block copied
+        # without its owning SDFG comes back owner-less. Insertion is what establishes ownership.
+        for block in branch.all_control_flow_blocks():
+            block.sdfg = self.sdfg
 
     def remove_branch(self, branch: ControlFlowRegion):
         self._branches = [(c, b) for c, b in self._branches if b is not branch]
@@ -3921,6 +3955,15 @@ class ConditionalBlock(AbstractControlFlowRegion):
             if c is not None:
                 read_memlets.extend(memlets_in_ast(c.code[0], arrays, include_scalars=include_scalars))
         return read_memlets
+
+    def read_and_write_sets(self) -> Tuple[Set[AnyStr], Set[AnyStr]]:
+        read_set, write_set = super().read_and_write_sets()
+        if self.sdfg is not None:
+            # Branch conditions are the block's own reads, invisible to nodes()/edges() below (empty for branches).
+            arrays = self.sdfg.arrays.keys()
+            for code in self.get_meta_codeblocks():
+                read_set |= code.get_free_symbols() & arrays
+        return read_set, write_set
 
     def propagate_memlets(self, border_memlets: Dict[str, Dict[str, Optional[mm.Memlet]]]) -> None:
         """
@@ -3996,7 +4039,7 @@ class ConditionalBlock(AbstractControlFlowRegion):
             replace_properties_dict(self, repl, symrepl)
 
         for cond, region in self._branches:
-            region.replace_dict(repl, symrepl, replace_in_graph)
+            region.replace_dict(repl, symrepl, replace_in_graph, replace_keys)
             if cond is not None:
                 replace_in_codeblock(cond, repl)
 

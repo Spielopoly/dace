@@ -331,6 +331,10 @@ class LoopToScan(ppl.Pass):
         """Replace a symbolic-stride scan ``loop`` with ``if (guard) { scan } else
         { original sequential loop }`` via :func:`specialize_loop_under_condition`.
 
+        ``sdfg`` is the SDFG OWNING ``loop`` (see :func:`_collect_loops`), which is what
+        gets handed to the ``_lift`` callback -- the specialization keeps both clones in
+        ``parent``, so the owner is unchanged by the splice.
+
         The true-branch clone is re-matched and lifted to the ``Scan`` pipeline;
         the else-branch clone is pinned sequential (``LoopToMap`` / a re-run of
         this pass leave it alone). ``guard`` is the ``stride >= 1`` predicate from
@@ -353,15 +357,15 @@ class LoopToScan(ppl.Pass):
         """
         from dace.transformation.passes.loop_specialization import specialize_loop_under_condition
 
-        def _lift(par_loop: LoopRegion, par_region: ControlFlowRegion, _owner: SDFG):
-            par_infos = _match_all(par_loop, sdfg)
+        def _lift(par_loop: LoopRegion, par_region: ControlFlowRegion, owner: SDFG):
+            par_infos = _match_all(par_loop, owner)
             if par_infos and not self.lift_nested_scan:
                 par_infos = [
                     info for info in par_infos
-                    if not (info.inner_loop is not None and self._inner_loop_parallelizable(info.inner_loop, sdfg))
+                    if not (info.inner_loop is not None and self._inner_loop_parallelizable(info.inner_loop, owner))
                 ]
             for info in par_infos:
-                _rewrite(par_region, par_loop, info, sdfg)
+                _rewrite(par_region, par_loop, info, owner)
 
         if _stride_guard_is_statically_dischargeable(infos) and _lift_proven_doall_to_map(parent, loop, sdfg):
             return
@@ -370,69 +374,18 @@ class LoopToScan(ppl.Pass):
     def apply_pass(self, sdfg: SDFG, _pipeline_results) -> Optional[int]:
         """Lift carried-dependence loops to ``Scan`` library nodes.
 
-        :returns: The number of scans lifted; ``0`` when no scan was lifted but the
-                  normalization preprocess below still edited the graph; ``None`` only when
-                  the SDFG was left untouched.
+        :returns: The number of scans lifted, or ``None`` when none was -- in which case the
+                  SDFG is left untouched.
 
         ``apply_pass`` returning ``None`` means "did not modify the SDFG", and callers act
         on it: the pipeline skips its per-stage ``validate()`` and leaves ``self._modified``
         alone, so cached analyses are reused and a ``FixedPointPipeline`` stops iterating.
-        Deriving the return from the lift count alone would report ``None`` for a run that
-        converted every WCR edge, stripped every copy tasklet, flipped every
-        backward-iterating loop and fused body states -- all of which happen unconditionally
-        below, whether or not a scan is then found. ``0`` is the "modified, but nothing of my
-        own kind matched" report (as ``AccumulatorToMapAndReduce`` uses an empty dict); it
-        keeps the lift count itself meaningful instead of inflating it with preprocess edits.
+        The body normalization the matcher needs (WCR-to-augassign, copy-tasklet folding,
+        negative-stride flipping, body-state fusion) therefore does NOT live here -- it is
+        :class:`~dace.transformation.passes.lift_preprocess.LiftPreprocess`, which the
+        canonicalization pipeline runs immediately before this pass and which a direct
+        caller must run itself.
         """
-        # Whole-SDFG preprocess: strip frontend ``__out = __inp`` copy tasklets so the
-        # matcher sees the bare ``out[i+1] = out[i] + delta[i]`` shape. Without this the
-        # carry hides behind an ``assign_NN`` copy node on the write side.
-        from dace.transformation.dataflow.trivial_tasklet_elimination import TrivialTaskletElimination
-        from dace.transformation.dataflow.wcr_conversion import WCRToAugAssign
-        from dace.transformation.passes.pattern_matching import PatternMatchAndApplyRepeated
-        # Normalise reductions written as WCR edges back to in-body augmented
-        # assignment so the matcher sees a uniform tasklet shape. No-op on SDFGs
-        # whose pre-existing reductions are already in augassign form (the
-        # common case for canonicalised Fortran frontends).
-        normalized = 0
-        applied = PatternMatchAndApplyRepeated([WCRToAugAssign()]).apply_pass(sdfg, {})
-        normalized += sum(len(v) for v in applied.values()) if applied else 0
-        applied = PatternMatchAndApplyRepeated([TrivialTaskletElimination()]).apply_pass(sdfg, {})
-        normalized += sum(len(v) for v in applied.values()) if applied else 0
-
-        # NOTE: D4 (CleanAccessNode + CleanTasklet) is deliberately NOT applied
-        # here. LoopToScan's matcher already handles the frontend's scalar-
-        # slice intermediates via ``_chase_forward_to_accum`` and friends;
-        # the existing WCR/TrivialTasklet preprocess above is sufficient.
-        # Running the clean folds in addition (in either order vs WCR) is
-        # redundant work and previously regressed the
-        # ``for_1133_shape_reverse_engineered`` case by stripping
-        # intermediates the matcher relies on.
-
-        # Normalise backward-iterating loops (``range(N, 0, -1)`` shape; cloudsc
-        # ``for_1079`` is the canonical case) to forward iteration. ``LoopToScan``'s
-        # matcher only handles ``stride == 1``; rather than build sign-flip handling
-        # into every gate, delegate to the dedicated canonicalisation pass once up
-        # front so subsequent analysis sees only positive-stride loops.
-        # ``NormalizeNegativeStride`` rebinds the old iterator on the body entry
-        # iedge (``jm = N - _loop_pos_X``) rather than rewriting body memlets;
-        # follow up with ``SymbolPropagation`` so the body's subsets are expressed
-        # in the new positive-stride iterator and the matcher recognises them.
-        from dace.transformation.passes.canonicalize.normalize_negative_stride import NormalizeNegativeStride
-        from dace.transformation.passes.symbol_propagation import SymbolPropagation
-        flipped = NormalizeNegativeStride().apply_pass(sdfg, {})
-        if flipped:
-            normalized += flipped
-            propagated = SymbolPropagation().apply_pass(sdfg, {})
-            normalized += len(propagated) if propagated else 0
-
-        # Per-loop preprocess: fold adjacent content SDFGStates inside the body when the
-        # iedge between them is trivial (v5 -- the cloudsc ``pfsqrf`` shape). Whole-SDFG
-        # ``StateFusion`` doesn't reach into LoopRegion bodies via ``MatchPatterns``, so
-        # do a targeted body-local merge.
-        for loop, _ in _collect_loops(sdfg):
-            normalized += _fuse_body_states(loop)
-
         count = 0
         # Optional first pass: interchange the Map-wrapped carry shape.
         # Done up-front so the carry loop runs sequentially per-thread INSIDE
@@ -443,18 +396,20 @@ class LoopToScan(ppl.Pass):
         # sequential-per-thread form).
         interchanged_loop_ids = set()
         if self.interchange_carry_with_map:
-            for loop, parent in list(_collect_loops(sdfg)):
-                shape = _detect_carry_loop_with_inner_map(loop, sdfg)
+            for loop, parent, owner in list(_collect_loops(sdfg)):
+                shape = _detect_carry_loop_with_inner_map(loop, owner)
                 if shape is None:
                     continue
-                relocated = _rewrite_interchange_carry_with_map(shape, sdfg)
+                relocated = _rewrite_interchange_carry_with_map(shape, owner)
                 if relocated is None:
                     continue
                 if isinstance(relocated, LoopRegion):
                     interchanged_loop_ids.add(id(relocated))
                 count += 1
 
-        for loop, parent in _collect_loops(sdfg):
+        # ``owner`` -- NOT ``sdfg`` -- is what every matcher and rewrite below gets: a loop
+        # inside a NestedSDFG names ITS OWN SDFG's arrays. See :func:`_collect_loops`.
+        for loop, parent, owner in _collect_loops(sdfg):
             if id(loop) in interchanged_loop_ids:
                 continue
             if loop.pinned_sequential:
@@ -462,7 +417,7 @@ class LoopToScan(ppl.Pass):
                 # specialization (below); re-matching it would recurse into
                 # another if/else. Leave it as the original sequential loop.
                 continue
-            infos = _match_all(loop, sdfg, allow_multi_slot=True)
+            infos = _match_all(loop, owner, allow_multi_slot=True)
             # Multi-slot shape (several independent scans on distinct constant
             # slots of one carrier -- ``acc[0,i]``, ``acc[1,i]``, ...): the shared
             # body can't go through the per-info ``_rewrite`` path (ambiguous
@@ -470,7 +425,7 @@ class LoopToScan(ppl.Pass):
             # leave it sequential if it isn't a clean forward-flat slot set.
             if infos and _is_multi_slot(infos):
                 if _multi_slot_liftable(infos):
-                    _rewrite_multi_slot(parent, loop, infos, sdfg)
+                    _rewrite_multi_slot(parent, loop, infos, owner)
                     count += 1
                     continue
                 # Not a clean forward-flat slot set (e.g. the nested cloudsc
@@ -489,7 +444,7 @@ class LoopToScan(ppl.Pass):
             if infos and not self.lift_nested_scan:
                 infos = [
                     info for info in infos
-                    if not (info.inner_loop is not None and self._inner_loop_parallelizable(info.inner_loop, sdfg))
+                    if not (info.inner_loop is not None and self._inner_loop_parallelizable(info.inner_loop, owner))
                 ]
             if infos:
                 guard = _symbolic_stride_guard(infos)
@@ -501,11 +456,11 @@ class LoopToScan(ppl.Pass):
                     # rather than lift unconditionally: a violating runtime value
                     # (stride 0 -> a degenerate in-place update) degrades to the
                     # sequential fallback and still computes correctly.
-                    self._specialize_scan_under_stride_guard(parent, loop, guard, sdfg, infos)
+                    self._specialize_scan_under_stride_guard(parent, loop, guard, owner, infos)
                     count += 1
                     continue
                 for info in infos:
-                    _rewrite(parent, loop, info, sdfg)
+                    _rewrite(parent, loop, info, owner)
                     count += 1
                 continue
             # The COMPOSITE-BODY shape (cloudsc ``for_1133``): outer body has
@@ -515,9 +470,9 @@ class LoopToScan(ppl.Pass):
             # AccessNodes at the chain endpoints, leaving intermediate
             # transients untouched) and emits the standard
             # ``Scan`` + seed-add via the nested-scan helpers.
-            comp = _match_composite_body(loop, sdfg)
+            comp = _match_composite_body(loop, owner)
             if comp is not None:
-                if _rewrite_composite_body(parent, loop, comp, sdfg):
+                if _rewrite_composite_body(parent, loop, comp, owner):
                     count += 1
                     continue
             # No array-carry match; try scalar-carry (TSVC s3112: scalar accumulator
@@ -525,9 +480,9 @@ class LoopToScan(ppl.Pass):
             # exclusive with array-carry by construction -- array-carry needs the
             # carrier read+written at offset (i + k_r) / (i + k_w), scalar-carry
             # needs a SCALAR carrier read+written at constant subset [0].
-            sc = _match_scalar_carry(loop, sdfg)
+            sc = _match_scalar_carry(loop, owner)
             if sc is not None:
-                _rewrite_scalar_carry(parent, loop, sc, sdfg)
+                _rewrite_scalar_carry(parent, loop, sc, owner)
                 count += 1
         if count > 0:
             # Narrow the freshly-emitted state-level memlets on the new
@@ -538,17 +493,24 @@ class LoopToScan(ppl.Pass):
             # tight subset rather than the conservative one.
             from dace.sdfg.propagation import propagate_memlets_sdfg
             propagate_memlets_sdfg(sdfg)
-        if count:
-            return count
-        return 0 if normalized else None
+        return count or None
 
 
 def _collect_loops(sdfg: SDFG):
+    """``(loop, parent_graph, owner_sdfg)`` for every named loop, nested SDFGs included.
+
+    ``owner_sdfg`` is the SDFG whose ``arrays`` the loop's memlets name -- for a loop
+    inside a NestedSDFG that is the INNER SDFG, not ``sdfg``. Every matcher and rewrite
+    below resolves descriptors and allocates its scan buffers there; handing them the
+    top-level ``sdfg`` instead allocates ``_scan_out_<out>`` in the wrong descriptor
+    repository and the states emitted next to the loop then reference a name their own
+    SDFG has never heard of.
+    """
     out: List = []
     for sd in sdfg.all_sdfgs_recursive():
         for region in sd.all_control_flow_regions():
             if isinstance(region, LoopRegion) and region.loop_variable:
-                out.append((region, region.parent_graph))
+                out.append((region, region.parent_graph, sd))
     return out
 
 
@@ -2728,14 +2690,20 @@ def _resolve_input(state: SDFGState, edge):
         desc = state.sdfg.arrays.get(src.data)
         if desc is None:
             return None, None
-        if not getattr(desc, 'transient', False):
+        if not desc.transient:
             return src.data, real_subset
         if state.in_degree(src) != 1 or state.out_degree(src) != 1:
             return None, None
         pred = state.in_edges(src)[0]
         if pred.data is None or pred.data.subset is None:
             return None, None
-        real_subset = pred.data.subset
+        # A cross-array copy memlet names one side in ``data`` and holds the other in
+        # ``other_subset``; when it names this (destination) node, the source position --
+        # the one being walked back to -- is in ``other_subset``, not ``subset``.
+        if pred.data.data == src.data and pred.data.other_subset is not None:
+            real_subset = pred.data.other_subset
+        else:
+            real_subset = pred.data.subset
         cur = pred
 
 

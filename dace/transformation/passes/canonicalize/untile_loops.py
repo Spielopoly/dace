@@ -69,7 +69,7 @@ still be referenced by interstate-edge assignments that the cascade-up pass
 hoisted; those are left alone.)
 """
 import copy
-from typing import List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import sympy
 
@@ -99,18 +99,18 @@ def count_applied(result) -> int:
 
 
 def _next_id(sdfg: SDFG) -> int:
-    used: Set[int] = set()
+    used: Dict[int, None] = {}
     for sd in sdfg.all_sdfgs_recursive():
         for s in list(sd.symbols.keys()):
             if s.startswith(_UNTILE_PREFIX):
                 tail = s[len(_UNTILE_PREFIX):]
                 if tail.isdigit():
-                    used.add(int(tail))
+                    used[int(tail)] = None
         for cfg in sd.all_control_flow_regions():
             if isinstance(cfg, LoopRegion) and cfg.loop_variable and cfg.loop_variable.startswith(_UNTILE_PREFIX):
                 tail = cfg.loop_variable[len(_UNTILE_PREFIX):]
                 if tail.isdigit():
-                    used.add(int(tail))
+                    used[int(tail)] = None
     n = 0
     while n in used:
         n += 1
@@ -140,17 +140,6 @@ def _try_extract_perfect_one_child(cfg: ControlFlowRegion) -> Optional[ControlFl
     return candidate
 
 
-def _try_extract_perfect_two_level_nest(outer: LoopRegion) -> Optional[LoopRegion]:
-    """Backward-compatible single-level wrapper around
-    :func:`_try_extract_perfect_one_child`. Kept for tests that pin the
-    immediate-inner contract; new code should prefer
-    :func:`_iter_candidate_inners` for multi-dim support."""
-    inner = _try_extract_perfect_one_child(outer)
-    if isinstance(inner, LoopRegion):
-        return inner
-    return None
-
-
 def _iter_candidate_inners(outer: LoopRegion):
     """Walk down through perfect 1-child intermediate chains, yielding
     every descendant :class:`LoopRegion` as a potential tile-pair partner
@@ -162,13 +151,13 @@ def _iter_candidate_inners(outer: LoopRegion):
     (a non-empty plain state, a sibling CFR, etc.), so non-perfect-nest
     cases are still refused.
     """
-    seen: Set[int] = set()
+    seen: Dict[int, None] = {}
     current: ControlFlowRegion = outer
     while True:
         nxt = _try_extract_perfect_one_child(current)
         if nxt is None or id(nxt) in seen:
             return
-        seen.add(id(nxt))
+        seen[id(nxt)] = None
         if isinstance(nxt, LoopRegion):
             yield nxt
         current = nxt
@@ -194,7 +183,7 @@ def _intermediate_chain_clean(outer: LoopRegion, inner: LoopRegion, outer_var: s
                 try:
                     free = symbolic.pystr_to_symbolic(code.as_string).free_symbols
                 except Exception:
-                    free = set()
+                    free = {}
                 if outer_sym in free:
                     return False
         current = current.parent_graph
@@ -381,28 +370,6 @@ def _collect_body_subset_exprs(inner: LoopRegion) -> List[symbolic.SymbolicType]
     return exprs
 
 
-def _all_memlet_uses_only(inner: LoopRegion, allowed_atoms: Set[str], forbidden_atoms: Set[str]) -> bool:
-    """``True`` iff every memlet-subset expression references at most symbols
-    from ``allowed_atoms`` (any expression of them is fine) and references *no*
-    symbol from ``forbidden_atoms``.
-
-    The check is conservative: an expression like ``2*i + ii + 1`` is fine if
-    both ``i`` and ``ii`` are allowed (because ``i + ii`` is the combined
-    iterator), but ``i`` alone without ``ii`` is forbidden -- the rewrite would
-    map only the ``i + ii`` part to ``k`` and would leave the bare ``i`` adrift.
-
-    This function only checks the *atom membership* of each expression's free
-    symbols; the structural ``i + ii`` vs ``ii``-only requirement is enforced
-    by the caller (it sets ``allowed_atoms`` appropriately).
-    """
-    forbidden = {symbolic.pystr_to_symbolic(a) for a in forbidden_atoms}
-    for ex in _collect_body_subset_exprs(inner):
-        free = ex.free_symbols
-        if any(f in forbidden for f in free):
-            return False
-    return True
-
-
 def depends_only_on_sum(ex: sympy.Basic, i_sym: sympy.Symbol, ii_sym: sympy.Symbol) -> bool:
     """``True`` iff ``ex`` reads ``i`` and ``ii`` only through the sum ``i + ii``.
 
@@ -523,7 +490,9 @@ class UntileLoops(ppl.Pass):
         from dace.transformation.interstate.multistate_inline import InlineMultistateSDFG
         from dace.transformation.passes.pattern_matching import PatternMatchAndApplyRepeated
         applied = count_applied(PatternMatchAndApplyRepeated([MapExpansion()]).apply_pass(sdfg, {}))
-        applied += count_applied(PatternMatchAndApplyRepeated([MapToForLoop()]).apply_pass(sdfg, {}))
+        lower_maps = MapToForLoop()
+        lower_maps.keep_reductions_parallel = True  # canon preference, off in the transformation's default contract
+        applied += count_applied(PatternMatchAndApplyRepeated([lower_maps]).apply_pass(sdfg, {}))
         # Sweep up any NSDFG wrappers that survived MapToForLoop's
         # inline_after step because they were Map-scoped at the time.
         # After all Maps are lifted they are no longer scoped, so a

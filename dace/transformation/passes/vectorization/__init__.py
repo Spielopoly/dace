@@ -14,7 +14,7 @@ import importlib
 
 # Importing this module registers the ``"vectorized"`` implementation on the
 # standard ``Reduce`` library node (schedule-aware dispatcher). Cycle-safe.
-from . import reduce_expansion  # noqa: F401
+from dace.transformation.passes.vectorization import reduce_expansion  # noqa: F401
 
 #: Lazily-exported pipeline entry points, mapped to their defining submodule.
 _PIPELINE_EXPORTS = {

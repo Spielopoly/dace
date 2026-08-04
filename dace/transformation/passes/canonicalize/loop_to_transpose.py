@@ -222,7 +222,7 @@ def _classify_side(subset, loop_var_syms, ndims: int):
         axis_of_var[v] = axis
         coeff_of_var[v] = coeff
         off_of_var[v] = off
-    if set(axis_of_var.keys()) != set(loop_var_syms):
+    if dict.fromkeys(axis_of_var) != dict.fromkeys(loop_var_syms):
         return None
     return axis_of_var, coeff_of_var, off_of_var
 
@@ -293,6 +293,14 @@ class LoopToTranspose(ppl.Pass):
                 return False  # duplicated iterator name -- not a clean nest
             ranges[v] = (symbolic.pystr_to_symbolic(str(lo)), symbolic.pystr_to_symbolic(str(last)), inc_i)
             loop_var_syms.append(v)
+
+        # A bound naming another iterator makes the nest triangular, and a triangular window is not a
+        # transposable box: the lift would splice that iterator into the view subsets, stranding it as a
+        # free symbol (`for j in range(i+1, M)` -> `B[..., _loop_it_0 + 1:M]`).
+        nest_syms = set(loop_var_syms)
+        for lo, last, _ in ranges.values():
+            if (lo.free_symbols | last.free_symbols) & nest_syms:
+                return False
 
         d = len(loops)
         extracted = _extract_permutation_copy(body)

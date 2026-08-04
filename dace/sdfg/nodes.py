@@ -3,6 +3,7 @@
     dataflow multigraph representation. """
 
 import ast
+import collections.abc
 from copy import deepcopy as dcpy
 from collections.abc import KeysView
 import dace
@@ -45,9 +46,9 @@ class Node(object):
 
     def __init__(self, in_connectors=None, out_connectors=None):
         # Convert connectors to typed connectors with autodetect type
-        if isinstance(in_connectors, (set, list, KeysView)):
+        if isinstance(in_connectors, (collections.abc.Set, list, KeysView)):
             in_connectors = {k: None for k in in_connectors}
-        if isinstance(out_connectors, (set, list, KeysView)):
+        if isinstance(out_connectors, (collections.abc.Set, list, KeysView)):
             out_connectors = {k: None for k in out_connectors}
 
         self.in_connectors = in_connectors or {}
@@ -401,6 +402,10 @@ class CodeNode(Node):
         """True if running this node may do more than write its outputs."""
         return False
 
+    def has_ordered_side_effects(self, sdfg) -> bool:
+        """True if this node's side effect must not be reordered relative to others."""
+        return self.has_side_effects(sdfg)
+
 
 @make_properties
 class Tasklet(CodeNode):
@@ -431,6 +436,13 @@ class Tasklet(CodeNode):
                             'additional side effects on the system state (e.g., callback). '
                             'Defaults to None, which lets the framework make assumptions based on '
                             'the tasklet contents')
+    ordered_side_effects = Property(dtype=bool,
+                                    allow_none=True,
+                                    default=None,
+                                    desc='Whether this side effect is observable relative to other side '
+                                    'effects (and so must not be reordered or merged with them), as opposed '
+                                    'to merely not being visible in its outputs. Defaults to None, which '
+                                    'assumes ordered whenever the tasklet has side effects at all.')
     ignored_symbols = SetProperty(element_type=str,
                                   desc='A set of symbols to ignore when computing '
                                   'the symbols used by this tasklet. Used to skip certain symbols in non-Python '
@@ -520,6 +532,16 @@ class Tasklet(CodeNode):
                         if cname in sdfg.symbols or cname in sdfg.arrays:
                             return True
         return False
+
+    def has_ordered_side_effects(self, sdfg) -> bool:
+        """
+        Returns True if this tasklet's side effect is observable relative to other side effects, and so
+        must not be reordered or merged with them. ``ordered_side_effects`` overrides the default, which
+        is to assume ordered whenever the tasklet has side effects at all.
+        """
+        if self.ordered_side_effects is not None:
+            return self.ordered_side_effects
+        return self.has_side_effects(sdfg)
 
     def infer_connector_types(self, sdfg, state):
         # If a MLIR tasklet, simply read out the types (it's explicit)
@@ -697,6 +719,12 @@ class NestedSDFG(CodeNode):
         return any(
             isinstance(node, CodeNode) and not isinstance(node, NestedSDFG) and node.has_side_effects(parent.sdfg)
             for node, parent in self.sdfg.all_nodes_recursive())
+
+    def has_ordered_side_effects(self, sdfg) -> bool:
+        """True if any nested node has an ordered side effect. ``sdfg`` unused: inner ones apply."""
+        return any(
+            isinstance(node, CodeNode) and not isinstance(node, NestedSDFG)
+            and node.has_ordered_side_effects(parent.sdfg) for node, parent in self.sdfg.all_nodes_recursive())
 
     def used_symbols(self, all_symbols: bool) -> Set[str]:
         free_syms = set().union(*(map(str, pystr_to_symbolic(v).free_symbols) for v in self.location.values()))
@@ -1391,6 +1419,16 @@ class LibraryNode(CodeNode):
                             default=dtypes.ScheduleType.Default)
     debuginfo = DebugInfoProperty(allow_none=True)
 
+    #: Whether this node must be expanded before other library nodes in the same state.
+    #: Set on nodes whose expansion *reads* neighbouring library nodes and therefore needs
+    #: to see them un-expanded -- e.g. ``BackwardPass``, which differentiates the forward
+    #: subgraph and has per-library-node backward rules (a ``Reduce`` it can differentiate
+    #: directly becomes an opaque C++ tasklet once expanded). ``SDFG.expand_library_nodes``
+    #: honours this ordering. Class-level attribute rather than a Property: it describes the
+    #: node type, is not part of the serialised SDFG, and lets the core stay unaware of the
+    #: libraries that set it.
+    expand_before_peers: bool = False
+
     def __init__(self, name, *args, schedule=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.name = name
@@ -1408,6 +1446,10 @@ class LibraryNode(CodeNode):
         when expanded. ``sdfg`` is unused; taken to match :class:`CodeNode`.
         """
         return False
+
+    def has_ordered_side_effects(self, sdfg) -> bool:
+        """Returns True if this library node's side effect must not be reordered relative to others."""
+        return self.has_side_effects(sdfg)
 
     def to_json(self, parent):
         jsonobj = super().to_json(parent)

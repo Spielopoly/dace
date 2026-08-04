@@ -29,14 +29,38 @@ The actual distribution + parallelization is done by the passes that follow
 whatever should recombine.
 """
 import copy
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional
 
-from dace import SDFG, Memlet, properties, symbolic
+from dace import SDFG, Memlet, dtypes, properties, symbolic
 from dace.sdfg import nodes
-from dace.sdfg.state import ConditionalBlock, LoopRegion, SDFGState
+from dace.sdfg.state import ConditionalBlock, LoopRegion
 from dace.transformation import pass_pipeline as ppl, transformation
 from dace.transformation.passes.break_anti_dependence import BreakAntiDependence
 from dace.transformation.passes.loop_fission import _single_compute_state
+
+
+def is_opaque_code(node, sdfg: SDFG) -> bool:
+    """Whether ``node``'s effects are invisible to statement splitting.
+
+    Splitting clones a body once per independent output group, so anything a node does
+    beyond writing its out-memlets happens once per clone. Two black boxes qualify: a node
+    that declares (or is detected to have) side effects, and a non-Python tasklet -- the
+    detection behind :meth:`Tasklet.has_side_effects` walks a Python AST, so a C++ / MLIR
+    body answers ``False`` for lack of anything to look at, not for lack of effects.
+
+    :param node: The node to classify.
+    :param sdfg: The SDFG owning ``node`` (for the side-effect query).
+    """
+    if not isinstance(node, nodes.CodeNode) or isinstance(node, nodes.NestedSDFG):
+        return False
+    if isinstance(node, nodes.Tasklet) and node.language != dtypes.Language.Python:
+        return True
+    return node.has_side_effects(sdfg)
+
+
+def has_opaque_code(sdfg: SDFG) -> bool:
+    """Whether any node anywhere in ``sdfg`` is opaque to splitting (:func:`is_opaque_code`)."""
+    return any(is_opaque_code(node, parent.sdfg) for node, parent in sdfg.all_nodes_recursive())
 
 
 def _has_conditional(sdfg: SDFG) -> bool:
@@ -55,22 +79,22 @@ def _has_interstate_assignments(sdfg: SDFG) -> bool:
     return any(e.data.assignments for e in sdfg.all_interstate_edges())
 
 
-def _output_dependency(sdfg: SDFG, out_name: str, input_names: Set[str]) -> Set[str]:
+def _output_dependency(sdfg: SDFG, out_name: str, input_names: Dict[str, None]) -> Dict[str, None]:
     """Inner array names that feed ``out_name``, excluding pure shared inputs."""
-    deps: Set[str] = set()
+    deps: Dict[str, None] = {}
     for state in sdfg.all_states():
         writers = [n for n in state.nodes() if isinstance(n, nodes.AccessNode) and n.data == out_name]
-        seen = set()
+        seen: Dict = {}
         stack = list(writers)
         while stack:
             node = stack.pop()
             if node in seen:
                 continue
-            seen.add(node)
+            seen[node] = None
             if isinstance(node, nodes.AccessNode):
                 if node.data in input_names:
                     continue
-                deps.add(node.data)
+                deps[node.data] = None
             for e in state.in_edges(node):
                 stack.append(e.src)
     return deps
@@ -96,9 +120,13 @@ class SplitStatements(ppl.Pass):
     split_maps = properties.Property(
         dtype=bool, default=False, desc="Also fission a straight-line multi-global-output map into one map per output.")
 
-    def __init__(self, split_maps: bool = False) -> None:
+    break_anti_dependence = properties.Property(
+        dtype=bool, default=True, desc="Snapshot-rename a forward-read anti-dependence to unbind the statements.")
+
+    def __init__(self, split_maps: bool = False, break_anti_dependence: bool = True) -> None:
         super().__init__()
         self.split_maps = split_maps
+        self.break_anti_dependence = break_anti_dependence
 
     def modifies(self) -> ppl.Modifies:
         return ppl.Modifies.Everything
@@ -107,7 +135,7 @@ class SplitStatements(ppl.Pass):
         return False
 
     def depends_on(self):
-        return set()
+        return {}
 
     def apply_pass(self, sdfg: SDFG, _pipeline_results: Dict[str, Any]) -> Optional[int]:
         count = 0
@@ -119,10 +147,13 @@ class SplitStatements(ppl.Pass):
         if self.split_maps:
             count += self._split_map_bodies(sdfg)
         # (2) Forward-read anti-dependences: snapshot-rename the read-ahead so
-        #     LoopFission can distribute the loop into independent statements.
-        loops = [r for r in sdfg.all_control_flow_regions() if isinstance(r, LoopRegion) and r.loop_variable]
-        for loop in loops:
-            count += self._snapshot_forward_reads(loop, sdfg)
+        #     LoopFission can distribute the loop into independent statements. Same
+        #     rewrite (and same whole-array copy cost) as BreakAntiDependence, so it
+        #     answers to the same knob -- otherwise turning the knob off still snapshots.
+        if self.break_anti_dependence:
+            loops = [r for r in sdfg.all_control_flow_regions() if isinstance(r, LoopRegion) and r.loop_variable]
+            for loop in loops:
+                count += self._snapshot_forward_reads(loop, sdfg)
         return count or None
 
     # ------------------------------------------------------------------
@@ -146,8 +177,22 @@ class SplitStatements(ppl.Pass):
 
     @staticmethod
     def _independent_output_groups(state, node: nodes.NestedSDFG):
-        """Partition ``node``'s output connectors into independent groups."""
+        """Partition ``node``'s output connectors into independent groups, or ``None`` to refuse."""
+        # In-place read-modify-write: an output array that is ALSO an input connector. Cloning the
+        # body per group re-evaluates every branch guard and re-reads that array in EVERY clone,
+        # while one clone writes it -- so the arms stop being mutually exclusive and a guard is
+        # tested against already-updated data. Measured on TSVC s2710: ``a[i] = a[i] + b[i]*d[i]``
+        # flips ``a[i] > b[i]``, and the else-arm's store to ``b`` then fires on if-arm lanes.
+        # ``_output_dependency`` cannot see it either -- an RMW output's writer IS an input name, so
+        # it stops before traversing and reports no dependency at all. Mirror the RMW refusal
+        # :meth:`_split_one_map` already carries (split_statements.py) and leave the body alone.
+        if any(c in node.in_connectors for c in node.out_connectors):
+            return None
         if not _has_conditional(node.sdfg) and not _has_interstate_assignments(node.sdfg):
+            return None
+        # A black-box body is not analyzable: ``_output_dependency`` reads the memlets, which
+        # do not describe an opaque node's effects, and ``_split`` would then duplicate them.
+        if has_opaque_code(node.sdfg):
             return None
         out_conns = [c for c in node.out_connectors]
         if len(out_conns) < 2:
@@ -156,7 +201,7 @@ class SplitStatements(ppl.Pass):
         for e in state.out_edges(node):
             if e.data is None or e.data.wcr is not None:
                 return None
-        in_names = set(node.in_connectors)
+        in_names = dict.fromkeys(node.in_connectors)
         dep = {oc: _output_dependency(node.sdfg, oc, in_names) for oc in out_conns}
         parent = {oc: oc for oc in out_conns}
 
@@ -168,11 +213,11 @@ class SplitStatements(ppl.Pass):
 
         for i, a in enumerate(out_conns):
             for b in out_conns[i + 1:]:
-                if dep[a] & dep[b]:
+                if any(s in dep[b] for s in dep[a]):
                     parent[find(a)] = find(b)
-        groups: Dict[str, Set[str]] = {}
+        groups: Dict[str, Dict[str, None]] = {}
         for oc in out_conns:
-            groups.setdefault(find(oc), set()).add(oc)
+            groups.setdefault(find(oc), {})[oc] = None
         return list(groups.values())
 
     @staticmethod
@@ -265,17 +310,13 @@ class SplitStatements(ppl.Pass):
         # lost) and duplicate the write -- both silently wrong, and it still validates. Mirror the RMW
         # guard SplitTasklets uses (split_tasklets.py) and leave such a map unsplit. Global
         # (non-transient) arrays only: a shared local temp is meant to be recomputed per output.
-        read_arrays = {
-            e.data.data
-            for e in state.in_edges(entry)
-            if e.data is not None and e.data.data is not None and not cfg.arrays[e.data.data].transient
-        }
-        write_arrays = {
-            e.data.data
-            for e in state.in_edges(xit)
-            if e.data is not None and e.data.data is not None and not cfg.arrays[e.data.data].transient
-        }
-        if read_arrays & write_arrays:
+        read_arrays = dict.fromkeys(
+            e.data.data for e in state.in_edges(entry)
+            if e.data is not None and e.data.data is not None and not cfg.arrays[e.data.data].transient)
+        write_arrays = dict.fromkeys(
+            e.data.data for e in state.in_edges(xit)
+            if e.data is not None and e.data.data is not None and not cfg.arrays[e.data.data].transient)
+        if any(a in write_arrays for a in read_arrays):
             return False
         scope = state.scope_subgraph(entry, include_entry=True, include_exit=True)
         inner = [n for n in scope.nodes() if n not in (entry, xit)]
@@ -291,9 +332,13 @@ class SplitStatements(ppl.Pass):
         # PLAIN leaf map only: no nested map / NestedSDFG in the body (those go to _replicate_components).
         if not inner or any(isinstance(n, (nodes.NestedSDFG, nodes.MapEntry, nodes.MapExit)) for n in inner):
             return False
-        before = {n for n in state.nodes() if isinstance(n, nodes.NestedSDFG)}
+        # Same black-box refusal as the NestedSDFG path: the clones below recompute the whole
+        # body per output, which is only sound while every node's effect is its out-memlets.
+        if any(is_opaque_code(n, cfg) for n in inner):
+            return False
+        before = dict.fromkeys(n for n in state.nodes() if isinstance(n, nodes.NestedSDFG))
         nsdfg_node = helpers.nest_state_subgraph(cfg, state, subgraph_cls(state, list(scope.nodes())))
-        groups = [{o} for o in nsdfg_node.out_connectors if o in out_names]
+        groups = [dict.fromkeys([o]) for o in nsdfg_node.out_connectors if o in out_names]
         if len(groups) < 2:  # nesting coalesced the outputs onto one connector -- nothing to split
             return False
         SplitStatements._split(cfg, state, nsdfg_node, groups, simplify_cls)
@@ -311,12 +356,18 @@ class SplitStatements(ppl.Pass):
             return 0
         ivar = loop.loop_variable
         oracle = BreakAntiDependence()
+        # Forward stride only. ``_dep_class`` reads direction off the sign of the carried
+        # offset alone, so under a reverse stride it calls ``a[i + 1]`` read-ahead when it is
+        # really the value the PREVIOUS iteration wrote -- redirecting it to the pre-loop
+        # snapshot then silently computes the wrong thing.
+        if not oracle._safe_stride(loop, sdfg):
+            return 0
         internal_syms = oracle._loop_internal_symbols(loop)
         applied = 0
 
         written = sorted(
-            {n.data
-             for n in state.data_nodes() if state.in_degree(n) > 0 and not sdfg.arrays[n.data].transient})
+            dict.fromkeys(n.data for n in state.data_nodes()
+                          if state.in_degree(n) > 0 and not sdfg.arrays[n.data].transient))
         for arr in written:
             write_subsets = []
             for n in state.data_nodes():
@@ -339,7 +390,7 @@ class SplitStatements(ppl.Pass):
                     if rs is None:
                         continue
                     verdicts = [oracle._dep_class(rs, ws, ivar, loop=loop, sdfg=sdfg) for ws in write_subsets]
-                    kinds = {v[0] for v in verdicts}
+                    kinds = dict.fromkeys(v[0] for v in verdicts)
                     # Redirect to the pre-loop snapshot ONLY when EVERY verdict is a read-ahead
                     # (WAR / WAR_symbolic). A RAW/complex producer, OR a 'none' (offset-0, same-index
                     # producer THIS iteration), means the read consumes a value made within the sweep
@@ -347,10 +398,10 @@ class SplitStatements(ppl.Pass):
                     # miscompile. (The old gate only skipped RAW/complex and required *some* WAR, so a
                     # read that was WAR vs one sibling write but 'none' vs another --
                     # ``A[i]=..; A[i+1]=..; d[i]=A[i+1]`` -- slipped through and read the stale value.)
-                    if not (kinds and kinds <= {'WAR', 'WAR_symbolic'}):
+                    if not (kinds and all(k in ('WAR', 'WAR_symbolic') for k in kinds)):
                         continue
                     guards = {p for k, p in verdicts if k == 'WAR_symbolic'}
-                    if any({str(s) for s in g.free_symbols} & internal_syms for g in guards):
+                    if any(str(s) in internal_syms for g in guards for s in g.free_symbols):
                         continue
                     sym_guards |= guards
                     fwd_edges.append((n, e))

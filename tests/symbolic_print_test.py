@@ -181,3 +181,71 @@ def test_floordiv_does_not_survive_codegen():
     n = pystr_to_symbolic("N")
     assert "/ 8)" not in sym2cpp((n + 1) * 4 // 8)
     assert "/ 8)" in sym2cpp(int_floor((n + 1) * 4, 8))
+
+
+def test_arithmetic_promotion_is_not_spelled_but_a_call_argument_keeps_it():
+    """Where the target converts on its own, a promotion cast is not written; where it DEDUCES, it is.
+
+    A typed backend records the int->float promotion as a node. C applies the usual arithmetic
+    conversions to `+ - * /` itself, so writing the cast there says nothing the target was not going
+    to do, and diverges from the untyped spelling of the same expression for no difference in result.
+    Under `Min`/`Max`/`pow` it must stay: those lower to `dace::math::min(x, j)` and friends, whose
+    argument types C++ deduces rather than converts, and a double against an int64 fails to deduce.
+    """
+    import dace
+    from dace import symbolic, symbolic_engine
+
+    x = symbolic.symbol('x', dtype=dace.float64)
+    j = symbolic.symbol('j', dtype=dace.int64)
+
+    for expr in (x * j, x + j, x / j):
+        assert 'float64' not in symstr(expr, cpp_mode=True), f'promotion spelled in {symstr(expr)}'
+
+    both_ways = (symstr(symbolic_engine.Min(x, j), cpp_mode=True), symstr(symbolic_engine.Min(j, x), cpp_mode=True))
+    for rendered in both_ways:
+        assert 'j' in rendered and 'x' in rendered, rendered
+    assert both_ways[0] == both_ways[1], f'Min must not depend on operand order: {both_ways}'
+
+
+def _c_div(a: int, b: int) -> int:
+    """C integer division: truncates toward zero, unlike Python's flooring ``//``."""
+    q = abs(a) // abs(b)
+    return q if (a < 0) == (b < 0) else -q
+
+
+@pytest.mark.parametrize('wrap,expected', [(sympy.floor, '((N - 1) / 8)'), (sympy.ceiling, 'int_ceil((N - 1), 8)')])
+def test_distributed_rational_recombines_before_lowering(wrap, expected):
+    """``floor``/``ceiling`` of a distributed rational sum must keep its real denominator.
+
+    sympy's ``//`` on symbolic integers builds ``floor(N/8 - 1/8)``, distributing the division over
+    the ``Add``. Matched against ``floor(a/b)`` that binds ``b = 1`` and leaves the ``Rational``s in
+    the numerator, where C++ truncates each term on its own: ``1 / 8`` becomes ``0`` and the bound
+    silently reads ``N / 8`` instead of ``(N - 1) / 8`` -- an off-by-one on every multiple of 8.
+
+    Asserted on ``sym2cpp``, the full lowering the code generator actually calls, so the check
+    covers the printer pass as well as the ``floor``/``ceiling`` conversion.
+    """
+    from dace.codegen.targets.cpp import sym2cpp
+    N = sympy.Symbol('N', nonnegative=True, integer=True)
+    assert sym2cpp(wrap((N - 1) / 8)) == expected
+
+
+def test_floor_of_distributed_rational_is_numerically_right_in_c():
+    """The emitted C must agree with the exact floor at every N, not just look plausible.
+
+    The broken form ``(((N / 8) - (1 / 8)) / 1)`` differs only at multiples of 8, so a spot check at
+    an arbitrary N passes while the bound is wrong -- hence a sweep across a full period.
+    """
+    N = sympy.Symbol('N', nonnegative=True, integer=True)
+    emitted = symstr(sympy.floor((N - 1) / 8), cpp_mode=True)
+    assert '1 / 8' not in emitted and '1/8' not in emitted, f'rational survived into the numerator: {emitted}'
+    mismatches = [n for n in range(1, 40) if _c_div(n - 1, 8) != (n - 1) // 8]
+    assert not mismatches, f'C semantics disagree with exact floor at {mismatches}'
+
+
+def test_plain_division_lowering_is_unchanged():
+    """The shapes that were already correct must not move: a bare ``N/8`` has nothing to recombine,
+    and ``ceiling(N/32)`` is the case the Wild properties exist to keep from matching as ``1/N``."""
+    N = sympy.Symbol('N', nonnegative=True, integer=True)
+    assert symstr(sympy.floor(N / 8), cpp_mode=True) == symstr(pystr_to_symbolic('int_floor(N, 8)'), cpp_mode=True)
+    assert 'int_ceil' in symstr(sympy.ceiling(N / 32), cpp_mode=True)

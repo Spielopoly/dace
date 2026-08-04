@@ -19,6 +19,7 @@ single documented conversion helper, not a per-call shim pattern repeated everyw
 directed s-t max-flow/min-cut (handled in dace.graphlib.algorithms.flow.edmondskarp, which
 reuses this same helper).
 """
+import collections.abc
 import copy
 
 from networkx.exception import NetworkXError, NetworkXNoCycle, NetworkXNoPath, NetworkXUnfeasible, NodeNotFound
@@ -269,13 +270,18 @@ class RustworkxGraphHandle:
     # recovers real networkx's actual insertion-order iteration (see EdgeView._list's docstring
     # for the full explanation and the real bug this fixes).
 
-    def in_edges(self, node):
-        idx = self._index.index_of(node)
-        return [(self._index.node_at(u), self._index.node_at(v)) for u, v, _ in reversed(list(self._rx.in_edges(idx)))]
+    # data=True yields (u, v, attr dict) triples, matching networkx.DiGraph.in_edges/out_edges' own
+    # data= keyword; the payload is the stored dict by reference, same as G[u][v].
 
-    def out_edges(self, node):
-        idx = self._index.index_of(node)
-        return [(self._index.node_at(u), self._index.node_at(v)) for u, v, _ in reversed(list(self._rx.out_edges(idx)))]
+    def in_edges(self, node, data=False):
+        at = self._index.node_at
+        edges = reversed(list(self._rx.in_edges(self._index.index_of(node))))
+        return [(at(u), at(v), p) for u, v, p in edges] if data else [(at(u), at(v)) for u, v, _ in edges]
+
+    def out_edges(self, node, data=False):
+        at = self._index.node_at
+        edges = reversed(list(self._rx.out_edges(self._index.index_of(node))))
+        return [(at(u), at(v), p) for u, v, p in edges] if data else [(at(u), at(v)) for u, v, _ in edges]
 
     def successors(self, node):
         idx = self._index.index_of(node)
@@ -428,11 +434,11 @@ class RustworkxDiGraphMatcher:
         node_matcher = (lambda a, b: self._node_match(a, b)) if self._node_match else None
         edge_matcher = (lambda a, b: self._edge_match(a, b)) if self._edge_match else None
         mappings = rustworkx.digraph_vf2_mapping(self._G1._rx,
-                                                  self._G2._rx,
-                                                  node_matcher=node_matcher,
-                                                  edge_matcher=edge_matcher,
-                                                  subgraph=True,
-                                                  induced=True)
+                                                 self._G2._rx,
+                                                 node_matcher=node_matcher,
+                                                 edge_matcher=edge_matcher,
+                                                 subgraph=True,
+                                                 induced=True)
         for mapping in mappings:
             yield {self._G1._index.node_at(a): self._G2._index.node_at(b) for a, b in mapping.items()}
 
@@ -468,6 +474,20 @@ class RustworkxBackend:
         for comp in rustworkx.weakly_connected_components(G._rx):
             yield {G._index.node_at(i) for i in comp}
 
+    def weakly_connected_component(self, G, node):
+        # Deliberately scans weakly_connected_components on the PyDiGraph instead of the more direct
+        # to_undirected() + node_connected_component: PyDiGraph.to_undirected() RENUMBERS node indices
+        # whenever the graph has index holes from a remove_node (confirmed empirically -- directed
+        # [0, 2, 3] comes back as undirected [0, 1, 2]), so its result cannot be mapped back through
+        # NodeIndexMap. Missing node raises KeyError, matching real networkx.node_connected_component.
+        import rustworkx
+        G = _coerce(G)
+        idx = _index_of(G, node, KeyError, node)
+        for comp in rustworkx.weakly_connected_components(G._rx):
+            if idx in comp:
+                return {G._index.node_at(i) for i in comp}
+        raise KeyError(node)
+
     def topological_sort(self, G):
         # lazy generator, matching real networkx.topological_sort. rustworkx raises its own
         # rustworkx.DAGHasCycle on a cyclic graph where real networkx raises NetworkXUnfeasible
@@ -499,7 +519,7 @@ class RustworkxBackend:
         # passes an explicit, non-empty source list, so this doesn't affect anything reachable.
         import rustworkx
         G = _coerce(G)
-        sources = list(source) if isinstance(source, (list, tuple, set)) else [source]
+        sources = list(source) if isinstance(source, (list, tuple, collections.abc.Set)) else [source]
         for src in sources:
             # unlike the other methods here, real networkx does NOT raise for a missing/None
             # source in find_cycle -- it just finds no cycle from it. Match that: skip rather
@@ -574,9 +594,9 @@ class RustworkxBackend:
         source_idx = _index_of(G, source, NodeNotFound, f'Source {source} is not in G')
         target_idx = _index_of(G, target, NodeNotFound, f'Target {target} is not in G')
         lengths = rustworkx.dijkstra_shortest_path_lengths(G._rx,
-                                                             source_idx,
-                                                             edge_cost_fn=lambda _: 1.0,
-                                                             goal=target_idx)
+                                                           source_idx,
+                                                           edge_cost_fn=lambda _: 1.0,
+                                                           goal=target_idx)
         if target_idx not in lengths:
             raise NetworkXNoPath(f'No path between {source} and {target}.')
         return int(lengths[target_idx])

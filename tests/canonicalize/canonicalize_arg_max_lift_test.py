@@ -11,6 +11,13 @@ import dace
 from dace.sdfg.state import LoopRegion, ConditionalBlock
 from dace.libraries.standard.nodes import Reduce
 from dace.transformation.passes.canonicalize.arg_max_lift import ArgMaxLift
+from dace.libraries.standard.nodes.scan import Scan
+from dace.transformation.passes.lift_preprocess import LiftPreprocess
+
+
+def _num_scan_nodes(sdfg) -> int:
+    return sum(1 for n, _ in sdfg.all_nodes_recursive() if isinstance(n, Scan))
+
 
 N = dace.symbol('N')
 
@@ -390,12 +397,8 @@ def test_loop_to_reduce_doesnt_lift_an_argmax_loop():
     res = LoopToReduce().apply_pass(sdfg, {})
     assert res is None, "LoopToReduce must not lift conditional argmax loops (two accumulators in the branch)"
 
-    # ``wcr-scalar`` mode normalizes before matching (TrivialTaskletElimination +
-    # AugAssignToWCR), and those rewrites are real modifications the pass must report -- so
-    # assert what this test is actually about, that NO reduction was lifted, rather than that
-    # the pass returned None. See the ``apply_pass`` docstring in loop_to_reduce.py.
     reduces_before = _num_reduces(sdfg)
-    LoopToReduce(prefer='wcr-scalar').apply_pass(sdfg, {})
+    assert LoopToReduce(prefer='wcr-scalar').apply_pass(sdfg, {}) is None
     assert _num_reduces(sdfg) == reduces_before, \
         "LoopToReduce(wcr-scalar) must also refuse argmax: branch body has two accumulator writes"
 
@@ -412,8 +415,10 @@ def test_loop_to_scan_doesnt_lift_an_argmax_loop():
                 x = a[i]
         result[0] = x
 
-    res = LoopToScan().apply_pass(s314.to_sdfg(simplify=True), {})
-    assert res is None, "LoopToScan must not lift conditional argmax loops"
+    sdfg = s314.to_sdfg(simplify=True)
+    LiftPreprocess().apply_pass(sdfg, {})
+    assert LoopToScan().apply_pass(sdfg, {}) is None
+    assert _num_scan_nodes(sdfg) == 0, "LoopToScan must not lift conditional argmax loops"
 
 
 def test_loop_to_reduce_doesnt_lift_a_scan_loop():
@@ -441,8 +446,10 @@ def test_loop_to_scan_doesnt_lift_a_reduction_loop():
             s = s + a[i]
         result[0] = s
 
-    res = LoopToScan().apply_pass(reduce_loop.to_sdfg(simplify=True), {})
-    assert res is None, "LoopToScan must not lift plain reductions"
+    sdfg = reduce_loop.to_sdfg(simplify=True)
+    LiftPreprocess().apply_pass(sdfg, {})
+    LoopToScan().apply_pass(sdfg, {})
+    assert _num_scan_nodes(sdfg) == 0, "LoopToScan must not lift plain reductions"
 
 
 # -----------------------------------------------------------------------------
@@ -988,6 +995,612 @@ def test_2d_argmax_refuses_non_contiguous_partial_rows():
     xi, yi = flat // (m - 1), flat % (m - 1)
     assert np.isclose(out[0], ref[xi, yi])
     assert int(out[1]) == xi and int(out[2]) == yi
+
+
+# -----------------------------------------------------------------------------
+# Shifted gather: ``a[i + b]`` over a 0-based loop. Same reduced element set as
+# the unshifted ``a[i]`` over ``b:N``, which is exactly what rebasing a loop's
+# origin to 0 (``NormalizeLoopAndMapOrigin``) leaves behind.
+# -----------------------------------------------------------------------------
+
+
+def test_shifted_gather_max_value_only_lifts():
+    """``x = a[0]; for i in range(0, N - 1): if a[i + 1] > x: x = a[i + 1]``
+    gathers ``a[1:N]`` -- exactly what ``range(1, N)`` / ``a[i]`` gathers -- so
+    it lifts to the same value-only ``Reduce(Max)``. The base is folded into the
+    emitted slice; the seed sits at position 0, one gather-step below the loop's
+    first."""
+
+    @dace.program
+    def shifted_max(a: dace.float64[N], result: dace.float64[1]):
+        x = a[0]
+        for i in range(0, N - 1):
+            if a[i + 1] > x:
+                x = a[i + 1]
+        result[0] = x
+
+    sdfg = shifted_max.to_sdfg(simplify=True)
+    assert _num_loops(sdfg) == 1
+    assert ArgMaxLift().apply_pass(sdfg, {}) == 1, 'shifted gather must lift'
+    sdfg.validate()
+    assert _num_loops(sdfg) == 0
+    assert _num_reduces(sdfg) == 1
+
+    n = 16
+    rng = np.random.default_rng(3141)
+    a = rng.standard_normal(n)
+    out = np.zeros(1)
+    sdfg(a=a, result=out, N=n)
+    assert np.isclose(out[0], np.max(a)), f'got {out[0]}, expected {np.max(a)}'
+
+
+def test_shifted_gather_min_value_only_lifts():
+    """``<`` sibling of :func:`test_shifted_gather_max_value_only_lifts` --
+    ``Reduce(Min)`` over the same shifted slice."""
+
+    @dace.program
+    def shifted_min(a: dace.float64[N], result: dace.float64[1]):
+        x = a[0]
+        for i in range(0, N - 1):
+            if a[i + 1] < x:
+                x = a[i + 1]
+        result[0] = x
+
+    sdfg = shifted_min.to_sdfg(simplify=True)
+    assert ArgMaxLift().apply_pass(sdfg, {}) == 1
+    sdfg.validate()
+    assert _num_loops(sdfg) == 0
+    assert _num_reduces(sdfg) == 1
+
+    n = 16
+    rng = np.random.default_rng(3161)
+    a = rng.standard_normal(n)
+    out = np.zeros(1)
+    sdfg(a=a, result=out, N=n)
+    assert np.isclose(out[0], np.min(a)), f'got {out[0]}, expected {np.min(a)}'
+
+
+def test_shifted_gather_seed_element_is_the_extreme():
+    """The dropped pre-loop seed ``x = a[0]`` must stay inside the shifted
+    slice: with ``a[0]`` the maximum, a slice starting one element too high
+    would return the wrong value."""
+
+    @dace.program
+    def shifted_seed(a: dace.float64[N], result: dace.float64[1]):
+        x = a[0]
+        for i in range(0, N - 1):
+            if a[i + 1] > x:
+                x = a[i + 1]
+        result[0] = x
+
+    sdfg = shifted_seed.to_sdfg(simplify=True)
+    assert ArgMaxLift().apply_pass(sdfg, {}) == 1
+    sdfg.validate()
+    a = np.array([100.0, 1.0, 2.0, 3.0, 4.0, 5.0])
+    out = np.zeros(1)
+    sdfg(a=a, result=out, N=6)
+    assert np.isclose(out[0], 100.0)
+
+
+def test_shifted_gather_refuses_mismatched_value_write():
+    """``if a[i] > x: x = a[i + 1]`` compares one element and stores ANOTHER --
+    not a reduction. The carrier write is matched by its affine index against
+    the compared gather's, so the mismatch is refused."""
+
+    @dace.program
+    def mismatched(a: dace.float64[N], result: dace.float64[1]):
+        x = a[0]
+        for i in range(0, N - 1):
+            if a[i] > x:
+                x = a[i + 1]
+        result[0] = x
+
+    assert ArgMaxLift().apply_pass(mismatched.to_sdfg(simplify=True), {}) is None
+
+
+def test_shifted_gather_with_index_refused():
+    """The index-tracking variant of the shifted gather is NOT lifted: the
+    tracked position would have to be recovered in the gather's shifted space,
+    which neither the true-branch matcher (it accepts only ``idx := i``) nor the
+    ``ArgReduce`` index recovery (it equates position with iteration) does. It
+    must stay a loop rather than lift with a wrong index."""
+    from dace.libraries.standard.nodes import ArgReduce
+
+    @dace.program
+    def shifted_idx(a: dace.float64[N], result: dace.float64[1], idx_result: dace.int64[1]):
+        x = a[0]
+        idx = 0
+        for i in range(0, N - 1):
+            if a[i + 1] > x:
+                x = a[i + 1]
+                idx = i + 1
+        result[0] = x
+        idx_result[0] = idx
+
+    sdfg = shifted_idx.to_sdfg(simplify=True)
+    assert ArgMaxLift().apply_pass(sdfg, {}) is None, 'shifted gather with index must be refused'
+    assert sum(1 for n, _ in sdfg.all_nodes_recursive() if isinstance(n, ArgReduce)) == 0
+
+    n = 12
+    rng = np.random.default_rng(3152)
+    a = rng.standard_normal(n)
+    out = np.zeros(1)
+    out_idx = np.zeros(1, dtype=np.int64)
+    sdfg(a=a, result=out, idx_result=out_idx, N=n)
+    assert np.isclose(out[0], np.max(a))
+    assert int(out_idx[0]) == int(np.argmax(a))
+
+
+# -----------------------------------------------------------------------------
+# Predicate index, no value carrier (TSVC s331).
+# -----------------------------------------------------------------------------
+
+
+def _num_wcr_max_maps(sdfg) -> int:
+    """Maps whose exit carries a max-WCR write -- the parallel form the s331 lift emits."""
+    count = 0
+    for state in sdfg.all_states():
+        for node in state.nodes():
+            if not isinstance(node, dace.sdfg.nodes.MapExit):
+                continue
+            if any(e.data.wcr is not None and 'max' in e.data.wcr for e in state.out_edges(node)):
+                count += 1
+    return count
+
+
+def _run_s331(sdfg, a, n):
+    out = np.zeros(2)
+    sdfg(a=a.copy(), b=out, N=n)
+    return int(out[0])
+
+
+def _reference_last_index(a) -> int:
+    """The sequential loop's answer: last index with ``a[i] < 0``, else -1."""
+    hits = np.nonzero(a < 0.0)[0]
+    return int(hits[-1]) if len(hits) else -1
+
+
+def test_tsvc_s331_predicate_index_lifts_to_wcr_max_map():
+    """``j = -1; for i: if a[i] < 0.0: j = i`` is ``j = max{i : a[i] < 0}`` and lifts
+    to a parallel WCR-max map over the masked iteration index."""
+
+    @dace.program
+    def s331(a: dace.float64[N], b: dace.float64[2]):
+        j = -1
+        j = -1
+        for i in range(N):
+            if a[i] < 0.0:
+                j = i
+        b[0] = j
+
+    sdfg = s331.to_sdfg(simplify=True)
+    assert _num_loops(sdfg) == 1
+    assert ArgMaxLift().apply_pass(sdfg, {}) == 1
+    sdfg.validate()
+    assert _num_loops(sdfg) == 0
+    assert _num_wcr_max_maps(sdfg) == 1
+
+    n = 37
+    rng = np.random.default_rng(331)
+    a = np.abs(rng.standard_normal(n))
+    a[5] = -1.0
+    a[19] = -2.0
+    assert _run_s331(sdfg, a, n) == _reference_last_index(a) == 19
+
+
+def test_predicate_index_empty_predicate_set_yields_the_seed():
+    """No element satisfies the predicate -> the result is the pre-loop seed, and the
+    seed is READ from the source, not assumed to be -1."""
+
+    @dace.program
+    def s331_seed(a: dace.float64[N], b: dace.float64[2]):
+        j = -7
+        for i in range(N):
+            if a[i] < 0.0:
+                j = i
+        b[0] = j
+
+    sdfg = s331_seed.to_sdfg(simplify=True)
+    assert ArgMaxLift().apply_pass(sdfg, {}) == 1
+    sdfg.validate()
+    assert _num_loops(sdfg) == 0
+
+    n = 24
+    a = np.abs(np.random.default_rng(3311).standard_normal(n)) + 1.0
+    assert _run_s331(sdfg, a, n) == -7, 'empty predicate set must return the seed verbatim'
+    # ... and a single match still beats the seed.
+    a[11] = -0.5
+    assert _run_s331(sdfg, a, n) == 11
+
+
+def test_predicate_index_last_match_wins_not_first():
+    """Distinguishes the max-reduction from a min- / first-match lowering: with matches
+    at both ends of the range only the LAST one is the sequential answer."""
+
+    @dace.program
+    def s331_last(a: dace.float64[N], b: dace.float64[2]):
+        j = -1
+        for i in range(N):
+            if a[i] < 0.0:
+                j = i
+        b[0] = j
+
+    sdfg = s331_last.to_sdfg(simplify=True)
+    assert ArgMaxLift().apply_pass(sdfg, {}) == 1
+    sdfg.validate()
+
+    n = 40
+    a = np.abs(np.random.default_rng(3312).standard_normal(n)) + 1.0
+    a[2] = -1.0
+    a[3] = -1.0
+    a[n - 2] = -1.0
+    got = _run_s331(sdfg, a, n)
+    assert got == _reference_last_index(a) == n - 2, f'first-match lowering would have given 2, got {got}'
+
+
+def test_predicate_index_offset_loop_and_threshold_scalar():
+    """A non-zero loop start with a runtime threshold read from a scalar container:
+    the threshold is wired as a second tasklet input, and the seed check is against
+    the loop's own start."""
+
+    @dace.program
+    def s331_thr(a: dace.float64[N], thr: dace.float64[1], b: dace.float64[2]):
+        j = -3
+        for i in range(2, N):
+            if a[i] > thr[0]:
+                j = i
+        b[0] = j
+
+    sdfg = s331_thr.to_sdfg(simplify=True)
+    assert ArgMaxLift().apply_pass(sdfg, {}) == 1
+    sdfg.validate()
+    assert _num_loops(sdfg) == 0
+
+    n = 21
+    a = np.linspace(-1.0, 1.0, n)
+    thr = np.array([0.5])
+    out = np.zeros(2)
+    sdfg(a=a.copy(), thr=thr.copy(), b=out, N=n)
+    hits = np.nonzero(a[2:] > thr[0])[0]
+    assert int(out[0]) == (int(hits[-1]) + 2 if len(hits) else -3)
+
+    out = np.zeros(2)
+    sdfg(a=a.copy(), thr=np.array([5.0]), b=out, N=n)
+    assert int(out[0]) == -3, 'no element above the threshold must return the seed'
+
+
+def test_predicate_index_refuses_seed_above_the_loop_start():
+    """``j = 5`` over ``range(N)``: masking non-matching iterations with the seed would
+    let the seed WIN over a real match below it (``max(5, 2) == 5`` where the loop says
+    ``2``). The pass must refuse, and the untouched loop must still be correct."""
+
+    @dace.program
+    def high_seed(a: dace.float64[N], b: dace.float64[2]):
+        j = 5
+        for i in range(N):
+            if a[i] < 0.0:
+                j = i
+        b[0] = j
+
+    sdfg = high_seed.to_sdfg(simplify=True)
+    assert ArgMaxLift().apply_pass(sdfg, {}) is None
+    assert _num_loops(sdfg) == 1
+
+    n = 16
+    a = np.abs(np.random.default_rng(3313).standard_normal(n)) + 1.0
+    a[2] = -1.0
+    assert _run_s331(sdfg, a, n) == 2, 'sequential answer is the last match, not the seed'
+
+
+def test_predicate_index_refuses_guard_reading_the_carrier():
+    """``if a[i] < 0 and j < 0`` is a find-FIRST search -- the guard stops firing after
+    the first hit -- so it is NOT a max over positions and must be refused."""
+
+    @dace.program
+    def first_match(a: dace.float64[N], b: dace.float64[2]):
+        j = -1
+        for i in range(N):
+            if a[i] < 0.0 and j < 0:
+                j = i
+        b[0] = j
+
+    sdfg = first_match.to_sdfg(simplify=True)
+    assert ArgMaxLift().apply_pass(sdfg, {}) is None
+    assert _num_loops(sdfg) == 1
+
+    n = 16
+    a = np.abs(np.random.default_rng(3314).standard_normal(n)) + 1.0
+    a[4] = -1.0
+    a[9] = -1.0
+    assert _run_s331(sdfg, a, n) == 4, 'find-first keeps the FIRST match'
+
+
+def test_predicate_index_refuses_extra_true_branch_write():
+    """A second write in the true branch is dropped by the rewrite, so it is refused."""
+
+    @dace.program
+    def two_writes(a: dace.float64[N], b: dace.float64[2]):
+        j = -1
+        k = -1
+        for i in range(N):
+            if a[i] < 0.0:
+                j = i
+                k = i
+        b[0] = j + k
+
+    sdfg = two_writes.to_sdfg(simplify=True)
+    assert ArgMaxLift().apply_pass(sdfg, {}) is None
+    assert _num_loops(sdfg) == 1
+
+
+def test_predicate_index_refuses_break():
+    """A break makes the loop a find-FIRST search; ``EarlyExitToFindIndex`` owns it."""
+
+    @dace.program
+    def with_break(a: dace.float64[N], b: dace.float64[2]):
+        j = -1
+        for i in range(N):
+            if a[i] < 0.0:
+                j = i
+                break
+        b[0] = j
+
+    sdfg = with_break.to_sdfg(simplify=True)
+    assert ArgMaxLift().apply_pass(sdfg, {}) is None
+    assert _num_loops(sdfg) == 1
+
+
+def test_predicate_index_refuses_indirect_guard_read():
+    """``a[b[i]]`` in the guard is not expressible as one memlet subset."""
+
+    @dace.program
+    def indirect(a: dace.float64[N], idx: dace.int64[N], b: dace.float64[2]):
+        j = -1
+        for i in range(N):
+            if a[idx[i]] < 0.0:
+                j = i
+        b[0] = j
+
+    sdfg = indirect.to_sdfg(simplify=True)
+    assert ArgMaxLift().apply_pass(sdfg, {}) is None
+    assert _num_loops(sdfg) == 1
+
+
+def test_predicate_index_refuses_stale_seed_behind_a_prior_loop():
+    """A LOOP sits between the ``j = -1`` seed and the matched loop and can rebind
+    ``j`` to a value above the iteration range. The collected pre-loop binding is then
+    stale, so the seed check must refuse rather than trust it."""
+
+    @dace.program
+    def stale_seed(a: dace.float64[N], b: dace.float64[2]):
+        j = -1
+        for k in range(N):
+            if a[k] > 100.0:
+                j = k + 5
+        for i in range(N):
+            if a[i] < 0.0:
+                j = i
+        b[0] = j
+
+    sdfg = stale_seed.to_sdfg(simplify=True)
+    assert _num_loops(sdfg) == 2
+    assert ArgMaxLift().apply_pass(sdfg, {}) is None
+    assert _num_loops(sdfg) == 2
+
+    n = 12
+    a = np.abs(np.random.default_rng(3315).standard_normal(n)) + 1.0
+    a[3] = 200.0
+    assert _run_s331(sdfg, a, n) == 8, 'the live seed comes from the prior loop, not from -1'
+
+
+def test_predicate_index_does_not_mutate_on_refusal():
+    """A refused match must leave the SDFG byte-identical -- the pass decides before
+    it touches anything."""
+
+    @dace.program
+    def high_seed(a: dace.float64[N], b: dace.float64[2]):
+        j = 5
+        for i in range(N):
+            if a[i] < 0.0:
+                j = i
+        b[0] = j
+
+    sdfg = high_seed.to_sdfg(simplify=True)
+    before = sdfg.to_json()
+    assert ArgMaxLift().apply_pass(sdfg, {}) is None
+    assert sdfg.to_json() == before
+
+
+# -----------------------------------------------------------------------------
+# FRONTEND-shaped argmax coverage (TSVC s318) and the value+index / index-only
+# contrast.
+#
+# The s318 fixtures above are hand-built and hand ``a[inc*i]`` to the pass --
+# i.e. the gather ALREADY closed. The kernel as the frontend actually lowers it
+# still carries the secondary induction variable ``k += inc`` as a dataflow
+# tasklet (``inc`` is a scalar CONTAINER, so the step is not symbolic), which
+# ``InductionVariableSubstitution`` cannot close. These tests pin both ends: the
+# closed-form gather lifts, the un-closed frontend shape does not, and the
+# un-lifted loop still computes the right answer.
+# -----------------------------------------------------------------------------
+
+NA = dace.symbol('NA')
+NI = dace.symbol('NI')
+INC = dace.symbol('INC')
+
+
+def _abs_argmax_reference(a, inc, n_iter):
+    """The sequential kernel's answer: (max |a[inc*i]|, first argmax i) over i in 0:n_iter."""
+    vals = np.abs(a[[inc * i for i in range(n_iter)]])
+    return float(vals.max()), int(vals.argmax())
+
+
+def test_tsvc_s318_closed_form_gather_lifts_with_value_and_index():
+    """s318's argmax -- max VALUE and its INDEX over a strided, abs-transformed
+    gather -- lifts once the gather is a closed affine form ``a[INC*i]``. Both
+    outputs are checked, since an index-only or value-only lowering would still
+    match the value."""
+
+    @dace.program
+    def s318_closed(a: dace.float64[NA], result: dace.float64[1], idx_result: dace.int64[1]):
+        index = 0
+        maxv = abs(a[0])
+        for i in range(1, NI):
+            v = abs(a[INC * i])
+            if v > maxv:
+                index = i
+                maxv = v
+        result[0] = maxv
+        idx_result[0] = index
+
+    sdfg = s318_closed.to_sdfg(simplify=True)
+    assert _num_loops(sdfg) == 1
+    assert ArgMaxLift().apply_pass(sdfg, {}) == 1, 'closed-form strided abs-argmax with index must lift'
+    sdfg.validate()
+    assert _num_loops(sdfg) == 0
+
+    inc, n_iter = 3, 9
+    rng = np.random.default_rng(318)
+    a = rng.standard_normal(inc * n_iter)
+    out_v = np.zeros(1)
+    out_i = np.zeros(1, dtype=np.int64)
+    sdfg(a=a.copy(), result=out_v, idx_result=out_i, NA=a.size, NI=n_iter, INC=inc)
+    ref_v, ref_i = _abs_argmax_reference(a, inc, n_iter)
+    assert out_v[0] == ref_v, f'value {out_v[0]} != {ref_v}'
+    assert int(out_i[0]) == ref_i, f'index {int(out_i[0])} != {ref_i}'
+
+
+def test_tsvc_s318_frontend_shape_is_refused_pending_iv_closure():
+    """TSVC s318 EXACTLY as written: the stride comes in as a scalar container, so
+    the secondary IV update ``k = k + inc`` lowers to a dataflow tasklet in a body
+    state rather than a symbolic interstate assignment.
+    ``InductionVariableSubstitution`` cannot close ``k`` into ``a[inc*i]``, and
+    :meth:`ArgMaxLift.guarded_loop_skeleton` then refuses the loop because its body
+    holds a non-empty state. The argmax analysis itself is NOT the gap -- the
+    closed-form test above lifts the same reduction -- so this pins the cause, and
+    the un-lifted loop must still be numerically right.
+    """
+
+    @dace.program
+    def s318(a: dace.float64[NA], result: dace.float64[1], idx_result: dace.int64[1], inc: dace.int32):
+        k = 0
+        index = 0
+        maxv = abs(a[0])
+        k = k + inc
+        for i in range(1, NI):
+            v = abs(a[k])
+            if v > maxv:
+                index = i
+                maxv = v
+            k = k + inc
+        result[0] = maxv
+        idx_result[0] = index
+
+    sdfg = s318.to_sdfg(simplify=True)
+    loops = [r for r in sdfg.all_control_flow_regions() if isinstance(r, LoopRegion) and r.loop_variable]
+    assert len(loops) == 1
+    # The cause, asserted rather than described: a non-empty state in the body.
+    assert any(isinstance(b, dace.SDFGState) and len(b.nodes()) > 0 for b in loops[0].nodes())
+    assert ArgMaxLift().guarded_loop_skeleton(loops[0]) is None
+    assert ArgMaxLift().apply_pass(sdfg, {}) is None
+    assert _num_loops(sdfg) == 1
+
+    inc, n_iter = 2, 11
+    rng = np.random.default_rng(3181)
+    a = rng.standard_normal(inc * n_iter)
+    out_v = np.zeros(1)
+    out_i = np.zeros(1, dtype=np.int64)
+    sdfg(a=a.copy(), result=out_v, idx_result=out_i, inc=inc, NA=a.size, NI=n_iter)
+    ref_v, ref_i = _abs_argmax_reference(a, inc, n_iter)
+    assert out_v[0] == ref_v and int(out_i[0]) == ref_i
+
+
+def test_argmax_no_match_keeps_the_seed_value_and_index():
+    """The guard never fires (the seed element IS the strict maximum), so the lifted
+    form must return the seed's value and its index 0 -- the value-carrier analogue
+    of the predicate-index empty-set case."""
+
+    @dace.program
+    def s318_closed(a: dace.float64[NA], result: dace.float64[1], idx_result: dace.int64[1]):
+        index = 0
+        maxv = abs(a[0])
+        for i in range(1, NI):
+            v = abs(a[INC * i])
+            if v > maxv:
+                index = i
+                maxv = v
+        result[0] = maxv
+        idx_result[0] = index
+
+    sdfg = s318_closed.to_sdfg(simplify=True)
+    assert ArgMaxLift().apply_pass(sdfg, {}) == 1
+    sdfg.validate()
+
+    inc, n_iter = 2, 8
+    a = np.linspace(0.1, 0.8, inc * n_iter)
+    a[0] = 99.0  # seed dominates -> no iteration updates the carriers
+    out_v = np.zeros(1)
+    out_i = np.zeros(1, dtype=np.int64)
+    sdfg(a=a.copy(), result=out_v, idx_result=out_i, NA=a.size, NI=n_iter, INC=inc)
+    assert out_v[0] == 99.0 and int(out_i[0]) == 0
+
+
+def test_value_and_index_versus_index_only_lift_to_different_reductions():
+    """The two shapes this pass carries, on the same data.
+
+    ``if a[i] > maxv: index = i; maxv = a[i]`` tracks a VALUE and its position and
+    lowers to an ``ArgReduce``; ``if a[i] < 0: j = i`` has no value carrier at all
+    and lowers to a WCR-max map over the masked index. Both must lift, and each
+    must agree with its own sequential reference -- the argmax is FIRST-wins under
+    the strict guard, the predicate index is LAST-wins by construction.
+
+    Driven through the full pipeline rather than ``apply_pass`` alone: the frontend
+    seeds ``maxv`` from ``a[0]``, which leaves it a data SCALAR, and the
+    data-carrier path refuses a true-branch ``index = i``. An earlier canonicalize
+    stage promotes the carrier to a symbol first -- which is how TSVC s315 reaches
+    this pass -- so a bare ``apply_pass`` would be testing a shape the corpus never
+    presents.
+    """
+    from dace.libraries.standard.nodes import ArgReduce
+    from dace.transformation.passes.canonicalize import canonicalize
+
+    @dace.program
+    def value_and_index(a: dace.float64[N], result: dace.float64[1], idx_result: dace.int64[1]):
+        index = 0
+        maxv = a[0]
+        for i in range(1, N):
+            if a[i] > maxv:
+                index = i
+                maxv = a[i]
+        result[0] = maxv
+        idx_result[0] = index
+
+    @dace.program
+    def index_only(a: dace.float64[N], b: dace.float64[2]):
+        j = -1
+        for i in range(N):
+            if a[i] < 0.0:
+                j = i
+        b[0] = j
+
+    n = 32
+    rng = np.random.default_rng(31831)
+    a = rng.standard_normal(n)
+
+    sdfg_vi = value_and_index.to_sdfg(simplify=True)
+    canonicalize(sdfg_vi, validate=True)
+    assert _num_loops(sdfg_vi) == 0
+    assert sum(1 for nd, _ in sdfg_vi.all_nodes_recursive() if isinstance(nd, ArgReduce)) == 1
+    out_v = np.zeros(1)
+    out_i = np.zeros(1, dtype=np.int64)
+    sdfg_vi(a=a.copy(), result=out_v, idx_result=out_i, N=n)
+    assert out_v[0] == a.max() and int(out_i[0]) == int(a.argmax())
+
+    sdfg_io = index_only.to_sdfg(simplify=True)
+    canonicalize(sdfg_io, validate=True)
+    assert _num_loops(sdfg_io) == 0
+    assert sum(1 for nd, _ in sdfg_io.all_nodes_recursive() if isinstance(nd, ArgReduce)) == 0
+    assert _run_s331(sdfg_io, a, n) == _reference_last_index(a)
 
 
 if __name__ == '__main__':

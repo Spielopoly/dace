@@ -574,13 +574,15 @@ class SDFG(ControlFlowRegion):
         memo[id(self)] = result
         for k, v in self.__dict__.items():
             # Skip derivative attributes and GUID
-            if k in ('_cached_start_block', '_edges', '_nodes', '_parent', '_parent_sdfg', '_parent_nsdfg_node',
-                     '_cfg_list', '_transformation_hist', 'guid'):
+            if k in ('_start_block', '_cached_start_block', '_edges', '_nodes', '_parent', '_parent_sdfg',
+                     '_parent_nsdfg_node', '_cfg_list', '_transformation_hist', 'guid'):
                 continue
             setattr(result, k, copy.deepcopy(v, memo))
         # Copy edges and nodes
         result._edges = copy.deepcopy(self._edges, memo)
         result._nodes = copy.deepcopy(self._nodes, memo)
+        # Both name a block, so they are copied with the nodes to land on the copies rather than the originals.
+        result._start_block = copy.deepcopy(self._start_block, memo)
         result._cached_start_block = copy.deepcopy(self._cached_start_block, memo)
         # Copy parent attributes
         result._parent = memo.get(id(self._parent))
@@ -754,8 +756,8 @@ class SDFG(ControlFlowRegion):
             e = dace.serialize.from_json(e, context=context)
             ret.add_edge(nodelist[int(e.src)], nodelist[int(e.dst)], e.data)
 
-        if 'start_block' in json_obj:
-            ret._start_block = json_obj['start_block']
+        if json_obj.get('start_block') is not None:
+            ret._start_block = nodelist[int(json_obj['start_block'])]
 
         if 'source_files' in json_obj:  # This will only happen on the root SDFG, once deserialization is complete
             ret.rematerialize_debuginfo_files(json_obj['source_files'])
@@ -1133,8 +1135,11 @@ class SDFG(ControlFlowRegion):
         if self.instrument != dtypes.InstrumentationType.No_Instrumentation:
             return True
         try:
+            # There are two different `instrument` attributes one in `SDFGState`, with type
+            #  `InstrumentationType` and one in `AccessNode`, with type `DataInstrumentationType`.
+            #  The check bellow works for both cases.
             next(n for n, _ in self.all_nodes_recursive()
-                 if hasattr(n, 'instrument') and n.instrument != dtypes.InstrumentationType.No_Instrumentation)
+                 if hasattr(n, 'instrument') and n.instrument != type(n.instrument).No_Instrumentation)
             return True
         except StopIteration:
             return False
@@ -1293,6 +1298,14 @@ class SDFG(ControlFlowRegion):
         # Avoid import loop
         from dace.sdfg.analysis.schedule_tree import sdfg_to_tree as s2t
         return s2t.as_schedule_tree(self, in_place=in_place)
+
+    @property
+    def build_folder_is_default(self) -> bool:
+        """Whether the build folder follows the ``cache`` policy rather than being assigned.
+
+        An assigned folder belongs to whoever assigned it, so nothing may reclaim it.
+        """
+        return self._build_folder is None
 
     @property
     def build_folder(self) -> str:
@@ -1459,11 +1472,6 @@ class SDFG(ControlFlowRegion):
     @parent_nsdfg_node.setter
     def parent_nsdfg_node(self, value):
         self._parent_nsdfg_node = value
-
-    def remove_node(self, node: SDFGState):
-        if node is self._cached_start_block:
-            self._cached_start_block = None
-        return super().remove_node(node)
 
     def states(self):
         """ Returns the states in this SDFG, recursing into state scope blocks. """
@@ -1886,6 +1894,7 @@ class SDFG(ControlFlowRegion):
             :param filename: File name to load SDFG from.
             :return: An SDFG.
         """
+        filename = os.path.expanduser(filename)
         # Try compressed first. If fails, try uncompressed
         try:
             with gzip.open(filename, 'rb') as fp:
@@ -2697,6 +2706,7 @@ class SDFG(ControlFlowRegion):
 
         # Compute build folder path before running codegen
         build_folder = self.build_folder
+        compiler.register_disposable_folder(self)
 
         # Get the folder mode, but if the folder already exists, then use the `FOLDER_MODE` file.
         folder_mode = compiler.get_folder_mode(build_folder, probe=True)
@@ -3195,7 +3205,14 @@ class SDFG(ControlFlowRegion):
         while len(states) > 0:
             state = states.pop()
             expanded_something = False
-            for node in list(state.nodes()):  # Make sure we have a copy
+            # Expand ``expand_before_peers`` nodes first: their expansion inspects neighbouring
+            # library nodes and must see them un-expanded (``BackwardPass`` differentiates a
+            # ``Reduce`` via its registered backward rule, but only while it is still a library
+            # node -- once expanded it is an opaque C++ tasklet that autodiff cannot reverse).
+            # ``state.nodes()`` is otherwise in arbitrary graph order, so this was a coin flip.
+            for node in sorted(
+                    state.nodes(),  # sorted() also gives us the required copy
+                    key=lambda n: not (isinstance(n, nd.LibraryNode) and n.expand_before_peers)):
                 if isinstance(node, nd.NestedSDFG):
                     node.sdfg.expand_library_nodes(recursive=recursive, predicate=predicate)  # Call recursively
                 elif isinstance(node, nd.LibraryNode):

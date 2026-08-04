@@ -56,9 +56,11 @@ inward passes that may have buried invariant assignments inside loops, and
 again before the parallelization stage so the ``LoopToMap`` refuse-check
 sees a clean shape.
 """
-from typing import Any, Dict, Optional, Set, Tuple
+import ast
+from typing import Any, Dict, Optional, Tuple
 
-from dace import SDFG, symbolic
+from dace import SDFG
+from dace.frontend.python import astutils
 from dace.sdfg import nodes
 from dace.sdfg.sdfg import InterstateEdge
 from dace.sdfg.state import ConditionalBlock, ControlFlowBlock, ControlFlowRegion, LoopRegion, SDFGState
@@ -66,28 +68,37 @@ from dace.sdfg.utils import set_nested_sdfg_parent_references
 from dace.transformation import pass_pipeline as ppl, transformation
 
 
-def _free(expr: str) -> Set[str]:
-    """Free symbols of a string expression."""
+def names_read_by(expr: str) -> Dict[str, None]:
+    """Every name a string expression reads: symbols AND the data containers it subscripts.
+
+    Read off the AST, not off ``pystr_to_symbolic``: sympy renders ``A[0]`` as an indexed
+    object whose ``free_symbols`` is empty, so the array base is lost. A guard that compares
+    this against the containers written inside a region needs ``A``, or an element read is
+    treated as invariant and hoisted out of the loop that writes it.
+    """
     try:
-        return {str(s) for s in symbolic.pystr_to_symbolic(expr).free_symbols}
+        visitor = astutils.TaskletFreeSymbolVisitor([])
+        visitor.visit(ast.parse(expr.strip(), mode='eval'))
     except Exception:
-        return set()
+        return {}
+    # Consumed only by membership tests, so the visitor's unordered set cannot reach codegen.
+    return dict.fromkeys(visitor.free_symbols)
 
 
-def _region_writes(region: ControlFlowRegion) -> Tuple[Set[str], Set[str]]:
+def _region_writes(region: ControlFlowRegion) -> Tuple[Dict[str, None], Dict[str, None]]:
     """All symbols (interstate assignments) and data containers written
     anywhere inside ``region`` and its descendants.
 
     :returns: ``(assigned_symbols, written_data)``.
     """
-    asyms: Set[str] = set()
-    wdata: Set[str] = set()
+    asyms: Dict[str, None] = {}
+    wdata: Dict[str, None] = {}
     for e in region.all_interstate_edges():
-        asyms.update(e.data.assignments.keys())
+        asyms.update(dict.fromkeys(e.data.assignments.keys()))
     for st in region.all_states():
         for n in st.nodes():
             if isinstance(n, nodes.AccessNode) and st.in_degree(n) > 0:
-                wdata.add(n.data)
+                wdata[n.data] = None
     return asyms, wdata
 
 
@@ -139,7 +150,7 @@ def _on_conditional_branch(cfg: ControlFlowRegion, dest: ControlFlowRegion, sdfg
     return False
 
 
-def _predecessors_in(parent: ControlFlowRegion, child: ControlFlowBlock) -> Set[ControlFlowBlock]:
+def _predecessors_in(parent: ControlFlowRegion, child: ControlFlowBlock) -> Dict[ControlFlowBlock, None]:
     """Strict predecessors of a block within its parent region.
 
     :param parent: The region whose edges are walked.
@@ -147,19 +158,19 @@ def _predecessors_in(parent: ControlFlowRegion, child: ControlFlowBlock) -> Set[
     :returns: Blocks reachable backwards from ``child`` via ``parent``'s
               edges, excluding ``child`` itself.
     """
-    out: Set[ControlFlowBlock] = set()
+    out: Dict[ControlFlowBlock, None] = {}
     stack = [child]
     while stack:
         cur = stack.pop()
         for e in parent.in_edges(cur):
             if e.src in out or e.src is child:
                 continue
-            out.add(e.src)
+            out[e.src] = None
             stack.append(e.src)
     return out
 
 
-def _block_reads_symbols(block: ControlFlowBlock) -> Optional[Set[str]]:
+def _block_reads_symbols(block: ControlFlowBlock) -> Optional[Dict[str, None]]:
     """All symbols read anywhere inside a block (state, region, etc.).
 
     This is a legality predicate, so it fails CLOSED: an unreadable ``free_symbols`` or condition
@@ -167,33 +178,33 @@ def _block_reads_symbols(block: ControlFlowBlock) -> Optional[Set[str]]:
     the caller is looking for and lets an illegal hoist through.
 
     :param block: The state or region to scan.
-    :returns: The set of symbol names read inside ``block``, or ``None`` if it cannot be determined.
+    :returns: The names of symbols read inside ``block``, or ``None`` if it cannot be determined.
     """
-    syms: Set[str] = set()
+    syms: Dict[str, None] = {}
     if isinstance(block, SDFGState):
         try:
-            syms |= {str(s) for s in block.free_symbols}
+            syms.update(dict.fromkeys(str(s) for s in block.free_symbols))
         except Exception:
             return None
         return syms
     if isinstance(block, ControlFlowRegion):
         for st in block.all_states():
             try:
-                syms |= {str(s) for s in st.free_symbols}
+                syms.update(dict.fromkeys(str(s) for s in st.free_symbols))
             except Exception:
                 return None
         for e in block.all_interstate_edges():
             for rhs in e.data.assignments.values():
-                syms |= _free(rhs)
+                syms.update(names_read_by(rhs))
             if not e.data.is_unconditional():
                 try:
-                    syms |= {str(s) for s in e.data.condition.get_free_symbols()}
+                    syms.update(dict.fromkeys(str(s) for s in e.data.condition.get_free_symbols()))
                 except Exception:
                     return None
     return syms
 
 
-def _block_writes(block: ControlFlowBlock) -> Tuple[Set[str], Set[str]]:
+def _block_writes(block: ControlFlowBlock) -> Tuple[Dict[str, None], Dict[str, None]]:
     """All symbols assigned and data containers written anywhere inside a block.
 
     A state-only block contributes tasklet writes to its AccessNodes; a
@@ -204,17 +215,17 @@ def _block_writes(block: ControlFlowBlock) -> Tuple[Set[str], Set[str]]:
     """
     if isinstance(block, ControlFlowRegion):
         return _region_writes(block)
-    asyms: Set[str] = set()
-    wdata: Set[str] = set()
+    asyms: Dict[str, None] = {}
+    wdata: Dict[str, None] = {}
     if isinstance(block, SDFGState):
         for n in block.nodes():
             if isinstance(n, nodes.AccessNode) and block.in_degree(n) > 0:
-                wdata.add(n.data)
+                wdata[n.data] = None
     return asyms, wdata
 
 
-def _legal_to_hoist_into(parent: ControlFlowRegion, child: ControlFlowRegion, key: str, rhs: str, rhs_syms: Set[str],
-                         sdfg: SDFG) -> bool:
+def _legal_to_hoist_into(parent: ControlFlowRegion, child: ControlFlowRegion, key: str, rhs: str,
+                         rhs_syms: Dict[str, None], sdfg: SDFG) -> bool:
     """Decide whether an assignment inside ``child`` may move up one level.
 
     Checks L1 RHS-invariance and L2/L3/L4 (no intervening reads/writes of
@@ -250,10 +261,10 @@ def _legal_to_hoist_into(parent: ControlFlowRegion, child: ControlFlowRegion, ke
     if isinstance(child, LoopRegion) and _key_has_other_writer(child, key, rhs):
         return False
     inner_asyms, inner_wdata = _region_writes(child)
-    inner_asyms.discard(key)  # discount the assignment we're moving
-    if rhs_syms & inner_asyms:
+    inner_asyms.pop(key, None)  # discount the assignment we're moving
+    if any(s in inner_asyms for s in rhs_syms):
         return False
-    if rhs_syms & inner_wdata:
+    if any(s in inner_wdata for s in rhs_syms):
         return False  # a tasklet inside child writes to a container our rhs reads
 
     # L2/L3/L4: examine strict predecessors of ``child`` in ``parent``.
@@ -268,7 +279,7 @@ def _legal_to_hoist_into(parent: ControlFlowRegion, child: ControlFlowRegion, ke
         b_asyms, b_wdata = _block_writes(b)
         if key in b_asyms or key in b_wdata:
             return False  # L4: predecessor writes key
-        if (rhs_syms & b_asyms) or (rhs_syms & b_wdata):
+        if any(s in b_asyms for s in rhs_syms) or any(s in b_wdata for s in rhs_syms):
             return False  # L2: predecessor writes a rhs symbol
 
     # Also any iedge in parent (other than the in-edges of ``child``) that
@@ -303,8 +314,9 @@ def _find_destination(edge_region: ControlFlowRegion, key: str, rhs: str, sdfg: 
                    block, so those blocks are checked here; ``_legal_to_hoist_into`` only ever sees
                    ``edge_region`` from the outside and cannot look in.
     """
-    rhs_syms = _free(rhs)
-    for b in _predecessors_in(edge_region, origin) | {origin}:
+    rhs_syms = names_read_by(rhs)
+    # legality scan (early-exit AND): iteration order does not affect the True/False outcome
+    for b in dict.fromkeys([*_predecessors_in(edge_region, origin), origin]):
         reads = _block_reads_symbols(b)
         if reads is None or key in reads:
             return None
@@ -349,11 +361,8 @@ def _place_assignment_at(dest: ControlFlowRegion, child: ControlFlowRegion, key:
         for e in in_edges:
             e.data.assignments[key] = rhs
         return
-    is_start = dest.start_block is child
-    pre = dest.add_state(f'{child.label}_iedge_hoist')
+    pre = dest.add_state(f'{child.label}_iedge_hoist', is_start_block=dest.start_block is child)
     dest.add_edge(pre, child, InterstateEdge(assignments={key: rhs}))
-    if is_start:
-        dest.start_block = dest.node_id(pre)
 
 
 def _drop_inner_symbol_declarations(sdfg: SDFG, key: str, dest: ControlFlowRegion):
@@ -416,8 +425,8 @@ class CascadeInterstateEdgeAssignmentsUp(ppl.Pass):
     def should_reapply(self, modified: ppl.Modifies) -> bool:
         return False
 
-    def depends_on(self) -> Set:
-        return set()
+    def depends_on(self) -> Dict:
+        return {}
 
     def apply_pass(self, sdfg: SDFG, _pipeline_results: Dict[str, Any]) -> Optional[int]:
         """Repeatedly hoist legal interstate-edge assignments until a fixpoint.

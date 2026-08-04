@@ -70,7 +70,7 @@ def test_float_scalar_launch_normalization_codegen():
     """The launch site passes float scalars as 1-element device arrays and
     the kernel binds them as scalar tiles."""
     sdfg = _lower(_gofast_like)
-    code = sdfg.generate_code()[0].code.replace(" ", "")
+    code = "".join(sdfg.generate_code()[0].code.split())
     assert "cupy.asarray(trace,dtype=numpy.float64).reshape(1)" in code
     assert "ct.load(trace,(0,),shape=()).item()" in code
 

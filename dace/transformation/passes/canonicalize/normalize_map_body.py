@@ -19,7 +19,6 @@ import copy
 from typing import Dict, List, Optional, Tuple
 
 from dace import SDFG, data, nodes, properties
-from dace.memlet import Memlet
 from dace.sdfg import SDFGState
 from dace.sdfg import InterstateEdge
 from dace.sdfg import utils as sdutil
@@ -58,7 +57,7 @@ def _uniquify_data_against(inner: SDFG, taken_data) -> dict:
     drepl = {}
     for name in list(inner.arrays.keys()):
         if name in taken_data:
-            drepl[name] = data.find_new_name(name, taken_data | set(inner.arrays.keys()) | set(drepl.values()))
+            drepl[name] = data.find_new_name(name, dict.fromkeys([*taken_data, *inner.arrays.keys(), *drepl.values()]))
     if drepl:
         replace_datadesc_names(inner, drepl)
     return drepl
@@ -200,10 +199,10 @@ class NormalizeMapBody(ppl.Pass):
             # the reserved set is base's arrays PLUS its symbols, constants, and every node
             # connector (e.g. symm's ``reset_tmp`` writes a connector ``tmp``; a tail array
             # ``tmp`` merged in unchecked would collide with it).
-            reserved = set(base.arrays.keys()) | set(base.symbols.keys()) | set(base.constants_prop.keys())
+            reserved = dict.fromkeys([*base.arrays.keys(), *base.symbols.keys(), *base.constants_prop.keys()])
             for bstate in base.all_states():
                 for bnode in bstate.nodes():
-                    reserved |= set(bnode.in_connectors.keys()) | set(bnode.out_connectors.keys())
+                    reserved.update(dict.fromkeys([*bnode.in_connectors.keys(), *bnode.out_connectors.keys()]))
             drepl = _uniquify_data_against(tail, reserved)
             # Carry tail's (now non-colliding) data descriptors + symbols into base.
             for name, desc in list(tail.arrays.items()):
@@ -249,6 +248,8 @@ class NormalizeMapBody(ppl.Pass):
         _dedup_boundary_aliases(state, keep)
 
         sdutil.set_nested_sdfg_parent_references(base)
-        for blk in base.all_control_flow_blocks(recursive=True):
+        # Not recursive: that descends THROUGH NestedSDFG nodes, so a state owned by a deeper SDFG
+        # would get ``base`` as its owner and later miss that SDFG's own arrays.
+        for blk in base.all_control_flow_blocks():
             blk.sdfg = base
         return True

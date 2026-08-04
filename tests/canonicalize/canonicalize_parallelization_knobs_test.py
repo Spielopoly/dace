@@ -15,6 +15,7 @@ import pytest
 import dace
 from dace.sdfg import nodes
 from dace.sdfg.state import ConditionalBlock, LoopRegion
+from dace.transformation.passes.analysis import loop_analysis
 from dace.transformation.passes.canonicalize import canonicalize
 
 N = dace.symbol('N')
@@ -371,8 +372,9 @@ def test_loop_peeling_modulo_symbolic_offset_specializes_if_par_else_seq():
     assert 'K < N' in cond.as_string, f'true branch must be guarded by K < N: {cond.as_string!r}'
     assert any(isinstance(n, nodes.MapEntry) for n, _ in par_region.all_nodes_recursive()), \
         'the K < N branch must be the band split lifted to Maps'
-    seq_loops = [r for r in seq_region.all_control_flow_regions(recursive=True)
-                 if isinstance(r, LoopRegion) and r.loop_variable]
+    seq_loops = [
+        r for r in seq_region.all_control_flow_regions(recursive=True) if isinstance(r, LoopRegion) and r.loop_variable
+    ]
     assert seq_loops and all(l.pinned_sequential for l in seq_loops), \
         'the else branch must keep the original (pinned) sequential modular loop'
 
@@ -471,7 +473,17 @@ def test_loop_peeling_front_range_guard_knob_parallelizes():
 
     on = _front_range_guard.to_sdfg(simplify=True)
     canonicalize(on, validate=True, peel_limit=8)
-    assert _nmaps(on) >= 1 and _nloops(on) == 0, 'peeling must prune the i<2 guard and map the remainder'
+    assert _nmaps(on) >= 1, 'peeling must map the remainder'
+    assert not [b for b in on.all_control_flow_blocks() if isinstance(b, ConditionalBlock)], \
+        'the i<2 guard must be pruned: it is a contradiction over the remainder'
+    # The guarded run stays ONE loop rather than an iteration per segment. ``ShortLoopUnroll`` runs
+    # at the `reduce` stage, before `peel`, so nothing unrolls it afterwards -- whether to is a
+    # separate decision, deliberately not made here.
+    survivors = [r for r in on.all_control_flow_regions(recursive=True) if isinstance(r, LoopRegion)]
+    assert len(survivors) == 1, f'expected only the guarded prefix loop, got {[r.label for r in survivors]}'
+    trip = (int(loop_analysis.get_loop_end(survivors[0])) - int(loop_analysis.get_init_assignment(survivors[0]))) \
+        // int(loop_analysis.get_loop_stride(survivors[0])) + 1
+    assert trip == 2, f'the prefix loop must cover exactly the guarded iterations i<2, got {trip}'
 
     A = np.arange(1, 9, dtype=np.float64)
     B = np.arange(8, dtype=np.float64) + 0.5

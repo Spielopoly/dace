@@ -15,7 +15,9 @@ block structure. Four phases, in order:
    state and a copy-out terminal state. Constants are **dual-resident**: copied in once, never copied
    out, and the host original stays live and valid.
 4. **Promote transients** to ``GPU_Global`` (scalars to ``Register``) and propagate that storage
-   through NestedSDFG connector bindings.
+   through NestedSDFG connector bindings. A transient read on a host interstate edge (a branch guard
+   or edge assignment) is the exception: it is kept host and given a ``gpu_<name>`` mirror instead
+   (:func:`mirror_host_needed_transients`), since a device buffer can't be read on the host edge.
 
 ``Sequential``, not ``Default``, for the block map: ``dace.sdfg.infer_types`` resolves a
 ``Default``-schedule map from the storage of its incident memlets (``SCOPEDEFAULT_SCHEDULE``,
@@ -37,6 +39,7 @@ from dace.memlet import Memlet
 from dace.sdfg import nodes
 from dace.sdfg.analysis.writeset_underapproximation import UnderapproximateWrites
 from dace.sdfg.sdfg import InterstateEdge
+from dace.transformation.passes.length_one_array_scalar_conversion import ConvertLengthOneArraysToScalars
 from dace.sdfg.state import SDFGState
 from dace.transformation.passes.analysis.analysis import FindAccessNodes, StateReachability
 
@@ -44,12 +47,10 @@ from dace.transformation.passes.analysis.analysis import FindAccessNodes, StateR
 #: CloudSC Fortran driver loops ``DO IBL = 1, NBLOCKS``; the GPU SCC k-caching driver loops
 #: ``DO JKGLO = 1, NGPTOT, NPROMA`` instead, so that frontend passes ``('ngptot', )``. A name signal is
 #: needed because after canonicalization the block map is not distinguishable from a horizontal map by
-#: shape alone -- but it is only trusted together with the structural guard in :func:`is_block_map`.
+#: shape alone.
 BLOCK_MAP_SYMBOLS: Tuple[str, ...] = ('nblocks', )
 
 CPU_STORAGES = (dtypes.StorageType.Default, dtypes.StorageType.CPU_Heap, dtypes.StorageType.Register)
-
-BOUNDARY_NODE_TYPES = (nodes.MapEntry, nodes.MapExit, nodes.NestedSDFG)
 
 
 def offload_cloudsc_to_gpu(sdfg: dace.SDFG,
@@ -64,8 +65,16 @@ def offload_cloudsc_to_gpu(sdfg: dace.SDFG,
                                  where they are accessed.
     """
     block_symbols = frozenset(block_map_symbols)
+    # A length-1 input (e.g. ptsphy) read on BOTH host (per-block scalar inits) and device must become
+    # a Scalar -> Register: passed into kernels by value and readable on the host, so it never needs a
+    # host/device split. ``preserve_abi`` is required to reach the non-transient inputs at all -- left
+    # clear, the pass skips non-transients entirely and ptsphy stays an Array. It stages rather than
+    # rewrites them, so the SDFG signature is byte-identical afterwards: the caller still passes a
+    # 1-element buffer for every program output (ngpblks), which gets its copy-out state.
+    ConvertLengthOneArraysToScalars(preserve_abi=True, recursive=True).apply_pass(sdfg, {})
     assign_schedules(sdfg, block_symbols)
     mirror_nontransients_to_gpu(sdfg, frozenset(exclude_from_offload))
+    mirror_host_needed_transients(sdfg)
     promote_transients_to_gpu(sdfg)
     propagate_gpu_storage_into_nested_sdfgs(sdfg)
     sdfg.validate()
@@ -74,26 +83,21 @@ def offload_cloudsc_to_gpu(sdfg: dace.SDFG,
 # -- Phase 1: schedules -------------------------------------------------------------------------
 
 
-def encloses_compute(entry: nodes.MapEntry, state: SDFGState) -> bool:
-    """True iff ``entry``'s body holds a map or a NestedSDFG -- i.e. there is something inside it to
-    offload. Without this guard a leaf map whose range happens to mention a block symbol would be
-    demoted to the host with nothing taking its place on the device."""
-    body = state.scope_subgraph(entry, include_entry=False, include_exit=False)
-    return any(isinstance(n, (nodes.MapEntry, nodes.NestedSDFG)) for n in body.nodes())
+def is_block_map(entry: nodes.MapEntry, block_symbols: FrozenSet[str]) -> bool:
+    """A block map iterates over the block count, and stays on the host whatever its body holds.
+
+    The body shape must not enter this decision: the canon pipelines flatten the block map's body to
+    bare tasklets, so a "body holds a map or NestedSDFG" test reads the per-block orchestrator as a
+    leaf compute map and offloads the whole loop as one grid.
+    """
+    return bool({str(s) for s in entry.map.range.free_symbols} & block_symbols)
 
 
-def is_block_map(entry: nodes.MapEntry, state: SDFGState, block_symbols: FrozenSet[str]) -> bool:
-    """A block map iterates over the block count AND encloses further compute."""
-    if not {str(s) for s in entry.map.range.free_symbols} & block_symbols:
-        return False
-    return encloses_compute(entry, state)
-
-
-def enclosed_by_kernel(node: nodes.Node, state: SDFGState, sdict: Dict, block_symbols: FrozenSet[str]) -> bool:
+def enclosed_by_kernel(node: nodes.Node, sdict: Dict, block_symbols: FrozenSet[str]) -> bool:
     """True iff some enclosing map of ``node`` was offloaded, i.e. is a non-block map."""
     parent = sdict[node]
     while parent is not None:
-        if isinstance(parent, nodes.MapEntry) and not is_block_map(parent, state, block_symbols):
+        if isinstance(parent, nodes.MapEntry) and not is_block_map(parent, block_symbols):
             return True
         parent = sdict[parent]
     return False
@@ -110,15 +114,15 @@ def assign_schedules(sdfg: dace.SDFG, block_symbols: FrozenSet[str], in_kernel: 
         sdict = state.scope_dict()
         for node in state.nodes():
             if isinstance(node, (nodes.MapEntry, nodes.LibraryNode)):
-                nested = in_kernel or enclosed_by_kernel(node, state, sdict, block_symbols)
-                host = nested or (isinstance(node, nodes.MapEntry) and is_block_map(node, state, block_symbols))
+                nested = in_kernel or enclosed_by_kernel(node, sdict, block_symbols)
+                host = nested or (isinstance(node, nodes.MapEntry) and is_block_map(node, block_symbols))
                 schedule = dtypes.ScheduleType.Sequential if host else dtypes.ScheduleType.GPU_Device
                 if isinstance(node, nodes.MapEntry):
                     node.map.schedule = schedule
                 else:
                     node.schedule = schedule
             elif isinstance(node, nodes.NestedSDFG):
-                below = in_kernel or enclosed_by_kernel(node, state, sdict, block_symbols)
+                below = in_kernel or enclosed_by_kernel(node, sdict, block_symbols)
                 assign_schedules(node.sdfg, block_symbols, below)
 
 
@@ -303,7 +307,7 @@ def mirror_nontransients_to_gpu(sdfg: dace.SDFG, excluded: FrozenSet[str]) -> No
         for edge in state.edges():
             if edge.data is None or edge.data.data not in mirrored:
                 continue
-            if edge_is_kernel_side(edge, sdict, retargeted):
+            if edge_is_kernel_side(edge, state, sdict, retargeted):
                 edge.data.data = 'gpu_' + edge.data.data
 
 
@@ -313,56 +317,374 @@ def add_full_copy(state: SDFGState, src: str, src_desc: data.Data, dst: str) -> 
 
 
 def arrays_needing_gpu_mirror(sdfg: dace.SDFG) -> Set[str]:
-    """Non-transient CPU-storage Arrays with at least one kernel-side access node. Host-only arrays
-    (touched solely by top-level tasklets) are left alone."""
+    """Non-transient CPU-storage Arrays that are actually read/written inside a kernel. Host-only
+    arrays are left alone -- including those that merely *feed* a NestedSDFG but are used only on the
+    host inside it (which the ``is_kernel_side`` boundary test would wrongly flag)."""
     candidates = {
         name
         for name, desc in sdfg.arrays.items()
         if isinstance(desc, data.Array) and not desc.transient and desc.storage in CPU_STORAGES
     }
-    if not candidates:
-        return set()
-    needed = set()
-    for state in sdfg.states():
+    return candidates & device_touched_names(sdfg) if candidates else set()
+
+
+def is_device_boundary(node: nodes.Node) -> bool:
+    """A Map/Library boundary node scheduled on ``GPU_Device`` -- data crossing it is device data."""
+    if isinstance(node, (nodes.MapEntry, nodes.MapExit)):
+        return node.map.schedule == dtypes.ScheduleType.GPU_Device
+    if isinstance(node, nodes.LibraryNode):
+        return node.schedule == dtypes.ScheduleType.GPU_Device
+    return False
+
+
+def touches_device(node: nodes.Node, state: SDFGState, sdict: Dict, in_kernel: bool = False) -> bool:
+    """True iff ``node`` executes on the device: already inside a kernel (``in_kernel``, carried across
+    NestedSDFG boundaries), inside a ``GPU_Device`` scope, or staged at top level directly against a
+    ``GPU_Device`` map/library boundary.
+
+    ``in_kernel`` is essential and easy to miss: ``scope_dict`` restarts per NestedSDFG, and
+    :func:`assign_schedules` marks maps *below* a kernel ``Sequential``. So a node inside an NSDFG that
+    sits inside a kernel has no ``GPU_Device`` scope above it *within its own state* and would look
+    host-side to a local-only test.
+    """
+    if in_kernel:
+        return True
+    parent = sdict[node]
+    while parent is not None:
+        if isinstance(parent, nodes.MapEntry) and parent.map.schedule == dtypes.ScheduleType.GPU_Device:
+            return True
+        parent = sdict[parent]
+    if not isinstance(node, nodes.AccessNode):
+        return False
+    return (any(is_device_boundary(e.src) for e in state.in_edges(node))
+            or any(is_device_boundary(e.dst) for e in state.out_edges(node)))
+
+
+def device_touched_per_sdfg(graph: dace.SDFG,
+                            in_kernel: bool = False,
+                            out: Optional[Dict[int, Set[str]]] = None) -> Dict[int, Set[str]]:
+    """Map ``id(sdfg) -> local data names that reach a ``GPU_Device`` computation``, for ``graph`` and
+    every SDFG below it.
+
+    Computed top-down in one walk so the "already inside a kernel" flag reaches nested SDFGs -- a
+    per-graph query cannot recover it (see :func:`touches_device`). A name is device-touched when it is
+    accessed on the device or bound to a NestedSDFG connector that is itself device-touched. Precise
+    where :func:`is_kernel_side` over-approximates: an array that only feeds a NestedSDFG but is used
+    solely on the host inside it is not device-touched, so it is neither mirrored nor promoted.
+
+    Edges are scanned as well as nodes: an array can reach a kernel purely through a memlet path
+    (``pin -> block_map -> device_map -> tasklet``) without any AccessNode of its own inside a device
+    scope, and a node-only scan would call it host-only.
+    """
+    if out is None:
+        out = {}
+    touched: Set[str] = set()
+    for state in graph.states():
+        sdict = state.scope_dict()
+        for edge in state.edges():
+            if edge.data is None or edge.data.data is None:
+                continue
+            if any(
+                    is_device_boundary(end) or touches_device(end, state, sdict, in_kernel)
+                    for end in (edge.src, edge.dst)):
+                touched.add(edge.data.data)
+        for node in state.nodes():
+            if isinstance(node, nodes.AccessNode):
+                if touches_device(node, state, sdict, in_kernel):
+                    touched.add(node.data)
+            elif isinstance(node, nodes.NestedSDFG):
+                below = in_kernel or touches_device(node, state, sdict)
+                device_touched_per_sdfg(node.sdfg, below, out)
+                inner = out[id(node.sdfg)]
+                for edge in list(state.in_edges(node)) + list(state.out_edges(node)):
+                    if edge.data is None or edge.data.data is None:
+                        continue
+                    conn = edge.dst_conn if edge.dst is node else edge.src_conn
+                    if conn in inner:
+                        touched.add(edge.data.data)
+    out[id(graph)] = touched
+    return out
+
+
+def device_touched_names(graph: dace.SDFG) -> Set[str]:
+    """Device-touched local names of ``graph`` itself, treating it as a top-level (host) SDFG."""
+    return device_touched_per_sdfg(graph)[id(graph)]
+
+
+def device_written_per_sdfg(graph: dace.SDFG,
+                            in_kernel: bool = False,
+                            out: Optional[Dict[int, Set[str]]] = None) -> Dict[int, Set[str]]:
+    """Names WRITTEN by device code, per SDFG, following NestedSDFG connector bindings.
+
+    The write-side twin of :func:`device_touched_per_sdfg`, and whole-SDFG for the same reason: a
+    per-graph tasklet scan cannot see a write performed inside a NestedSDFG, which is how a
+    device-written array slips past the "two masters" guard in :func:`mirror_host_needed_transients`
+    and gets a host mirror whose master is never filled.
+    """
+    if out is None:
+        out = {}
+    written: Set[str] = set()
+    for state in graph.states():
         sdict = state.scope_dict()
         for node in state.nodes():
-            if isinstance(node, nodes.AccessNode) and node.data in candidates and is_kernel_side(node, state, sdict):
-                needed.add(node.data)
-    return needed
+            if isinstance(node, nodes.AccessNode):
+                if state.in_degree(node) == 0:
+                    continue
+                if (touches_device(node, state, sdict, in_kernel)
+                        or any(is_device_boundary(edge.src) for edge in state.in_edges(node))):
+                    written.add(node.data)
+            elif isinstance(node, nodes.NestedSDFG):
+                below = in_kernel or touches_device(node, state, sdict)
+                device_written_per_sdfg(node.sdfg, below, out)
+                inner = out[id(node.sdfg)]
+                # Only out-edges: a NestedSDFG writes an outer array through an output connector.
+                for edge in state.out_edges(node):
+                    if edge.data is not None and edge.data.data is not None and edge.src_conn in inner:
+                        written.add(edge.data.data)
+    out[id(graph)] = written
+    return out
+
+
+def sdfgs_inside_kernels(graph: dace.SDFG, in_kernel: bool = False, out: Optional[Set[int]] = None) -> Set[int]:
+    """``id(sdfg)`` for every SDFG below ``graph`` that executes inside a ``GPU_Device`` kernel. Its
+    top-level nodes are device nodes even though ``scope_dict`` shows no enclosing scope."""
+    if out is None:
+        out = set()
+    if in_kernel:
+        out.add(id(graph))
+    for state in graph.states():
+        sdict = state.scope_dict()
+        for node in state.nodes():
+            if isinstance(node, nodes.NestedSDFG):
+                sdfgs_inside_kernels(node.sdfg, in_kernel or touches_device(node, state, sdict), out)
+    return out
+
+
+def device_facing(node: nodes.Node, state: SDFGState, sdict: Dict) -> bool:
+    """True iff ``node`` runs device code, or is a NestedSDFG whose interior may. The NestedSDFG case is
+    deliberately conservative -- its inner storage is settled by
+    :func:`propagate_gpu_storage_into_nested_sdfgs`, not here."""
+    if isinstance(node, nodes.NestedSDFG) or is_device_boundary(node):
+        return True
+    return touches_device(node, state, sdict)
 
 
 def is_kernel_side(node: nodes.AccessNode, state: SDFGState, sdict: Dict) -> bool:
-    """Inside any scope, or at top level but wired to a map/NSDFG boundary. Block maps count: data
-    entering a block map still reaches the kernels nested inside it."""
-    if sdict[node] is not None:
+    """True iff this access is produced or consumed on the device, resolved along the memlet PATH so a
+    map's pass-through connector cannot hide the real endpoint.
+
+    Sitting inside a scope is NOT the test. The canon pipelines put bare host tasklets straight into the
+    Sequential block map's body, so an any-scope test retargets those host reads onto the device mirror
+    and reintroduces the very GPU_Global-read-on-host it was meant to prevent.
+    """
+    if touches_device(node, state, sdict):
         return True
-    if any(isinstance(e.src, BOUNDARY_NODE_TYPES) for e in state.in_edges(node)):
+    if any(device_facing(state.memlet_path(e)[0].src, state, sdict) for e in state.in_edges(node)):
         return True
-    return any(isinstance(e.dst, BOUNDARY_NODE_TYPES) for e in state.out_edges(node))
+    return any(device_facing(state.memlet_path(e)[-1].dst, state, sdict) for e in state.out_edges(node))
 
 
-def edge_is_kernel_side(edge, sdict: Dict, retargeted: Set[int]) -> bool:
-    """Kernel-side iff an endpoint was retargeted, the edge sits inside a scope, or it touches a scope
-    boundary. Edges between two host-side nodes keep the original name."""
+def edge_is_kernel_side(edge, state: SDFGState, sdict: Dict, retargeted: Set[int]) -> bool:
+    """Kernel-side iff an endpoint was retargeted, or the memlet path this edge lies on ends in device
+    code. Edges between two host-side nodes keep the original name."""
     if id(edge.src) in retargeted or id(edge.dst) in retargeted:
         return True
-    if sdict[edge.src] is not None or sdict[edge.dst] is not None:
-        return True
-    return isinstance(edge.src, BOUNDARY_NODE_TYPES) or isinstance(edge.dst, BOUNDARY_NODE_TYPES)
+    path = state.memlet_path(edge)
+    return device_facing(path[0].src, state, sdict) or device_facing(path[-1].dst, state, sdict)
 
 
 # -- Phase 4: transient promotion and NSDFG storage propagation -----------------------------------
+
+
+def interstate_read_arrays(graph: dace.SDFG) -> Set[str]:
+    """Transient Array names read on any interstate edge within ``graph``. Interstate edges evaluate
+    on the host, so these must keep a host-readable copy -- they cannot be promoted to ``GPU_Global``."""
+    names: Set[str] = set()
+    arrays = set(graph.arrays)
+    for edge in graph.all_interstate_edges():
+        for name in edge.data.free_symbols & arrays:
+            desc = graph.arrays[name]
+            if isinstance(desc, data.Array) and desc.transient:
+                names.add(name)
+    return names
+
+
+def tasklet_accessed_arrays(graph: dace.SDFG, in_kernel: bool, device_side: bool, writing: bool) -> Set[str]:
+    """Transient Array names a Tasklet on the requested side of the host/device split accesses.
+
+    A host-side access of either direction pins the master to the host. Only ``writing=True,
+    device_side=True`` carries the extra meaning of disqualifying an array from mirroring -- two
+    masters cannot both be authoritative, which a device read does not create.
+
+    The tasklet is the far end of the memlet PATH, not the AccessNode's neighbour: a tasklet inside a
+    map scope reaches the array through the map's pass-through connector, so an adjacency test misses
+    it entirely.
+
+    ``in_kernel`` comes from :func:`sdfgs_inside_kernels`; inside a kernel every tasklet is device
+    code no matter what the per-state scope dict says (it restarts at each NestedSDFG).
+    """
+    names: Set[str] = set()
+    for state in graph.states():
+        sdict = state.scope_dict()
+        for node in state.nodes():
+            if not isinstance(node, nodes.AccessNode):
+                continue
+            desc = graph.arrays.get(node.data)
+            if not (isinstance(desc, data.Array) and desc.transient):
+                continue
+            for edge in (state.in_edges(node) if writing else state.out_edges(node)):
+                path = state.memlet_path(edge)
+                tasklet = path[0].src if writing else path[-1].dst
+                if not isinstance(tasklet, nodes.Tasklet):
+                    continue
+                if (in_kernel or touches_device(tasklet, state, sdict)) is device_side:
+                    names.add(node.data)
+                    break
+    return names
+
+
+def host_pinned_arrays(graph: dace.SDFG, in_kernel: bool) -> Set[str]:
+    """Transient Arrays in ``graph`` that must keep a host-resident master, because host code accesses
+    them: on an interstate edge, or from a bare tasklet reading or writing. The master cannot move to
+    ``GPU_Global``; device users get a ``gpu_<name>`` mirror instead."""
+    return (interstate_read_arrays(graph) | tasklet_accessed_arrays(graph, in_kernel, False, writing=True)
+            | tasklet_accessed_arrays(graph, in_kernel, False, writing=False))
+
+
+def mirror_host_needed_transients(sdfg: dace.SDFG) -> int:
+    """Dual-resident a transient that host code touches AND a kernel uses.
+
+    Two ways a transient gets pinned to the host, both instances of one rule -- a host-side access
+    means the master must stay host-readable:
+
+    * **read on a host interstate edge**: ``imelt`` (``imelt[i] = -99`` then a ``jn = imelt[0]``
+      guard) and ``zvqx`` (``zvqx[k] > 0`` guards). The edge would read device memory.
+    * **written by a bare host tasklet**: ``iphase`` in the canon pipelines, whose ``(5, )`` phase
+      classification is LICM-hoisted to a host init and then read only inside the kernel. The write
+      would store to device memory.
+
+    The fix mirrors :func:`mirror_nontransients_to_gpu` without a copy-out -- keep the host array
+    (writers, guards and host readers stay on it), add a ``gpu_<name>`` ``GPU_Global`` sibling, copy
+    host -> device right after EVERY writer state, and retarget the kernel-side reads to the mirror.
+    Copy-after-every-writer is correct in the cyclic per-block loop: on any path the copy that follows
+    the last write fills the mirror.
+
+    An array the device also *writes* is skipped: the mirror would be a second master and the host
+    copy would silently go stale. Those stay unmirrored and fail validation loudly rather than
+    miscompiling. Returns the number of transients mirrored.
+    """
+    count = 0
+    per_graph = device_touched_per_sdfg(sdfg)
+    written_per_graph = device_written_per_sdfg(sdfg)
+    inside = sdfgs_inside_kernels(sdfg)
+    for graph in sdfg.all_sdfgs_recursive():
+        in_kernel = id(graph) in inside
+        device_written = written_per_graph.get(id(graph), set())
+        mirrored = (host_pinned_arrays(graph, in_kernel) & per_graph.get(id(graph), set())) - device_written
+        if not mirrored:
+            continue
+        copy_states: Set[SDFGState] = set()
+        for name in sorted(mirrored):
+            desc = graph.arrays[name]
+            gpu_name = 'gpu_' + name
+            if gpu_name in graph.arrays:
+                continue
+            gpu_desc = copy.deepcopy(desc)
+            gpu_desc.transient = True
+            gpu_desc.storage = dtypes.StorageType.GPU_Global
+            gpu_desc.lifetime = dtypes.AllocationLifetime.SDFG
+            graph.add_datadesc(gpu_name, gpu_desc)
+            writer_states = [
+                state for state in graph.states() if any(
+                    isinstance(n, nodes.AccessNode) and n.data == name and state.in_edges(n) for n in state.nodes())
+            ]
+            for wstate in writer_states:
+                cstate = wstate.parent_graph.add_state_after(wstate, f'gpu_copy_{name}')
+                add_full_copy(cstate, name, desc, gpu_name)
+                copy_states.add(cstate)
+        for name in sorted(mirrored):
+            retarget_kernel_side_reads(graph, name, 'gpu_' + name, copy_states)
+        count += len(mirrored)
+    return count
+
+
+def retarget_kernel_side_reads(graph: dace.SDFG, name: str, gpu_name: str, skip: Set[SDFGState]) -> None:
+    """Point kernel-side accesses of ``name`` at ``gpu_name`` (mirrors the retarget in
+    :func:`mirror_nontransients_to_gpu`). Host writers and host interstate/tasklet readers are left on
+    ``name``; the host -> device copy states in ``skip`` are untouched so the copy source stays host.
+
+    Classified per EDGE, not per node: a top-level AccessNode can fan out to both a device kernel and a
+    host tasklet from the same scope, and a node-granularity test would drag the host edge's read onto
+    the device mirror along with the legitimately kernel-side one. A node with mixed edges is therefore
+    SPLIT -- a second ``gpu_name`` AccessNode takes only the device-facing edges, the original keeps the
+    rest -- instead of renamed whole.
+    """
+    retargeted: Set[int] = set()
+    for state in graph.states():
+        if state in skip:
+            continue
+        sdict = state.scope_dict()
+        for node in list(state.nodes()):
+            if not (isinstance(node, nodes.AccessNode) and node.data == name):
+                continue
+            # Empty memlets are happens-before ordering, not data: they carry no subset, so they
+            # neither vote on the device/host split nor move. Naming one would make it non-empty, and
+            # the copy-insertion pass -- which skips empty memlets -- would then materialize it into a
+            # real copy with subsets derived from the shapes.
+            in_edges = [e for e in state.in_edges(node) if not e.data.is_empty()]
+            out_edges = [e for e in state.out_edges(node) if not e.data.is_empty()]
+            in_device = [device_facing(state.memlet_path(e)[0].src, state, sdict) for e in in_edges]
+            out_device = [device_facing(state.memlet_path(e)[-1].dst, state, sdict) for e in out_edges]
+            if not any(in_device) and not any(out_device):
+                continue
+            if all(in_device) and all(out_device):
+                node.data = gpu_name
+                retargeted.add(id(node))
+                continue
+            mirror = state.add_access(gpu_name)
+            retargeted.add(id(mirror))
+            for edge, device in zip(in_edges, in_device):
+                if not device:
+                    continue
+                memlet = copy.deepcopy(edge.data)
+                memlet.data = gpu_name
+                state.remove_edge(edge)
+                state.add_edge(edge.src, edge.src_conn, mirror, edge.dst_conn, memlet)
+            for edge, device in zip(out_edges, out_device):
+                if not device:
+                    continue
+                memlet = copy.deepcopy(edge.data)
+                memlet.data = gpu_name
+                state.remove_edge(edge)
+                state.add_edge(mirror, edge.src_conn, edge.dst, edge.dst_conn, memlet)
+    for state in graph.states():
+        if state in skip:
+            continue
+        sdict = state.scope_dict()
+        for edge in state.edges():
+            if edge.data is None or edge.data.data != name:
+                continue
+            if edge_is_kernel_side(edge, state, sdict, retargeted):
+                edge.data.data = gpu_name
 
 
 def promote_transients_to_gpu(sdfg: dace.SDFG) -> None:
     """Transient Arrays -> ``GPU_Global``; Scalars -> ``Register``. Non-transient scalars are included
     because an NSDFG's inner descriptor shadows its outer binding, and a CPU_Heap inner scalar fed to a
     kernel trips DaCe's ``IllegalCopy`` dispatch."""
+    per_graph = device_touched_per_sdfg(sdfg)
+    inside = sdfgs_inside_kernels(sdfg)
     for graph in sdfg.all_sdfgs_recursive():
-        for desc in graph.arrays.values():
+        host_needed = host_pinned_arrays(graph, id(graph) in inside)
+        device = per_graph.get(id(graph), set())
+        for name, desc in graph.arrays.items():
             if desc.storage not in CPU_STORAGES:
                 continue
             if isinstance(desc, data.Array) and desc.transient:
+                # Only device-used transients go on the GPU. A host-only transient stays host (else
+                # its host readers fault); a host-pinned one is kept host + mirrored instead.
+                if name not in device or name in host_needed:
+                    continue
                 desc.storage = dtypes.StorageType.GPU_Global
             elif isinstance(desc, data.Scalar):
                 desc.storage = dtypes.StorageType.Register

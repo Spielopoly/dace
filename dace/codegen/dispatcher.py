@@ -8,6 +8,7 @@ from dace.codegen.prettycode import CodeIOStream
 from dace.codegen.py.prettycode import PythonCodeIOStream
 from dace import attr_enum, config, data as dt, dtypes, nodes
 from dace.memlet import Memlet
+from dace.codegen import exceptions as cgx
 from dace.codegen import target
 from dace.sdfg import utils as sdutil, SDFG, SDFGState, ScopeSubgraphView
 from dace.sdfg.graph import MultiConnectorEdge
@@ -19,6 +20,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     IOStream = CodeIOStream | PythonCodeIOStream
+
 
 class DefinedType(attr_enum.ExtensibleAttributeEnum):
     """ Data types for `DefinedMemlets`.
@@ -100,8 +102,7 @@ class DefinedMemlets:
                     if not allow_shadowing:
                         print("WARNING: " + err_str)
                 else:
-                    pass
-                    #raise cgx.CodegenError(err_str)
+                    raise cgx.CodegenError(err_str)
             if not can_access_parent:
                 break
         self._scopes[-1 - ancestor][1][name] = (dtype, ctype)

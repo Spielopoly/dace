@@ -650,17 +650,21 @@ class SameWriteSetIfElseToITECFG(ppl.Pass):
         # Subset per target: arms must agree when both write it (element-write
         # convention M3.1b enforces upstream).
         write_subsets = {}
-        for arr in all_escapes:
+        for arr in sorted(all_escapes):  # hash order here would decide ITE tasklet creation order
             t, e = then_writes.get(arr), else_writes.get(arr)
             if t is not None and e is not None and str(t) != str(e):
                 raise NotImplementedError(
                     f"SameWriteSetIfElseToITECFG: arms write {arr!r} with different subsets ({t} vs {e})")
             write_subsets[arr] = t if t is not None else e
 
+        # Read before adding states: each add_state drops a disconnected node into
+        # ``parent``, so ``start_block`` turns ambiguous and raises.
+        was_start = (parent.start_block is cb)
+
         # New 3-CFG states in parent graph. compute-else = empty pass-through for
         # single-arm conditionals (no else to clone); apply-merge reads pre-cb value of
         # each target via ``else_op = arr`` fallback.
-        ct_state = parent.add_state(f"compute_then_{cb.label}")
+        ct_state = parent.add_state(f"compute_then_{cb.label}", is_start_block=was_start)
         ce_state = parent.add_state(f"compute_else_{cb.label}")
         am_state = parent.add_state(f"apply_ITE_{cb.label}")
 
@@ -681,7 +685,6 @@ class SameWriteSetIfElseToITECFG(ppl.Pass):
         # it correctly.
         in_edges = list(parent.in_edges(cb))
         out_edges = list(parent.out_edges(cb))
-        was_start = (parent.start_block is cb)
         for e in in_edges + out_edges:
             parent.remove_edge(e)
         parent.remove_node(cb)
@@ -691,8 +694,6 @@ class SameWriteSetIfElseToITECFG(ppl.Pass):
         parent.add_edge(ce_state, am_state, dace.InterstateEdge())
         for e in out_edges:
             parent.add_edge(am_state, e.dst, e.data)
-        if was_start:
-            parent.start_block = parent.node_id(ct_state)
 
         # ITE tasklets. Non-writing arm contributes pre-cb value (reads original ``arr``,
         # intact because writing arm targets its private temp). Resolve cond once so the

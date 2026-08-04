@@ -6,7 +6,7 @@ import copy
 
 import dace
 from dace import properties, symbolic
-from dace.data import View
+from dace.data import Scalar, View
 from dace.memlet import Memlet
 from dace.sdfg import SDFG, SDFGState
 from dace.sdfg import nodes
@@ -14,6 +14,30 @@ from dace.sdfg import utils as sdutil
 from dace.sdfg.state import LoopRegion
 from dace.transformation import transformation
 from typing import Tuple, Optional
+
+
+def dynamic_range_ref(sdfg: SDFG, memlet: Memlet) -> str:
+    """SDFG-level expression that reads the single value a dynamic map range carries on ``memlet``.
+
+    The result is spliced into a ``LoopRegion``'s init / condition / update statement, which is
+    PYTHON source over SDFG names -- not C++. A ``Scalar`` has no indexable dimension there: its
+    value is the bare name (this is what ``InterstateEdgeUnparser._Name`` lowers, and what the
+    frontend itself emits for ``for i in range(n1 - 1, N, n3)`` with a scalar ``n1``). Subscripting
+    it instead (``n1[0]``) breaks TWICE -- the emitted C++ indexes a by-value ``int64_t n1``, and
+    any later pass that re-reads the statement into a symbolic map range carries a
+    ``Subscript(n1, 0)`` term into every expression derived from it, including array shapes.
+
+    An ``Array`` keeps the ``cpp_array_expr`` form: a single element of one is genuinely a
+    subscript, and it is what ``InterstateEdgeUnparser._Subscript`` expects.
+
+    :param sdfg: SDFG owning ``memlet``'s descriptor.
+    :param memlet: Memlet on the dynamic map range's input edge.
+    :return: Source text reading that value.
+    """
+    from dace.codegen.targets.cpp import cpp_array_expr
+    if isinstance(sdfg.arrays[memlet.data], Scalar):
+        return memlet.data
+    return cpp_array_expr(sdfg, memlet)
 
 
 def _wcr_index_is_data_dependent(subset, containing_sdfg: SDFG) -> bool:
@@ -57,11 +81,24 @@ class MapToForLoop(transformation.SingleStateTransformation):
     + :class:`~dace.transformation.interstate.multistate_inline.InlineMultistateSDFG`
     so the LoopRegion lands directly at the parent CFR. Set
     ``inline_after=False`` to keep the legacy wrapped form.
+
+    Sequentializing a map is always LEGAL, reductions included, so by default the
+    only refusal is the structural one (a single map parameter). Canonicalization
+    additionally does not *want* a surviving reduction serialized; it opts into that
+    preference with ``keep_reductions_parallel``.
     """
 
     map_entry = transformation.PatternNode(nodes.MapEntry)
 
     loop_region: Optional[LoopRegion] = None
+
+    keep_reductions_parallel = properties.Property(
+        dtype=bool,
+        default=False,
+        desc='Refuse a map whose surviving WCR output is a genuine parallel reduction, so it stays a '
+        'map and codegens to an OpenMP reduction instead of a sequential loop. A canonicalization '
+        'PREFERENCE, not a legality condition: off by default so that consumers which mechanically '
+        'need the map->loop rewrite (DoubleBuffering, StencilTiling) are not silently refused.')
 
     inline_after = properties.Property(dtype=bool,
                                        default=True,
@@ -84,29 +121,32 @@ class MapToForLoop(transformation.SingleStateTransformation):
         if len(self.map_entry.map.params) > 1:
             return False
 
-        # Refuse a map that still has a WCR (reduction) output. By this point
-        # WCRToAugAssign has rewritten every conflict-free (injective) WCR into an
-        # explicit RMW, so a surviving WCR output is a genuine parallel reduction.
-        # Lowering it to a sequential loop serializes the reduction AND severs an
-        # in-state-consumed accumulator; keep it a parallel map so it codegens to an
-        # OpenMP reduction and the producer->consumer edge is preserved.
-        map_exit = graph.exit_node(self.map_entry)
-        for e in graph.out_edges(map_exit):
-            if e.data is not None and e.data.wcr is not None:
-                return False
+        # Everything below is the canonicalization PREFERENCE, not legality -- see
+        # ``keep_reductions_parallel``.
+        if self.keep_reductions_parallel:
+            # Refuse a map that still has a WCR (reduction) output. By this point
+            # WCRToAugAssign has rewritten every conflict-free (injective) WCR into an
+            # explicit RMW, so a surviving WCR output is a genuine parallel reduction.
+            # Lowering it to a sequential loop serializes the reduction AND severs an
+            # in-state-consumed accumulator; keep it a parallel map so it codegens to an
+            # OpenMP reduction and the producer->consumer edge is preserved.
+            map_exit = graph.exit_node(self.map_entry)
+            for e in graph.out_edges(map_exit):
+                if e.data is not None and e.data.wcr is not None:
+                    return False
 
-        # Refuse a map whose body carries a DATA-DEPENDENT (indirect) scatter reduction,
-        # i.e. a surviving WCR write ``A[bin] (wcr)= ...`` whose index ``bin`` is computed
-        # from input data (a histogram / bincount ``np.add.at`` shape). The reduction WCR
-        # here is buried inside the body (a nested SDFG), so the map-exit scan above misses
-        # it. Such a scatter is a genuine parallel reduction that codegens soundly as an
-        # atomic-WCR parallel map, but -- unlike an affine/structured reduction (covariance,
-        # gemm) -- canon CANNOT re-parallelize it once serialized to a loop: LoopToReduce
-        # needs a scalar/affine accumulator and ScatterToGuardedMaps needs a precomputed
-        # index ARRAY, neither of which matches a computed index. Lowering it would strand
-        # the loop as sequential; keep it the parallel scatter map instead.
-        if _map_body_has_data_dependent_wcr(graph, self.map_entry):
-            return False
+            # Refuse a map whose body carries a DATA-DEPENDENT (indirect) scatter reduction,
+            # i.e. a surviving WCR write ``A[bin] (wcr)= ...`` whose index ``bin`` is computed
+            # from input data (a histogram / bincount ``np.add.at`` shape). The reduction WCR
+            # here is buried inside the body (a nested SDFG), so the map-exit scan above misses
+            # it. Such a scatter is a genuine parallel reduction that codegens soundly as an
+            # atomic-WCR parallel map, but -- unlike an affine/structured reduction (covariance,
+            # gemm) -- canon CANNOT re-parallelize it once serialized to a loop: LoopToReduce
+            # needs a scalar/affine accumulator and ScatterToGuardedMaps needs a precomputed
+            # index ARRAY, neither of which matches a computed index. Lowering it would strand
+            # the loop as sequential; keep it the parallel scatter map instead.
+            if _map_body_has_data_dependent_wcr(graph, self.map_entry):
+                return False
 
         return True
 
@@ -206,14 +246,10 @@ class MapToForLoop(transformation.SingleStateTransformation):
                 loop_to = loop_to.subs(repldict)
                 loop_step = loop_step.subs(repldict)
 
-        # Avoiding import loop
-        from dace.codegen.targets.cpp import cpp_array_expr
-
         def replace_param(param):
             param = symbolic.symstr(param, cpp_mode=False)
             for p, pval in param_to_edge.items():
-                # TODO: Correct w.r.t. connector type
-                param = param.replace(p, cpp_array_expr(nsdfg, pval.data))
+                param = param.replace(p, dynamic_range_ref(nsdfg, pval.data))
             return param
 
         # End of dynamic input range

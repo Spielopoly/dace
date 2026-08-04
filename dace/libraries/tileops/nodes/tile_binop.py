@@ -18,6 +18,7 @@ import numpy as np
 import dace
 from dace import library, properties
 from dace.frontend.python import astutils
+from dace.codegen.cppunparse import pyexpr2cpp
 from dace.sdfg import nodes
 from dace.transformation.transformation import ExpandTransformation
 
@@ -187,13 +188,13 @@ _OP_CPP = {
     # tile_binop_apply (which calls ``std::min`` / ``std::max``).
     "min": ("std::min(", ", ", ")"),
     "max": ("std::max(", ", ", ")"),
-    # Python ``**`` -> ``std::pow``. ``PowerOperatorExpansion`` runs upstream in the
-    # multi-dim pipeline: it rewrites integer-constant exponents (``x**2`` -> ``x*x``) and
-    # every other ``**`` to the canonical ``pow(base, exp)`` call; only a residual bare
-    # ``**`` (never produced by that pass, kept for robustness) reaches this lowering.
+    # Python ``**`` -> ``std::pow``. ``PowerOperatorExpansion`` runs upstream in the multi-dim
+    # pipeline but only rewrites a LITERAL integer exponent > 1 to repeated multiplies
+    # (``x**2`` -> ``x*x``); exponents 0 / 1, a non-integer literal and any non-constant
+    # exponent are deliberately left as ``**`` and reach this lowering.
     "**": ("std::pow(", ", ", ")"),
-    # ``pow(base, exp)`` (the canonical spelling ``PowerOperatorExpansion`` emits) ->
-    # ``std::pow`` (libm ``double``); vectorizes via libmvec through the pure per-lane loop.
+    # ``pow(base, exp)`` -- the frontend / ``math.pow`` spelling -> ``std::pow`` (libm
+    # ``double``); vectorizes via libmvec through the pure per-lane loop.
     "pow": ("std::pow(", ", ", ")"),
     # ``ipow(base, exp)`` -- an integer-exponent power ``RelaxIntegerPowers`` relaxed from
     # ``pow`` / ``**``. ``dace::math::ipow`` is exact repeated multiply (bit-exact with
@@ -286,7 +287,7 @@ class ExpandTileBinopPure(ExpandTransformation):
             the operand dtype is bool (logical ops; no ``(bool)X`` is emitted).
             """
             if kind == _SYMBOL:
-                return f"{_cast}({expr})"
+                return f"{_cast}({pyexpr2cpp(expr)})"
             if kind == _TILE:
                 return f"{conn}[{off}]"
             # Scalar operand. A tile-shape Array widened upstream is a pointer

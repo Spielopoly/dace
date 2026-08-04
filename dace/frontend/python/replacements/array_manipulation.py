@@ -15,7 +15,6 @@ from numbers import Integral
 from typing import Any, Optional, List, Sequence, Tuple, Union
 
 import numpy as np
-import ml_dtypes
 
 
 @oprepo.replaces('numpy.flip')

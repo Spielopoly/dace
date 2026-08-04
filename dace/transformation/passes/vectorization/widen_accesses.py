@@ -24,6 +24,7 @@ Downstream chain ``GenerateTileIterationMask`` -> ``InsertTileLoadStore`` -> ``G
 ``ConvertTaskletsToTileOps`` then emits gather/scatter.
 """
 import copy
+import re
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import dace
@@ -42,6 +43,18 @@ from dace.transformation.passes.vectorization.utils.pass_invariants import (asse
                                                                             no_memlet_dim_mismatch)
 from dace.transformation.passes.vectorization.utils.subsets import an_side_subset
 from dace.transformation.passes.vectorization.utils.tile_access import PerDimKind, classify_tile_access
+
+
+def _is_single_element(size) -> bool:
+    """``size`` (a descriptor ``total_size`` / memlet element count) is PROVABLY one element.
+
+    A symbolic size (``M`` for a per-row accumulator connector) is not provably one, and ``int()``
+    on it raises -- so decide it here rather than letting the raise escape the pass.
+    """
+    try:
+        return int(size) == 1
+    except (TypeError, ValueError):
+        return False
 
 
 def _find_iedge_defining_symbol(inner_sdfg: SDFG, sym_name: str):
@@ -187,6 +200,9 @@ class WidenAccesses(ppl.Pass):
 
         SYMMETRIC: walks in-edges (writes) AND out-edges (reads); non-CONSTANT on
         either side marks the data lane-dep.
+
+        A View joins them: it is an ALIAS of the array it views, never a buffer of its own, so
+        its accesses widen in place (step 2) and it is never descriptor-swapped (step 4).
         """
         lane_dep: Set[str] = set()
         for state in inner_sdfg.states():
@@ -194,7 +210,7 @@ class WidenAccesses(ppl.Pass):
                 if not isinstance(an, AccessNode):
                     continue
                 desc = inner_sdfg.arrays.get(an.data)
-                if desc is None or desc.transient:
+                if desc is None or (desc.transient and not isinstance(desc, dd.View)):
                     continue
                 if an.data in lane_dep:
                     continue
@@ -309,7 +325,6 @@ class WidenAccesses(ppl.Pass):
     @staticmethod
     def _tasklet_references_iter_var(tasklet: Tasklet, iter_vars: Tuple[str, ...]) -> bool:
         """True iff ``tasklet``'s code body references any tile iter-var name."""
-        import re
         if tasklet.code is None:
             return False
         code_str = tasklet.code.as_string or ""
@@ -321,6 +336,9 @@ class WidenAccesses(ppl.Pass):
     @staticmethod
     def _data_names_of_edge(edge, side: str) -> List[str]:
         """Collect all data names that ``edge`` references on ``side``."""
+        # An ordering edge references no data at all; its endpoint's array name is not a touch.
+        if edge.data is not None and edge.data.is_empty():
+            return []
         names = []
         endpoint = edge.src if side == "src" else edge.dst
         if isinstance(endpoint, AccessNode):
@@ -405,7 +423,7 @@ class WidenAccesses(ppl.Pass):
                             and not self._edge_reads_lane_dependent(edge, state, inner_sdfg, iter_vars)):
                         continue
                     desc = inner_sdfg.arrays.get(dst_name)
-                    if desc is None or not desc.transient:
+                    if desc is None or not desc.transient or isinstance(desc, dd.View):
                         continue
                     if dst_name in index_symbols:
                         continue  # index/address symbol -> stays scalar
@@ -434,7 +452,7 @@ class WidenAccesses(ppl.Pass):
                     for e in state.out_edges(node):
                         for nm in self._data_names_of_edge(e, "dst"):
                             desc = inner_sdfg.arrays.get(nm)
-                            if desc is None or not desc.transient:
+                            if desc is None or not desc.transient or isinstance(desc, dd.View):
                                 continue
                             if nm in index_symbols:
                                 continue  # index/address symbol -> stays scalar
@@ -563,7 +581,6 @@ class WidenAccesses(ppl.Pass):
 
         :returns: number of (AN, k) pairs seeded.
         """
-        import re as _re
         widths = tuple(self.widths)
         seeded = 0
         for inner_state in inner_sdfg.states():
@@ -593,7 +610,7 @@ class WidenAccesses(ppl.Pass):
                         if kind != PerDimKind.GATHER:
                             continue
                         begin_str = str(sub.ranges[k][0]).strip()
-                        if _re.fullmatch(r"[A-Za-z_]\w*", begin_str) is None:
+                        if re.fullmatch(r"[A-Za-z_]\w*", begin_str) is None:
                             continue
                         if emit_per_lane_symbol_fanout(inner_sdfg,
                                                        begin_str,
@@ -725,7 +742,11 @@ class WidenAccesses(ppl.Pass):
             except Exception:  # noqa: BLE001 -- non-augmentable WCR: leave the copyback untouched
                 continue
             oc_desc = inner_sdfg.arrays.get(oc)
-            if oc_desc is None or int(oc_desc.total_size) != 1:
+            # A per-row reduction (``mean[j] (+)= data[i, j]``) keeps the FULL accumulator array on
+            # the connector, so ``total_size`` is symbolic -- ``int()`` on it raises. Only a
+            # provably single-element accumulator has a copyback to fold; anything else (symbolic
+            # or genuinely larger) is left alone.
+            if oc_desc is None or not _is_single_element(oc_desc.total_size):
                 continue
             for ist in inner_sdfg.states():
                 for edge in list(ist.edges()):
@@ -739,7 +760,7 @@ class WidenAccesses(ppl.Pass):
                     src_desc = inner_sdfg.arrays.get(edge.src.data)
                     if src_desc is None or not src_desc.transient:
                         continue
-                    if int(m.subset.num_elements()) != 1:  # single-element accumulator copy only
+                    if not _is_single_element(m.subset.num_elements()):  # single-element copy only
                         continue
                     self._rewrite_copyback_to_fold(ist, edge, oc, body_expr)
                     rewritten += 1
@@ -795,13 +816,13 @@ class WidenAccesses(ppl.Pass):
             nt_lane_dep = self._classify_non_transients(inner_sdfg, iter_vars)
             # Step 2: widen non-transient boundary memlets. SYMMETRIC over
             # gather/scatter edges.
-            for name in nt_lane_dep:
+            for name in sorted(nt_lane_dep):
                 if self._widen_non_transient_memlets(inner_sdfg, name, iter_vars):
                     total += 1
             # Step 3: propagate lane-dep through Tasklets (fixed point).
             to_widen = self._propagate_lane_dep(inner_sdfg, iter_vars, nt_lane_dep)
             # Step 4: widen lane-dep transient descriptors.
-            for name in to_widen:
+            for name in sorted(to_widen):
                 if self._widen_transient(inner_sdfg, name, to_widen):
                     total += 1
             assert_invariant(lane_dep_transients_widened(inner_sdfg, to_widen, tuple(self.widths)), "WidenAccesses",

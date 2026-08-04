@@ -1,11 +1,15 @@
 # Copyright 2019-2021 ETH Zurich and the DaCe authors. All rights reserved.
 from typing import Tuple
 
+import numpy as np
 import pytest
 
 import dace
 from dace.sdfg import nodes
 from dace.transformation import dataflow as dftrans
+from dace.transformation.dataflow import map_fusion_helper as mfhelper
+
+from tests.helpers.isolation import exit_code
 
 from .map_fusion_vertical_test import count_nodes, unique_name
 
@@ -416,6 +420,138 @@ def test_horizontal_fusion_relocates_a_multi_edge_connector_once():
     sdfg.validate()
 
 
+def _make_shared_dynamic_map_range_sdfg(binding: str) -> dace.SDFG:
+    """Two parallel Maps whose ranges are both bounded by a dynamic map range named ``lim``.
+
+    ``binding`` selects how the two bounds are read: ``same_node`` (one AccessNode feeding both),
+    ``same_data`` (two AccessNodes of the same never-written array), ``other_data`` (two different
+    arrays) or ``written_data`` (same array, but a tasklet writes it in this very state).
+    """
+    sdfg = dace.SDFG(unique_name(f"shared_dmr_{binding}"))
+    for name in ("bound", "other_bound"):
+        sdfg.add_array(name, shape=(1, ), dtype=dace.int64, transient=False)
+    for name in ("A", "B"):
+        sdfg.add_array(name, shape=(10, ), dtype=dace.float64, transient=False)
+    state = sdfg.add_state(is_start_block=True)
+
+    first_source = state.add_access("bound")
+    if binding == "same_node":
+        second_source = first_source
+    elif binding == "other_data":
+        second_source = state.add_access("other_bound")
+    else:
+        second_source = state.add_access("bound")
+    if binding == "written_data":
+        writer = state.add_tasklet("set_bound", {}, {"__out"}, "__out = 4")
+        state.add_edge(writer, "__out", state.add_access("bound"), None, dace.Memlet("bound[0]"))
+
+    for name, source, value in (("A", first_source, 1.0), ("B", second_source, 2.0)):
+        _, map_entry, _ = state.add_mapped_tasklet(
+            f"comp_{name}",
+            map_ranges={"__i": "0:lim"},
+            inputs={},
+            code=f"__out = {value}",
+            outputs={"__out": dace.Memlet(f"{name}[__i]")},
+            output_nodes={name: state.add_access(name)},
+            external_edges=True,
+        )
+        map_entry.add_in_connector("lim")
+        state.add_edge(source, None, map_entry, "lim", dace.Memlet(f"{source.data}[0]"))
+    sdfg.validate()
+    return sdfg
+
+
+@pytest.mark.parametrize("binding", ["same_node", "same_data"])
+def test_horizontal_fusion_drops_an_equal_dynamic_map_range(binding: str):
+    """A dynamic map range both Maps bind to the same value is redundant, so it is dropped.
+
+    Relocation cannot rename a colliding symbol; before the fix any collision raised
+    ``NotImplementedError`` from the middle of ``apply()``, leaving the state half-rewired.
+    """
+    sdfg = _make_shared_dynamic_map_range_sdfg(binding)
+    state = sdfg.start_block
+
+    assert sdfg.apply_transformations_repeated(dftrans.MapFusionHorizontal, validate_all=True) == 1
+
+    fused_entry = count_nodes(state, nodes.MapEntry, return_nodes=True)
+    assert len(fused_entry) == 1
+    # The surviving Map still binds `lim` exactly once, through exactly one edge.
+    assert fused_entry[0].dynamic_input_connectors == {"lim"}
+    assert len(list(state.in_edges_by_connector(fused_entry[0], "lim"))) == 1
+    assert count_nodes(state, nodes.AccessNode) == 3  # bound, A, B -- the duplicate source is gone
+    sdfg.validate()
+
+
+def test_horizontal_fusion_keeps_the_dynamic_map_range_bound():
+    """Dropping the redundant binding must not change the iteration space of the fused Map.
+
+    Run in a spawned child so a miscompiled kernel segfaulting cannot take the session down. Spawn,
+    not fork: this process has already run compiled kernels, so a fork child would inherit an
+    OpenMP team it does not own and deadlock instead of reporting anything.
+    """
+    sdfg = _make_shared_dynamic_map_range_sdfg("same_data")
+    assert sdfg.apply_transformations_repeated(dftrans.MapFusionHorizontal, validate_all=True) == 1
+
+    bound = np.full((1, ), 4, dtype=np.int64)
+    args = {name: np.full((10, ), -1.0, dtype=np.float64) for name in ("A", "B")}
+    expected = {name: np.where(np.arange(10) < 4, value, -1.0) for name, value in (("A", 1.0), ("B", 2.0))}
+
+    kwargs = dict(args, bound=bound, other_bound=bound.copy())
+    code = exit_code(sdfg, kwargs, [(args[name], expected[name]) for name in args], exact=True)
+    assert code >= 0, f"fused kernel killed by signal {-code}"
+    assert code == 0, f"fused Map did not honor the dynamic bound (code {code})"
+
+
+@pytest.mark.parametrize("binding", ["other_data", "written_data"])
+def test_horizontal_fusion_rejects_a_disagreeing_dynamic_map_range(binding: str):
+    """Two Maps binding the same symbol to different values cannot fuse -- and must not mutate."""
+    sdfg = _make_shared_dynamic_map_range_sdfg(binding)
+    state = sdfg.start_block
+    before = (state.number_of_nodes(), state.number_of_edges())
+
+    assert sdfg.apply_transformations_repeated(dftrans.MapFusionHorizontal, validate_all=True) == 0
+
+    assert (state.number_of_nodes(), state.number_of_edges()) == before
+    assert count_nodes(state, nodes.MapEntry) == 2
+    sdfg.validate()
+
+
+def test_horizontal_fusion_rejects_a_dynamic_map_range_bound_by_tasklets():
+    """Two Maps whose ranges are bound by DIFFERENT tasklets must not be treated as agreeing.
+
+    The agreement proof for distinct sources is "nothing in this state writes that data", which is
+    vacuously true when the binding does not come from an AccessNode at all -- no AccessNode of that
+    data exists, so the scan finds no writer and declares the two bounds equal. Fusing then keeps one
+    binding and silently gives the other Map the wrong trip count.
+    """
+    sdfg = dace.SDFG(unique_name("dmr_bound_by_tasklets"))
+    sdfg.add_scalar("bound", dace.int64, transient=True)
+    for name in ("A", "B"):
+        sdfg.add_array(name, shape=(10, ), dtype=dace.float64, transient=False)
+    state = sdfg.add_state(is_start_block=True)
+
+    for name, value in (("A", 3), ("B", 5)):
+        _, map_entry, _ = state.add_mapped_tasklet(
+            f"comp_{name}",
+            map_ranges={"__i": "0:lim"},
+            inputs={},
+            code=f"__out = {float(value)}",
+            outputs={"__out": dace.Memlet(f"{name}[__i]")},
+            output_nodes={name: state.add_access(name)},
+            external_edges=True,
+        )
+        bound = state.add_tasklet(f"bound_{name}", set(), {"__out"}, f"__out = {value}")
+        map_entry.add_in_connector("lim")
+        state.add_edge(bound, "__out", map_entry, "lim", dace.Memlet("bound[0]"))
+    sdfg.validate()
+
+    entries = count_nodes(state, nodes.MapEntry, return_nodes=True)
+    assert not mfhelper.dynamic_map_ranges_agree(entries[0], entries[1], state), \
+        "two different tasklet-produced bounds were declared equal"
+    assert sdfg.apply_transformations_repeated(dftrans.MapFusionHorizontal, validate_all=True) == 0
+    assert count_nodes(state, nodes.MapEntry) == 2
+
+
 if __name__ == '__main__':
     test_horizontal_fusion_relocates_a_multi_edge_connector_once()
     test_horizontal_fusion_preserves_distinct_ordering_in_edges()
@@ -426,3 +562,9 @@ if __name__ == '__main__':
     test_vertical_maps_are_not_fused_horizontally()
     test_deterministic_label_in_horizontal_map_fusion(first_order=True)
     test_deterministic_label_in_horizontal_map_fusion(first_order=False)
+    test_horizontal_fusion_drops_an_equal_dynamic_map_range("same_node")
+    test_horizontal_fusion_drops_an_equal_dynamic_map_range("same_data")
+    test_horizontal_fusion_keeps_the_dynamic_map_range_bound()
+    test_horizontal_fusion_rejects_a_disagreeing_dynamic_map_range("other_data")
+    test_horizontal_fusion_rejects_a_disagreeing_dynamic_map_range("written_data")
+    test_horizontal_fusion_rejects_a_dynamic_map_range_bound_by_tasklets()

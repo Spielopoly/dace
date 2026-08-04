@@ -13,6 +13,7 @@ from typing import Tuple
 import pytest
 
 from dace.libraries.tileops import TileBinop, TileMaskGen
+from dace.libraries.tileops import _dispatch
 from dace.libraries.tileops._dispatch import (
     _ISA_TO_IMPL,
     detect_host_isa,
@@ -50,9 +51,11 @@ def test_k_ge_2_is_always_pure(widths: Tuple[int, ...], target_isa: str):
         ("CUTILE", "cutile"),
     ],
 )
-def test_k1_maps_isa_to_node_implementation(target_isa: str, expected: str):
+def test_k1_maps_isa_to_node_implementation(target_isa: str, expected: str, monkeypatch: pytest.MonkeyPatch):
     """K == 1 maps each known ISA to its per-node implementation name
     (``TileBinop`` defines all of them, so no fallback kicks in)."""
+    monkeypatch.setattr(_dispatch, "host_supported_isas",
+                        lambda: frozenset({"AVX512", "AVX2", "ARM_SVE", "ARM_NEON", "SCALAR"}))
     assert select_tile_implementation(_binop((8, ), target_isa)) == expected
 
 

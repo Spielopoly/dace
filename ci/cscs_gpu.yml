@@ -38,7 +38,7 @@ build_cscs_gh200:
     - .container-runner-daint-gh200
   image: ${CSCS_REGISTRY_PATH}/public/dace-gpu:${DOCKER_TAG}
   variables:
-    TEST_VARIANTS: 'gpu'
+    TEST_VARIANTS: 'gpu and not mpi'  # no MPI launcher here; the GPU workflow covers those
     SLURM_GPUS_PER_NODE: 4
     SLURM_JOB_NUM_NODES: 1
     SLURM_TIMELIMIT: 30
@@ -78,12 +78,17 @@ build_cscs_gh200:
     -   echo "Codecov.io is unreachable"
     - fi
 
+# The two codegens are paired on purpose: an experimental GPU kernel is emitted into
+# a frame the experimental CPU generator produced, so testing them apart leaves the
+# combination that actually ships untested.
 test_cscs_gh200_legacy:
   extends: .test_cscs_gh200_base
   variables:
     DACE_compiler_cuda_implementation: legacy
+    DACE_compiler_cpu_implementation: legacy
 
 test_cscs_gh200_experimental:
   extends: .test_cscs_gh200_base
   variables:
     DACE_compiler_cuda_implementation: experimental
+    DACE_compiler_cpu_implementation: experimental_readable

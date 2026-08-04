@@ -39,14 +39,7 @@ _PHASES = ("canon", "canon_vec")
 # Genuine per-(kernel, phase) gaps, marked xfail(strict) with the tracking reason -- NOT a blanket skip:
 # a case that starts passing flips the suite red so the entry is removed. Populated from the full sweep.
 # Two classes: canon-phase = real canon/codegen bugs (dace lane); canon_vec-phase = multidim-vectorize gaps.
-_XFAIL: dict = {
-    ("azimint_naive", "canon_vec"): "multidim-vectorize: output diverges from reference",
-    ("nbody", "canon_vec"): "multidim-vectorize StrideMapByTileWidths invariant: TILE_MAIN last-K step != width",
-    ("mandelbrot1", "canon_vec"): "multidim-vectorize: KeyError __t0_split_0 (tile split)",
-    ("mandelbrot2", "canon_vec"): "multidim-vectorize WidenAccesses invariant: lane-dep transients",
-    ("spmv", "canon_vec"): "multidim-vectorize: indirect-access node validation fails post-vectorize",
-    ("stockham_fft", "canon_vec"): "multidim-vectorize: worker crash (segfault) during vectorize",
-}
+_XFAIL: dict = {}
 
 
 def _cases():
@@ -97,6 +90,9 @@ def test_npbench_corpus(name, phase):
     sdfg = copy.deepcopy(canon)
     if phase == "canon_vec":
         _multidim_pass(name).apply_pass(sdfg, {})
+    # Per-(kernel, phase) name: concurrent xdist builds must not share .dacecache (race -> spurious
+    # CompilationError), matching the ``*_simplify_multidim`` sibling.
+    sdfg.name = f"{sdfg.name}_{phase}"
     sdfg.validate()
     got = npbench.run_outputs(_CORPUS[name], sdfg, arrays, params)
     assert npbench.outputs_match(ref, got), f"{name}/{phase}: output diverges from npbench reference"

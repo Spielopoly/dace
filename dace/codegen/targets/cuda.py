@@ -12,7 +12,7 @@ import dace
 from dace import data as dt, Memlet
 from dace import dtypes, registry
 from dace import subsets, symbolic
-from dace.codegen import common, cppunparse
+from dace.codegen import common, compiler_family, cppunparse
 from dace.codegen.codeobject import CodeObject
 from dace.codegen.dispatcher import DefinedType
 from dace.codegen.prettycode import CodeIOStream
@@ -38,6 +38,20 @@ from dace.transformation.dataflow.add_threadblock_map import AddThreadBlockMap
 if TYPE_CHECKING:
     from dace.codegen.targets.framecode import DaCeCodeGenerator
     from dace.codegen.targets.cpu import CPUCodeGen
+
+#: Host flags a device compiler must not be handed: warnings that only fire inside the CUDA headers,
+#: and position-independent code, which CMake already adds itself for a shared library.
+HOST_FLAGS_NOT_FORWARDED = frozenset({'-Wall', '-Wextra', '-fPIC'})
+
+
+def forwarded_host_args() -> List[str]:
+    """The host flags a ``.cu`` or ``.hip`` translation unit has to be built with as well.
+
+    Most of what DaCe emits into one is host code -- the state struct, the kernel launchers, the
+    stream setup -- and both it and the ``.cpp`` include the same header-only runtime. Compiling the
+    two halves under different flags leaves two versions of the same inline function to pick from.
+    """
+    return [flag for flag in compiler_family.cpu_args().split() if flag not in HOST_FLAGS_NOT_FORWARDED]
 
 
 def prod(iterable):
@@ -243,6 +257,9 @@ class CUDACodeGen(TargetCodeGenerator):
         # Annotate CUDA streams and events
         self._cuda_streams, self._cuda_events = self._compute_cudastreams(sdfg)
 
+        # Stream-unaware GPU callbacks -> default stream (see method).
+        self._default_stream_unaware_gpu_callbacks(sdfg)
+
         # Find points where memory should be released to the memory pool
         self._compute_pool_release(sdfg)
 
@@ -401,6 +418,7 @@ class CUDACodeGen(TargetCodeGenerator):
 
 DACE_EXPORTED int __dace_init_cuda({sdfg_state_name} *__state{params});
 DACE_EXPORTED int __dace_exit_cuda({sdfg_state_name} *__state);
+DACE_EXPORTED int __dace_gpu_last_error({sdfg_state_name} *__state);
 DACE_EXPORTED bool __dace_gpu_set_stream({sdfg_state_name} *__state, int streamid, gpuStream_t stream);
 DACE_EXPORTED void __dace_gpu_set_all_streams({sdfg_state_name} *__state, gpuStream_t stream);
 
@@ -462,6 +480,15 @@ int __dace_exit_cuda({sdfg_state_name} *__state) {{
     }}
 
     delete __state->gpu_context;
+    return __err;
+}}
+
+// The runtime's own last-error slot is per-host-thread and shared with every other GPU user in the
+// process, so it is not a reliable carrier for this SDFG's failures. Hand back what the generated
+// code recorded instead, and clear it so a failure is delivered exactly once.
+int __dace_gpu_last_error({sdfg_state_name} *__state) {{
+    int __err = static_cast<int>(__state->gpu_context->lasterror);
+    __state->gpu_context->lasterror = (gpuError_t)0;
     return __err;
 }}
 
@@ -548,14 +575,18 @@ void __dace_gpu_set_all_streams({sdfg_state_name} *__state, gpuStream_t stream)
             cuda_arch = ';'.join(cuda_arch)
             options.append(f'-DDACE_CUDA_ARCHITECTURES_DEFAULT="{cuda_arch}"')
 
-            flags = Config.get("compiler", "cuda", "args")
+            # One ``-Xcompiler`` per flag, since nvcc splits the comma-separated form on commas.
+            # CMake hands nvcc nothing from CMAKE_CXX_FLAGS, so this is the only route.
+            flags = ' '.join([Config.get('compiler', 'cuda', 'args')] +
+                             [f'-Xcompiler={flag}' for flag in forwarded_host_args()])
             options.append("-DCMAKE_CUDA_FLAGS=\"{}\"".format(flags))
 
         if backend == 'hip':
             hip_arch = Config.get('compiler', 'cuda', 'hip_arch').split(',')
             hip_arch = [ha for ha in hip_arch if ha is not None and len(ha) > 0]
 
-            flags = Config.get("compiler", "cuda", "hip_args")
+            # No wrapping: hipcc is one driver, with no separate host compiler to forward to.
+            flags = ' '.join([Config.get('compiler', 'cuda', 'hip_args')] + forwarded_host_args())
             options.append(f'-DDACE_HIP_ARCHITECTURES_DEFAULT="{";".join(hip_arch)}"')
             options.append("-DCMAKE_HIP_FLAGS=\"{}\"".format(flags))
 
@@ -650,13 +681,13 @@ void __dace_gpu_set_all_streams({sdfg_state_name} *__state, gpuStream_t stream)
                 if cudastream != 'nullptr':
                     cudastream = f'__state->gpu_context->streams[{cudastream}]'
                 result_alloc.write(
-                    f'DACE_GPU_CHECK({self.backend}MallocAsync((void**)&{dataname}, {arrsize_malloc}, {cudastream}));\n'
-                )
+                    cpp.gpu_alloc_check(
+                        f'{self.backend}MallocAsync((void**)&{dataname}, {arrsize_malloc}, {cudastream})', nodedesc))
                 self._emit_sync(result_alloc)
             else:
                 # Strides are left to the user's discretion
-                result_alloc.write('DACE_GPU_CHECK(%sMalloc((void**)&%s, %s));\n' %
-                                   (self.backend, dataname, arrsize_malloc))
+                result_alloc.write(
+                    cpp.gpu_alloc_check(f'{self.backend}Malloc((void**)&{dataname}, {arrsize_malloc})', nodedesc))
 
             if node.setzero:
                 result_alloc.write('DACE_GPU_CHECK(%sMemset(%s, 0, %s));\n' % (self.backend, dataname, arrsize_malloc))
@@ -668,7 +699,8 @@ void __dace_gpu_set_all_streams({sdfg_state_name} *__state, gpuStream_t stream)
             self._dispatcher.defined_vars.add(dataname, DefinedType.Pointer, ctypedef)
 
             # Strides are left to the user's discretion
-            result_alloc.write('DACE_GPU_CHECK(%sMallocHost(&%s, %s));\n' % (self.backend, dataname, arrsize_malloc))
+            result_alloc.write(cpp.gpu_alloc_check(f'{self.backend}MallocHost(&{dataname}, {arrsize_malloc})',
+                                                   nodedesc))
             if node.setzero:
                 result_alloc.write('memset(%s, 0, %s);\n' % (dataname, arrsize_malloc))
             if nodedesc.start_offset != 0:
@@ -952,6 +984,29 @@ void __dace_alloc_{location}(uint32_t {size}, dace::GPUStream<{type}, {is_pow2}>
 
         return max_streams, max_events
 
+    def _default_stream_unaware_gpu_callbacks(self, top_sdfg: SDFG):
+        """A GPU-touching callback not using ``__dace_current_stream`` is forced onto the null stream."""
+        for sd in top_sdfg.all_sdfgs_recursive():
+            for state in sd.states():
+                for node in list(state.nodes()):
+                    if not (isinstance(node, nodes.Tasklet) and node.side_effects):
+                        continue
+                    if is_devicelevel_gpu(sd, state, node):
+                        continue
+                    if not any(
+                            e.data.data in sd.arrays and sd.arrays[e.data.data].storage == dtypes.StorageType.GPU_Global
+                            for e in state.all_edges(node)):
+                        continue
+                    if '__dace_current_stream' in node.code.as_string:  # stream-aware: leave as is
+                        continue
+                    warnings.warn(
+                        f'Callback "{node.label}" accesses GPU memory but is not stream-aware, so its data '
+                        'movement is forced onto the default stream. This is only correct if the callback uses '
+                        'the default stream; for any other stream, add a "dace.current_stream" argument to the '
+                        'callback and use it (e.g. cupy ExternalStream).', UserWarning)
+                    for n in nx.weakly_connected_component(state.nx, node):
+                        n._cuda_stream = 'nullptr'
+
     def _emit_copy(self, state_id: int, src_node: nodes.Node, src_storage: dtypes.StorageType, dst_node: nodes.Node,
                    dst_storage: dtypes.StorageType, dst_schedule: dtypes.ScheduleType,
                    edge: Tuple[nodes.Node, str, nodes.Node, str, Memlet], sdfg: SDFG, cfg: ControlFlowRegion,
@@ -1151,7 +1206,7 @@ void __dace_alloc_{location}(uint32_t {size}, dace::GPUStream<{type}, {is_pow2}>
 
                             length = node_dtype._typeclass._length[field_name]
                             size = 'sizeof({})*{}[__idx].{}'.format(dtypes._CTYPES[tclass], str(src_node), length)
-                            callsite_stream.write('DACE_GPU_CHECK({backend}Malloc(&{dst}[__idx].{fname}, '
+                            callsite_stream.write('DACE_GPU_CHECK_RETURN({backend}Malloc(&{dst}[__idx].{fname}, '
                                                   '{sz}));'.format(dst=str(dst_node),
                                                                    fname=field_name,
                                                                    sz=size,

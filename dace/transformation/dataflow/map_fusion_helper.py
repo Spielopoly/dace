@@ -6,7 +6,7 @@ import sympy
 
 import dace
 from dace import subsets, symbolic
-from dace.sdfg import graph, nodes as nodes, validation
+from dace.sdfg import graph, nodes as nodes, utils as sdutils, validation
 from dace.transformation import helpers
 
 
@@ -298,11 +298,18 @@ def relocate_nodes(
             #  inside the Map scope to define a variable. We handle it directly.
             dmr_symbol = edge_to_move.dst_conn
 
-            # TODO(phimuell): Check if the symbol is really unused in the target scope.
             if dmr_symbol in to_node.in_connectors:
-                raise NotImplementedError(f"Tried to move the dynamic map range '{dmr_symbol}' from {from_node}'"
-                                          f" to '{to_node}', but the symbol is already known there, but the"
-                                          " renaming is not implemented.")
+                # Same symbol, same value: the moved binding is redundant, so drop it instead.
+                if not dynamic_map_range_binding_agrees(state, to_node, from_node, dmr_symbol):
+                    raise NotImplementedError(f"Tried to move the dynamic map range '{dmr_symbol}' from {from_node}'"
+                                              f" to '{to_node}', but the symbol is already known there, but the"
+                                              " renaming is not implemented.")
+                source = edge_to_move.src
+                state.remove_edge(edge_to_move)
+                from_node.remove_in_connector(dmr_symbol)
+                if state.degree(source) == 0:
+                    state.remove_node(source)
+                continue
             if not to_node.add_in_connector(dmr_symbol, force=False):
                 raise RuntimeError(  # Might fail because of out connectors.
                     f"Failed to add the dynamic map range symbol '{dmr_symbol}' to '{to_node}'.")
@@ -541,14 +548,61 @@ def _scope_boundary_accesses(
         for edge in edges:
             if edge.data is None or edge.data.is_empty() or edge.data.data is None:
                 continue
-            subset = edge.data.subset
-            if subset is None:
-                return {}, {}
+            data, subset = _boundary_access(state, edge)
+            if data is None or subset is None:
+                return None, None
             subset = copy.deepcopy(subset)
             if param_repl:
                 symbolic.safe_replace(param_repl, subset.replace)
-            target.setdefault(edge.data.data, []).append((node_of(edge), subset))
+            target.setdefault(data, []).append((node_of(edge), subset))
     return reads, writes
+
+
+def _boundary_access(
+    state: dace.SDFGState,
+    edge: graph.MultiConnectorEdge[dace.Memlet],
+) -> Tuple[Optional[str], Optional[subsets.Subset]]:
+    """What a boundary edge really touches, or `(None, None)` if that cannot be determined.
+
+    A copy-Memlet names one END of the edge and carries the other in `other_subset`, so `data`
+    alone can name an inner buffer. Views resolve to what they view.
+    """
+    outer = _outer_data_of_boundary_edge(state, edge)
+    if outer is None:
+        return None, None
+    if edge.data.data == outer:
+        return outer, edge.data.subset
+    # The Memlet names the other end, so only `other_subset` describes the outer access.
+    return outer, edge.data.other_subset
+
+
+def _outer_data_of_boundary_edge(
+    state: dace.SDFGState,
+    edge: graph.MultiConnectorEdge[dace.Memlet],
+) -> Optional[str]:
+    """The de-aliased array reached by following `edge` out through its scope node."""
+    connector = edge.dst_conn if isinstance(edge.dst, nodes.MapExit) else edge.src_conn
+    if connector is None or not connector.startswith(("IN_", "OUT_")):
+        return None
+    scope_node = edge.dst if isinstance(edge.dst, nodes.MapExit) else edge.src
+    if isinstance(scope_node, nodes.MapExit):
+        outer_edges = list(state.out_edges_by_connector(scope_node, "OUT_" + connector[3:]))
+        endpoints = [e.dst for e in outer_edges]
+    else:
+        outer_edges = list(state.in_edges_by_connector(scope_node, "IN_" + connector[4:]))
+        endpoints = [e.src for e in outer_edges]
+    if len(endpoints) != 1 or not isinstance(endpoints[0], nodes.AccessNode):
+        return None
+    return _dealias(state, endpoints[0])
+
+
+def _dealias(state: dace.SDFGState, node: nodes.AccessNode) -> Optional[str]:
+    """The name of the array `node` ultimately refers to, resolving Views."""
+    desc = node.desc(state.sdfg)
+    if not isinstance(desc, dace.data.View):
+        return node.data
+    viewed = sdutils.get_last_view_node(state, node)
+    return None if viewed is None else viewed.data
 
 
 def _is_iteration_private(
@@ -639,6 +693,9 @@ def analyze_happens_before_fusion(
 
     first_reads, first_writes = _scope_boundary_accesses(state, first_map_entry, None)
     second_reads, second_writes = _scope_boundary_accesses(state, second_map_entry, param_repl)
+    # An access the scan could not read hides every hazard it takes part in.
+    if first_reads is None or second_reads is None:
+        return None
     params = [symbolic.pystr_to_symbolic(param) for param in first_map_entry.map.params]
 
     # An ordering edge must end up in front of the second Map's access, and a nested scope
@@ -661,6 +718,47 @@ def analyze_happens_before_fusion(
                     inner_pairs.append((order_source(first_node), order_target(second_node)))
 
     return ordering_edges, list(dict.fromkeys(inner_pairs))
+
+
+def dynamic_map_range_edge(
+    state: dace.SDFGState,
+    map_entry: nodes.MapEntry,
+    symbol: str,
+) -> graph.MultiConnectorEdge:
+    """The single edge that binds dynamic-map-range `symbol` on `map_entry`."""
+    return next(iter(state.in_edges_by_connector(map_entry, symbol)))
+
+
+def dynamic_map_range_binding_agrees(
+    state: dace.SDFGState,
+    map_entry: nodes.MapEntry,
+    other_map_entry: nodes.MapEntry,
+    symbol: str,
+) -> bool:
+    """`True` if both Maps bind dynamic-map-range `symbol` to provably the same value."""
+    edge = dynamic_map_range_edge(state, map_entry, symbol)
+    other_edge = dynamic_map_range_edge(state, other_map_entry, symbol)
+    data = edge.data.data
+    if (data != other_edge.data.data or edge.src_conn != other_edge.src_conn
+            or edge.data.subset != other_edge.data.subset):
+        return False
+    if edge.src is other_edge.src:
+        return True
+    # Any other producer computes a value this scan cannot see, making the test below vacuous.
+    if not isinstance(edge.src, nodes.AccessNode) or not isinstance(other_edge.src, nodes.AccessNode):
+        return False
+    # Distinct sources agree only if nothing writes that data in this state.
+    return not any(state.in_degree(dn) for dn in state.data_nodes() if dn.data == data)
+
+
+def dynamic_map_ranges_agree(
+    first_map_entry: nodes.MapEntry,
+    second_map_entry: nodes.MapEntry,
+    state: dace.SDFGState,
+) -> bool:
+    """`True` if every dynamic-map-range symbol both Maps bind is bound to the same value."""
+    shared = first_map_entry.dynamic_input_connectors & second_map_entry.dynamic_input_connectors
+    return all(dynamic_map_range_binding_agrees(state, first_map_entry, second_map_entry, symbol) for symbol in shared)
 
 
 def can_topologically_be_fused(
@@ -710,6 +808,10 @@ def can_topologically_be_fused(
     elif only_toplevel_maps:
         if scope[first_map_entry] is not None:
             return None
+
+    # A colliding dynamic map range cannot be renamed, only dropped when both bind the same value.
+    if not dynamic_map_ranges_agree(first_map_entry, second_map_entry, graph):
+        return None
 
     # We will now check if we can rename the Map parameter of the second Map such that they
     #  match the one of the first Map.
