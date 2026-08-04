@@ -465,9 +465,7 @@ def _promote_read_output_connectors_to_inout(sdfg: dace.SDFG) -> int:
                             None)
             if template is None:
                 continue
-            # An inout connector deliberately has the same name in both connector
-            # dictionaries. The default rejects that cross-direction collision.
-            node.add_in_connector(oc, force=True)
+            node.add_in_connector(oc)
             parent.add_edge(template.src, template.src_conn, node, oc, copy.deepcopy(out_edge.data))
             promoted += 1
     return promoted

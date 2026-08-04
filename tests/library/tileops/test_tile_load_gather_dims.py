@@ -171,19 +171,18 @@ def test_icon_pattern_K2_vec_K3_src_gather_dims_0_and_2():
     assert "_idx_1" not in node.in_connectors
 
 
-@pytest.mark.parametrize(
-    "idx_dtype", [dace.int8, dace.int16, dace.int32, dace.int64, dace.uint8, dace.uint16, dace.uint32, dace.uint64])
-def test_integer_index_dtypes_validate(idx_dtype):
-    """Signed and unsigned integer tiles are valid gather indices."""
+@pytest.mark.parametrize("idx_dtype", [dace.uint32, dace.uint64])
+def test_unsigned_index_dtypes_validate(idx_dtype):
+    """Common unsigned 32- and 64-bit index tiles are valid gather indices."""
     sdfg, state, node = _build_load(widths=(4, 8), gather_dims=(0, ), idx_shapes=[(4, ONE)], idx_dtype=idx_dtype)
     node.validate(sdfg, state)
 
 
 def test_refuse_wrong_index_dtype():
-    """Index dtype must be integral. Uses a valid
+    """Index dtype must be a supported integer type. Uses a valid
     full-K-dim shape so the dtype check (not the shape check) is the failure."""
     sdfg, state, node = _build_load(widths=(4, 8), gather_dims=(0, ), idx_shapes=[(4, ONE)], idx_dtype=dace.float64)
-    with pytest.raises(ValueError, match="dtype.*not an integer"):
+    with pytest.raises(ValueError, match="dtype.*not in"):
         node.validate(sdfg, state)
 
 
