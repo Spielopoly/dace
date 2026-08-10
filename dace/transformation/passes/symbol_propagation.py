@@ -1,7 +1,9 @@
 # Copyright 2019-2025 ETH Zurich and the DaCe authors. All rights reserved.
 
+import ast
 from dataclasses import dataclass
 from dace.sdfg.state import (
+    AbstractControlFlowRegion,
     ControlFlowBlock,
     ControlFlowRegion,
     ConditionalBlock,
@@ -55,6 +57,35 @@ def _mutated_scalar_names(sdfg: SDFG) -> Set[str]:
     return mutated
 
 
+def _meta_read_symbols(blk: ControlFlowBlock) -> Set[str]:
+    """Symbols read by a region's OWN meta code -- a conditional's branch conditions, a loop's
+    init / condition / update statements.
+
+    ``free_symbols`` answers "what must be supplied from OUTSIDE this block", so it subtracts
+    every symbol the region binds internally. A symbol that a region reads in its meta code and
+    *also* rebinds on an interstate edge inside its body therefore reads as "not free" -- yet the
+    meta code runs BEFORE the body, so that read is live and must keep the assignment feeding it
+    alive (argmax's ``if __rd0_best == __rd0_best`` over a branch body doing
+    ``__rd0_best = x[...]``; a ``while udiff > 1e-30`` over a body recomputing ``udiff``).
+    Counting these reads explicitly is what stops the dead-iedge sweep from deleting a LIVE
+    assignment and stranding the meta code on an undefined symbol.
+
+    :param blk: The control-flow block to inspect.
+    :returns: The names of symbols read by the block's own meta code blocks (empty for states).
+    """
+    if not isinstance(blk, AbstractControlFlowRegion):
+        return set()
+    names: Set[str] = set()
+    for code in blk.get_meta_codeblocks():
+        if code is None:
+            continue
+        try:
+            names |= {str(s) for s in code.get_free_symbols()}
+        except Exception:
+            pass
+    return names
+
+
 def _is_array_access(value: Optional[str]) -> bool:
     """True iff an assignment RHS reads a data container (``tbl[i]``) rather than being a
     pure symbolic expression.
@@ -70,10 +101,34 @@ def _is_array_access(value: Optional[str]) -> bool:
       ``__tmp0_size(i)`` whose body named an out-of-scope ``A_indptr``). The kernel already stages
       the bound through ``dc.define_local_scalar``; folding it back defeats exactly that.
 
+    A struct MEMBER read spells the same thing with a dot instead of brackets -- ``np.argmax``
+    reduces into a ``_val_and_idx`` struct and then reads ``b_slice.idx`` -- so the bracket test
+    alone let that through. Propagated, it landed in a tasklet carrying no memlet for ``b_slice``
+    and codegen emitted ``b[b_idx(0)] = b_slice.idx;`` against an undeclared name.
+
     :param value: The assignment RHS string, or ``None``.
-    :returns: Whether the RHS contains a subscripted data access.
+    :returns: Whether the RHS reads a data container, by subscript or by struct member.
     """
-    return value is not None and ("[" in value or "]" in value)
+    if value is None:
+        return False
+    if "[" in value or "]" in value:
+        return True
+    return _reads_struct_member(value)
+
+
+def _reads_struct_member(value: str) -> bool:
+    """True iff ``value`` reads an attribute off a plain name (``b_slice.idx``).
+
+    Attribute access on a name is how a struct member is spelled, but it is also how a qualified
+    call is spelled (``math.floor(x)``), and refusing those would stop propagating ordinary integer
+    arithmetic. So an attribute that is the callee of a call does not count.
+    """
+    try:
+        tree = ast.parse(value.strip(), mode='eval')
+    except (SyntaxError, ValueError):
+        return False  # not parseable as an expression -> leave it to the other filters
+    callees = {id(node.func) for node in ast.walk(tree) if isinstance(node, ast.Call)}
+    return any(isinstance(node, ast.Attribute) and id(node) not in callees for node in ast.walk(tree))
 
 
 def _resolve(value, table: Dict[str, Any]):
@@ -286,6 +341,7 @@ class SymbolPropagation(ppl.Pass):
             used_in_ir: Set[str] = set()
             for blk in sd.all_control_flow_blocks():
                 used_in_ir |= {str(s) for s in blk.free_symbols}
+                used_in_ir |= _meta_read_symbols(blk)
             for e in sd.all_interstate_edges():
                 for rhs in e.data.assignments.values():
                     used_in_ir |= _free_symbols(rhs)

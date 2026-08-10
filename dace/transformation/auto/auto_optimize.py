@@ -1,6 +1,8 @@
 # Copyright 2019-2026 ETH Zurich and the DaCe authors. All rights reserved.
 """ Automatic optimization routines for SDFGs. """
 
+import os
+
 import dace
 import sympy
 from dace.sdfg import infer_types
@@ -382,7 +384,22 @@ def find_fast_library(device: dtypes.DeviceType) -> List[str]:
         if openblas.OpenBLAS.is_installed():
             result.append('OpenBLAS')
 
-        return result + ['pure']
+        # Same order as canonicalize's ``canonicalize_fast_library_priority``, deliberately: the two
+        # pipelines are compared column against column, so a node that lowers to a tuned expansion
+        # under one and to the serial ``pure`` loop under the other measures the priority list rather
+        # than the pipeline. Everything past the vendor BLAS was previously missing here, which left
+        # a tensor transpose/contraction or a threaded reduction falling through to ``pure`` under
+        # auto_optimize while canonicalize took the fast form.
+        #
+        # HPTT needs its own install (gated on HPTT_ROOT); TTGT is transpose+GEMM with no external
+        # dependency; ``OpenMP`` covers Reduce/ArgReduce and ``CPU`` the OpenMP-5 Scan / radix sort /
+        # ScatterConflictCheck. ``apply_cpu_library_parallelism`` below still has the last word on the
+        # scope-dependent types, so a node nested in a parallel map keeps its sequential expansion.
+        if 'HPTT_ROOT' in os.environ:
+            result.append('HPTT')
+        result.append('TTGT')
+
+        return result + ['OpenMP', 'CPU', 'pure']
 
     return ['pure']
 
@@ -410,6 +427,96 @@ def move_small_arrays_to_stack(sdfg: SDFG) -> None:
 
     if config.Config.get_bool('debugprint') and converted > 0:
         print(f'Statically allocating {converted} transient arrays')
+
+
+def libnode_is_sequential(node: nodes.LibraryNode, state: SDFGState, sdfg: SDFG) -> bool:
+    """Whether ``node`` is re-entered inside an outer parallel/repeated scope and so must NOT open
+    its own (nested) parallel region -- it lowers to its efficient single-core expansion instead.
+
+    The storage-derived ``node.schedule`` is NOT a reliable signal here:
+    :func:`~dace.sdfg.infer_types.set_default_schedule_and_storage_types` sets a library node's
+    schedule from the *storage* of its neighbouring memlets (``CPU_Heap`` ->
+    ``ScheduleType.CPU_Multicore``), NOT from the parallelism of the enclosing scope, so a ``Reduce``
+    nested in a parallel map can carry ``CPU_Multicore`` and would then wrongly open a nested
+    ``#pragma omp parallel`` per outer iteration -- the "constant parallel reductions" catastrophe.
+    Determine sequentiality from SCOPE instead: a libnode is sequential if it has a parallel parent
+    map or an enclosing loop (both re-enter it).
+
+    A ``NestedSDFG`` node carries no ``schedule`` of its own, so "lives inside a sequential nested
+    SDFG" is not a distinct case to probe for:
+    :func:`~dace.transformation.helpers.get_parent_map_and_loop_scopes` walks OUT across every
+    nested-SDFG boundary up to the root and yields every enclosing ``MapEntry`` / ``LoopRegion``
+    regardless of how many nsdfg levels separate ``node`` from them. A genuinely top-level node
+    returns ``False`` and is free to open its own OpenMP / device-parallel region.
+
+    :param node: The library node to classify.
+    :param state: The state containing ``node``.
+    :param sdfg: The root SDFG.
+    :returns: True if ``node`` is re-entered by an enclosing parallel map or loop.
+    """
+    from dace.sdfg.state import LoopRegion  # Avoid an import cycle at module load.
+    if node.schedule == dtypes.ScheduleType.Sequential:
+        return True
+    for scope in xfh.get_parent_map_and_loop_scopes(sdfg, node, state):
+        if isinstance(scope, nodes.MapEntry):
+            if scope.map.schedule != dtypes.ScheduleType.Sequential:
+                return True
+        elif isinstance(scope, LoopRegion):
+            return True
+    return False
+
+
+def apply_cpu_library_parallelism(node: nodes.LibraryNode, state: SDFGState, sdfg: SDFG) -> bool:
+    """Pick the CPU lowering of the library nodes whose parallel form depends on their SCOPE.
+
+    The single home for the CPU parallel-lowering rule, shared by :func:`set_fast_implementations`
+    and canonicalize's
+    :func:`~dace.transformation.passes.canonicalize.finalize.canonicalize_set_fast_implementations`,
+    so the ``auto_optimize`` and ``canonicalize`` paths cannot drift onto different implementations
+    of the same node. :func:`find_fast_library` lists only the vendor BLAS names, so without this the
+    nodes below all fell through to the terminal ``pure`` fallback and a top-level reduction/scan lost
+    its parallelism.
+
+    A top-level node opens its own parallel region; a node re-entered inside a parallel map or a loop
+    (:func:`libnode_is_sequential`) takes its efficient single-core expansion instead.
+
+    * ``Reduce`` / ``ArgReduce``: ``OpenMP`` (privatized ``reduction(op:var)``; for ArgReduce a
+      ``declare reduction`` over the (value, index) pair) vs the plain ``pure`` accumulate loop --
+      never a contended ``omp atomic`` or a re-forked team per outer iteration.
+    * ``Scan`` / ``ScatterConflictCheck``: ``CPU`` (OpenMP 5.0 ``reduction(inscan,..)`` +
+      ``#pragma omp scan`` for the scan; an OpenMP tagged-write + verify for the conflict check) vs
+      the serial ``pure`` form.
+    * ``Copy`` / ``Memset``: ``Auto`` at top level, whose own size gate routes a large contiguous
+      transfer to the element map that DaCe parallelizes across threads. A nested node asks its OWN
+      selector for a concrete expansion, because the contiguous-only single-call forms would raise.
+
+    :param node: The library node to select an implementation for.
+    :param state: The state containing ``node``.
+    :param sdfg: The root SDFG.
+    :returns: True if ``node`` is one of the governed types and its implementation was set.
+    """
+    from dace.libraries.sort.nodes.scatter_conflict_check import ScatterConflictCheck
+    from dace.libraries.standard.nodes.arg_reduce import ArgReduce
+    from dace.libraries.standard.nodes.copy_node import CopyLibraryNode, select_copy_implementation
+    from dace.libraries.standard.nodes.memset_node import MemsetLibraryNode, select_memset_implementation
+    from dace.libraries.standard.nodes.reduce import Reduce
+    from dace.libraries.standard.nodes.scan import Scan
+
+    if not isinstance(node, (Reduce, ArgReduce, Scan, ScatterConflictCheck, CopyLibraryNode, MemsetLibraryNode)):
+        return False
+    impls = type(node).implementations
+    sequential = libnode_is_sequential(node, state, sdfg)
+    if isinstance(node, (Reduce, ArgReduce)):
+        # ``pure-seq`` needs an ``identity`` a lifted node may not carry, so ``pure`` is the robust
+        # single-core choice (it lowers to a plain accumulate loop when Sequential).
+        node.implementation = 'pure' if sequential else ('OpenMP' if 'OpenMP' in impls else node.implementation)
+    elif isinstance(node, (Scan, ScatterConflictCheck)):
+        node.implementation = 'pure' if sequential else ('CPU' if 'CPU' in impls else node.implementation)
+    elif isinstance(node, CopyLibraryNode):
+        node.implementation = select_copy_implementation(node, state) if sequential else 'Auto'
+    else:
+        node.implementation = select_memset_implementation(node, state) if sequential else 'Auto'
+    return True
 
 
 def set_fast_implementations(sdfg: SDFG,
@@ -447,7 +554,10 @@ def set_fast_implementations(sdfg: SDFG,
 
     # general nodes
     for node, _ in sdfg.all_nodes_recursive():
-        if isinstance(node, nodes.LibraryNode):
+        # ``auto_select_implementation`` opts a node out entirely: its lowering was chosen by a
+        # transformation (the tile ops, from the vectorizer's ``target_isa``), and every branch below
+        # would silently reset it to the generic fallback -- no error, just the ISA path gone.
+        if isinstance(node, nodes.LibraryNode) and node.auto_select_implementation:
             # NOTE: LibraryNodes with sequential schedule on GPU must be expanded to CUDA kernel-compatible code.
             # NOTE: Pure implementations are a safe choice for now but this should be revisited in the future.
             if device == dtypes.DeviceType.GPU and node.schedule == dtypes.ScheduleType.Sequential:
@@ -462,10 +572,19 @@ def set_fast_implementations(sdfg: SDFG,
                     node.implementation = impl
                     break
 
+    # CPU: the nodes whose parallel lowering depends on scope. ``implementation_prio`` names only the
+    # vendor BLAS libraries, so a Reduce / ArgReduce / Scan / Copy / Memset fell through to the
+    # terminal ``pure`` fallback above and a TOP-LEVEL one silently lost its parallelism. Runs after
+    # the priority loop so it has the last word on exactly those types.
+    if device == dtypes.DeviceType.CPU:
+        for node, state in sdfg.all_nodes_recursive():
+            if isinstance(node, nodes.LibraryNode) and node.auto_select_implementation:
+                apply_cpu_library_parallelism(node, state, sdfg)
+
     # reduce nodes
     if device == dtypes.DeviceType.GPU:
         for node, state in sdfg.all_nodes_recursive():
-            if isinstance(node, dace.nodes.LibraryNode):
+            if isinstance(node, dace.nodes.LibraryNode) and node.auto_select_implementation:
                 if device == dtypes.DeviceType.GPU and node.schedule == dtypes.ScheduleType.Sequential:
                     node.implementation = "pure"
                     continue

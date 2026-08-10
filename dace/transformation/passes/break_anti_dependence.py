@@ -14,15 +14,49 @@ recurrence and must stay sequential). The pass therefore renames only when, for
 the array's affine point accesses, every read/write pair is WAR or non-aliasing
 and at least one is WAR.
 
-It trades an extra array + an O(N) copy for parallelism, so it is meant to run
+It trades an extra array + a copy of the window the loop reads (see
+:meth:`BreakAntiDependence._snapshot_window`) for parallelism, so it is meant to run
 **optionally** (a tuning knob), not as part of the default pipeline.
+
+Two admission policies share the one classifier, selected by the ``forward_reads``
+property. Breaking an anti-dependence is this pass's job in BOTH; nothing else in
+the codebase snapshots, and in particular ``SplitStatements`` does distribution
+only:
+
+* **whole array** (``forward_reads=False``, the default) -- the array's ENTIRE
+  read/write cross product must be free of true dependences, so after the rename
+  every read comes from the snapshot and ``LoopToMap`` can parallelize the loop.
+* **forward reads** (``forward_reads=True``) -- admit an individual read EDGE that
+  is purely read-ahead even when the array's OTHER reads are not. The loop may well
+  stay sequential; what this buys is that the read-ahead no longer binds two
+  otherwise-independent statements, so fission can distribute them (TSVC ``s1244``,
+  ``A[i]=..; d[i]=A[i]+A[i+1]``). Its symbolic-offset guard is STRICTLY positive
+  rather than nonnegative -- see :meth:`BreakAntiDependence._snapshot_forward_reads`.
+
+ORDER: run this AFTER ``SplitStatements``, not before. Distribution is what makes
+an anti-dependence go away for free -- once the read-ahead and the write sit in
+different loops there is nothing left to break -- so breaking first pays a
+whole-array copy for arrays the distribution was about to separate anyway. The
+converse does not hold on the shapes that motivate either pass: in the mixed
+``A[i]=..; d[i]=A[i]+A[i+1]``, the same-index read ``A[i]`` STAYS on the live
+array (redirecting it would read the stale original), so ``A`` is still both read
+and written by ``d``'s group afterwards and ``SplitStatements`` refuses it exactly
+as it did before -- breaking first exposes no split that distribution-first
+misses. Checked against the motivating carry kernel (no anti-dependence at all,
+order irrelevant), TSVC ``s421`` (single output, distribution never applies) and
+the ``fission_dep_const_offset`` / ``fission_dep_sym_offset`` shapes (refused by
+the split either way, distributed later by ``LoopFission``).
+
+Breaking is never declined because the copy looks expensive: the canonical form
+prefers the parallel version, and cost is the tuner's call, not this pass's.
 """
+import copy
 from functools import lru_cache
 from typing import Any, Dict, Optional, Set
 
 import sympy
 
-from dace import data, dtypes, properties, symbolic, Memlet
+from dace import data, dtypes, properties, subsets, symbolic, Memlet
 from dace.sdfg import SDFG, nodes
 from dace.sdfg.state import LoopRegion
 from dace.transformation import pass_pipeline as ppl
@@ -149,6 +183,16 @@ class BreakAntiDependence(ppl.Pass):
     """
 
     CATEGORY: str = 'Optimization Preparation'
+
+    forward_reads = properties.Property(
+        dtype=bool,
+        default=False,
+        desc="Break a read-ahead EDGE even when the array's other reads are true dependences, so the "
+        "read-ahead stops binding two otherwise-independent statements (TSVC s1244).")
+
+    def __init__(self, forward_reads: bool = False) -> None:
+        super().__init__()
+        self.forward_reads = forward_reads
 
     def modifies(self) -> ppl.Modifies:
         return ppl.Modifies.Everything
@@ -384,7 +428,7 @@ class BreakAntiDependence(ppl.Pass):
 
         Scope safety: we also refuse to substitute a binding whose RHS
         introduces a free symbol that is not already defined at the loop's
-        SDFG scope (``sdfg.symbols`` ∪ ``sdfg.arrays`` ∪ ``{isym}``). A
+        SDFG scope (``sdfg.symbols`` + ``sdfg.arrays`` + ``{isym}``). A
         binding referencing an unknown name would produce an unbound symbol
         in the matcher's algebra, leading to spurious 'complex' verdicts at
         best and silent misclassification at worst.
@@ -748,6 +792,51 @@ class BreakAntiDependence(ppl.Pass):
         guard.side_effects = True
         return guard
 
+    def _snapshot_window(self, loop: LoopRegion, name: str, sdfg: SDFG, read_subsets) -> Optional[Memlet]:
+        """The copy memlet for ``name -> snap`` restricted to the elements the
+        redirected reads actually touch, or ``None`` to fall back to a whole-array copy.
+
+        Only the redirected read edges ever source from the snapshot, so copying more
+        than the image of their subsets over the loop's iteration space is pure data
+        movement. The image is the standard memlet propagation
+        (:func:`~dace.sdfg.propagation.propagate_subset`), which over-approximates --
+        the copy can only come out too large, never too small.
+
+        The saving is proportional, not constant: on a flat loop that sweeps a whole
+        1-D array the window IS the array. It matters when the loop touches a slice --
+        a blocked/tiled inner loop over ``a[t*B : (t+1)*B]`` copied the entire array
+        once per outer iteration, an O(outer x N) memcpy for an O(N) sweep.
+
+        The snapshot descriptor keeps the FULL shape so the redirected reads keep
+        indexing it exactly as they indexed ``name`` -- no index rewriting, and the
+        pages outside the window are never touched, so the untouched tail costs
+        address space rather than memory.
+
+        Returns ``None`` (whole array) when the loop bounds are not parseable or when
+        the window would index by a symbol that only exists inside the loop -- the copy
+        state sits BEFORE the loop, where such a symbol is not defined.
+        """
+        from dace.sdfg import propagation
+        from dace.transformation.passes.analysis import loop_analysis
+        start = loop_analysis.get_init_assignment(loop)
+        end = loop_analysis.get_loop_end(loop)
+        stride = loop_analysis.get_loop_stride(loop)
+        if start is None or end is None or stride is None:
+            return None
+        desc = sdfg.arrays[name]
+        memlets = [Memlet(data=name, subset=copy.deepcopy(s)) for s in read_subsets]
+        window = propagation.propagate_subset(memlets, desc, [loop.loop_variable],
+                                              subsets.Range([(start, end, stride)])).subset
+        if window is None:
+            return None
+        # Symbols the loop DEFINES -- its iterator, nested map/loop iterators, and anything
+        # an interstate edge of the body assigns -- do not exist in the pre-loop state.
+        internal = self._loop_internal_symbols(loop)
+        internal.update(k for e in loop.all_interstate_edges() for k in (e.data.assignments or {}))
+        if {str(s) for s in window.free_symbols} & internal:
+            return None
+        return Memlet(data=name, subset=copy.deepcopy(window), other_subset=copy.deepcopy(window))
+
     def _snapshot_and_redirect(self, loop: LoopRegion, name: str, sdfg: SDFG, guards=None, array_guards=None):
         """Insert ``snap = name`` before ``loop`` and point the loop's
         *read-ahead* reads of ``name`` at ``snap``. Also plants runtime
@@ -831,9 +920,12 @@ class BreakAntiDependence(ppl.Pass):
                                      storage=desc.storage,
                                      find_new_name=True)
 
-        # Snapshot copy `name -> snap` in a fresh state right before the loop.
+        # Snapshot copy `name -> snap` in a fresh state right before the loop, over the
+        # window the redirected reads touch (see :meth:`_snapshot_window`).
+        read_subsets = [e.data.get_src_subset(e, st) or e.data.subset for st, e in to_move]
+        copy_mem = self._snapshot_window(loop, name, sdfg, read_subsets) or Memlet.from_array(name, desc)
         pre = loop.parent_graph.add_state_before(loop, label=f'{name}_snapshot')
-        pre.add_nedge(pre.add_read(name), pre.add_write(snap), Memlet.from_array(name, desc))
+        pre.add_nedge(pre.add_read(name), pre.add_write(snap), copy_mem)
 
         # Emit runtime positive-check tasklets for any symbolic guards.
         for expr in (guards or ()):
@@ -854,16 +946,131 @@ class BreakAntiDependence(ppl.Pass):
             if st.degree(src) == 0:
                 st.remove_node(src)
 
+    def _snapshot_forward_reads(self, loop: LoopRegion, sdfg: SDFG) -> int:
+        """Break only the READ-AHEAD edges of ``loop``, leaving the array's other reads live.
+
+        The whole-array policy above disqualifies an array the moment ONE read/write pair is a true
+        dependence, because its goal is a loop that maps. This policy has a different goal: the
+        MIXED shape ``A[i] = ..; d[i] = A[i] + A[i + 1]`` (TSVC s1244), where the read-ahead is the
+        only thing binding two otherwise-independent statements. Moving just that edge to the
+        snapshot unbinds them -- the ``A[i]`` read stays on the live array and keeps its value, and
+        the loop is free to be distributed even though it stays sequential.
+
+        Restricted to a single-compute-state body: the edge-level verdict is computed against the
+        writes of that one state, so a producer chain spanning states is not analyzable here.
+
+        :param loop: The loop to break.
+        :param sdfg: The SDFG owning ``loop``.
+        """
+        from dace.transformation.passes.loop_fission import _single_compute_state
+
+        state = _single_compute_state(loop)
+        if state is None:
+            return 0
+        ivar = loop.loop_variable
+        # Forward stride only. ``_dep_class`` reads direction off the sign of the carried
+        # offset alone, so under a reverse stride it calls ``a[i + 1]`` read-ahead when it is
+        # really the value the PREVIOUS iteration wrote -- redirecting it to the pre-loop
+        # snapshot then silently computes the wrong thing.
+        if not self._safe_stride(loop, sdfg):
+            return 0
+        internal_syms = self._loop_internal_symbols(loop)
+        applied = 0
+
+        written = sorted(
+            dict.fromkeys(n.data for n in state.data_nodes()
+                          if state.in_degree(n) > 0 and not sdfg.arrays[n.data].transient))
+        for arr in written:
+            write_subsets = []
+            for n in state.data_nodes():
+                if n.data != arr:
+                    continue
+                for e in state.in_edges(n):
+                    ws = e.data.get_dst_subset(e, state) if e.data is not None else None
+                    if ws is not None:
+                        write_subsets.append(ws)
+            if not write_subsets:
+                continue
+
+            fwd_edges = []
+            sym_guards = set()
+            for n in list(state.data_nodes()):
+                if n.data != arr:
+                    continue
+                for e in state.out_edges(n):
+                    rs = e.data.get_src_subset(e, state) if e.data is not None else None
+                    if rs is None:
+                        continue
+                    verdicts = [self._dep_class(rs, ws, ivar, loop=loop, sdfg=sdfg) for ws in write_subsets]
+                    kinds = dict.fromkeys(v[0] for v in verdicts)
+                    # Redirect to the pre-loop snapshot ONLY when EVERY verdict is a read-ahead
+                    # (WAR / WAR_symbolic). A RAW/complex producer, OR a 'none' (offset-0, same-index
+                    # producer THIS iteration), means the read consumes a value made within the sweep
+                    # and must keep its live-array value -- moving it to the stale snapshot is a silent
+                    # miscompile. (The old gate only skipped RAW/complex and required *some* WAR, so a
+                    # read that was WAR vs one sibling write but 'none' vs another --
+                    # ``A[i]=..; A[i+1]=..; d[i]=A[i+1]`` -- slipped through and read the stale value.)
+                    if not (kinds and all(k in ('WAR', 'WAR_symbolic') for k in kinds)):
+                        continue
+                    guards = {p for k, p in verdicts if k == 'WAR_symbolic'}
+                    if any(str(s) in internal_syms for g in guards for s in g.free_symbols):
+                        continue
+                    sym_guards |= guards
+                    fwd_edges.append((n, e))
+            if not fwd_edges:
+                continue
+
+            # Snapshot before the loop and redirect only the read-ahead edges to it. The copy
+            # covers the window those edges read (see :meth:`_snapshot_window`), not the whole
+            # array. The break itself is never declined because the copy looked expensive.
+            desc = sdfg.arrays[arr]
+            snap, _ = sdfg.add_transient(f'{arr}_split_snap',
+                                         desc.shape,
+                                         desc.dtype,
+                                         storage=desc.storage,
+                                         find_new_name=True)
+            read_subsets = [e.data.get_src_subset(e, state) for _, e in fwd_edges]
+            copy_mem = self._snapshot_window(loop, arr, sdfg, read_subsets) or Memlet.from_array(arr, desc)
+            pre = loop.parent_graph.add_state_before(loop, label=f'{arr}_split_snapshot')
+            pre.add_nedge(pre.add_read(arr), pre.add_write(snap), copy_mem)
+            # sorted: ``sym_guards`` is a set of sympy exprs (hashed via symbol-name strings). It is iterated
+            # to EMIT tasklets into ``pre``, so its order fixes their node names/ids and the emitted C order.
+            for expr in sorted(sym_guards, key=symbolic.symstr):
+                # STRICT (>0) guard -- NOT the >=0 the whole-array policy uses. There every read of
+                # ``arr`` moves to the snapshot and a same-index read ``arr[i]`` equals the pre-loop
+                # original (only iteration i writes ``arr[i]``), so a symbolic offset of 0 is sound.
+                # HERE the shape is MIXED -- ``arr[i]=..; d[i]=arr[i]+arr[i+sym]`` -- so a SIBLING
+                # statement writes ``arr[i]`` earlier in the SAME iteration, and a read
+                # ``arr[i+sym]`` with ``sym == 0`` aliases that just-written live value and must NOT
+                # be redirected to the stale snapshot. Trap unless ``sym >= 1`` (offsets are integer,
+                # so ``sym - 1 >= 0`` is exactly the strict ``sym > 0``); ``sym == 0`` is then a loud
+                # runtime fault instead of a silent miscompile.
+                self._emit_positive_guard(pre, expr - 1)
+
+            for src, e in fwd_edges:
+                snap_node = state.add_access(snap)
+                new_mem = Memlet(data=snap, subset=e.data.get_src_subset(e, state))
+                if isinstance(e.dst, nodes.AccessNode):
+                    new_mem.other_subset = e.data.get_dst_subset(e, state)
+                state.add_edge(snap_node, e.src_conn, e.dst, e.dst_conn, new_mem)
+                state.remove_edge(e)
+                if state.degree(src) == 0:
+                    state.remove_node(src)
+            applied += 1
+        return applied
+
     def apply_pass(self, sdfg: SDFG, _pipeline_results: Dict[str, Any]) -> Optional[int]:
         """Snapshot-rename every loop with a read-ahead anti-dependence; returns the
         number of arrays renamed, or ``None``.
 
-        Handles the whole-array pure-WAR rename: every read of the array is read-ahead,
-        so the array is snapshotted before the loop and all its reads move to the
-        snapshot. The per-edge MIXED shape (only the read-ahead edges of an array whose
-        sibling reads are RAW) belongs to
-        :meth:`SplitStatements._snapshot_forward_reads`, which is what the canonicalize
-        pipeline runs."""
+        ``forward_reads`` picks the admission policy (see the module docstring): the default
+        whole-array pure-WAR rename, or the per-edge read-ahead break that unbinds two statements
+        of a loop that stays sequential."""
+        if self.forward_reads:
+            applied = 0
+            for loop in self._loops(sdfg):
+                applied += self._snapshot_forward_reads(loop, sdfg)
+            return applied or None
         renamed = 0
         for loop in self._loops(sdfg):
             if not self._safe_stride(loop, sdfg):

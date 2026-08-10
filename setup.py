@@ -32,7 +32,7 @@ try:
         output = subprocess.check_output([cmake_path, '--version']).decode('utf-8')
         cmake_version = tuple(int(t) for t in output.splitlines()[0].split(' ')[-1].split('.'))
         # If version meets minimum requirements, CMake is not necessary
-        if cmake_version >= (3, 17):
+        if cmake_version >= (3, 18):
             cmake_requires = []
 except (subprocess.CalledProcessError, OSError, IndexError, ValueError):
     # Any failure in getting the CMake version counts as "not found"
@@ -91,6 +91,9 @@ setup(
             'ipykernel',
             'nbconvert',
             'pytest-timeout',
+            # Plotting the corpus perf results (tests/perf/plot_corpus_perf.py); analysis only,
+            # never imported by dace itself.
+            'matplotlib',
         ],
         'ml-testing': [
             'coverage', 'pytest-cov', 'scipy', 'absl-py', 'opt_einsum', 'pymlir', 'click', 'ipykernel', 'nbconvert',

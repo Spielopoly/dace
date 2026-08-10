@@ -114,21 +114,36 @@ def nest_sdfg_subgraph(sdfg: SDFG, subgraph: SubgraphView, start: Optional[SDFGS
                     if s in sdfg.arrays:
                         read_set.add(s)
 
-        # Find NestedSDFG's unique data
+        # Find NestedSDFG's unique data -- the transients nothing OUTSIDE the subgraph observes, which
+        # move into the nest instead of crossing its boundary as connectors.
         rw_set = read_set | write_set
+        #
+        # ``blocks`` is the subgraph at BLOCK level, so it holds a control-flow region as ONE node
+        # while ``sdfg.states()`` yields the states nested inside it -- ``state in blocks`` therefore
+        # never matched for a region subgraph, and a transient used only inside an outlined
+        # LoopRegion still came back out as a connector. ``all_blocks`` is the same subgraph
+        # flattened to every block it contains, which is the container this test has to consult.
+        inside = set(all_blocks)
+        outside_names: Set[str] = set()
+        for block in sdfg.all_control_flow_blocks():
+            if block in inside:
+                continue
+            if isinstance(block, SDFGState):
+                outside_names.update(n.data for n in block.data_nodes())
+            elif isinstance(block, ConditionalBlock):
+                for c, _ in block.branches:
+                    if c is not None:
+                        outside_names.update(c.get_free_symbols())
+            elif isinstance(block, LoopRegion):
+                outside_names.update(block.loop_condition.get_free_symbols())
+        # A promoted scalar is read by NAME on an interstate edge, not through an access node, so the
+        # node walk alone would call it unused and move a live value into the nest.
+        for edge in sdfg.all_interstate_edges():
+            if edge.src not in inside or edge.dst not in inside:
+                outside_names.update(edge.data.free_symbols)
         unique_set = set()
         for name in rw_set:
-            if not sdfg.arrays[name].transient:
-                continue
-            found = False
-            for state in sdfg.states():
-                if state in blocks:
-                    continue
-                for node in state.nodes():
-                    if (isinstance(node, nodes.AccessNode) and node.data == name):
-                        found = True
-                        break
-            if not found:
+            if sdfg.arrays[name].transient and name not in outside_names:
                 unique_set.add(name)
 
         # Find NestedSDFG's connectors
@@ -1197,7 +1212,8 @@ def replicate_scope(sdfg: SDFG, state: SDFGState, scope: ScopeSubgraphView) -> S
     new_nodes = []
     new_entry = None
     new_exit = None
-    to_find_new_names: Set[nodes.AccessNode] = set()
+    # List, not a set: rename order must stay deterministic run to run.
+    to_find_new_names: List[nodes.AccessNode] = []
     # One memo for the whole clone: a scope's entry and exit share a single Map/Consume object,
     # and a per-node deepcopy hands them one copy each -- an identity split that validate_state
     # now rejects and that CPU codegen would otherwise turn into an unbalanced map brace.
@@ -1212,7 +1228,7 @@ def replicate_scope(sdfg: SDFG, state: SDFGState, scope: ScopeSubgraphView) -> S
 
         if (isinstance(node, nodes.AccessNode) and node.desc(sdfg).lifetime == dtypes.AllocationLifetime.Scope
                 and node.desc(sdfg).transient):
-            to_find_new_names.add(node_copy)
+            to_find_new_names.append(node_copy)
         state.add_node(node_copy)
         new_nodes.append(node_copy)
 
@@ -1230,11 +1246,16 @@ def replicate_scope(sdfg: SDFG, state: SDFGState, scope: ScopeSubgraphView) -> S
     # Set the exit node's map to match the entry node
     new_exit.map = new_entry.map
 
-    # Replicate all temporary transients within scope
+    # Replicate all temporary transients within scope. One new name per container, shared by
+    # every AccessNode replica of it, so a later reader stays bound to its writer's name.
+    renamed: Dict[str, str] = {}
     for node in to_find_new_names:
         desc = node.desc(sdfg)
         old_name = node.data
-        new_name = sdfg.add_datadesc(old_name, copy.deepcopy(desc), find_new_name=True)
+        new_name = renamed.get(old_name)
+        if new_name is None:
+            new_name = sdfg.add_datadesc(old_name, copy.deepcopy(desc), find_new_name=True)
+            renamed[old_name] = new_name
         node.data = new_name
         for edge in state.all_edges(node):
             for e in state.memlet_tree(edge):
@@ -1245,8 +1266,14 @@ def replicate_scope(sdfg: SDFG, state: SDFGState, scope: ScopeSubgraphView) -> S
                 # blindly renaming every edge corrupts those unrelated memlets. A
                 # dependency edge (structural, no data) carries ``data is None`` and
                 # is skipped by the same guard.
-                if e.data is not None and e.data.data == old_name:
-                    e.data.data = new_name
+                if e.data is None or e.data.data != old_name:
+                    continue
+                # Skip an edge touching an out-of-scope AccessNode of the same container (its
+                # container wasn't renamed); an in-scope sibling replica shares the new name.
+                if any(n is not node and isinstance(n, nodes.AccessNode) and n.data == old_name and not any(
+                        n is m for m in new_nodes) for n in (e.src, e.dst)):
+                    continue
+                e.data.data = new_name
 
     return ScopeSubgraphView(state, new_nodes, new_entry)
 

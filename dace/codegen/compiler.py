@@ -657,13 +657,6 @@ def cmake_configure_and_build(
                 command_db.template(command_db.capture(build_folder), build_folder, program_folder, program_name))
 
 
-#: Program folders this process built that no later run could ever address, dropped on the way out.
-#: Not tied to ``CompiledSDFG`` lifetime: CPython frees that object through the garbage collector,
-#: so "the folder goes when the handle goes" is not a moment anything can observe -- a reference
-#: cycle anywhere in the call graph defers it arbitrarily.
-_disposable_folders: Set[str] = set()
-
-
 def build_folder_is_disposable(sdfg: 'dace.SDFG') -> bool:
     """Whether ``sdfg``'s build folder is garbage the moment this process is done with it.
 
@@ -677,6 +670,13 @@ def build_folder_is_disposable(sdfg: 'dace.SDFG') -> bool:
     An explicitly assigned build folder is the caller's, never ours to remove.
     """
     return sdfg.build_folder_is_default and Config.get('cache') == 'unique'
+
+
+#: Program folders this process built that no later run could ever address, dropped on the way out.
+#: Not tied to ``CompiledSDFG`` lifetime: CPython frees that object through the garbage collector,
+#: so "the folder goes when the handle goes" is not a moment anything can observe -- a reference
+#: cycle anywhere in the call graph defers it arbitrarily.
+_disposable_folders: Set[str] = set()
 
 
 def register_disposable_folder(sdfg: 'dace.SDFG') -> None:

@@ -19,9 +19,19 @@ from dace.transformation import transformation as xf
 from dace.transformation.passes.analysis import loop_analysis
 
 
+def _align_itersym(expr, itersym):
+    """Re-point free symbols named like ``itersym`` at ``itersym``: same-named sympy symbols
+    with different assumptions are distinct objects and silently mismatch in ``.match()``."""
+    repl = {s: itersym for s in expr.free_symbols if s.name == itersym.name and s is not itersym}
+    return expr.subs(repl) if repl else expr
+
+
 def _check_range(subset, a, itersym, b, step):
     found = False
     for rb, re, _ in subset.ndrange():
+        # ``ndrange()`` yields plain ints as well as sympy expressions, and an int has no ``match``
+        # -- a fixed-slot write such as a scalar's ``[0]`` would raise instead of failing the test.
+        rb, re = _align_itersym(sp.sympify(rb), itersym), _align_itersym(sp.sympify(re), itersym)
         if rb != 0:
             m = rb.match(a * itersym + b)
             if m is None:
@@ -234,6 +244,11 @@ def _dim_provably_disjoint(idx1, idx2, itersym, step=1, start=0) -> bool:
     A2 = a2 * step_s
     B1 = a1 * start_s + b1
     B2 = a2 * start_s + b2
+    # One name can be TWO sympy symbols here -- identity folds in the assumptions and the DaCe dtype,
+    # so a subset rebuilt through arithmetic carries a differently-tagged ``i`` from the one a bound
+    # was reparsed into. They never cancel, so the ``a[i]``/``a[i-1]`` pair of an inner loop leaves
+    # ``i - 1 - i`` symbolic, ``is_number`` False, and a provably disjoint pair reads as "may alias".
+    B1, B2 = symbolic.equalize_symbols(B1, B2)
     diff = sp.expand(B2 - B1)
     if A1 == 0 and A2 == 0:
         return diff.is_number and diff != 0
@@ -249,6 +264,92 @@ def _dim_provably_disjoint(idx1, idx2, itersym, step=1, start=0) -> bool:
     if not diff.is_Integer:
         return True
     return sp.Integer(diff) % g != 0
+
+
+def carried_local_transients(loop: LoopRegion, candidates: Set[str]) -> Set[str]:
+    """ Among ``candidates`` -- transients that appear ONLY inside ``loop`` -- the ones an iteration
+        can READ before it writes them, so their value comes from the PREVIOUS iteration.
+
+        :func:`LoopToMap.apply` privatizes every loop-local transient into the loop-body NestedSDFG,
+        giving each iteration a private copy. That is sound only when the iteration writes the
+        transient before it reads it; one that is read first is a loop-carried dependency and
+        privatizing it silently drops the carry (``if c: t = x`` / ``use(t)`` keeps ``t`` from the
+        last iteration that took the branch). Such a transient is reported here so it re-enters the
+        ordinary write-index analysis, which refuses the lift: a carrier is written at a fixed slot,
+        never at ``a*i+b``.
+
+        A write inside a ``ConditionalBlock`` counts only when the conditional is exhaustive (has an
+        else arm) and every branch writes -- the partially-guarded write IS the carry shape. A write
+        inside a nested ``LoopRegion`` counts: treating a nested loop as possibly-empty would report
+        every scratch array CloudSC fills in one inner ``jl`` loop and reads back in the next, and
+        refuse the outer loops this pass exists to parallelize.
+
+        A carry nothing outside ``candidates`` depends on is dropped again by
+        :func:`observable_locals`: dead scratch left behind by an earlier rewrite would otherwise
+        cost the loop its lift.
+    """
+    carried: Set[str] = set()
+
+    def scan(region: ControlFlowRegion, written: Set[str]) -> None:
+        for block in cfg_analysis.blockorder_topological_sort(region, recursive=False, ignore_nonstate_blocks=False):
+            if isinstance(block, SDFGState):
+                for dn in block.data_nodes():
+                    if (dn.data in candidates and dn.data not in written and block.in_degree(dn) == 0
+                            and block.out_degree(dn) > 0):
+                        carried.add(dn.data)
+                written |= {dn.data for dn in block.data_nodes() if dn.data in candidates and block.in_degree(dn) > 0}
+            elif isinstance(block, ConditionalBlock):
+                per_branch = []
+                for _cond, body in block.branches:
+                    branch_written = set(written)
+                    scan(body, branch_written)
+                    per_branch.append(branch_written)
+                if per_branch and any(cond is None for cond, _ in block.branches):
+                    written |= set.intersection(*per_branch)
+            elif isinstance(block, ControlFlowRegion):
+                scan(block, written)
+
+    scan(loop, set())
+    if not carried:
+        return carried
+    return carried & observable_locals(loop, candidates)
+
+
+def observable_locals(loop: LoopRegion, candidates: Set[str]) -> Set[str]:
+    """ Among ``candidates`` -- transients that appear ONLY inside ``loop`` -- the ones whose value
+        can be observed outside the set: it flows into a container that is not a candidate, or a
+        header/interstate edge of ``loop`` reads it.
+
+        Everything else is dead within the loop, so no privatization of it can change an output.
+        The pipeline reaches ``LoopToMap`` with such scratch in hand: lifting a recurrence to a
+        ``Scan`` leaves the original loop behind writing a renamed private copy nothing reads, and
+        refusing that loop on its own dead carry keeps it as a residual ``LoopRegion`` that
+        fragments the maps around it.
+    """
+    downstream: Dict[str, Set[str]] = defaultdict(set)
+    for block in loop.all_control_flow_blocks():
+        if not isinstance(block, SDFGState):
+            continue
+        for dn in block.data_nodes():
+            if dn.data not in candidates:
+                continue
+            for reached in block.bfs_nodes(dn):
+                if isinstance(reached, nodes.AccessNode) and reached is not dn:
+                    downstream[dn.data].add(reached.data)
+
+    read_by_control_flow = {s for e in loop.all_interstate_edges() for s in e.data.free_symbols}
+    headers = [loop] + [b for b in loop.all_control_flow_blocks() if isinstance(b, (LoopRegion, ConditionalBlock))]
+    read_by_control_flow |= {s for h in headers for c in h.get_meta_codeblocks() for s in c.get_free_symbols()}
+
+    observable = {n for n in candidates if n in read_by_control_flow or (downstream[n] - candidates)}
+    changed = True
+    while changed:
+        changed = False
+        for name in candidates - observable:
+            if downstream[name] & observable:
+                observable.add(name)
+                changed = True
+    return observable
 
 
 def loop_varying_symbols(loop: LoopRegion) -> Set[str]:
@@ -369,8 +470,7 @@ def _collision_forces_same_iteration(sub1: subsets.Subset, sub2: subsets.Subset,
     if len(nd1) != len(nd2) or len(nd1) == 0:
         return False
     p, q = sp.Dummy('p'), sp.Dummy('q')
-    eqs = []
-    params: Set[str] = set()
+    indices = []
     for (b1, e1, _), (b2, e2, _) in zip(nd1, nd2):
         if b1 != e1 or b2 != e2:  # only point subsets participate in the collision system
             return False
@@ -385,8 +485,17 @@ def _collision_forces_same_iteration(sub1: subsets.Subset, sub2: subsets.Subset,
         # p != q -- TSVC s114's OUTER transpose anti-dependence, a genuine carried dependence.
         if any(str(s) in varying for s in x1.free_symbols) or any(str(s) in varying for s in x2.free_symbols):
             return False
-        eqs.append(sp.expand(x1.subs(itersym, p) - x2.subs(itersym, q)))
-        params |= {s for s in (set(x1.free_symbols) | set(x2.free_symbols)) if str(s) != str(itersym)}
+        indices.append((x1, x2))
+
+    # One name can reach us as SEVERAL sympy symbols, and each instance then occupies its own monomial
+    # that no choice of ``lam_d`` can cancel, so a certificate that exists is never found: s114's read
+    # ``aa[j,i]`` and write ``aa[i,j]`` carry three different instances of ``i`` between them. The clash
+    # is across DIMENSIONS as much as within one, hence the whole group at once, not pair by pair.
+    flat = symbolic.equalize_symbols_across(*[x for pair in indices for x in pair])
+    indices = list(zip(flat[::2], flat[1::2]))
+
+    eqs = [sp.expand(x1.subs(itersym, p) - x2.subs(itersym, q)) for x1, x2 in indices]
+    params = {s for x1, x2 in indices for s in (set(x1.free_symbols) | set(x2.free_symbols)) if str(s) != str(itersym)}
     monomials = [p, q] + sorted(params, key=str)
     # Require every equation affine (total degree <= 1) in {p, q, params}; bail conservatively
     # on anything non-linear (e.g. ``A[i*i]``) where a linear certificate would be unsound.
@@ -611,6 +720,19 @@ class LoopToMap(xf.MultiStateTransformation):
         # Add non-transient nodes from loop state
         for state in loop_states:
             other_access_nodes |= set(n.data for n in state.data_nodes() if not sdfg.arrays[n.data].transient)
+        # A transient living ONLY in the loop is exempt from the analysis below because ``apply``
+        # gives every iteration a private copy -- sound only while each iteration writes it before
+        # reading it (see :func:`carried_local_transients`). The whole loop-local set is the
+        # analysis universe; a pure-read access node among them is the cheap trigger that keeps the
+        # block-order walk off most loops.
+        local_transients = {
+            n.data
+            for state in loop_states
+            for n in state.data_nodes() if sdfg.arrays[n.data].transient
+        } - other_access_nodes
+        if any(n.data in local_transients and state.in_degree(n) == 0 and state.out_degree(n) > 0
+               for state in loop_states for n in state.data_nodes()):
+            other_access_nodes |= carried_local_transients(self.loop, local_transients)
 
         # read_and_write_sets() walks every state/edge of the loop and is only needed from here
         # on (the per-array write analysis below). Computing it lazily -- after the cheaper
@@ -967,16 +1089,15 @@ class LoopToMap(xf.MultiStateTransformation):
                         if e.data.data and e.data.data in sdfg.arrays:
                             write_set.add(e.data.data)
 
-        # Add headers of any nested loops and conditional blocks
-        nodelist = list(self.loop.nodes())
-        while nodelist:
-            node = nodelist.pop()
-            if isinstance(node, (LoopRegion, ConditionalBlock)):
-                code_blocks = node.get_meta_codeblocks()
-                free_syms = {s for c in code_blocks for s in c.get_free_symbols()}
-                free_syms = {s for s in free_syms if s in sdfg.arrays.keys()}
-                read_set |= set(free_syms)
-                nodelist.extend(node.nodes())
+        # Add headers of any nested loops and conditional blocks, at EVERY depth: a walk that
+        # recurses only into LoopRegion / ConditionalBlock stops at a ConditionalBlock's branch,
+        # which is a plain ControlFlowRegion. A container a header below that point reads then
+        # stayed a free symbol of the body, which ``add_nested_sdfg`` types ``int`` -- truncating
+        # CloudSC's float64 ``yrecldp_rlmin`` threshold to 0 and flipping the branch it guards.
+        for block in self.loop.all_control_flow_blocks():
+            if isinstance(block, (LoopRegion, ConditionalBlock)):
+                free_syms = {s for c in block.get_meta_codeblocks() for s in c.get_free_symbols()}
+                read_set |= {s for s in free_syms if s in sdfg.arrays}
 
         # Add data from edges
         for edge in self.loop.all_interstate_edges():

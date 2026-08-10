@@ -310,13 +310,21 @@ class ExperimentalCUDACodeGen(TargetCodeGenerator):
             kernel_function_stream = self._globalcode
 
             self._in_device_code = True
-
-            kernel_scope_generator = KernelScopeGenerator(codegen=self)
-            if kernel_scope_generator.applicable(sdfg, cfg, dfg_scope, state_id, kernel_function_stream, kernel_stream):
-                kernel_scope_generator.generate(sdfg, cfg, dfg_scope, state_id, kernel_function_stream, kernel_stream)
-            else:
-                raise ValueError("Invalid kernel configuration: This strategy is only applicable if the "
-                                 "outermost GPU schedule is of type GPU_Device (most likely cause).")
+            # Key generated-function dedup to the .cu owner for this whole scope: helpers flushed
+            # during scope allocation under the host key would otherwise be redefined in the .cu.
+            old_codegen = self._cpu_codegen.calling_codegen
+            self._cpu_codegen.calling_codegen = self
+            try:
+                kernel_scope_generator = KernelScopeGenerator(codegen=self)
+                if kernel_scope_generator.applicable(sdfg, cfg, dfg_scope, state_id, kernel_function_stream,
+                                                     kernel_stream):
+                    kernel_scope_generator.generate(sdfg, cfg, dfg_scope, state_id, kernel_function_stream,
+                                                    kernel_stream)
+                else:
+                    raise ValueError("Invalid kernel configuration: This strategy is only applicable if the "
+                                     "outermost GPU schedule is of type GPU_Device (most likely cause).")
+            finally:
+                self._cpu_codegen.calling_codegen = old_codegen
 
             self._localcode.write(scope_entry_stream.getvalue())
             self._localcode.write(kernel_stream.getvalue() + '\n')

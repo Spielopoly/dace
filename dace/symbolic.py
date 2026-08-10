@@ -9,7 +9,7 @@ import threading
 import pickle
 import re
 import types
-from typing import Any, Callable, Dict, FrozenSet, Iterable, Optional, Set, Tuple, Union, TYPE_CHECKING, List
+from typing import Any, Callable, Dict, FrozenSet, Iterable, Optional, Set, Tuple, Type, Union, TYPE_CHECKING, List
 import numpy
 import sympy.abc
 import sympy.printing.str
@@ -1492,6 +1492,8 @@ class int_floor(DaceFunction):
         if y.is_Number:
             if y == 1:
                 return x
+            if y == -1:
+                return -x
             # Exact division is not a rounding operation at all -- return the quotient itself, so the
             # expression stays comparable and simplifiable instead of hiding behind an int_floor node.
             quotient = x / y
@@ -1810,19 +1812,65 @@ _builtin_userfunctions.update(_CAST_CLASSES)
 
 
 class bitwise_and(DaceFunction):
-    pass
+
+    @classmethod
+    def eval(cls, x, y):
+        """
+        Evaluates a bitwise AND.
+
+        :param x: Left operand.
+        :param y: Right operand.
+        :return: The folded literal if both operands are concrete integers, else ``None``.
+        """
+        # Fold concrete integers, exactly as ``left_shift``/``right_shift`` do. Without this the
+        # expression stays unevaluated and any consumer that unparses it to Python source and
+        # ``eval``s it (e.g. ``replacements.utils.sym_type``) raises ``NameError: bitwise_and``.
+        if x.is_Integer and y.is_Integer:
+            return sympy.Integer(int(x) & int(y))
 
 
 class bitwise_or(DaceFunction):
-    pass
+
+    @classmethod
+    def eval(cls, x, y):
+        """
+        Evaluates a bitwise OR.
+
+        :param x: Left operand.
+        :param y: Right operand.
+        :return: The folded literal if both operands are concrete integers, else ``None``.
+        """
+        if x.is_Integer and y.is_Integer:
+            return sympy.Integer(int(x) | int(y))
 
 
 class bitwise_xor(DaceFunction):
-    pass
+
+    @classmethod
+    def eval(cls, x, y):
+        """
+        Evaluates a bitwise XOR.
+
+        :param x: Left operand.
+        :param y: Right operand.
+        :return: The folded literal if both operands are concrete integers, else ``None``.
+        """
+        if x.is_Integer and y.is_Integer:
+            return sympy.Integer(int(x) ^ int(y))
 
 
 class bitwise_invert(DaceFunction):
-    pass
+
+    @classmethod
+    def eval(cls, x):
+        """
+        Evaluates a bitwise NOT.
+
+        :param x: Operand.
+        :return: The folded literal if the operand is a concrete integer, else ``None``.
+        """
+        if x.is_Integer:
+            return sympy.Integer(~int(x))
 
 
 class left_shift(DaceFunction):
@@ -1922,6 +1970,20 @@ class __left_shift(left_shift):
 
 class __right_shift(right_shift):
     pass
+
+
+# Symbolic counterpart of every Python bitwise/shift operator, keyed by the ``ast`` operator class
+# name. Holds the ``__``-prefixed variants so a parsed expression prints back as the operator and
+# therefore round-trips. Lives at module level because a ``__``-prefixed name written inside a class
+# body -- e.g. the serialized-SDFG parser's ``_binops`` table below -- would be name-mangled.
+BITWISE_OPERATOR_FUNCTIONS: Dict[str, Type[DaceFunction]] = {
+    'BitAnd': __bitwise_and,
+    'BitOr': __bitwise_or,
+    'BitXor': __bitwise_xor,
+    'Invert': __bitwise_invert,
+    'LShift': __left_shift,
+    'RShift': __right_shift,
+}
 
 
 class ROUND(DaceFunction):
@@ -2466,6 +2528,20 @@ class PythonOpToSympyConverter(ast.NodeTransformer):
         return ast.copy_location(new_node, node)
 
 
+def _construct_function_uncached(func, *args, **kwargs):
+    # Construct without SymPy's ``@cacheit`` constructor caches (both
+    # ``Function.__new__`` and ``Application.__new__`` are cached, and ``eval``
+    # implementations re-enter them): DaCe symbol equality ignores dtype, so a
+    # cache entry built from an equal-named, different-dtype symbol would
+    # silently substitute that symbol into the result. Symbol-free arguments
+    # hash soundly and keep the regular (evaluating) constructors.
+    if (isinstance(func, type) and issubclass(func, sympy.core.function.Application)
+            and not (set(kwargs) - {'evaluate'}) and not kwargs.get('evaluate', False)
+            and any(isinstance(arg, sympy.Basic) and arg.free_symbols for arg in args)):
+        return sympy.Basic.__new__(func, *args)
+    return func(*args, **kwargs)
+
+
 class _SerializedSymbolicParser(ast.NodeVisitor):
     """
     Parser for the deterministic expression strings produced by
@@ -2572,26 +2648,46 @@ class _SerializedSymbolicParser(ast.NodeVisitor):
 
     @staticmethod
     def _binop_mod(a, b):
-        return sympy.Mod(a, b, evaluate=False)
+        return _construct_function_uncached(sympy.Mod, a, b, evaluate=False)
 
     @staticmethod
     def _unary_minus(a):
         return _SerializedSymbolicParser._negate(a)
 
     _binops = {
-        ast.Add: _binop_add,
-        ast.Sub: _binop_sub,
-        ast.Mult: _binop_mul,
-        ast.Div: _binop_div,
-        ast.Pow: _binop_pow,
-        ast.Mod: _binop_mod,
-        ast.FloorDiv: lambda a, b: int_floor(a, b),
+        ast.Add:
+        _binop_add,
+        ast.Sub:
+        _binop_sub,
+        ast.Mult:
+        _binop_mul,
+        ast.Div:
+        _binop_div,
+        ast.Pow:
+        _binop_pow,
+        ast.Mod:
+        _binop_mod,
+        ast.FloorDiv:
+        lambda a, b: _construct_function_uncached(int_floor, a, b),
+        # A hand-written or hand-edited SDFG may spell a subset/range with the bitwise and shift
+        # operators rather than the serializer's function form; without these the parser raised
+        # ``KeyError: <class 'ast.BitAnd'>``. Mirrors what ``pystr_to_symbolic`` mints.
+        ast.BitAnd:
+        BITWISE_OPERATOR_FUNCTIONS['BitAnd'],
+        ast.BitOr:
+        BITWISE_OPERATOR_FUNCTIONS['BitOr'],
+        ast.BitXor:
+        BITWISE_OPERATOR_FUNCTIONS['BitXor'],
+        ast.LShift:
+        BITWISE_OPERATOR_FUNCTIONS['LShift'],
+        ast.RShift:
+        BITWISE_OPERATOR_FUNCTIONS['RShift'],
     }
     _unaryops = {
         ast.UAdd: lambda a: +a,
         ast.USub: _unary_minus,
-        ast.Not: lambda a: sympy.Not(a),
-        ast.Invert: lambda a: bitwise_invert(a),
+        ast.Not: lambda a: _construct_function_uncached(sympy.Not, a),
+        ast.Invert: lambda a: _construct_function_uncached(bitwise_invert, a),
     }
     _comparators = {
         ast.Eq: sympy.Eq,
@@ -2705,20 +2801,22 @@ class _SerializedSymbolicParser(ast.NodeVisitor):
         if isinstance(node.op, ast.And):
             result = values[0]
             for value in values[1:]:
-                result = AND(result, value)
+                result = _construct_function_uncached(AND, result, value)
             return result
         result = values[0]
         for value in values[1:]:
-            result = OR(result, value)
+            result = _construct_function_uncached(OR, result, value)
         return result
 
     def visit_Compare(self, node):
         if len(node.ops) != 1 or len(node.comparators) != 1:
             raise NotImplementedError('Chained comparisons are not supported in symbolic deserialization')
-        return self._comparators[type(node.ops[0])](self.visit(node.left), self.visit(node.comparators[0]))
+        return _construct_function_uncached(self._comparators[type(node.ops[0])], self.visit(node.left),
+                                            self.visit(node.comparators[0]))
 
     def visit_IfExp(self, node):
-        return IfExpr(self.visit(node.test), self.visit(node.body), self.visit(node.orelse))
+        return _construct_function_uncached(IfExpr, self.visit(node.test), self.visit(node.body),
+                                            self.visit(node.orelse))
 
     def visit_Call(self, node):
         if isinstance(node.func, ast.Name) and node.func.id == '__dace_typed_const__':
@@ -2768,9 +2866,7 @@ class _SerializedSymbolicParser(ast.NodeVisitor):
             return _cast_symbolic_value(args[0], func)
 
         kwargs = {kw.arg: self.visit(kw.value) for kw in node.keywords}
-        if kwargs:
-            return func(*args, **kwargs)
-        return func(*args)
+        return _construct_function_uncached(func, *args, **kwargs)
 
     def visit_Attribute(self, node):
         if isinstance(node.value, ast.Name) and node.value.id == 'dace':
@@ -2778,7 +2874,9 @@ class _SerializedSymbolicParser(ast.NodeVisitor):
                 return getattr(dtypes, node.attr)
             except AttributeError as ex:
                 raise TypeError(f'Unknown DaCe dtype "{node.attr}"') from ex
-        return Attr(self.visit(node.value), sympy_symbol(node.attr))
+        # Uncached: a symbol-bearing function expression built through SymPy's cache can come
+        # back with an equal-named symbol of the wrong dtype.
+        return _construct_function_uncached(Attr, self.visit(node.value), symbol(node.attr))
 
     def generic_visit(self, node):
         raise TypeError(f'Unsupported node in symbolic deserialization: {type(node).__name__}')
@@ -2806,7 +2904,7 @@ def _cast_symbolic_value(value, dtype: dtypes.typeclass):
         return TypedConstant(value, dtype=dtype)
     # Non-constant composite expressions are preserved as explicit casts so they
     # can round-trip even when no constant/symbol dtype rewrite is possible.
-    return sympy.Function(f'dace.{dtype.to_string()}')(value)
+    return _construct_function_uncached(sympy.Function(f'dace.{dtype.to_string()}'), value)
 
 
 class DaceSympySerializer(sympy.printing.str.StrPrinter):
@@ -3162,6 +3260,11 @@ def provably_nonnegative(expr, assume_symbols_nonnegative: bool = False) -> bool
     CANONICALIZATION contract (runtime-guarded there), not a property of SDFGs at large, so it is
     off by default: a caller that has not established it must not be handed an answer leaning on it.
     """
+    if isinstance(expr, sympy.Expr):
+        # A bound reparsed from a CodeBlock string and a subset an assumption-setting pass rebuilt
+        # spell one name as two sympy symbols, which then never cancel -- ``x - x`` reads as undecided
+        # rather than 0. Merging them only ever decides an expression that was unprovable before.
+        expr = equalize_symbol(expr)
     s = simplify(expr)
     if not isinstance(s, sympy.Basic):
         return s >= 0
@@ -3260,6 +3363,8 @@ class DaceSympyPrinter(sympy.printing.str.StrPrinter):
         # expression keeps its exact (truncating for int) semantics.
         if self.cpp_mode and str(expr.func) in _TYPECAST_CPP:
             return '%s(%s)' % (_TYPECAST_CPP[str(expr.func)], self._print(expr.args[0]))
+        if self.cpp_mode and str(expr.func) == 'fma':
+            return 'dace::math::fma(%s)' % ', '.join(self._print(arg) for arg in expr.args)
         # Complex conjugate: ``conj(x)`` -> ``dace::math::conj(x)`` in C++
         if self.cpp_mode and str(expr.func) in ('conj', 'conjugate'):
             return 'dace::math::conj(%s)' % self._print(expr.args[0])
@@ -3641,15 +3746,69 @@ class SympyAwareUnpickler(pickle.Unpickler):
             raise pickle.UnpicklingError("unsupported persistent object")
 
 
+def free_symbol_like(expr: Any, sym: Any) -> sympy.Symbol | None:
+    """The instance of `sym` that `expr` actually holds -- same NAME, whatever assumptions and dtype
+    it carries -- or ``None`` when `expr` does not depend on that name.
+
+    Sympy symbol identity folds in the assumptions AND (per :meth:`symbol._hashable_content`) the DaCe
+    dtype, so one SDFG legitimately holds both spellings of a name: ``a[i]`` keeps the plain ``i`` while
+    an ``a[N - i - 1]`` rebuilt by an assumption-setting pass carries a ``nonnegative``, ``int64`` one.
+    Queried with the wrong instance, ``sym in expr.free_symbols`` is silently ``False`` and
+    ``expr.coeff(sym, 1)`` silently ``0`` -- no error, just a predicate that quietly stops holding.
+    :meth:`symbol._eval_subs` already settles substitution by name; this is the same rule for the
+    membership / coefficient queries, which go through hash and ``__eq__`` and so bypass it.
+
+    Hands back the expression's OWN instance rather than rewriting `expr`, so nothing downstream loses
+    an assumption or has its index arithmetic silently retyped.
+
+    :param expr: The expression to look in; a non-symbolic value holds no symbol and gives ``None``.
+    :param sym: The symbol to look for. Only its name is used.
+    :returns: `expr`'s instance of that name, or ``None``.
+    """
+    if not isinstance(expr, SymbolicBasic):
+        return None
+    free = expr.free_symbols
+    if sym in free:
+        return sym  # identical spelling, the common case: settled by one hash lookup
+    matches = [s for s in free if s.name == sym.name]
+    if not matches:
+        return None
+    # `free_symbols` is a set, so pick deterministically when one name is split across variants.
+    return matches[0] if len(matches) == 1 else min(matches, key=structural_repr)
+
+
+def symbol_merge_key(sym: Any) -> tuple[int, str, str]:
+    """Total order over same-named symbol instances, smallest = the one to keep.
+
+    Most DECLARED first: an instance that lost assumptions did so by being reparsed from a string,
+    which cannot know what the SDFG declared about the name. The rest of the key only has to break
+    ties, and must do so without reading `free_symbols` iteration order, which varies per run.
+    """
+    declared = sum(1 for k in _STRUCTURAL_ASSUMPTIONS if sym.assumptions0.get(k))
+    ctype = sym.dtype.ctype if is_symbol_leaf(sym) else ''
+    return (-declared, structural_repr(sym), ctype)
+
+
 def equalize_symbol(sym: sympy.Expr) -> sympy.Expr:
+    """`sym` with every group of same-named free symbols collapsed onto one instance.
+
+    A name denotes ONE value in an SDFG, but sympy symbol identity folds in the assumptions and (per
+    :meth:`symbol._hashable_content`) the DaCe dtype, so an expression can hold two instances of a
+    name -- a subset an assumption-setting pass rebuilt, against a bound reparsed from its
+    ``CodeBlock`` string -- which sympy then treats as independent variables that never cancel.
     """
-    If a symbol or symbolic expressions has multiple symbols with the same
-    name, it substitutes them with the last symbol (as they appear in
-    s.free_symbols).
-    """
-    symdict = {s.name: s for s in sym.free_symbols}
-    repldict = {s: symdict[s.name] for s in sym.free_symbols}
-    return sym.subs(repldict)
+    free: set = sym.free_symbols
+    by_name: dict[str, list] = {}
+    for s in free:
+        by_name.setdefault(s.name, []).append(s)
+    if len(by_name) == len(free):
+        return sym  # every name unique: nothing to merge, and no rebuild to pay for
+    repl = {}
+    for group in by_name.values():
+        if len(group) > 1:
+            keep = min(group, key=symbol_merge_key)
+            repl.update({s: keep for s in group if s is not keep})
+    return sym.xreplace(repl)
 
 
 def equalize_symbols(a: sympy.Expr, b: sympy.Expr) -> Tuple[sympy.Expr, sympy.Expr]:
@@ -3669,6 +3828,37 @@ def equalize_symbols(a: sympy.Expr, b: sympy.Expr) -> Tuple[sympy.Expr, sympy.Ex
             repldict[b_syms[name]] = a_syms[name]
         b = b.subs(repldict)
     return a, b
+
+
+def equalize_symbols_across(*exprs: sympy.Expr) -> Tuple[sympy.Expr, ...]:
+    """The input expressions rewritten so every same-named free symbol is ONE instance across ALL of
+    them, chosen by :func:`symbol_merge_key`.
+
+    Use this before any operation that goes through symbol identity rather than name -- subtraction
+    that should cancel, ``.match`` against a ``Wild(exclude=[sym])``, ``sym in expr.free_symbols``,
+    ``expr.coeff(sym)`` -- whenever the expressions come from different sources (two memlets, a subset
+    against a reparsed loop bound). See :func:`equalize_symbol` for why one name yields several
+    instances; none of those operations raises when it happens, they just quietly answer wrong.
+
+    ⛔ Equalizing PAIRWISE is not the same as equalizing a GROUP, so this is not
+    :func:`equalize_symbols` applied repeatedly: three expressions equalized in pairs can still
+    disagree, and a linear system over them then puts one name in two monomials, making a solution
+    that exists unreachable. Unlike the 2-argument form, which keeps the FIRST expression's instance,
+    this picks the group's :func:`symbol_merge_key` minimum so the result does not depend on argument
+    order.
+    """
+    equalized = tuple(equalize_symbol(e) for e in exprs)
+    by_name: Dict[str, List[sympy.Symbol]] = {}
+    for e in equalized:
+        for s in e.free_symbols:
+            by_name.setdefault(s.name, []).append(s)
+    repl = {}
+    for group in by_name.values():
+        keep = min(group, key=symbol_merge_key)
+        repl.update({s: keep for s in group if s is not keep})
+    if not repl:
+        return equalized
+    return tuple(e.xreplace(repl) for e in equalized)
 
 
 def inequal_symbols(a: Union[sympy.Expr, Any], b: Union[sympy.Expr, Any]) -> bool:

@@ -1,7 +1,12 @@
 # Copyright 2019-2022 ETH Zurich and the DaCe authors. All rights reserved.
+import ctypes
 import ctypes.util
+import functools
 import glob
 import os
+import shutil
+import subprocess
+import warnings
 
 import dace.library
 
@@ -10,6 +15,13 @@ import dace.library
 # de-facto CMake/spack conventions. Each may name either an install prefix (with
 # ``lib``/``lib64`` + ``include`` under it) or a lib dir directly.
 OPENBLAS_ENV_VARS = ('OPENBLAS_DIR', 'OPENBLAS_ROOT', 'OPENBLAS_HOME', 'OpenBLAS_HOME')
+
+# ``openblas_get_parallel()`` return codes, and the spack variant each corresponds to.
+OPENBLAS_PARALLEL_NAMES = {
+    0: 'sequential (spack threads=none)',
+    1: 'pthreads (spack threads=pthreads)',
+    2: 'OpenMP (spack threads=openmp)'
+}
 
 
 def _include_dir_for(libdir):
@@ -92,7 +104,38 @@ def _standalone_libopenblas():
     lib = _scan_ld_library_path()
     if lib:
         return lib, _include_dir_for(os.path.dirname(lib))
+    root = _spack_openblas_prefix()
+    if root:
+        for libdir in (os.path.join(root, 'lib'), os.path.join(root, 'lib64')):
+            lib = _libopenblas_in(libdir)
+            if lib:
+                return lib, _include_dir_for(libdir)
     return None, None
+
+
+@functools.lru_cache(maxsize=1, typed=True)
+def _spack_openblas_prefix() -> str | None:
+    """Install prefix of a spack-managed OpenBLAS, or ``None``.
+
+    Last resort, after the env vars and the loader paths: an OpenBLAS that is merely *installed*
+    under spack, never ``spack load``ed, is on no search path at all and every earlier probe misses
+    it. Asking spack costs a subprocess, so it runs once per process and only once nothing cheaper
+    found a library. A spack that is absent, slow, or reports several matching installs leaves the
+    detection exactly where it was.
+    """
+    exe = shutil.which('spack')
+    if not exe:
+        return None
+    try:
+        out = subprocess.run([exe, 'location', '-i', 'openblas'],
+                             capture_output=True,
+                             text=True,
+                             timeout=30,
+                             check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    prefix = out.stdout.strip()
+    return prefix if out.returncode == 0 and os.path.isdir(prefix) else None
 
 
 def _openblas_present() -> bool:
@@ -105,6 +148,75 @@ def _system_blas_libs():
     """Generic distro BLAS shared libs (``liblapacke``/``libcblas``/``libblas``) on the loader
     path, or ``[]``. These are update-alternatives symlinks and may point at ANY implementation."""
     return [p for p in (ctypes.util.find_library(l) for l in ('lapacke', 'cblas', 'blas')) if p]
+
+
+def _mapped_openblas_path() -> str | None:
+    """Absolute path of the ``libopenblas`` this process actually mapped, or ``None``. Needed
+    because the loader is given a bare soname, and Debian and spack both keep several flavors
+    side by side -- only the concrete path tells the user which one they got."""
+    try:
+        with open('/proc/self/maps') as f:  # Linux-only; absent elsewhere, hence the guard
+            for line in f:
+                if 'libopenblas' in line:
+                    return line.rstrip().rsplit(' ', 1)[-1]
+    except OSError:
+        pass
+    return None
+
+
+@functools.lru_cache(maxsize=None, typed=True)
+def _openblas_threading_flavor() -> tuple[int | None, str | None, str | None]:
+    """``(parallel_code, config, path)`` of the OpenBLAS that would be loaded, ``(None, None, None)``
+    if none can be probed.
+
+    ``threads=openmp``, ``threads=pthreads`` and ``threads=none`` all install a file named
+    ``libopenblas.so``, so presence checks and filenames cannot tell them apart -- only calling
+    ``openblas_get_parallel()`` can. Loaded ``RTLD_LOCAL`` (ctypes' default) so it cannot interpose
+    on symbols numpy's own BLAS already provides, and cached so this costs one ``dlopen`` per
+    process."""
+    lib_path = _standalone_libopenblas()[0] or ctypes.util.find_library('openblas')
+    if not lib_path:
+        return None, None, None
+    try:
+        lib = ctypes.CDLL(lib_path)
+        lib.openblas_get_parallel.restype = ctypes.c_int
+        code = lib.openblas_get_parallel()
+    except (OSError, AttributeError):
+        # Unloadable here, or too old to export the symbol. Diagnostics only -- never fatal.
+        return None, None, None
+    try:
+        lib.openblas_get_config.restype = ctypes.c_char_p
+        raw = lib.openblas_get_config()
+        config = raw.decode() if raw else None
+    except AttributeError:
+        config = None
+    return code, config, (lib_path if os.path.isabs(lib_path) else _mapped_openblas_path() or lib_path)
+
+
+@functools.lru_cache(maxsize=None, typed=True)
+def _warn_unless_openmp_threaded() -> None:
+    """Name the resolved threading flavor when it is not the OpenMP one. Zero args, so the
+    ``lru_cache`` makes this warn at most once per process.
+
+    Deliberately a warning and not an error: a pthreads or sequential OpenBLAS computes the
+    right answer, it only times badly. A pthreads build spawns a pool of its own rather than
+    sharing libgomp's, so called from inside DaCe's OpenMP maps the two pools multiply and
+    oversubscribe the machine; BLAS-heavy kernels (gemm, syrk, symm, cholesky, ...) then get slow
+    and non-deterministic with nothing in a results table revealing why. Note the pthreads build
+    still *seeds* its pool from ``OMP_NUM_THREADS`` -- it is the separate pool that hurts, so
+    matching the two thread counts does not make the arms comparable."""
+    code, config, path = _openblas_threading_flavor()
+    if code is None or code == 2:
+        return
+    flavor = OPENBLAS_PARALLEL_NAMES.get(code, f'unknown ({code})')
+    effect = ('spawns a thread pool of its own instead of sharing libgomp\'s, so inside DaCe OpenMP '
+              'maps the two pools multiply and oversubscribe the machine'
+              if code == 1 else 'leaves every BLAS call single-threaded')
+    warnings.warn(
+        f'OpenBLAS at {path} is the {flavor} build: it {effect}. Results stay correct, '
+        'timings do not -- load an OpenBLAS built with threads=openmp before measuring. '
+        f'openblas_get_config()={config}',
+        stacklevel=2)
 
 
 @dace.library.environment
@@ -165,12 +277,13 @@ class OpenBLAS:
         # Driven by _mode() like the other four, so is_installed() cannot report an OpenBLAS
         # the mode has already rejected.
         mode = OpenBLAS._mode()
+        if mode is None:
+            return []
+        _warn_unless_openmp_threaded()  # only once an OpenBLAS is actually going to be used
         if mode == 'find_package':
             return _system_blas_libs()
-        if mode == 'direct_link':
-            lib, _ = _standalone_libopenblas()
-            return [lib]
-        return []
+        lib, _ = _standalone_libopenblas()
+        return [lib]
 
     @staticmethod
     def is_installed():

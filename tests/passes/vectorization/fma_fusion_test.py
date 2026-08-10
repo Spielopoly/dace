@@ -6,6 +6,7 @@ The fusion is OPT-IN (``VectorizeConfig.fuse_multiply_add``): a fused single-rou
 the separate ``*`` then ``+`` (and a NumPy reference) by up to one ULP, so results are compared
 with a tolerance, never bit-exact.
 """
+import ast
 import os
 import shutil
 
@@ -18,8 +19,9 @@ import numpy as np
 import pytest
 
 import dace
+from dace.codegen import cppunparse
 from dace.libraries.tileops._dispatch import detect_host_isa
-from dace.symbolic import fma, pystr_to_symbolic
+from dace.symbolic import fma, pystr_to_symbolic, symstr
 from dace.transformation.interstate import LoopToMap
 from dace.transformation.passes.vectorization.fuse_multiply_add import FuseMultiplyAdd
 from dace.transformation.passes.vectorization.vectorize_cpu_multi_dim import VectorizeCPUMultiDim
@@ -27,6 +29,7 @@ from dace.transformation.passes.vectorization.vectorize_gpu import VectorizeGPU
 from dace.transformation.passes.vectorization.config import VectorizeConfig
 from dace.transformation.passes.canonicalize.finalize import offload_to_gpu
 from dace.libraries.tileops import TileFMA, TileBinop
+from dace.libraries.tileops.nodes import TILEOPS_NODE_TYPES
 
 _HAS_NVCC = shutil.which("nvcc") is not None
 N = dace.symbol("N")
@@ -56,6 +59,9 @@ def test_fma_symbolic_function():
     e = pystr_to_symbolic("fma(a, b, c)")
     assert str(e) == "fma(a, b, c)"
     assert {str(s) for s in e.free_symbols} == {"a", "b", "c"}
+    assert symstr(e, cpp_mode=True) == "(dace::math::fma(a, b, c))"
+    tasklet_cpp = cppunparse.cppunparse(ast.parse("out = fma(a, b, c)"), expr_semicolon=True)
+    assert "out = dace::math::fma(a, b, c)" in tasklet_cpp
     # 'fma' is a recognised built-in function name, not a per-lane symbol.
     from dace.symbolic import builtin_userfunctions
     assert "fma" in builtin_userfunctions()
@@ -102,6 +108,7 @@ def test_tile_fma_registered():
     impls = set(node.implementations)
     assert {"pure", "cutile", "scalar", "avx512", "avx2", "neon", "sve", "cuda"} <= impls
     assert node.default_implementation == "pure"
+    assert TileFMA in TILEOPS_NODE_TYPES
 
 
 @pytest.mark.parametrize("isa,dt", [("SCALAR", dace.float32), (_HOST_ISA, dace.float32), (_HOST_ISA, dace.float64)])

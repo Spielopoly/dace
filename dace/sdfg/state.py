@@ -929,16 +929,24 @@ class DataflowGraphView(BlockGraphView, abc.ABC):
                 } if top_source_edge.src.data not in descs else {})
 
             elif isinstance(edge.dst, nd.ExitNode) and isinstance(edge.src, (nd.AccessNode, nd.CodeNode)):
-                # Same case as above, but for outgoing Memlets. The whole tree, not one hop out of
-                # the exit: with a nested scope (an inserted thread-block map) the next hop still
-                # carries the inner Memlet, and only the edge leaving the outermost exit names the
-                # data. Branches are why this is the tree and not the path -- one write can leave
-                # through several exits.
-                additional_descs = {
-                    oedge.data.data: sdfg.arrays[oedge.data.data]
-                    for oedge in graph.memlet_tree(edge) if not isinstance(oedge.dst, nd.ExitNode)
-                    and not oedge.data.is_empty() and oedge.data.data not in descs
-                }
+                # Same case as above, but for outgoing Memlets. Every edge on the matching connector
+                #   is inspected, since the data can go to more than one destination, and each is
+                #   followed to where it lands: one hop still names the inner transient whenever the
+                #   write leaves through more than one exit, as it does in a tiled map.
+                additional_descs = {}
+                connector_to_look = "OUT_" + edge.dst_conn[3:]
+                for oedge in self.graph.out_edges_by_connector(edge.dst, connector_to_look):
+                    last = self.graph.memlet_path(oedge)[-1]
+                    if last.data.is_empty():
+                        continue
+                    # Name the destination by the node the path LANDS ON, not by the terminal
+                    # memlet: a source-relative outgoing memlet still names the inner transient,
+                    # which is already in ``descs``, so trusting it drops the outer array -- and
+                    # its shape/stride symbols -- from the arglist, and codegen then emits a
+                    # signature referencing an undeclared identifier.
+                    dest = last.dst.data if isinstance(last.dst, nd.AccessNode) else last.data.data
+                    if dest not in descs and dest not in additional_descs:
+                        additional_descs[dest] = sdfg.arrays[dest]
 
             else:
                 # Case is ignored.
@@ -1682,9 +1690,18 @@ class SDFGState(OrderedMultiDiConnectorGraph[nd.Node, mm.Memlet], ControlFlowBlo
         # Find scopes this node is situated in
         sdict = self.scope_dict()
         scope_list = []
+        seen = {id(node)}
         curnode = node
         while sdict[curnode] is not None:
             curnode = sdict[curnode]
+            # A scope chain is a path to the top of the state, so revisiting a node means the
+            # scope structure is cyclic -- a malformed graph some transformation produced. Without
+            # this the walk appends forever: the SDFG stops changing while memory grows without
+            # bound, which reads as a hang rather than as the invalid graph it is.
+            if id(curnode) in seen:
+                raise ValueError(f'Cyclic scope structure in state "{self.label}": node {curnode} is its own '
+                                 f'ancestor on the scope path from {node}. The state is malformed.')
+            seen.add(id(curnode))
             scope_list.append(curnode)
 
         # Add the scope symbols top-down
@@ -2954,7 +2971,12 @@ class AbstractControlFlowRegion(OrderedDiGraph[ControlFlowBlock, 'dace.sdfg.Inte
         node.sdfg = sdfg
         if isinstance(node, AbstractControlFlowRegion):
             for n in node.all_control_flow_blocks():
-                n.sdfg = self.sdfg
+                n.sdfg = sdfg
+            # ``cfg_id`` is a position in ``cfg_list``, so a region that is not in the list
+            # reports 0 -- the same id as the root and as every other unregistered region.
+            # Appending instead would assign positions in insertion order while this assigns
+            # them in tree order, so the next reset would silently renumber.
+            self.reset_cfg_list()
         start_block = is_start_block
         if is_start_state is not None:
             warnings.warn('is_start_state is deprecated, use is_start_block instead', DeprecationWarning)
@@ -3919,11 +3941,16 @@ class ConditionalBlock(AbstractControlFlowRegion):
         self._branches.append([condition, branch])
         branch.parent_graph = self
         branch.sdfg = self.sdfg
-        # Same subtree repair ``add_node`` performs: a branch is routinely a deep copy, and
-        # ``ControlFlowBlock.__deepcopy__`` resolves ``_sdfg`` through the memo, so every block copied
-        # without its owning SDFG comes back owner-less. Insertion is what establishes ownership.
+        # A branch is reached only through this list, never through ``nodes()``, so the generic
+        # ``add_node`` bookkeeping never runs for it. Two things have to happen here instead.
+        # First the subtree repair: a branch is routinely a deep copy, and
+        # ``ControlFlowBlock.__deepcopy__`` resolves ``_sdfg`` through the memo, so every block
+        # copied without its owning SDFG comes back owner-less. Insertion establishes ownership.
         for block in branch.all_control_flow_blocks():
             block.sdfg = self.sdfg
+        # Then registration: otherwise the branch stays out of the CFG list and reports ``cfg_id``
+        # 0 -- colliding with the root and with every other unregistered region.
+        self.reset_cfg_list()
 
     def remove_branch(self, branch: ControlFlowRegion):
         self._branches = [(c, b) for c, b in self._branches if b is not branch]

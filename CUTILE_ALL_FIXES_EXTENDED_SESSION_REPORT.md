@@ -326,3 +326,85 @@ The report and completed merge are published on:
 
 No changes were pushed to the original `agent/cutile-all-fixes` branch during
 report publication.
+## Current-upstream refresh (2026-08-10)
+
+The integration branch was refreshed from
+`origin/codex/cutile-all-fixes-extended-merge` at
+`8c06333a985802fe498ea5abda394e7465f77082` to the current
+`upstream/extended` tip
+`dd5d544e7554ae05fb24569c0e5cf1bae2e34bf7`. The work was performed on
+`codex/cutile-all-fixes-extended-current` as a no-fast-forward merge.
+
+### Conflict decisions
+
+Eight textual conflicts were resolved semantically:
+
+- `tile_iota.py`: kept explicit pure/cuTile implementations and disabled
+  automatic implementation selection.
+- `validation.py`: combined Python-root backend handling with upstream symbol
+  assumption collision validation.
+- `empty_state_elimination.py`: adopted the upstream free-symbol dependency
+  analysis.
+- `canonicalize/pipeline.py`: gated the complete reduction normalization stage
+  with `reduction_to_wcr_map`.
+- `map_predicates.py`: retained both tiled-parameter branch-dependence checks
+  and foreign-language tasklet rejection.
+- `vectorize_multi_dim.py`: retained the assumption guard, cuTile/CUDA-warp
+  targets, all remainder strategies, and the vectorizer entry contract:
+  `semantic_lifting=False`, `reduction_to_wcr_map=False`, and
+  `unroll_limit=0`.
+- The two conflicting regression files were combined to cover both sides of
+  their corresponding resolutions.
+
+### Overlap bugs found during semantic review
+
+Three non-textual overlaps required fixes:
+
+1. `TileFMA` was absent from `TILEOPS_NODE_TYPES`. That made the vectorizer
+   treat a generated tile node as opaque during later analyses. It is now in
+   the central registry and covered by a regression assertion.
+2. Upstream residual scalar FMA emission produced an ambiguous
+   `fma(half, half, half)` call in CUDA. Tasklet and symbolic C++ emission now
+   use `dace::math::fma`; the runtime helper preserves integer semantics,
+   widens sub-float operands for a single rounded operation, and forwards normal
+   floating-point overloads to `std::fma`.
+3. The GPU wrapper documentation and remainder enums specified
+   `BRANCHED_MASKED_TAIL` as the K=1 default, but the implementation selected
+   `BRANCHED_TAIL`. The wrapper now selects the masked-tile branch and the
+   structural expectations account for both generated arms.
+
+Stale-ID validation tests were also updated to the current explicit
+`<unresolved ... id N>` diagnostic contract.
+
+### Validation of the refresh
+
+Passing coverage included:
+
+- conflict-focused tests: 153 passed;
+- tile-operation library-node tests excluding one reproduced strict-precision
+  baseline failure: 454 passed, 4 skipped;
+- Python backend: approximately 948 passed, 2 skipped, 9 xfailed, with only
+  reproduced baseline failures;
+- FMA fusion and runtime coverage: 10 passed, including CUDA fp16;
+- branched-tail CUDA coverage: 19 passed;
+- GPU reduction and vectorizer coverage: 30 passed;
+- the final non-corpus vectorization tail: 319 passed, 55 skipped.
+
+The broad vectorization sweep was run in chunks because native aborts and
+optional library failures prevent a reliable single aggregate. Every focused
+failure from the final tail was rerun on the pre-refresh integration tip and
+reproduced there: four reduction-via-map expectations, one three-way branch
+flattening expectation, and two multidimensional scatter-guard cases.
+
+Other inherited or environmental failures reproduced during the sweep include
+strict Jacobi precision, Python-backend rejection of a C++ reduction tasklet,
+OpenMP reduction code-shape assertions, multidimensional gather/scatter
+indexing, tile-store ordering, constant-only staging, TRMM correctness, and
+missing CBLAS/MKL. N-body canonicalization still fails on both revisions, but at
+different stages (current: invalid View during LoopToReduce; previous: missing
+MKL at link time), so that path remains a refresh risk rather than a passing
+regression test.
+
+No result above relies on a failure being merely assumed pre-existing: the
+listed structural failures were compared directly against a temporary worktree
+at the pre-refresh integration commit.

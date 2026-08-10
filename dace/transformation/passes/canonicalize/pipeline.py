@@ -33,6 +33,7 @@ from dace.transformation.passes.constant_propagation import ConstantPropagation
 from dace.transformation.passes.pattern_matching import PatternMatchAndApplyRepeated
 from dace.transformation.passes.prune_symbols import RemoveUnusedSymbols
 from dace.transformation.passes.canonicalize.split_statements import SplitStatements
+from dace.transformation.passes.length_one_array_scalar_conversion import ConvertLengthOneArraysToScalars
 from dace.transformation.passes.canonicalize.normalize_map_body import NormalizeMapBody
 from dace.transformation.passes.canonicalize.lift_loop_carried_reduction import LiftLoopCarriedReduction
 from dace.transformation.passes.canonicalize.fuse_chained_scalar_reductions import FuseChainedScalarReductions
@@ -66,7 +67,10 @@ from dace.transformation.passes.scalar_fission import ArrayFission, PrivatizeArr
 from dace.transformation.passes.parallelization_prep import (BestEffortLoopPeeling, ShortLoopUnroll,
                                                              DEFAULT_UNROLL_LIMIT)
 from dace.transformation.passes.break_anti_dependence import BreakAntiDependence
+from dace.transformation.passes.cpu_specialization import (ChunkAntiDependence, SequentializeParallelScopes,
+                                                           SpecializeCpuTransfers)
 from dace.transformation.passes.canonicalize.empty_state_elimination import EmptyStateElimination
+from dace.transformation.passes.dead_state_elimination import DeadStateElimination
 from dace.transformation.passes.canonicalize.hoist_iv_updates import HoistInductionVariableUpdates
 from dace.transformation.passes.canonicalize.induction_variable_substitution import (InductionVariableSubstitution,
                                                                                      LoopCarriedRotationSubstitution)
@@ -84,7 +88,6 @@ from dace.transformation.passes.promote_constant_index_access import PromoteCons
 from dace.transformation.passes.buffer_expansion import BufferExpansion
 from dace.transformation.passes.canonicalize.wavefront_skew import WavefrontSkew
 from dace.transformation.passes.canonicalize.loop_fusion import LoopFusion
-from dace.transformation.passes.canonicalize.sink_state_into_loop import SinkStateIntoLoop
 from dace.transformation.passes.canonicalize.reconstruct_wavefront_nest import ReconstructWavefrontNest
 from dace.transformation.passes.canonicalize.untile_loops import UntileLoops
 from dace.transformation.passes.canonicalize.arg_max_lift import ArgMaxLift
@@ -133,77 +136,35 @@ def disable_openmp_sections(sdfg: SDFG) -> None:
 
 
 def _structural_cleanup(label: str) -> List[Tuple[str, ppl.Pass]]:
-    """Between-phase structural cleanup (never ``SimplifyPass`` mid-pipeline):
-    fuse adjacent states, flatten nested SDFGs, then drop empty states, so each
-    phase starts from a tidy state machine.
-
-    Order: ``StateFusionExtended`` (a strict superset of ``StateFusion``;
-    accepts everything the base accepts and additionally fuses across
-    happens-before dependencies, emitting empty-memlet ordering edges as
-    needed) collapses adjacent states; both inliners flatten nestings --
-    ``InlineSDFG`` a single-``SDFGState`` NestedSDFG, ``InlineMultistateSDFG``
-    the control-flow-bearing NestedSDFGs that map->loop lowering produces
-    (a NestedSDFG wrapping a ``LoopRegion``/``ConditionalBlock``); without
-    the latter those nestings are permanent, burying loops so
-    ``MoveIfIntoLoop`` and cross-nest fusion cannot see them.
-    ``SinkStateIntoLoop`` then moves a replicable state sitting between two loops into the
-    second loop, restoring the adjacency ``FuseLoops`` needs. ``EmptyStateElimination``
-    finally removes the empty states fusion/inlining leave behind. None of these changes
-    the computed values; sinking is the only one that changes how often a state runs.
-
-    The non-extended ``StateFusion`` is intentionally NOT called here -- it
-    only runs inside ``SimplifyPass`` (the end-of-canonicalize Simplify
-    invocation and any caller-driven Simplify). Every shape it can fuse, the
-    extended variant can fuse; running both back-to-back used to mask gaps
-    in the extended matcher.
+    """Tidy the state machine between phases; never ``SimplifyPass`` mid-pipeline.
 
     :param label: The owning stage label.
-    :returns: ``(stage_label, pass)`` pairs for the cleanup, in order.
+    :returns: ``(stage_label, pass)`` pairs, in order.
     """
-    # Order rationale:
-    # * ``StateFusionExtended`` -- collapse adjacent states first.
-    # * ``PruneConnectors`` -- drop NestedSDFG in/out connectors nothing inside reads or writes,
-    #   FIRST in the inliner fixpoint: a dead connector is both a fake dependence for every
-    #   downstream analysis and a hard ``InlineSDFG`` refusal (its "every connector needs a valid
-    #   matching access node" gate). Pruning one can therefore unlock the inline in the same
-    #   fixpoint round. It never widens anything, so unlike ``ExpandNestedSDFGInputs`` (which
-    #   widens boundary memlets to full-array subsets and only pays that back if the multistate
-    #   inline then commits) it is safe to run unconditionally.
-    # * ``InlineMultistateSDFG`` + ``InlineSDFG`` -- flatten NestedSDFG
-    #   nestings so all subsequent cleanup passes can see across the
-    #   boundary. Both run in ONE fixpoint, not two sequential ones: in a
-    #   ``map { nsdfg { map { nsdfg { 2 states } } } }`` chain the inner
-    #   nesting is multistate, and flattening it exposes a fresh
-    #   single-state nesting that an already-converged ``InlineSDFG``
-    #   fixpoint would never revisit -- leaving the maps buried and
-    #   unfuseable.
-    # * ``RemoveViews`` (PR #2335) -- folds View access nodes into the
-    #   viewed array's address map: composing the view edge memlet's
-    #   affine mapping into every downstream memlet (and Python
-    #   tasklet subscript) eliminates the View node. Runs AFTER
-    #   inlining so views surfacing from a just-flattened NSDFG also
-    #   get folded.
-    # * Scalar-slice fold passes -- collapse the
-    #   ``AccessNode -> scalar slice -> Tasklet`` (``A``) and the
-    #   inverse ``Tasklet -> scalar slice -> AccessNode`` (``A^-1``)
-    #   bridges so a gather chain like ``d_index = d[i]`` reads as
-    #   ``d[i]`` directly. Wired here so downstream matchers (e.g.
-    #   ``EarlyExitToFindIndex`` 's cond read-analysis) see the
-    #   underlying array names rather than synthetic transients. The
-    #   folds had previously regressed ~13 TSVC kernels (branched
-    #   min/max s314-s316, gather-sum s4115/s4116, multi-state-chain
-    #   s3111/s31111/s352, etc.) by stripping a load-bearing scalar
-    #   that ``LoopToReduce`` / ``LoopToScan`` matched on; those
-    #   matchers have since been hardened to match through the folded
-    #   form.
-    # * ``EmptyStateElimination`` -- drop empty states left behind.
-    return [(label, PatternMatchAndApplyRepeated([StateFusionExtended()])),
-            (label, PatternMatchAndApplyRepeated([PruneConnectors(),
-                                                  InlineMultistateSDFG(),
-                                                  InlineSDFG()])), (label, RemoveViews()),
-            (label, CleanAccessNodeToScalarSliceToTaskletPattern()),
-            (label, CleanTaskletToScalarSliceToAccessNodePattern()), (label, SinkStateIntoLoop()),
-            (label, EmptyStateElimination())]
+    return [(label, PatternMatchAndApplyRepeated([StateFusionExtended()])), (label, EmptyStateElimination()),
+            (label, DeadStateElimination())]
+
+
+def _inline_single_state(label: str) -> List[Tuple[str, ppl.Pass]]:
+    """Flatten single-state NestedSDFG bodies; un-inlined, they report whole-array memlets and
+    every dependence test refuses on the box (seidel_2d). ``PruneConnectors`` shares the fixpoint
+    because a dead connector is a hard ``InlineSDFG`` refusal.
+
+    :param label: The owning stage label.
+    :returns: ``(stage_label, pass)`` pairs, in order.
+    """
+    return [(label, PatternMatchAndApplyRepeated([PruneConnectors(), InlineSDFG()]))]
+
+
+def _fold_scalar_slices(label: str) -> List[Tuple[str, ppl.Pass]]:
+    """Fold the frontend scalar-slice bridge; behind the transient a matcher has no index to shift,
+    which costs tsvc s252 its ``_remat`` clone and its map.
+
+    :param label: The owning stage label.
+    :returns: ``(stage_label, pass)`` pairs, in order.
+    """
+    return [(label, CleanAccessNodeToScalarSliceToTaskletPattern()),
+            (label, CleanTaskletToScalarSliceToAccessNodePattern())]
 
 
 def _coalesce() -> List[Tuple[str, ppl.Pass]]:
@@ -253,6 +214,7 @@ def _coalesce() -> List[Tuple[str, ppl.Pass]]:
                                      ('coalesce', PatternMatchAndApplyRepeated([TrivialMapElimination()])),
                                      ('coalesce', EmptyLoopElimination()),
                                      ('coalesce', PatternMatchAndApplyRepeated([MoveIfIntoMap()]))]
+    s += _inline_single_state('coalesce')
     s += _structural_cleanup('coalesce')
     s += [('coalesce', MinimizeStridePermutation())]
     s += [('coalesce', PatternMatchAndApplyRepeated([MapCollapse()]))]
@@ -267,6 +229,7 @@ def _coalesce() -> List[Tuple[str, ppl.Pass]]:
     #     box instead of the real subset and refuses (polybench seidel_2d: FuseLoops saw
     #     ``A[0:N, 0:N]`` where the body writes ``A[i, j+1]``). Leaving the phase tidy is this
     #     helper's stated contract; the earlier call at step 6 predates the fusion that dirties it.
+    s += _inline_single_state('coalesce')
     s += _structural_cleanup('coalesce')
     return s
 
@@ -578,9 +541,10 @@ def _build_stages(unroll_limit: int = DEFAULT_UNROLL_LIMIT,
     # in-nsdfg WCR into a write-only output connector (plain map-exit edge) is rewritten to
     # the seeded-local + map-exit-WCR shape the frontend already emits for the equivalent
     # polybench reduction (symm). Downstream then treats it like any map-exit reduction:
-    # WCRToAugAssign keeps the scalar WCR, MapToForLoop's map-exit-WCR refusal keeps it a
-    # parallel map, MapFusionVertical's seeded-reduction guard fires -- so it is neither
-    # severed nor double-counted. Idempotent, so the vectorizer can also run it standalone.
+    # WCRToAugAssign keeps the scalar WCR and MapToForLoop's map-exit-WCR refusal keeps it a
+    # parallel map, so it is neither severed nor double-counted. (This used to also credit
+    # MapFusionVertical's seeded-reduction guard, which is dead code -- see its docstring.)
+    # Idempotent, so the vectorizer can also run it standalone.
     s += [('normalize_reduction', NormalizeWCR())]
 
     # A loop with a ``break`` / ``continue`` is not splittable and its induction variable
@@ -626,8 +590,18 @@ def _build_stages(unroll_limit: int = DEFAULT_UNROLL_LIMIT,
     # statements -- replicate a conditional / gather-scatter NestedSDFG per
     # independent output so it can fission later (SplitStatements subsumes the
     # former ConditionalComponentFission and also handles forward-read anti-deps).
-    s += [('prep', PatternMatchAndApplyRepeated([MoveIfIntoMap()])),
-          ('prep', SplitStatements(break_anti_dependence=break_anti_dependence))]
+    #
+    # ConvertLengthOneArraysToScalars leads the stage: the frontend spells a scalar temporary as a
+    # ``(1,)`` transient Array, and every consumer downstream of here -- the statement split's
+    # dependency walk, fission, WCR handling -- keys on the descriptor, so the two spellings take
+    # different paths for the same value. Normalize to Scalar first. TRANSIENTS ONLY
+    # (``preserve_abi`` left clear): a signature-level length-1 array is the caller's contract and
+    # is not touched.
+    s += [('prep', PatternMatchAndApplyRepeated([MoveIfIntoMap()])), ('prep', ConvertLengthOneArraysToScalars()),
+          ('prep', SplitStatements())]
+    # Distribute first: the split removes the anti-dependence where reader and writer separate.
+    if break_anti_dependence:
+        s += [('prep', BreakAntiDependence(forward_reads=True))]
 
     # WCRToAugAssign BEFORE lower: rewrite every conflict-free (injective) WCR back to
     # an explicit RMW while maps are still maps; what stays WCR is a genuine reduction
@@ -639,6 +613,9 @@ def _build_stages(unroll_limit: int = DEFAULT_UNROLL_LIMIT,
     lower_maps = MapToForLoop()
     lower_maps.keep_reductions_parallel = True  # canon preference, off in the transformation's default contract
     s += [('lower', PatternMatchAndApplyRepeated([lower_maps]))]
+    # The pipeline's only ``InlineMultistateSDFG``: lowering mints the nestings here.
+    s += [('lower', PatternMatchAndApplyRepeated([PruneConnectors(), InlineMultistateSDFG(), InlineSDFG()]))]
+    s += _fold_scalar_slices('lower')
     s += _structural_cleanup('lower')
     # MapToForLoop leaves empty *_pre_state / *_post_state boundary states;
     # inside a guard branch they make the body look like a heterogeneous
@@ -980,6 +957,8 @@ def _build_stages(unroll_limit: int = DEFAULT_UNROLL_LIMIT,
     # subscripts, and the transpose matcher is the strictly narrower one (pure copy, one
     # operand, bijective permutation), so letting it claim its shape first costs the einsum
     # matcher nothing -- an einsum needs >= 2 operands and refuses this shape anyway.
+    # Re-fold: the stages since 'lower' mint fresh bridges (tsvc s254).
+    s += _fold_scalar_slices('loop_to_x')
     if semantic_lifting and lift:
         s += [('loop_to_x', LoopToTranspose())]
     s += [('loop_to_x', LoopToEinsum()), ('loop_to_x', PatternMatchAndApplyRepeated([WCRToAugAssign()])),
@@ -1063,7 +1042,11 @@ def _build_stages(unroll_limit: int = DEFAULT_UNROLL_LIMIT,
         # Rename same-named transient scratch arrays across the per-iteration NestedSDFGs
         # before structural cleanup.
         s += [('reduction_to_wcr_map', _PrivatizeScalarsStage()), ('reduction_to_wcr_map', _PrivatizeArraysStage())]
+        s += _inline_single_state('reduction_to_wcr_map')
         s += _structural_cleanup('reduction_to_wcr_map')
+        # LoopToMap outlines the body, trapping the fresh WCR inside the NSDFG. The earlier
+        # normalization cannot see it, so normalize once more after inlining and cleanup.
+        s += [('reduction_to_wcr_map', NormalizeWCR())]
 
     # scatter: ``ScatterToGuardedMaps`` inserts a runtime ``IntegerSort + WCR-summed
     # adjacent-equal collision count + post-region trap`` guard on each scatter
@@ -1089,7 +1072,21 @@ def _build_stages(unroll_limit: int = DEFAULT_UNROLL_LIMIT,
     # ``AssignmentAndCopyKernelToMemsetAndMemcpy`` lifts it to -- that recogniser matches the
     # assign tasklet this pass plants on the boundary copy.
     s += [('post_l2m', InsertAssignTaskletsAtMapBoundary())]
+    s += _inline_single_state('post_l2m')
     s += _structural_cleanup('post_l2m')
+
+    # cpu_specialize: trade the device-neutral anti-dependence snapshot for per-chunk
+    # seam buffers (sequential-within-chunk = CPU scheduling; matcher refuses GPU maps).
+    #
+    # Placed HERE, not directly after ``parallelize``. ``LoopToMap`` leaves the map body as an
+    # un-inlined NestedSDFG and the snapshot copy in its own predecessor state, so the read that
+    # decides the rewrite (``snap[i + 1]``) is not visible at the map's own state and the copy is
+    # not adjacent to it. The ``post_l2m`` band above is where the pipeline ALREADY inlines the
+    # body and fuses the copy state in -- which is exactly the flat, single-state canonical form
+    # the pass documents. Matching it before that band would mean reimplementing InlineSDFG's
+    # traversal inside the matcher.
+    if break_anti_dependence and target == 'cpu':
+        s += [('cpu_specialize', ChunkAntiDependence())]
 
     # coalesce: prepare the graph for maximal map fusion now that the DOALL
     # loops have become maps -- see ``_coalesce`` for the per-step rationale.
@@ -1121,6 +1118,7 @@ def _build_stages(unroll_limit: int = DEFAULT_UNROLL_LIMIT,
         # read AccessNode inside, and ``InlineSDFG`` refuses a connector with no valid matching
         # access node. Inlining is what replaces the whole-array boundary memlet with the body's
         # real ``A[i, j+1]``, which every downstream dependence test needs.
+        s += _inline_single_state('loop_fuse')
         s += _structural_cleanup('loop_fuse')
         s += [('loop_fuse', ReconstructWavefrontNest())]
     # GPU only: a state stranded between two loops blocks FuseLoops outright (it matches a two-node
@@ -1140,6 +1138,7 @@ def _build_stages(unroll_limit: int = DEFAULT_UNROLL_LIMIT,
     s += [('loop_fuse', LoopFusion())]
     s += [('loop_fuse', WavefrontSkew())]
     s += [('loop_fuse', PatternMatchAndApplyRepeated([LoopToMap()]))]
+    s += _inline_single_state('loop_fuse')
     s += _structural_cleanup('loop_fuse')
 
     # lift_copy (cleaning, post-parallelize): now that loops are maps, extract pure
@@ -1152,6 +1151,7 @@ def _build_stages(unroll_limit: int = DEFAULT_UNROLL_LIMIT,
     # MapEntry nodes) and before the compute-map transforms / the einsum lift.
     if semantic_lifting and lift_copy:
         s += [('lift_copy', AssignmentAndCopyKernelToMemsetAndMemcpy())]
+        s += _inline_single_state('lift_copy')
         s += _structural_cleanup('lift_copy')
 
     # interchange (post-parallelize, both modes): a sequential loop that survived
@@ -1164,6 +1164,7 @@ def _build_stages(unroll_limit: int = DEFAULT_UNROLL_LIMIT,
     # loop-only (LoopStridePermutation) passes cannot cross that boundary. The
     # produced ``map { nsdfg { loop } }`` is flattened by the following cleanup.
     s += [('interchange', MoveLoopIntoMapGated(target=target))]
+    s += _inline_single_state('interchange')
     s += _structural_cleanup('interchange')
 
     # TODO(perfect-nesting sift-down; GPU-oriented): a pass that turns an
@@ -1224,6 +1225,7 @@ def _build_stages(unroll_limit: int = DEFAULT_UNROLL_LIMIT,
     # opportunities; no FindSingleUseData).
     s += [('fuse', PatternMatchAndApplyRepeated([ConditionFusion()]))]
     s += [('fuse', LiftTrivialIf())]
+    s += _inline_single_state('fuse')
     s += _structural_cleanup('fuse')
     s += [('fuse',
            PatternMatchAndApplyRepeated([DistributeTaskletIntoMap(),
@@ -1241,6 +1243,7 @@ def _build_stages(unroll_limit: int = DEFAULT_UNROLL_LIMIT,
     # stage. Structural cleanup tidies the spliced states.
     s += [('fuse', NormalizeMapBody())]
     s += [('fuse', PatternMatchAndApplyRepeated([ConditionFusion()]))]
+    s += _inline_single_state('fuse')
     s += _structural_cleanup('fuse')
 
     # lift: recognize a tensor-contraction map (``map[i, k, j]: c(+)[i, j] =
@@ -1356,19 +1359,19 @@ def _build_stages(unroll_limit: int = DEFAULT_UNROLL_LIMIT,
     # normalized form) right before the terminal parallelize sweep.
     s += [('end', LiftLoopCarriedReduction())]
     s += [('end', PatternMatchAndApplyRepeated([LoopToMap()]))]
+    s += _inline_single_state('end')
 
     # Terminal fuse: the main ``fuse`` stage runs BEFORE ``normalize_wcr`` and the
     # terminal ``LoopToMap`` above. Two maps that were not yet fuseable at that point
     # can become fuseable only afterwards: ``NormalizeWCRSource`` reshapes a reduction
     # consumer's WCR from the seeded privatized-accumulator form (IN-wcr / plain
-    # copy-out -- which MapFusionVertical's ``_second_map_is_seeded_reduction`` guard
-    # rightly refuses) into a plain map-exit WCR that IS fuseable, and the terminal
+    # copy-out) into a plain map-exit WCR that IS fuseable, and the terminal
     # LoopToMap lifts residual loops into fresh maps adjacent to existing ones. With no
     # fuse after those stages, such producer->consumer pairs stay split (polybench
     # ``syrk``: the ``alpha*A*A`` product map + the ``C += ...`` k-reduction map, both
     # over the same ``0:i+1`` slice, stayed as two maps == two fork/joins per k step).
     # Re-run vertical+horizontal fusion in final map form so every fuseable pair is
-    # fused; the seeded-reduction / dependency guards still refuse the unsafe ones. The
+    # fused; the dependency guards still refuse the unsafe ones. The
     # following SymbolDedup cleans up the duplicate index symbols fusion introduces.
     s += [('end', PatternMatchAndApplyRepeated([DistributeTaskletIntoMap(),
                                                 MapFusionVertical(),
@@ -1428,6 +1431,22 @@ def _build_stages(unroll_limit: int = DEFAULT_UNROLL_LIMIT,
     # a Map-parameter-indexed slot (so a same-slot fold that continues a live prior -- nussinov's
     # ``_priv_table`` -- is left alone). It does not attempt full cross-nested-SDFG liveness, so a
     # fresh accumulator whose WCR is already AccessNode-sourced before that pass is not covered.
+
+    # cpu_specialize (terminal band): the canonical form is the maximally parallel one, so the
+    # decision to make a scope sequential again belongs to the target, not to canonicalization.
+    # ``SequentializeParallelScopes`` is the single home of that CPU fork/join cost model: it pins
+    # a map whose work per region cannot pay for a ``#pragma omp parallel`` (and every scope nested
+    # in a parallel map, which would fork a team per outer iteration).
+    # ``SpecializeCpuTransfers`` then gives the transfers it just sequentialized their single
+    # ``memcpy`` / ``memset`` back, so the parallel-by-default copy expansion costs nothing when
+    # the cost model refuses it.
+    #
+    # Placed at the very END, after fuse / collapse / the terminal LoopToMap: the verdict must be
+    # read off the FINAL map shapes (fusion and collapse change the work per region by orders of
+    # magnitude), and a schedule set earlier would also block the map fusion stages, which only
+    # fuse maps with equal schedules.
+    if target == 'cpu':
+        s += [('cpu_specialize', SequentializeParallelScopes()), ('cpu_specialize', SpecializeCpuTransfers())]
 
     # assume_constraints (LAST): make the assumptions the pipeline relied on
     # explicit and runtime-checked, by prepending a side-effecting

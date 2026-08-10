@@ -24,9 +24,17 @@ def _numpy_copy(pv: ProgramVisitor, sdfg: SDFG, state: SDFGState, a: str):
     """
     if a not in sdfg.arrays.keys():
         raise DaceSyntaxError(pv, None, "Prototype argument {a} is not SDFG data!".format(a=a))
-    # TODO: The whole AddTransientMethod class should be move in replacements.py
-    from dace.frontend.python.newast import _add_transient_data
-    name, desc = _add_transient_data(pv, sdfg, sdfg.arrays[a])
+    sample = sdfg.arrays[a]
+    if isinstance(sample, data.Array) and isinstance(sample, data.View):
+        # A slice (e.g. path[:, 1]) is an ArrayView, a concrete subclass that the
+        # generic transient dispatch below does not recognize (it keys on exact
+        # type). The view's own shape is already the sliced shape, so materialize
+        # the copy directly as a plain array of that shape and dtype.
+        name, desc = sdfg.add_transient(pv.get_target_name(), sample.shape, sample.dtype, find_new_name=True)
+    else:
+        # TODO: The whole AddTransientMethod class should be move in replacements.py
+        from dace.frontend.python.newast import _add_transient_data
+        name, desc = _add_transient_data(pv, sdfg, sample)
     rnode = state.add_read(a)
     wnode = state.add_write(name)
     state.add_nedge(rnode, wnode, Memlet.from_array(name, desc))
@@ -250,15 +258,24 @@ def _arange(pv: ProgramVisitor,
     else:
         start, stop, step = args
 
-    if isinstance(start, str):
-        raise TypeError(f'Cannot compile numpy.arange with a scalar start value "{start}" (only constants and symbolic '
-                        'expressions are supported). Please use numpy.linspace instead.')
-    if isinstance(stop, str):
-        raise TypeError(f'Cannot compile numpy.arange with a scalar stop value "{stop}" (only constants and symbolic '
-                        'expressions are supported). Please use numpy.linspace instead.')
-    if isinstance(step, str):
-        raise TypeError(f'Cannot compile numpy.arange with a scalar step value "{step}" (only constants and symbolic '
-                        'expressions are supported). Please use numpy.linspace instead.')
+    # A string bound is a name, not a value. An SDFG symbol names a symbolic extent directly; a size-1
+    # container (``K = nclusters; np.arange(K)``) is read into a symbol on an interstate edge, the same
+    # mechanism ``numpy.full`` uses to size its output. Any other data would take the extent from array
+    # contents, which cannot size the output.
+    for kind, value in (('start', start), ('stop', stop), ('step', step)):
+        if not isinstance(value, str):
+            continue
+        if value not in sdfg.symbols and not (value in sdfg.arrays and sdfg.arrays[value].total_size == 1):
+            raise TypeError(f'Cannot compile numpy.arange with a scalar {kind} value "{value}" (only constants and '
+                            'symbolic expressions are supported). Please use numpy.linspace instead.')
+
+    (start, stop, step), promoted = promote_size_scalars_in_shape(pv, sdfg, (start, stop, step))
+    if promoted:
+        # Promotion opens a state to carry the symbol assignment; the map has to follow it.
+        state = pv.last_block
+    start, stop, step = [symbolic.pystr_to_symbolic(v) if isinstance(v, str) else v for v in (start, stop, step)]
+    # Type inference below reads the call arguments, which have no case for a name.
+    args = (stop, ) if len(args) == 1 else (start, stop, step)[:len(args)]
 
     actual_step = step
     if isinstance(start, Number) and isinstance(stop, Number):

@@ -164,7 +164,9 @@ static DACE_CONSTEXPR DACE_HDFI T bitwise_xor(const T& left_operand,
   return left_operand ^ right_operand;
 }
 
-template <typename T, typename T2>
+// Unary: only ``T`` is deducible. A second template parameter (copied from the binary helpers
+// above) made every call ``bitwise_invert(x)`` fail with "couldn't deduce template parameter 'T2'".
+template <typename T>
 static DACE_CONSTEXPR DACE_HDFI T bitwise_invert(const T& value) {
   return ~value;
 }
@@ -652,6 +654,23 @@ DACE_CONSTEXPR DACE_HDFI thrust::complex<T> pow(const thrust::complex<T>& a,
 template <typename T, typename U>
 DACE_CONSTEXPR DACE_HDFI auto pow(const T& a, const U& b) {
   return std::pow(a, b);
+}
+
+// Keep a residual low-precision FMA well-typed and single-rounded. std::fma has
+// no half/bfloat16 overload, while integer fusion is ordinary arithmetic.
+template <typename T>
+DACE_CONSTEXPR DACE_HDFI T fma(const T& a, const T& b, const T& c) {
+  if constexpr (std::is_integral<T>::value) {
+    return T(a * b + c);
+  } else if constexpr (sizeof(T) < sizeof(float)) {
+    return T(std::fma(double(a), double(b), double(c)));
+  } else {
+    return T(std::fma(a, b, c));
+  }
+}
+template <typename T, typename U, typename V>
+DACE_CONSTEXPR DACE_HDFI auto fma(const T& a, const U& b, const V& c) -> decltype(std::fma(a, b, c)) {
+  return std::fma(a, b, c);
 }
 
 static DACE_CONSTEXPR DACE_HDFI int pow(const int& a, const int& b) {

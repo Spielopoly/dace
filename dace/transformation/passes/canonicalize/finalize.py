@@ -24,31 +24,28 @@ import os
 from dace import SDFG, dtypes
 from dace.config import Config
 from dace.sdfg import infer_types, nodes
-from dace.sdfg.state import LoopRegion
 from dace.libraries.blas.environments import openblas
-from dace.transformation.auto.auto_optimize import (apply_gpu_storage, make_transients_persistent,
+from dace.transformation.auto.auto_optimize import (apply_cpu_library_parallelism, apply_gpu_storage,
+                                                    libnode_is_sequential, make_transients_persistent,
                                                     move_small_arrays_to_stack, set_fast_implementations)
+from dace.transformation.passes.cpu_specialization.sequentialize_parallel_scopes import SequentializeParallelScopes
+from dace.transformation.passes.cpu_specialization.specialize_cpu_transfers import SpecializeCpuTransfers
 from dace.transformation.passes.gpu_block_size_selection import select_gpu_device_block_size
+from dace.transformation.passes.gpu_specialization.sequentialize_nested_device_scopes import (
+    SequentializeNestedDeviceScopes)
 from dace.transformation.passes.length_one_array_scalar_conversion import ConvertLengthOneArraysToScalars
-from dace.libraries.standard.nodes.reduce import Reduce
-from dace.libraries.standard.nodes.arg_reduce import ArgReduce
 from dace.libraries.standard.nodes.scan import Scan
-from dace.libraries.standard.nodes.copy_node import CopyLibraryNode, select_copy_implementation
-from dace.libraries.standard.nodes.memset_node import MemsetLibraryNode, select_memset_implementation
 from dace.transformation.dataflow import OTFMapFusion
 
 #: Map the canonicalize target string to the codegen device type.
 _TARGET_DEVICE = {'cpu': dtypes.DeviceType.CPU, 'gpu': dtypes.DeviceType.GPU}
 
-#: Per-dimension matmul extent at or below which canonicalization picks the inlined
-#: ``'pure'`` expansion (a fusible/vectorizable sequential loop nest) over a BLAS call.
-_SMALL_MATMUL_DIM = 256
-
-#: The row-wise (ikj) ``'pure'`` variant is selected only for *tiny* matmuls -- every
-#: dimension at most this. Its win (a vectorizable row update with a sequential K loop) is
-#: a register/cache-blocking effect that only pays off at very small sizes; a larger
-#: "small" matmul keeps the plain ``'pure'`` nest.
-_ROWWISE_MATMUL_DIM = 64
+#: Per-dimension matmul extent at or below which canonicalization picks an inlined expansion over
+#: a BLAS call. MEASURED against OpenBLAS at 64/128/256 cubed: OpenBLAS wins at every one of them
+#: (0.1/13/25 ms against 36/48/75 ms for plain ``'pure'``), because the plain nest emits one
+#: ``reduce_atomic`` per multiply-add. So the override is worth taking only where the BLAS call
+#: overhead really dominates, and only in the ``'rowwise'`` form, which carries no atomic.
+_SMALL_MATMUL_DIM = 32
 
 
 def _all_matmul_extents_small(state, node, limit: int) -> bool:
@@ -83,7 +80,7 @@ def canonicalize_fast_library_priority(device: dtypes.DeviceType):
       / device sort).
 
     Only impls whose environment is available on this host are listed, so forcing a pick never selects
-    an unbuilt library. ``MatMul``/``Gemm`` still get the tiny-matmul ``pure``/``rowwise`` override in
+    an unbuilt library. ``MatMul``/``Gemm`` still get the tiny-matmul ``rowwise`` override in
     :func:`canonicalize_set_fast_implementations`.
     """
     if device == dtypes.DeviceType.GPU:
@@ -99,44 +96,6 @@ def canonicalize_fast_library_priority(device: dtypes.DeviceType):
     return prio
 
 
-def libnode_is_sequential(node: nodes.LibraryNode, state, sdfg: SDFG) -> bool:
-    """Whether ``node`` is re-entered inside an outer parallel/repeated scope and so must NOT open
-    its own (nested) parallel region -- it lowers to its efficient single-core expansion instead.
-
-    The storage-derived ``node.schedule`` is NOT a reliable signal here: DaCe's schedule inference
-    (:func:`~dace.sdfg.infer_types.set_default_schedule_and_storage_types`) sets a library node's
-    schedule from the *storage* of its neighbouring memlets (``CPU_Heap`` ->
-    ``ScheduleType.CPU_Multicore`` via ``STORAGEDEFAULT_SCHEDULE``), NOT from the parallelism of the
-    enclosing scope, so a ``Reduce`` nested in a parallel map can carry ``CPU_Multicore`` rather than
-    ``Sequential`` and would then wrongly open a nested ``#pragma omp parallel`` per outer iteration
-    -- the "constant parallel reductions" catastrophe. Determine sequentiality from SCOPE instead:
-    a libnode is sequential if it has a parallel parent map or an enclosing loop (both re-enter it).
-
-    A ``NestedSDFG`` node carries no ``schedule`` property of its own (only ``Map`` /
-    ``LibraryNode`` do), so "lives inside a sequential nested SDFG" is not a distinct case to probe
-    for here: :func:`~dace.transformation.helpers.get_parent_map_and_loop_scopes` -- now
-    LibraryNode-aware (a library node is a "special tasklet") -- walks OUT across every nested-SDFG
-    boundary up to the root and yields every enclosing ``MapEntry`` / ``LoopRegion`` regardless of
-    how many nsdfg levels separate ``node`` from them, so a parallel map or loop several nsdfg levels
-    up is still found by the loop below; deep nesting is handled by the existing helper rather than a
-    bespoke climb. A genuinely top-level node (no enclosing parallel map / loop) returns ``False`` and
-    is free to open its own OpenMP / device-parallel region.
-    """
-    # Function-local import: ``dace.transformation.helpers`` pulls in a chain that re-enters the
-    # canonicalize package, so a top-level import here would be a cycle when ``finalize`` is imported
-    # as the package's first submodule.
-    from dace.transformation.helpers import get_parent_map_and_loop_scopes
-    if node.schedule == dtypes.ScheduleType.Sequential:
-        return True
-    for scope in get_parent_map_and_loop_scopes(sdfg, node, state):
-        if isinstance(scope, nodes.MapEntry):
-            if scope.map.schedule != dtypes.ScheduleType.Sequential:
-                return True
-        elif isinstance(scope, LoopRegion):
-            return True
-    return False
-
-
 def canonicalize_set_fast_implementations(sdfg: SDFG, device: dtypes.DeviceType, small_dim: int = _SMALL_MATMUL_DIM):
     """Select library-node implementations for the canonicalize perf tail.
 
@@ -145,10 +104,11 @@ def canonicalize_set_fast_implementations(sdfg: SDFG, device: dtypes.DeviceType,
     OpenMP, cuBLAS/cuSolverDn/cuTENSOR/CUB, never MKL -- so EVERY library node the pipeline introduces
     (Reduce, Scan, Transpose, TensorTranspose, Symm, Cholesky, Solve, ...) lowers to its fast expansion
     rather than the serial ``pure`` loop. Then OVERRIDES any GEMM/MatMul whose every dimension is a
-    known constant at most ``small_dim`` to the inlined ``'pure'`` expansion. A tiny matmul's
-    BLAS/cuBLAS call is pure overhead, and -- unlike an opaque library call -- a sequential loop nest
-    is fusible/vectorizable and keeps a loop of small matmuls sequential instead of issuing serialized
-    library calls. Symbolic- or large-dimensioned matmuls keep the fast BLAS implementation.
+    known constant at most ``small_dim`` to the inlined ``'rowwise'`` expansion. A tiny matmul's
+    BLAS/cuBLAS call is pure overhead, and -- unlike an opaque library call -- a loop nest is
+    fusible/vectorizable and keeps a loop of small matmuls sequential instead of issuing serialized
+    library calls. Symbolic- or large-dimensioned matmuls keep the fast BLAS implementation, and so
+    does a node with no ``'rowwise'`` expansion.
     """
     set_fast_implementations(sdfg, device, blocklist=['MKL'], find_fast_library_fn=canonicalize_fast_library_priority)
     for node, state in sdfg.all_nodes_recursive():
@@ -169,60 +129,31 @@ def canonicalize_set_fast_implementations(sdfg: SDFG, device: dtypes.DeviceType,
         if sequential and node.schedule != dtypes.ScheduleType.Sequential:
             node.schedule = dtypes.ScheduleType.Sequential
 
-        # ``Reduce``: parallel -> OpenMP privatized ``reduction(op:var)``; sequential -> the efficient
-        # single-core ``pure`` reduction (a plain accumulate loop, never a contended ``omp atomic`` /
-        # nested ``omp parallel``). ``find_fast_library`` omits both, so it would otherwise resolve to
-        # ``pure`` anyway; the explicit pick makes the top-level case parallel.
-        if isinstance(node, Reduce) and device == dtypes.DeviceType.CPU:
-            if sequential:
-                # ``pure-seq`` needs an ``identity`` the lifted node may not carry, so ``pure`` is the
-                # robust single-core choice (it lowers to a plain accumulate loop when Sequential).
-                node.implementation = 'pure'
-            elif 'OpenMP' in impls:
-                node.implementation = 'OpenMP'
+        # The CPU parallel-lowering rule for Reduce / ArgReduce / Scan / Copy / Memset lives in
+        # :func:`~dace.transformation.auto.auto_optimize.apply_cpu_library_parallelism`, shared with
+        # ``set_fast_implementations`` so the canonicalize and auto_optimize paths cannot drift onto
+        # different implementations of the same node. It has the last word on the types it governs
+        # (hence the ``continue``): a small Reduce would otherwise be clobbered by the matmul-size
+        # override below, which only means to catch GEMMs.
+        if device == dtypes.DeviceType.CPU and apply_cpu_library_parallelism(node, state, sdfg):
             continue
-        # ``ArgReduce``: parallel -> ``OpenMP`` (a ``declare reduction`` over the (value, index)
-        # pair -- argmax is associative on the PAIR, not on the value); sequential -> ``pure``.
-        if isinstance(node, ArgReduce) and device == dtypes.DeviceType.CPU:
-            node.implementation = 'pure' if sequential else ('OpenMP' if 'OpenMP' in impls else node.implementation)
-            continue
-        # ``Scan``: parallel -> ``CPU`` (OpenMP 5.0 ``#pragma omp parallel for simd reduction(inscan,..)``
-        # + ``#pragma omp scan``); sequential -> the serial ``pure`` scan.
-        if isinstance(node, Scan):
-            if device == dtypes.DeviceType.CPU:
-                node.implementation = 'pure' if sequential else ('CPU' if 'CPU' in impls else node.implementation)
-                continue
-            # GPU: a top-level parallel scan -> host-launched ``cub::DeviceScan``; a sequential
-            # (device-level, or map-/loop-nested) scan MUST stay ``pure`` -- ``ExpandCUDA`` emits a
-            # HOST-side ``cub::DeviceScan`` call that cannot be issued from inside a kernel (and it
-            # rejects stride>1). Guarding on ``sequential`` mirrors the Reduce branch; without it a
-            # device-level scan that ``set_fast_implementations`` correctly left ``pure`` was clobbered
-            # to an uncompilable in-kernel ``cub::DeviceScan``.
-            if device == dtypes.DeviceType.GPU:
-                node.implementation = 'pure' if sequential else ('CUDA' if 'CUDA' in impls else node.implementation)
-                continue
-        # ``Copy`` / ``Memset`` on CPU: a top-level node stays ``Auto`` (its own size gate routes a
-        # large/symbolic contiguous transfer to the element map, which DaCe parallelizes across
-        # OpenMP threads at top level). A sequential (nested) node asks its OWN selector for a
-        # concrete expansion -- ``MemcpyCPU`` / ``CPU`` for a small contiguous transfer, else the
-        # element map (``MappedTasklet`` / ``pure``), which DaCe schedules sequentially when nested
-        # so it opens no OpenMP region; the contiguous-only single-call forms would RAISE otherwise.
-        if isinstance(node, CopyLibraryNode) and device == dtypes.DeviceType.CPU:
-            node.implementation = select_copy_implementation(node, state) if sequential else 'Auto'
-            continue
-        if isinstance(node, MemsetLibraryNode) and device == dtypes.DeviceType.CPU:
-            node.implementation = select_memset_implementation(node, state) if sequential else 'Auto'
+        # GPU ``Scan``: a top-level parallel scan -> host-launched ``cub::DeviceScan``; a sequential
+        # (device-level, or map-/loop-nested) scan MUST stay ``pure`` -- ``ExpandCUDA`` emits a
+        # HOST-side ``cub::DeviceScan`` call that cannot be issued from inside a kernel (and it
+        # rejects stride>1). Guarding on ``sequential`` mirrors the CPU rule; without it a
+        # device-level scan that ``set_fast_implementations`` correctly left ``pure`` was clobbered
+        # to an uncompilable in-kernel ``cub::DeviceScan``.
+        if isinstance(node, Scan) and device == dtypes.DeviceType.GPU:
+            node.implementation = 'pure' if sequential else ('CUDA' if 'CUDA' in impls else node.implementation)
             continue
         if 'pure' not in impls:
             continue
-        if _all_matmul_extents_small(state, node, small_dim):
-            # Prefer the row-wise (ikj) pure expansion for TINY GEMMs (every dim <= 64): a
-            # vectorizable row update with a sequential K accumulation. Larger small matmuls,
-            # and nodes without a 'rowwise' impl (e.g. MatMul), keep the plain 'pure' nest.
-            if 'rowwise' in impls and _all_matmul_extents_small(state, node, _ROWWISE_MATMUL_DIM):
-                node.implementation = 'rowwise'
-            else:
-                node.implementation = 'pure'
+        # Only the row-wise (ikj) expansion: a vectorizable row update with a sequential K
+        # accumulation and no atomic. The plain 'pure' nest is deliberately NOT selectable here --
+        # it reduces through one ``reduce_atomic`` per multiply-add and measured slower than
+        # OpenBLAS at every size tried. A node without 'rowwise' (e.g. MatMul) keeps its BLAS call.
+        if 'rowwise' in impls and _all_matmul_extents_small(state, node, small_dim):
+            node.implementation = 'rowwise'
 
 
 def finalize_transient_storage(sdfg: SDFG, device: dtypes.DeviceType) -> None:
@@ -362,70 +293,6 @@ def assert_offloaded(sdfg: SDFG) -> None:
                      "before finalizing.")
 
 
-def sequentialize_nested_parallel_scopes(sdfg: SDFG, device: dtypes.DeviceType) -> None:
-    """Enforce 'only top-level maps parallelize' by SETTING schedules (the fixer that :func:`assert_no
-    _nested_parallel_maps` only checks). Any map, library node, or **nested SDFG** that still carries the
-    device-parallel schedule (``CPU_Multicore`` on CPU, ``GPU_Device`` on GPU) while re-entered inside a
-    parallel map of that schedule is pinned to ``Sequential``.
-
-    TRANSITIVE across nested-SDFG boundaries: a ``NestedSDFG`` node carries no ``schedule`` of its own,
-    so an nsdfg is made single-core by sequentializing its BODY -- ``all_nodes_recursive`` descends into
-    the nsdfg and visits its maps/libnodes directly, and ``get_parent_map_and_loop_scopes`` walks OUT
-    across the nsdfg boundary to find the enclosing parallel map, so a ``CPU_Multicore`` reduce/map
-    buried in an nsdfg inside a parallel map is caught and pinned. Otherwise it would fork a parallel
-    team per outer iteration (the "constant parallel reductions" catastrophe). Must run AFTER
-    ``set_default_schedule_and_storage_types`` (which derives schedules from storage, unaware of scope
-    parallelism) so the outer maps already carry their final ``CPU_Multicore``. A map nested in a plain
-    (sequential) LOOP is left parallel -- a parallel map inside a sequential loop is legal and desirable;
-    only nesting inside a *parallel map* is forbidden.
-
-    Efficient and rigorous: ONE top-down pass over the control-flow hierarchy threading two flags --
-    ``in_loop`` (set on entering a ``LoopRegion``) and ``in_parallel`` (inside a device-parallel map,
-    from an outer scope across an nsdfg boundary). Within a state a per-state ``scope_dict`` (built once)
-    is walked up for the in-state parallel-map ancestor. So the expensive per-node
-    ``get_parent_map_and_loop_scopes`` (which re-walks every enclosing scope across nsdfg boundaries) is
-    never called. A MAP is pinned only when nested in a parallel MAP (a parallel map inside a loop is
-    fine); a LIBRARY NODE is pinned when nested in a parallel map OR re-entered by a loop (a libnode must
-    never fork a parallel region per iteration)."""
-    from dace.sdfg.state import LoopRegion, ControlFlowRegion, SDFGState
-    parallel = (dtypes.ScheduleType.GPU_Device
-                if device == dtypes.DeviceType.GPU else dtypes.ScheduleType.CPU_Multicore)
-
-    def _process_state(state: SDFGState, in_loop: bool, in_parallel: bool) -> None:
-        scope_dict = state.scope_dict()
-
-        def under_parallel_map(node) -> bool:
-            if in_parallel:  # the whole (nested-SDFG) body already runs inside an outer parallel map
-                return True
-            s = scope_dict[node]
-            while s is not None:
-                if isinstance(s, nodes.MapEntry) and s.map.schedule == parallel:
-                    return True
-                s = scope_dict[s]
-            return False
-
-        for node in state.nodes():
-            if isinstance(node, nodes.MapEntry):
-                if node.map.schedule == parallel and under_parallel_map(node):
-                    node.map.schedule = dtypes.ScheduleType.Sequential
-            elif isinstance(node, nodes.LibraryNode):
-                if node.schedule == parallel and (in_loop or under_parallel_map(node)):
-                    node.schedule = dtypes.ScheduleType.Sequential
-            elif isinstance(node, nodes.NestedSDFG) and node.sdfg is not None:
-                _process_region(node.sdfg, in_loop, in_parallel or under_parallel_map(node))
-
-    def _process_region(region: ControlFlowRegion, in_loop: bool, in_parallel: bool) -> None:
-        for block in region.nodes():
-            if isinstance(block, SDFGState):
-                _process_state(block, in_loop, in_parallel)
-            elif isinstance(block, LoopRegion):
-                _process_region(block, True, in_parallel)
-            elif isinstance(block, ControlFlowRegion):  # conditional / generic region: loop flag unchanged
-                _process_region(block, in_loop, in_parallel)
-
-    _process_region(sdfg, False, False)
-
-
 def assert_no_nested_parallel_maps(sdfg: SDFG, device: dtypes.DeviceType) -> None:
     """Post-pipeline invariant: a parallel scope of the target's device schedule must NEVER be
     nested inside another parallel scope of the same schedule.
@@ -508,9 +375,16 @@ def finalize_for_target(sdfg: SDFG, target: str = 'cpu', validate: bool = True) 
     infer_types.set_default_schedule_and_storage_types(sdfg, None)
 
     # Storage-derived scheduling can leave a map/libnode/nested-SDFG on the device-parallel schedule
-    # while it is re-entered inside a parallel map -> pin all such nested scopes Sequential (transitively
-    # into nested SDFGs) BEFORE library selection, so libnode_is_sequential sees the corrected schedules.
-    sequentialize_nested_parallel_scopes(sdfg, device)
+    # while it is re-entered inside a parallel map or a long loop. Resolving that is the device
+    # specialization band's job, not canonicalization's, so the tail runs the band's own pass here
+    # -- BEFORE library selection, so libnode_is_sequential sees the corrected schedules. On CPU the
+    # pass is the fork/join cost model (idempotent, so a graph canonicalized with ``target='cpu'``
+    # is simply re-confirmed); on GPU it is the nested-kernel resolution.
+    if device == dtypes.DeviceType.GPU:
+        SequentializeNestedDeviceScopes().apply_pass(sdfg, {})
+    else:
+        SequentializeParallelScopes().apply_pass(sdfg, {})
+        SpecializeCpuTransfers().apply_pass(sdfg, {})
 
     canonicalize_set_fast_implementations(sdfg, device)
     # Select the fast implementation per library node but DO NOT expand here: a library

@@ -1188,14 +1188,10 @@ class CPPUnparser:
         'float64': 'dace::float64'
     }
 
-    # Complex-component accessors.  ``re(z)`` / ``im(z)`` extract the real /
-    # imaginary part of a complex value -- they lower to the ``dace::math``
-    # helpers (which call ``.real()`` / ``.imag()`` on ``std::complex`` /
-    # ``thrust::complex``).  Same call shape as a renamed function: write the
-    # C++ name, then the (single) argument list.  This is the tasklet-body
-    # spelling for a complex's components, mirroring how ``int_floor`` maps to
-    # ``dace::math::ifloor``.
+    # Bare tasklet functions that need a typed DaCe runtime helper rather than
+    # unqualified C++ overload resolution.
     _renamed_funcs = {
+        'fma': 'dace::math::fma',
         're': 'dace::math::re',
         'im': 'dace::math::im',
     }

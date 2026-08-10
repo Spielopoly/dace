@@ -19,6 +19,7 @@ jobs:
   test-gpu:
     if: "!contains(github.event.pull_request.labels.*.name, 'no-ci')"
     runs-on: [self-hosted, gpu]
+    timeout-minutes: 120
     steps:
     - uses: actions/checkout@v7
       with:
@@ -32,8 +33,17 @@ jobs:
     - name: Check mpi4py
       run: |
         source ~/.venv/bin/activate # activate venv
+        python -m pip install --upgrade pip
+        pip install flake8 pytest-xdist coverage
+        pip install mpi4py
         # The wheel dlopens libmpi on first use; without one it fails at every import, not here.
         MPI4PY_RC_INITIALIZE=0 python -c "from mpi4py import MPI; print(MPI.Get_library_version())"
+        pip install cupy
+        pip install cutensor-cu12
+        pip uninstall -y dace
+        pip install -e ".[testing,ml]"
+        curl -Os https://uploader.codecov.io/latest/linux/codecov
+        chmod +x codecov
 
     - name: Test dependencies
       run: |
