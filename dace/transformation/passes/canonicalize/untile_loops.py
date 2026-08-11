@@ -1,5 +1,5 @@
 # Copyright 2019-2026 ETH Zurich and the DaCe authors. All rights reserved.
-"""Collapse a manually-tiled two-level loop nest back to a single unit-stride loop.
+"""Collapse a manually-tiled loop nest back to a single unit-stride loop per axis.
 
 Source kernels often arrive with an unrolled tile already baked into the loop
 structure -- TSVC ``s116`` / ``s353`` / ``s31111`` write::
@@ -28,11 +28,12 @@ Pattern
 
 The outer loop must be ``for i in range(0, N, K)`` where ``K`` is a positive
 tile size -- a concrete integer literal ``> 1`` **or** a positive symbol (e.g.
-a block-size parameter) -- and the start is ``0``. The single body block of the
-outer must be exactly one nested :class:`~dace.sdfg.state.LoopRegion` and
-nothing else (perfect nest). Symbolic tiles admit only a unit inner stride
-(single-level untile); a concrete tile additionally admits cascade rungs whose
-inner stride divides ``K``.
+a block-size parameter). The single body block of the outer must be exactly one
+nested :class:`~dace.sdfg.state.LoopRegion` and nothing else (perfect nest).
+A cascade rung (inner stride ``S > 1``) needs ``S | K``: proven outright when
+both are concrete, otherwise admitted under a recorded divisibility assumption,
+which is what lets a double- or triple-tiled nest with symbolic tiles unwind
+level by level.
 
 The inner loop must be one of the following shapes (both with unit stride):
 
@@ -69,12 +70,13 @@ still be referenced by interstate-edge assignments that the cascade-up pass
 hoisted; those are left alone.)
 """
 import copy
-from typing import List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import sympy
 
 import dace
-from dace import SDFG, properties, symbolic
+from dace import SDFG, dtypes, properties, symbolic
+from dace.sdfg import nodes
 from dace.sdfg.graph import NodeNotFoundError
 from dace.sdfg.state import LoopRegion, SDFGState, ControlFlowRegion
 from dace.transformation import pass_pipeline as ppl
@@ -86,19 +88,30 @@ from dace.transformation.passes.canonicalize.tracked_assumptions import record_a
 _UNTILE_PREFIX = '_untile_k_'
 
 
+def count_applied(result) -> int:
+    """Number of transformations a ``PatternMatchAndApplyRepeated`` run applied.
+
+    It returns ``{transformation name: [applied, ...]}``, or ``None`` when it matched nothing.
+    Callers need the count to report their own modification honestly.
+    """
+    if not result:
+        return 0
+    return sum(len(applied) for applied in result.values())
+
+
 def _next_id(sdfg: SDFG) -> int:
-    used: Set[int] = set()
+    used: Dict[int, None] = {}
     for sd in sdfg.all_sdfgs_recursive():
         for s in list(sd.symbols.keys()):
             if s.startswith(_UNTILE_PREFIX):
                 tail = s[len(_UNTILE_PREFIX):]
                 if tail.isdigit():
-                    used.add(int(tail))
+                    used[int(tail)] = None
         for cfg in sd.all_control_flow_regions():
             if isinstance(cfg, LoopRegion) and cfg.loop_variable and cfg.loop_variable.startswith(_UNTILE_PREFIX):
                 tail = cfg.loop_variable[len(_UNTILE_PREFIX):]
                 if tail.isdigit():
-                    used.add(int(tail))
+                    used[int(tail)] = None
     n = 0
     while n in used:
         n += 1
@@ -128,17 +141,6 @@ def _try_extract_perfect_one_child(cfg: ControlFlowRegion) -> Optional[ControlFl
     return candidate
 
 
-def _try_extract_perfect_two_level_nest(outer: LoopRegion) -> Optional[LoopRegion]:
-    """Backward-compatible single-level wrapper around
-    :func:`_try_extract_perfect_one_child`. Kept for tests that pin the
-    immediate-inner contract; new code should prefer
-    :func:`_iter_candidate_inners` for multi-dim support."""
-    inner = _try_extract_perfect_one_child(outer)
-    if isinstance(inner, LoopRegion):
-        return inner
-    return None
-
-
 def _iter_candidate_inners(outer: LoopRegion):
     """Walk down through perfect 1-child intermediate chains, yielding
     every descendant :class:`LoopRegion` as a potential tile-pair partner
@@ -150,13 +152,13 @@ def _iter_candidate_inners(outer: LoopRegion):
     (a non-empty plain state, a sibling CFR, etc.), so non-perfect-nest
     cases are still refused.
     """
-    seen: Set[int] = set()
+    seen: Dict[int, None] = {}
     current: ControlFlowRegion = outer
     while True:
         nxt = _try_extract_perfect_one_child(current)
         if nxt is None or id(nxt) in seen:
             return
-        seen.add(id(nxt))
+        seen[id(nxt)] = None
         if isinstance(nxt, LoopRegion):
             yield nxt
         current = nxt
@@ -182,7 +184,7 @@ def _intermediate_chain_clean(outer: LoopRegion, inner: LoopRegion, outer_var: s
                 try:
                     free = symbolic.pystr_to_symbolic(code.as_string).free_symbols
                 except Exception:
-                    free = set()
+                    free = {}
                 if outer_sym in free:
                     return False
         current = current.parent_graph
@@ -195,7 +197,7 @@ def _is_constant_positive_int(expr) -> Optional[int]:
         s = symbolic.simplify(expr)
     except Exception:
         return None
-    if not getattr(s, 'is_number', False) or not getattr(s, 'is_Integer', False):
+    if not s.is_number or not s.is_Integer:
         return None
     v = int(s)
     return v if v > 0 else None
@@ -206,7 +208,7 @@ def _is_zero(expr) -> bool:
         s = symbolic.simplify(expr)
     except Exception:
         return False
-    return getattr(s, 'is_number', False) and s == 0
+    return s.is_number and s == 0
 
 
 def _tile_size(expr) -> Optional[Tuple[symbolic.SymbolicType, Optional[int]]]:
@@ -236,8 +238,8 @@ def _tile_size(expr) -> Optional[Tuple[symbolic.SymbolicType, Optional[int]]]:
         s = symbolic.simplify(expr)
     except Exception:
         return None
-    if getattr(s, 'is_number', False):
-        if not getattr(s, 'is_Integer', False):
+    if s.is_number:
+        if not s.is_Integer:
             return None
         v = int(s)
         if v <= 1:
@@ -248,6 +250,78 @@ def _tile_size(expr) -> Optional[Tuple[symbolic.SymbolicType, Optional[int]]]:
     if isinstance(s, sympy.Symbol):
         return (s, None)
     return None
+
+
+def map_tile_partner(outer: nodes.Map, inner: nodes.Map) -> bool:
+    """``True`` iff ``inner`` spans exactly one tile of ``outer`` on some axis.
+
+    Map-range mirror of :func:`_match_inner_case`: an outer dimension with a tile stride ``K``
+    against an inner dimension running ``[0, K-1]`` (case A) or ``[p, p + K - 1]`` (case B) for
+    that outer dimension's parameter ``p``. Subset ranges carry an INCLUSIVE end, which is the
+    same convention ``loop_analysis.get_loop_end`` returns, so the comparisons match the
+    LoopRegion matcher's.
+    """
+    for p, (_, _, step) in zip(outer.params, outer.range):
+        tile = _tile_size(step)
+        if tile is None:
+            continue
+        k_expr = tile[0]
+        p_sym = symbolic.pystr_to_symbolic(p)
+        for begin, end, _ in inner.range:
+            if _is_zero(begin) and _diff_is_zero(end, k_expr - 1):
+                return True
+            if _diff_is_zero(begin, p_sym) and _diff_is_zero(end, p_sym + k_expr - 1):
+                return True
+    return False
+
+
+def map_tile_pattern_present(sdfg: SDFG) -> bool:
+    """``True`` iff the SDFG holds a hand-tiled **Map** nest, i.e. a Map whose stride is a tile
+    size and another Map covering one such tile.
+
+    The matcher itself only reads LoopRegions, so a Map-tiled nest is invisible to it unless the
+    round trip lowers the Maps first; this is the trigger that decides whether that round trip is
+    worth running (see :meth:`UntileLoops.apply_pass`). Tile-strided Maps are rare, so the scan
+    bails on the first sweep for almost every SDFG. GPU-scheduled Maps are skipped: lowering
+    device parallelism to a sequential loop is not a canonicalization.
+    """
+    tiled: List[nodes.Map] = []
+    every: List[nodes.Map] = []
+    for n, _ in sdfg.all_nodes_recursive():
+        if not isinstance(n, nodes.MapEntry) or n.map.schedule in dtypes.GPU_SCHEDULES:
+            continue
+        every.append(n.map)
+        if any(_tile_size(step) is not None for _, _, step in n.map.range):
+            tiled.append(n.map)
+    if not tiled:
+        return False
+    return any(map_tile_partner(outer, inner) for outer in tiled for inner in every if inner is not outer)
+
+
+def tiles_a_parent_window(outer: LoopRegion, start, span) -> bool:
+    """``True`` iff ``outer`` walks a fixed-width window opened by an enclosing loop.
+
+    The witness is the pair (start depends on an enclosing loop's iterator, width does not): that
+    is the cascade rung ``for iiii in range(iii, iii + T2, T3)``, whose union is the window
+    ``[iii, iii + T2)`` itself. A loop over a global extent (``range(1, LEN - 1 - T, T)``) fails
+    the test and keeps the round-up bound, which is what makes its intended overshoot past the
+    last origin survive.
+    """
+    enclosing: Dict[str, None] = {}
+    graph = outer.parent_graph
+    while graph is not None:
+        if isinstance(graph, LoopRegion) and graph.loop_variable:
+            enclosing[graph.loop_variable] = None
+        graph = graph.parent_graph
+    if not enclosing or not any(str(s) in enclosing for s in start.free_symbols):
+        return False
+    return not any(str(s) in enclosing for s in span.free_symbols)
+
+
+def count_loops(sdfg: SDFG) -> int:
+    """Number of iterating LoopRegions anywhere in ``sdfg`` (nested SDFGs included)."""
+    return sum(1 for sd in sdfg.all_sdfgs_recursive() for r in sd.all_control_flow_regions()
+               if isinstance(r, LoopRegion) and r.loop_variable)
 
 
 def _match_inner_case(inner: LoopRegion, outer_var: str, K_expr: symbolic.SymbolicType,
@@ -339,7 +413,7 @@ def _diff_is_zero(a, b) -> bool:
         diff = symbolic.simplify(a - b)
     except Exception:
         return False
-    if hasattr(diff, "is_number") and diff.is_number:
+    if diff.is_number:
         try:
             return int(diff) == 0
         except (TypeError, ValueError):
@@ -369,35 +443,25 @@ def _collect_body_subset_exprs(inner: LoopRegion) -> List[symbolic.SymbolicType]
     return exprs
 
 
-def _all_memlet_uses_only(inner: LoopRegion, allowed_atoms: Set[str], forbidden_atoms: Set[str]) -> bool:
-    """``True`` iff every memlet-subset expression references at most symbols
-    from ``allowed_atoms`` (any expression of them is fine) and references *no*
-    symbol from ``forbidden_atoms``.
+def depends_only_on_sum(ex: sympy.Basic, i_sym: sympy.Symbol, ii_sym: sympy.Symbol) -> bool:
+    """``True`` iff ``ex`` reads ``i`` and ``ii`` only through the sum ``i + ii``.
 
-    The check is conservative: an expression like ``2*i + ii + 1`` is fine if
-    both ``i`` and ``ii`` are allowed (because ``i + ii`` is the combined
-    iterator), but ``i`` alone without ``ii`` is forbidden -- the rewrite would
-    map only the ``i + ii`` part to ``k`` and would leave the bare ``i`` adrift.
-
-    This function only checks the *atom membership* of each expression's free
-    symbols; the structural ``i + ii`` vs ``ii``-only requirement is enforced
-    by the caller (it sets ``allowed_atoms`` appropriately).
+    The case-A rewrite substitutes ``ii -> k - i`` and then ``i -> 0``, which preserves a
+    subexpression's value exactly when that subexpression is a function of ``i + ii``: any such
+    function has equal partials in both. Co-occurrence is NOT sufficient -- ``2*i + ii`` and
+    ``i**2 + ii**2`` both mention the two together yet collapse to ``k`` and ``k**2``. Anything
+    sympy cannot differentiate (``int_floor`` and friends) refuses, so the audit fails closed.
     """
-    forbidden = {symbolic.pystr_to_symbolic(a) for a in forbidden_atoms}
-    for ex in _collect_body_subset_exprs(inner):
-        free = ex.free_symbols
-        if any(f in forbidden for f in free):
-            return False
-    return True
+    try:
+        return symbolic.simplify(sympy.diff(ex, i_sym) - sympy.diff(ex, ii_sym)) == 0
+    except (TypeError, ValueError, AttributeError, NotImplementedError):
+        return False
 
 
 def _audit_combined_access(inner: LoopRegion, outer_var: str, inner_var: str, case: str) -> bool:
     """The structural safety check the docstring describes.
 
-    Case A (``ii in range(0, K)``): the combined expression ``i + ii`` must be
-    the *only* way ``i`` and ``ii`` enter any memlet. Conservative test: every
-    memlet-subset expression that mentions ``i`` must also mention ``ii``, and
-    vice-versa.
+    Case A (``ii in range(0, K)``): ``i`` and ``ii`` must enter every memlet only as ``i + ii``.
 
     Case B (``ii in range(i, i + K)``): ``i`` must NEVER appear in a memlet
     (only ``ii``). The new iterator ``k`` becomes ``ii`` directly.
@@ -409,13 +473,7 @@ def _audit_combined_access(inner: LoopRegion, outer_var: str, inner_var: str, ca
             if i_sym in ex.free_symbols:
                 return False
         return True
-    # Case A: ``i`` and ``ii`` must always appear together.
-    for ex in _collect_body_subset_exprs(inner):
-        has_i = i_sym in ex.free_symbols
-        has_ii = ii_sym in ex.free_symbols
-        if has_i != has_ii:
-            return False
-    return True
+    return all(depends_only_on_sum(ex, i_sym, ii_sym) for ex in _collect_body_subset_exprs(inner))
 
 
 @properties.make_properties
@@ -431,12 +489,11 @@ class UntileLoops(ppl.Pass):
     * Case B -- ``for i in range(0, N, K): for ii in range(i, i + K, S): ...``,
       body addresses arrays via ``ii``.
 
-    ``K`` is either a concrete positive integer literal (``> 1``) with ``S``
-    (inner stride) dividing ``K``, or a positive **symbol** (in which case
-    only ``S == 1`` is admitted -- a concrete stride cannot be proven to
-    divide a symbol). ``S == 1`` is the classic single-level untile; ``S > 1``
-    is an intermediate cascade rung that fixpoint then collapses with the
-    next inner.
+    ``K`` is a concrete positive integer literal (``> 1``) or a positive
+    **symbol**. ``S == 1`` is the classic single-level untile; ``S > 1`` is an
+    intermediate cascade rung that fixpoint then collapses with the next inner,
+    and needs ``S | K`` -- decided exactly when both are concrete, recorded as
+    a tracked assumption when either is symbolic.
 
     **Multi-dim ascent**: the inner doesn't have to be the immediate child
     of the outer. The matcher walks down through perfect 1-child
@@ -449,12 +506,16 @@ class UntileLoops(ppl.Pass):
     pair; multi-level cascades and multi-axis tiles unwind progressively.
     Bounded by the total LoopRegion count.
 
-    **Map round-trip** (``map_roundtrip=True``, default): pre-step lowers
-    every Map via :class:`MapExpansion` + :class:`MapToForLoop` so
-    Map-tiled patterns enter the matcher as LoopRegions; post-step
-    re-lifts via :class:`LoopToMap` + :class:`MapCollapse`. Set to
-    ``False`` from the canonicalize pipeline if a separate ``parallelize``
-    stage does the lift downstream (it's a no-op in that case anyway).
+    **Map round-trip**: pre-step lowers every Map via :class:`MapExpansion` +
+    :class:`MapToForLoop` so Map-tiled patterns enter the matcher as
+    LoopRegions; post-step re-lifts via :class:`LoopToMap` +
+    :class:`MapCollapse`. It runs when ``map_roundtrip=True`` forces it, and
+    otherwise whenever :func:`map_tile_pattern_present` finds a hand-tiled Map
+    nest AND :meth:`roundtrip_recovers_maps` confirms on a copy that the trip
+    both untiles something and gives every lowered Map back as a Map. A
+    ``dace.map``-tiled kernel is therefore recovered on the pass's defaults --
+    without the auto-trigger the matcher never sees it and the hand-written
+    tiling survives into codegen.
 
     Runs BEFORE :class:`~dace.transformation.passes.parallelization_prep.ShortLoopUnroll`
     so the small fixed-trip inner loop doesn't get straight-line-unrolled.
@@ -464,23 +525,24 @@ class UntileLoops(ppl.Pass):
 
     map_roundtrip = properties.Property(dtype=bool,
                                         default=False,
-                                        desc='Lower Maps to LoopRegions before untile and re-lift after, so '
-                                        'Map-tiled patterns are detected. Off by default: the canonicalize '
-                                        'pipeline runs the lift downstream and existing range-tile tests '
-                                        'assert on raw LoopRegion shape after untile. Test driver enables '
-                                        'when the kernel uses ``dace.map[...]`` tiles.')
+                                        desc='Force the Map -> LoopRegion -> Map round trip that exposes '
+                                        'Map-tiled patterns to the matcher. Off by default, in which case the '
+                                        'trip is taken only for SDFGs that hold a Map tile nest and only when '
+                                        'a probe on a copy shows it pays off; forcing it lowers and re-lifts '
+                                        'every Map unconditionally.')
 
     def __init__(self, map_roundtrip: bool = False):
         super().__init__()
         self.map_roundtrip = map_roundtrip
 
     def modifies(self) -> ppl.Modifies:
-        return ppl.Modifies.CFG | ppl.Modifies.Symbols | ppl.Modifies.Memlets
+        # Nodes: the Map round trip creates and removes Map scopes (and the NSDFGs around them).
+        return ppl.Modifies.CFG | ppl.Modifies.Symbols | ppl.Modifies.Memlets | ppl.Modifies.Nodes
 
     def should_reapply(self, _modified: ppl.Modifies) -> bool:
         return False
 
-    def _maps_to_loops(self, sdfg: SDFG) -> None:
+    def _maps_to_loops(self, sdfg: SDFG) -> int:
         """Pre-round-trip step: lower every Map to a LoopRegion.
 
         Sequence:
@@ -504,48 +566,43 @@ class UntileLoops(ppl.Pass):
         from dace.transformation.interstate.expand_nested_sdfg_inputs import ExpandNestedSDFGInputs
         from dace.transformation.interstate.multistate_inline import InlineMultistateSDFG
         from dace.transformation.passes.pattern_matching import PatternMatchAndApplyRepeated
-        PatternMatchAndApplyRepeated([MapExpansion()]).apply_pass(sdfg, {})
-        PatternMatchAndApplyRepeated([MapToForLoop()]).apply_pass(sdfg, {})
+        applied = count_applied(PatternMatchAndApplyRepeated([MapExpansion()]).apply_pass(sdfg, {}))
+        lower_maps = MapToForLoop()
+        lower_maps.keep_reductions_parallel = True  # canon preference, off in the transformation's default contract
+        applied += count_applied(PatternMatchAndApplyRepeated([lower_maps]).apply_pass(sdfg, {}))
         # Sweep up any NSDFG wrappers that survived MapToForLoop's
         # inline_after step because they were Map-scoped at the time.
         # After all Maps are lifted they are no longer scoped, so a
         # fixpoint sweep flattens them.
         for _ in range(16):
-            before = sum(1 for n, _ in sdfg.all_nodes_recursive()
-                         if hasattr(n, "sdfg") and hasattr(n, "symbol_mapping"))
-            PatternMatchAndApplyRepeated([ExpandNestedSDFGInputs()]).apply_pass(sdfg, {})
-            PatternMatchAndApplyRepeated([InlineMultistateSDFG()]).apply_pass(sdfg, {})
-            after = sum(1 for n, _ in sdfg.all_nodes_recursive() if hasattr(n, "sdfg") and hasattr(n, "symbol_mapping"))
+            before = sum(1 for n, _ in sdfg.all_nodes_recursive() if isinstance(n, nodes.NestedSDFG))
+            applied += count_applied(PatternMatchAndApplyRepeated([ExpandNestedSDFGInputs()]).apply_pass(sdfg, {}))
+            applied += count_applied(PatternMatchAndApplyRepeated([InlineMultistateSDFG()]).apply_pass(sdfg, {}))
+            after = sum(1 for n, _ in sdfg.all_nodes_recursive() if isinstance(n, nodes.NestedSDFG))
             if after >= before:
                 break
+        return applied
 
-    def _loops_back_to_maps(self, sdfg: SDFG) -> None:
+    def _loops_back_to_maps(self, sdfg: SDFG) -> int:
         """Post-round-trip step: re-lift every parallelizable LoopRegion
         to a Map and re-fuse adjacent uni-dim Maps."""
         from dace.transformation.dataflow.map_collapse import MapCollapse
         from dace.transformation.interstate.loop_to_map import LoopToMap
         from dace.transformation.passes.pattern_matching import PatternMatchAndApplyRepeated
-        PatternMatchAndApplyRepeated([LoopToMap()]).apply_pass(sdfg, {})
-        PatternMatchAndApplyRepeated([MapCollapse()]).apply_pass(sdfg, {})
+        applied = count_applied(PatternMatchAndApplyRepeated([LoopToMap()]).apply_pass(sdfg, {}))
+        applied += count_applied(PatternMatchAndApplyRepeated([MapCollapse()]).apply_pass(sdfg, {}))
+        return applied
 
-    def apply_pass(self, sdfg: SDFG, _) -> Optional[int]:
-        """Run the per-loop rewrite as a fixpoint over the SDFG.
+    def untile_fixpoint(self, sdfg: SDFG) -> int:
+        """Collapse tile pairs until none is left, and return how many were collapsed.
 
-        When ``map_roundtrip`` is on, lower every Map to a LoopRegion
-        first, run the fixpoint, then re-lift. Each fixpoint pass
-        collapses one (outer, inner) tile pair; multi-level cascade and
-        multi-axis tiles (where successive iterations expose new tile
-        pairs that became the outermost after the prior collapse) unwind
-        progressively. Iteration cap = 1 + (loop count); once an
-        iteration rewrites nothing we stop.
+        Each sweep collapses one (outer, inner) tile pair per nest; multi-level cascade and
+        multi-dim tiles (where successive sweeps expose the pair that became outermost after the
+        prior collapse) unwind progressively. Iteration cap = 1 + (loop count); once a sweep
+        rewrites nothing we stop.
         """
-        if self.map_roundtrip:
-            self._maps_to_loops(sdfg)
-
         total = 0
-        # Safety cap: at most one rewrite per LoopRegion in the SDFG.
-        max_iters = 1 + sum(1 for sd in sdfg.all_sdfgs_recursive()
-                            for r in sd.all_control_flow_regions() if isinstance(r, LoopRegion))
+        max_iters = 1 + count_loops(sdfg)
         for _ in range(max_iters):
             rewritten_this_pass = 0
             for sd in sdfg.all_sdfgs_recursive():
@@ -557,15 +614,50 @@ class UntileLoops(ppl.Pass):
             if rewritten_this_pass == 0:
                 break
             total += rewritten_this_pass
+        return total
 
-        if self.map_roundtrip:
-            self._loops_back_to_maps(sdfg)
+    def roundtrip_recovers_maps(self, sdfg: SDFG) -> bool:
+        """Whether taking the Map round trip on ``sdfg`` is worth it, decided on a copy.
+
+        Two conditions, both necessary. The trip must actually untile something -- otherwise it is
+        pure churn. And it must not leave a Map behind as a LoopRegion: the lowering is applied to
+        EVERY Map, and a Map that ``LoopToMap`` cannot re-derive (a scatter the user asserted was
+        parallel, say) would come back sequential, trading the hand-written tiling for lost
+        parallelism. Loop count is the exact witness -- untiling only ever removes loops, so any
+        growth is a Map that failed to return.
+        """
+        probe = copy.deepcopy(sdfg)
+        loops_before = count_loops(probe)
+        self._maps_to_loops(probe)
+        untiled = self.untile_fixpoint(probe)
+        self._loops_back_to_maps(probe)
+        return untiled > 0 and count_loops(probe) <= loops_before
+
+    def apply_pass(self, sdfg: SDFG, _) -> Optional[int]:
+        """Run the per-loop rewrite as a fixpoint over the SDFG, around the Map round trip when
+        that is forced or when a Map tile nest makes it pay off."""
+        # The round trip rewrites the graph even when no tile pair is found, so its edits have to
+        # be reported too -- returning None after lowering and re-lifting every map would tell the
+        # caller nothing changed and let it reuse stale analyses.
+        roundtrip = 0
+        take_roundtrip = self.map_roundtrip or (map_tile_pattern_present(sdfg) and self.roundtrip_recovers_maps(sdfg))
+        if take_roundtrip:
+            roundtrip += self._maps_to_loops(sdfg)
+
+        total = self.untile_fixpoint(sdfg)
+
+        if take_roundtrip:
+            roundtrip += self._loops_back_to_maps(sdfg)
         if total:
             # Propagate once, at the end of the pass -- the in-place iterator
             # rewrites above intentionally do not self-propagate per rewrite.
             from dace.sdfg.propagation import propagate_memlets_sdfg
             propagate_memlets_sdfg(sdfg)
-        return total or None
+        # ``total`` counts untiled loops; the round trip's edits do not add to that number, but
+        # they still mean "modified", hence 0 rather than None.
+        if total:
+            return total
+        return 0 if roundtrip else None
 
     def _try_untile(self, outer: LoopRegion, sdfg: SDFG) -> bool:
         # The outer must be ``for i in range(0, N, K)`` with a positive tile
@@ -652,9 +744,25 @@ class UntileLoops(ppl.Pass):
         # ``stop`` and ``outer_end + 1`` truncated the final tile (missed its tail
         # rows/cols). The earlier ``outer_end + outer_stride`` over-shot the other
         # way (a full extra tile). The round-up is the exact union.
+        #
+        # One shape rounds up to a WRONG bound: a rung that walks a fixed-width window carved out
+        # by an enclosing loop (``for iiii in range(iii, iii + T2, T3)`` inside the ``T2`` tile).
+        # There the window IS the union, and the source nest is only well formed when the rung
+        # divides it -- otherwise its own last tile overshoots the window, exactly as for the
+        # cascade-stride rung above. With a symbolic width the round-up cannot fold, so it leaves
+        # ``T3*int_ceil(T2, T3)`` where the enclosing rung expects ``T2``, and the next fixpoint
+        # sweep no longer recognises the pair (measured on ``jacobi2d_triple_tiled_sym``: the
+        # cascade stalled with two of three levels collapsed). Take the window as the union and
+        # record the divisibility, same contract as the stride rung.
         stop_excl = symbolic.simplify(outer_end + 1)
         span = symbolic.simplify(stop_excl - outer_start_sym)
-        N_excl = symbolic.simplify(outer_start_sym + symbolic.int_ceil(span, K_expr) * K_expr)
+        tiles_end = symbolic.simplify(symbolic.int_ceil(span, K_expr) * K_expr)
+        if _diff_is_zero(tiles_end,
+                         span) or tiles_end.is_number or not tiles_a_parent_window(outer, outer_start_sym, span):
+            N_excl = symbolic.simplify(outer_start_sym + tiles_end)
+        else:
+            record_assumption(sdfg, sympy.Eq(sympy.Mod(span, K_expr), 0))
+            N_excl = stop_excl
 
         # Body substitution: ``i + ii`` -> ``k`` (case A) or ``ii`` -> ``k`` (case B).
         i_sym = outer.loop_variable

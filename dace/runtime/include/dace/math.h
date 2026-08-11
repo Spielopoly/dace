@@ -94,6 +94,28 @@ static DACE_CONSTEXPR DACE_HDFI int frexp(const T& a) {
   return exponent;
 }
 
+// Fortran ``SCALE(x, n)`` -- return ``x * 2^n``.  Matches C's
+// ``std::ldexp`` exactly.  Templated so the same name covers
+// f32 / f64 operands without the frontend having to specialise.
+template <typename T,
+          std::enable_if_t<std::is_floating_point<T>::value>* = nullptr>
+static DACE_CONSTEXPR DACE_HDFI T ldexp(const T& x, int n) {
+  return std::ldexp(x, n);
+}
+
+// Fortran ``EXPONENT(x)`` -- return the integer exponent ``e`` such
+// that ``x = mantissa * 2^e`` with ``0.5 <= |mantissa| < 1``.
+// Equivalent to ``std::frexp``'s second result; ``ilogb(x) + 1`` for
+// finite ``x``.  Provide as ``ilogb`` so the bridge's runtime-call
+// recognition can map ``_FortranAExponent*`` to a single short name.
+template <typename T,
+          std::enable_if_t<std::is_floating_point<T>::value>* = nullptr>
+static DACE_CONSTEXPR DACE_HDFI int ilogb(const T& x) {
+  int e = 0;
+  std::frexp(x, &e);
+  return e;
+}
+
 // Implement to support Fortran's intrinsic NINT - round, but return an integer
 template <typename T,
           std::enable_if_t<std::is_floating_point<T>::value>* = nullptr>
@@ -142,7 +164,9 @@ static DACE_CONSTEXPR DACE_HDFI T bitwise_xor(const T& left_operand,
   return left_operand ^ right_operand;
 }
 
-template <typename T, typename T2>
+// Unary: only ``T`` is deducible. A second template parameter (copied from the binary helpers
+// above) made every call ``bitwise_invert(x)`` fail with "couldn't deduce template parameter 'T2'".
+template <typename T>
 static DACE_CONSTEXPR DACE_HDFI T bitwise_invert(const T& value) {
   return ~value;
 }
@@ -317,6 +341,20 @@ template <typename T,
 static DACE_CONSTEXPR DACE_HDFI T cpp_mod(const T& numerator,
                                           const T& denominator) {
   return (T)std::fmod(numerator, denominator);
+}
+
+// ``floor_mod(a, b)`` -- Fortran ``MODULO``: floored-quotient remainder
+// (same sign as the divisor).  Matches Python's ``%`` on both ints and
+// floats -- distinct from C++ ``%``, which truncates on signed ints.
+// Templated so a single ``floor_mod(a, b)`` call covers ``int32`` /
+// ``int64`` / ``float`` / ``double`` operands without the frontend
+// having to hint the operand type.  Fortran ``MOD`` (truncated) lowers
+// directly to ``arith.remsi`` for ints / ``std::fmod`` for floats and
+// doesn't need a helper.
+template <typename T>
+static DACE_CONSTEXPR DACE_HDFI T floor_mod(const T& numerator,
+                                            const T& denominator) {
+  return py_mod(numerator, denominator);
 }
 
 // Computes C/C++ divmod (std::div)
@@ -584,6 +622,23 @@ namespace math {
 static DACE_CONSTEXPR_HOSTDEV typeless_pi pi{};
 static DACE_CONSTEXPR typeless_nan nan{};
 //////////////////////////////////////////////////////
+
+// Complex-component accessors.  ``re(z)`` / ``im(z)`` extract the real
+// / imaginary part of a complex value.  ``cppunparse`` maps the
+// tasklet-body spellings ``re(_in)`` / ``im(_in)`` here so a complex
+// connector's component is read directly.  Generic over
+// ``std::complex`` / ``thrust::complex`` (both expose ``.real()`` /
+// ``.imag()``); the trailing ``decltype`` constrains it to complex
+// types.
+template <typename T>
+DACE_CONSTEXPR DACE_HDFI auto re(const T& z) -> decltype(z.real()) {
+  return z.real();
+}
+template <typename T>
+DACE_CONSTEXPR DACE_HDFI auto im(const T& z) -> decltype(z.imag()) {
+  return z.imag();
+}
+
 template <typename T>
 DACE_CONSTEXPR DACE_HDFI T exp(const T& a) {
   return (T)std::exp(a);
@@ -615,10 +670,15 @@ static DACE_CONSTEXPR DACE_HDFI unsigned int pow(const unsigned int& a,
   return result;
 }
 
-// Scalar types seed at ``T(1)`` so ``ipow(a, 0) == 1``.
+// Scalar types seed at ``T(1)`` so ``ipow(a, 0) == 1``. ``DACE_CONSTEXPR`` (the loop body is
+// constant-expression-legal since C++14, as the ``pow`` overloads above show) lets the readable
+// codegen's ``constexpr``/``consteval`` ``<arr>_idx`` / ``<arr>_size`` helpers call ``ipow`` directly
+// (RelaxIntegerPowers lowers integer powers in shapes/strides to ``ipow``); a non-constexpr callee
+// there is -Winvalid-constexpr and not a constant expression. Additive: runtime call sites are
+// unchanged.
 template <typename T,
           typename std::enable_if<std::is_constructible<T, int>::value>::type* = nullptr>
-DACE_HDFI T ipow(const T a, const unsigned int b) {
+DACE_CONSTEXPR DACE_HDFI T ipow(const T a, const unsigned int b) {
   T result = T(1);
   for (unsigned int i = 0; i < b; ++i) result *= a;
   return result;
@@ -628,7 +688,7 @@ DACE_HDFI T ipow(const T a, const unsigned int b) {
 // compile-time exponent >= 1 (the constant-power path emits a literal 1 for exponent 0).
 template <typename T,
           typename std::enable_if<!std::is_constructible<T, int>::value>::type* = nullptr>
-DACE_HDFI T ipow(const T a, const unsigned int b) {
+DACE_CONSTEXPR DACE_HDFI T ipow(const T a, const unsigned int b) {
   T result = a;
   for (unsigned int i = 1; i < b; ++i) result *= a;
   return result;
@@ -682,6 +742,114 @@ template <typename T>
 DACE_CONSTEXPR DACE_HDFI T log10(const T& a) {
   return std::log10(a);
 }
+template <typename T>
+DACE_CONSTEXPR DACE_HDFI T log1p(const T& a) {
+  return std::log1p(a);
+}
+template <typename T>
+DACE_CONSTEXPR DACE_HDFI T log2(const T& a) {
+  return std::log2(a);
+}
+template <typename T>
+DACE_CONSTEXPR DACE_HDFI T exp2(const T& a) {
+  return (T)std::exp2(a);
+}
+template <typename T>
+DACE_CONSTEXPR DACE_HDFI T expm1(const T& a) {
+  return (T)std::expm1(a);
+}
+template <typename T>
+DACE_CONSTEXPR DACE_HDFI T asin(const T& a) {
+  return std::asin(a);
+}
+template <typename T>
+DACE_CONSTEXPR DACE_HDFI T asinh(const T& a) {
+  return std::asinh(a);
+}
+template <typename T>
+DACE_CONSTEXPR DACE_HDFI T acos(const T& a) {
+  return std::acos(a);
+}
+template <typename T>
+DACE_CONSTEXPR DACE_HDFI T acosh(const T& a) {
+  return std::acosh(a);
+}
+template <typename T>
+DACE_CONSTEXPR DACE_HDFI T atan(const T& a) {
+  return std::atan(a);
+}
+template <typename T>
+DACE_CONSTEXPR DACE_HDFI T atan2(const T& a, const T& b) {
+  return std::atan2(a, b);
+}
+template <typename T>
+DACE_CONSTEXPR DACE_HDFI T atanh(const T& a) {
+  return std::atanh(a);
+}
+template <typename T>
+DACE_CONSTEXPR DACE_HDFI T cbrt(const T& a) {
+  return std::cbrt(a);
+}
+template <typename T>
+DACE_CONSTEXPR DACE_HDFI T fmod(const T& a, const T& b) {
+  return std::fmod(a, b);
+}
+template <typename T>
+DACE_CONSTEXPR DACE_HDFI T lgamma(const T& a) {
+  return std::lgamma(a);
+}
+template <typename T>
+DACE_CONSTEXPR DACE_HDFI T tgamma(const T& a) {
+  return std::tgamma(a);
+}
+template <typename T>
+DACE_CONSTEXPR DACE_HDFI T ceil(const T& a) {
+  return std::ceil(a);
+}
+template <typename T>
+DACE_CONSTEXPR DACE_HDFI T trunc(const T& a) {
+  return std::trunc(a);
+}
+template <typename T>
+DACE_CONSTEXPR DACE_HDFI T erf(const T& a) {
+  return std::erf(a);
+}
+template <typename T>
+DACE_CONSTEXPR DACE_HDFI T erfc(const T& a) {
+  return std::erfc(a);
+}
+template <typename T>
+DACE_CONSTEXPR DACE_HDFI T nearbyint(const T& a) {
+  return std::nearbyint(a);
+}
+template <typename T>
+DACE_CONSTEXPR DACE_HDFI T round(const T& a) {
+  return std::round(a);
+}
+template <typename T>
+DACE_CONSTEXPR DACE_HDFI T hypot(const T& a, const T& b) {
+  return std::hypot(a, b);
+}
+
+// Fused multiply-add ``a*b + c``, where ``cppunparse`` sends the tasklet-body
+// ``fma(a, b, c)``.  Forwards verbatim, so 32/64-bit stay bit-identical.
+template <typename T, typename U, typename V>
+DACE_CONSTEXPR DACE_HDFI auto fma(const T& a, const U& b, const V& c) {
+  return std::fma(a, b, c);
+}
+
+// A 16-bit float reaches ``float`` through one user-defined conversion, making
+// all three ``std::fma`` overloads equally good -- ambiguous, not a call.  Go
+// through ``float``, as ``tileops::tile_fma`` does for lanes it cannot pack
+// into ``__hfma2``.  Not ``DACE_CONSTEXPR``: ``__half(float)`` never folds, and
+// a non-template ``constexpr`` that cannot is -Winvalid-constexpr.
+#define DACE_MATH_FMA_LP(TYPE)                                             \
+  static DACE_HDFI TYPE fma(const TYPE& a, const TYPE& b, const TYPE& c) { \
+    return TYPE(std::fma(float(a), float(b), float(c)));                   \
+  }
+DACE_MATH_FMA_LP(dace::float16)
+DACE_MATH_FMA_LP(dace::bfloat16)
+#undef DACE_MATH_FMA_LP
 }  // namespace math
 
 namespace cmath {

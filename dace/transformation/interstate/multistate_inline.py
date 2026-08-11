@@ -17,6 +17,17 @@ from dace import data
 from dace.sdfg.state import LoopRegion, ReturnBlock
 
 
+def _same_layout(outer_desc: data.Data, inner_desc: data.Data) -> bool:
+    """Whether two descriptors carry the same shape and the same strides.
+
+    ``Scalar`` reports strides as a list and ``Array`` as a tuple, and ``same_value`` counts the
+    sequence type -- so a ``Scalar`` facing a length-1 ``Array``, the ordinary nested-SDFG boundary,
+    would refuse the inline over a container type. Compare by value.
+    """
+    return (symbolic.same_value(tuple(outer_desc.shape), tuple(inner_desc.shape))
+            and symbolic.same_value(tuple(outer_desc.strides), tuple(inner_desc.strides)))
+
+
 @make_properties
 @transformation.explicit_cf_compatible
 class InlineMultistateSDFG(transformation.SingleStateTransformation):
@@ -105,7 +116,7 @@ class InlineMultistateSDFG(transformation.SingleStateTransformation):
             #  for that. Clone the descriptor because the operation is inplace.
             inner_desc = nested_sdfg.sdfg.arrays[edge.dst_conn].clone()
             symbolic.safe_replace(nested_sdfg.symbol_mapping, lambda m: replace_properties_dict(inner_desc, m))
-            if (outer_desc.shape != inner_desc.shape or outer_desc.strides != inner_desc.strides):
+            if not _same_layout(outer_desc, inner_desc):
                 return False
 
         for edge in state.out_edges(nested_sdfg):
@@ -124,7 +135,7 @@ class InlineMultistateSDFG(transformation.SingleStateTransformation):
 
             inner_desc = nested_sdfg.sdfg.arrays[edge.src_conn].clone()
             symbolic.safe_replace(nested_sdfg.symbol_mapping, lambda m: replace_properties_dict(inner_desc, m))
-            if (outer_desc.shape != inner_desc.shape or outer_desc.strides != inner_desc.strides):
+            if not _same_layout(outer_desc, inner_desc):
                 return False
 
         if not helpers.isolate_nested_sdfg(state, nsdfg_node=nested_sdfg, test_if_applicable=True):
@@ -241,15 +252,33 @@ class InlineMultistateSDFG(transformation.SingleStateTransformation):
             if isinstance(b, LoopRegion):
                 if b.loop_variable is not None:
                     inner_assignments.add(b.loop_variable)
+        # The non-identity symbol_mapping keys are lowered below to interstate-edge assignments
+        # (``inner_K = outer_expr``) planted on the edge entering the inlined SDFG, i.e. they become
+        # symbols *defined* inside the inlined region. Treat them like inner assignments so that, if such a
+        # key collides with a symbol used elsewhere in the outer SDFG (e.g. a callback of the same name used
+        # by a sibling branch), it is disambiguated to a fresh name instead of hijacking the outer symbol
+        # and dropping it from the compiled signature (which left an uninitialized callback pointer -> crash).
+        inner_assignments |= set(non_identity_mapping.keys())
 
         allnames = set(outer_symbols.keys()) | set(sdfg.arrays.keys())
         assignments_to_replace = inner_assignments & (outer_assignments | allnames)
+        # Inner symbols that received their value from an IDENTITY symbol-mapping entry
+        # (outer ``K`` -> inner ``K``, lowered above via ``safe_replace`` as a no-op rename).
+        # Renaming such a symbol on collision (below) severs that implicit outer->inner link.
+        identity_names = {str(k) for k in identity_mapping}
         sym_replacements: Dict[str, str] = {}
         for assign in assignments_to_replace:
             newname = data.find_new_name(assign, allnames)
             allnames.add(newname)
             outer_symbols[newname] = nsdfg.symbols.get(assign, None)
             sym_replacements[assign] = newname
+            # ``assign`` was inner == outer (identity map) but is now renamed to ``newname``; the
+            # outer value no longer reaches the inlined region. Re-establish it as a non-identity
+            # assignment ``newname = assign`` (planted on the entry edge below) so the inlined
+            # region is initialized from the outer symbol -- otherwise ``newname`` is undefined
+            # (e.g. an external loop-init symbol whose inner name collides with the outer one).
+            if assign in identity_names:
+                non_identity_mapping[assign] = assign
         nsdfg.replace_dict(sym_replacements)
 
         #######################################################

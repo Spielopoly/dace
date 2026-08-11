@@ -72,9 +72,9 @@ def test_parallelize_runs_once_idempotent():
             C[i] = A[i] + B[i]
 
     sdfg = add.to_sdfg(simplify=True)
-    assert ParallelizePipeline().apply_pass(sdfg, {}) == 12  # composed stages
+    assert ParallelizePipeline().apply_pass(sdfg, {}) == 11  # composed stages
     # Re-running is harmless (nothing left to parallelize).
-    assert ParallelizePipeline().apply_pass(sdfg, {}) == 12
+    assert ParallelizePipeline().apply_pass(sdfg, {}) == 11
     sdfg.validate()
 
     A = np.random.default_rng(2).random(8)
@@ -118,6 +118,66 @@ def test_parallelize_unrolls_short_constant_loop():
     B = np.zeros(1)
     sdfg(A=A, B=B)
     assert np.allclose(B[0], A.sum())
+
+
+def test_short_loop_unroll_refuses_unfusable_branchy_body() -> None:
+    """The unroll is declined exactly when it can neither specialize an index nor decide a guard.
+
+    Unrolling substitutes the loop variable, so a body that never names it clones verbatim; if that
+    body is also branchy, the clones are separated by conditionals and the pass's local state fusion
+    re-merges none of them (npbench ``crc16``: 11 states -> 46, no map gained). Both halves of the
+    conjunction are load-bearing, so both are probed from the other side as well.
+    """
+
+    @dace.program
+    def bit_mix(seed: dace.int64[1], out: dace.int64[1]):
+        c = seed[0]
+        for _ in range(4):
+            if c & 1:
+                c = (c >> 1) ^ 7
+            else:
+                c = c >> 1
+        out[0] = c
+
+    @dace.program
+    def branchy_indexed(A: dace.float64[4], B: dace.float64[1]):
+        for m in range(4):
+            if A[m] > 0.0:
+                B[0] = B[0] + A[m]
+            else:
+                B[0] = B[0] - A[m]
+
+    @dace.program
+    def straight_line(x: dace.float64[1]):
+        for _ in range(4):
+            x[0] = x[0] * 0.5
+
+    # Branchy AND the iterate is unused -> refused, and the refusal leaves the SDFG untouched.
+    refused = bit_mix.to_sdfg(simplify=True)
+    states_before = sum(1 for sd in refused.all_sdfgs_recursive() for _ in sd.all_states())
+    ShortLoopUnroll(unroll_limit=8).apply_pass(refused, {})
+    assert _num_loops(refused) == 1
+    assert sum(1 for sd in refused.all_sdfgs_recursive() for _ in sd.all_states()) == states_before
+
+    # Branchy but the iterate INDEXES the body: unrolling pins it, which is what folds the guards
+    # and the constant subsets downstream (the CloudSC species loop). Still unrolled.
+    indexed = branchy_indexed.to_sdfg(simplify=True)
+    ShortLoopUnroll(unroll_limit=8).apply_pass(indexed, {})
+    assert _num_loops(indexed) == 0
+
+    # Unused iterate but straight-line: the clones fuse back down, which is the pass's whole point.
+    flat = straight_line.to_sdfg(simplify=True)
+    ShortLoopUnroll(unroll_limit=8).apply_pass(flat, {})
+    assert _num_loops(flat) == 0
+
+    # Value-preserving: the refused loop still computes the reference recurrence.
+    seed = np.array([12345], dtype=np.int64)
+    out = np.zeros(1, dtype=np.int64)
+    refused(seed=seed, out=out)
+    expected = 12345
+    for _ in range(4):
+        expected = ((expected >> 1) ^ 7) if expected & 1 else expected >> 1
+    assert out[0] == expected
 
 
 def test_parallelize_peel_mechanism_value_preserving():
@@ -175,32 +235,107 @@ def test_parallelize_peel_limit_zero_disables():
     assert _num_loops(sdfg) == before  # untouched
 
 
-def test_best_peel_gate_recognises_iter_var_guard():
-    """``_best_peel_for`` runs its (expensive) isolate-and-search only for loops whose body has
-    an iteration-variable guard -- the boundary special case a peel can strip. A positional
-    ``if i + 1 < mid`` guard is recognised (search proceeds); a recurrence with no iter-var branch
-    is not (search skipped, loop stays sequential -- the same outcome the old search reverted to)."""
+# -----------------------------------------------------------------------------
+# Unrolling a 3-level (double-tiled) nest: the shape ``UntileLoops`` hands over
+# when it cannot collapse a tile, and the shape that decides whether the tile
+# gets re-baked into the body as straight-line code.
+# -----------------------------------------------------------------------------
 
-    def _loop(sdfg):
-        return next(r for r in sdfg.all_control_flow_regions() if isinstance(r, LoopRegion) and r.loop_variable)
+
+def _num_tasklets(sdfg: dace.SDFG) -> int:
+    return len([n for n, _ in sdfg.all_nodes_recursive() if isinstance(n, nodes.Tasklet)])
+
+
+def test_short_loop_unroll_fully_unrolls_a_three_level_tile_nest():
+    """Three constant-trip levels (2 x 2 x 2) unroll to eight straight-line body copies.
+
+    Asserting the copy count is what separates a full unroll from a partial one: a residual loop
+    with a smaller trip count also leaves zero *matching* structure behind if only values are
+    checked."""
 
     @dace.program
-    def positional(a: dace.float64[N], b: dace.float64[N], c: dace.float64[N], d: dace.float64[N]):
-        mid = N // 2
-        for i in range(N):
-            if i + 1 < mid:
-                a[i] = a[i] + b[i] * c[i]
-            else:
-                a[i] = a[i] + b[i] * d[i]
+    def tiled(a: dace.float64[64], b: dace.float64[64]):
+        for i in range(0, 8, 4):
+            for ii in range(i, i + 4, 2):
+                for iii in range(ii, ii + 2):
+                    a[iii] = b[iii] * 2.0
+
+    sdfg = tiled.to_sdfg(simplify=True)
+    assert _num_loops(sdfg) == 3
+    per_body = _num_tasklets(sdfg)
+
+    assert ShortLoopUnroll(unroll_limit=8).apply_pass(sdfg, {}) == 3, 'all three levels must unroll'
+    sdfg.validate()
+    assert _num_loops(sdfg) == 0, 'full unroll must leave no residual loop'
+    assert _num_tasklets(sdfg) == 8 * per_body, f'expected 8 body copies, got {_num_tasklets(sdfg) / per_body}'
+
+    rng = np.random.default_rng(9)
+    b = rng.standard_normal(64)
+    a = np.zeros(64)
+    sdfg(a=a, b=b)
+    assert np.allclose(a[:8], b[:8] * 2.0)
+
+
+def test_short_loop_unroll_unrolls_the_constant_levels_under_a_symbolic_outer_tile():
+    """A symbolic outer tile keeps its loop; the two constant inner levels unroll to 4 x 4 copies.
+
+    This is the tile re-baking ``UntileLoops`` runs ahead of: with the tile still in place the
+    unroll writes 16 copies of the body into the outer loop, and the canonical unit-stride nest is
+    no longer recoverable from it."""
 
     @dace.program
-    def recurrence(A: dace.float64[N], B: dace.float64[N]):
-        B[0] = A[0]
-        for i in range(1, N):
-            B[i] = B[i - 1] + A[i]
+    def tiled(a: dace.float64[N], b: dace.float64[N]):
+        for i in range(0, N, 16):
+            for ii in range(i, i + 16, 4):
+                for iii in range(ii, ii + 4):
+                    a[iii] = b[iii] * 2.0
 
-    assert BestEffortLoopPeeling._has_iter_var_guard(_loop(positional.to_sdfg(simplify=True))) is True
-    assert BestEffortLoopPeeling._has_iter_var_guard(_loop(recurrence.to_sdfg(simplify=True))) is False
+    sdfg = tiled.to_sdfg(simplify=True)
+    per_body = _num_tasklets(sdfg)
+
+    assert ShortLoopUnroll(unroll_limit=8).apply_pass(sdfg, {}) == 2, 'both constant levels must unroll'
+    sdfg.validate()
+    loops = [r for r in sdfg.all_control_flow_regions() if isinstance(r, LoopRegion) and r.loop_variable]
+    assert len(loops) == 1 and loops[0].loop_variable == 'i', 'only the symbolic outer tile may survive'
+    assert _num_tasklets(sdfg) == 16 * per_body, f'expected 16 body copies, got {_num_tasklets(sdfg) / per_body}'
+
+    rng = np.random.default_rng(10)
+    b = rng.standard_normal(64)
+    a = np.zeros(64)
+    sdfg(a=a, b=b, N=64)
+    assert np.allclose(a, b * 2.0)
+
+
+def test_untile_before_unroll_leaves_the_unroll_nothing_to_re_bake():
+    """The pipeline order contract: ``UntileLoops`` first, so the tile never reaches the unroll.
+
+    Same kernel as above. Once untiled, the nest is a single symbolic-trip unit-stride loop --
+    ``ShortLoopUnroll`` finds no constant-trip loop, reports "untouched", and the canonical form
+    survives to the parallelization stage instead of being 16x straight-lined."""
+    from dace.transformation.passes.canonicalize.untile_loops import UntileLoops
+
+    @dace.program
+    def tiled(a: dace.float64[N], b: dace.float64[N]):
+        for i in range(0, N, 16):
+            for ii in range(i, i + 16, 4):
+                for iii in range(ii, ii + 4):
+                    a[iii] = b[iii] * 2.0
+
+    sdfg = tiled.to_sdfg(simplify=True)
+    per_body = _num_tasklets(sdfg)
+    assert UntileLoops().apply_pass(sdfg, {}) == 2, 'the 3-level cascade must collapse twice'
+    loops = [r for r in sdfg.all_control_flow_regions() if isinstance(r, LoopRegion) and r.loop_variable]
+    assert len(loops) == 1 and loops[0].loop_variable.startswith('_untile_k_')
+
+    assert ShortLoopUnroll(unroll_limit=8).apply_pass(sdfg, {}) is None, 'nothing left to unroll'
+    assert _num_tasklets(sdfg) == per_body, 'the body must not be duplicated'
+    assert _num_loops(sdfg) == 1
+
+    rng = np.random.default_rng(11)
+    b = rng.standard_normal(64)
+    a = np.zeros(64)
+    sdfg(a=a, b=b, N=64)
+    assert np.allclose(a, b * 2.0)
 
 
 if __name__ == '__main__':
@@ -208,6 +343,10 @@ if __name__ == '__main__':
     test_parallelize_rowsum_reduction_value_preserving()
     test_parallelize_runs_once_idempotent()
     test_parallelize_unrolls_short_constant_loop()
+    test_short_loop_unroll_refuses_unfusable_branchy_body()
     test_parallelize_peel_mechanism_value_preserving()
     test_parallelize_peeling_reverts_on_recurrence()
     test_parallelize_peel_limit_zero_disables()
+    test_short_loop_unroll_fully_unrolls_a_three_level_tile_nest()
+    test_short_loop_unroll_unrolls_the_constant_levels_under_a_symbolic_outer_tile()
+    test_untile_before_unroll_leaves_the_unroll_nothing_to_re_bake()

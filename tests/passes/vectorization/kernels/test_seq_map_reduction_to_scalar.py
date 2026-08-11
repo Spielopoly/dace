@@ -16,9 +16,14 @@ import numpy
 import pytest
 
 import dace
+from dace.libraries.tileops._dispatch import detect_host_isa
 from dace.transformation.passes.vectorization.config import VectorizeConfig
-from dace.transformation.passes.vectorization.enums import ISA, RemainderStrategy, BranchMode
+from dace.transformation.passes.vectorization.enums import RemainderStrategy, BranchMode
 from tests.passes.vectorization.helpers.harness import N, X, Y, run_vectorization_test
+
+#: The host's best runnable SIMD ISA; vectorization enforces arch-native, so a hardcoded AVX-512
+#: would SIGILL-refuse on an AVX2-only or ARM host.
+_HOST_ISA = detect_host_isa()
 
 pytestmark = pytest.mark.tile_nodes
 
@@ -48,7 +53,10 @@ def test_sum_1d_reduction(branch_mode, remainder_strategy):
     n = 60  # not a multiple of 8 -> remainder tile
     run_vectorization_test(
         dace_func=sum_1d,
-        arrays={"a": numpy.random.random(n), "s": numpy.zeros(1)},
+        arrays={
+            "a": numpy.random.random(n),
+            "s": numpy.zeros(1)
+        },
         params={"N": n},
         vector_width=8,
         sdfg_name="sum_1d",
@@ -64,8 +72,14 @@ def test_sum_2d_reduction_into_scalar(branch_mode, remainder_strategy):
     yv, xv = 8, 60
     run_vectorization_test(
         dace_func=sum_2d,
-        arrays={"a": numpy.random.random((yv, xv)), "s": numpy.zeros(1)},
-        params={"Y": yv, "X": xv},
+        arrays={
+            "a": numpy.random.random((yv, xv)),
+            "s": numpy.zeros(1)
+        },
+        params={
+            "Y": yv,
+            "X": xv
+        },
         vector_width=8,
         sdfg_name="sum_2d",
         branch_mode=branch_mode,
@@ -87,7 +101,9 @@ def _vectorize_and_check_2d_reduction(widths):
     sdfg = sum_2d.to_sdfg(simplify=True)
     sdfg.name = f"sum2d_k{len(widths)}"
     VectorizeCPUMultiDim(
-        VectorizeConfig(widths=widths, target_isa=ISA.AVX512, remainder_strategy=RemainderStrategy.MASKED_TAIL,
+        VectorizeConfig(widths=widths,
+                        target_isa=_HOST_ISA,
+                        remainder_strategy=RemainderStrategy.MASKED_TAIL,
                         branch_mode=BranchMode.MERGE)).apply_pass(sdfg, {})
     sdfg.validate()
     for s in {str(x) for x in sdfg.free_symbols}:
@@ -116,7 +132,11 @@ def test_dot_1d_reduction(branch_mode, remainder_strategy):
     n = 60
     run_vectorization_test(
         dace_func=dot_1d,
-        arrays={"a": numpy.random.random(n), "b": numpy.random.random(n), "s": numpy.zeros(1)},
+        arrays={
+            "a": numpy.random.random(n),
+            "b": numpy.random.random(n),
+            "s": numpy.zeros(1)
+        },
         params={"N": n},
         vector_width=8,
         sdfg_name="dot_1d",

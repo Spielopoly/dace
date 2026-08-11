@@ -619,11 +619,9 @@ def test_strided_fission_step2():
     strided_two_ops(A=A, B=B_ref)
 
     sdfg = strided_two_ops.to_sdfg()
-    sdfg.save("before.sdfg")
     assert sdfg.apply_transformations(MapFission, validate=True, validate_all=True) > 0
 
     sdfg(A=A, B=B_test)
-    sdfg.save("after.sdfg")
     assert np.allclose(B_test, B_ref)
 
 
@@ -1063,6 +1061,179 @@ def test_conditional_component_fission_single_is_noop():
     assert np.allclose(x, 1.0)
 
 
+N_carried = dace.symbol('N_carried')
+
+
+@dace.program
+def map_over_carried_loop(aa: dace.float64[N_carried, N_carried], bb: dace.float64[N_carried, N_carried]):
+    for i in dace.map[0:N_carried]:
+        for j in range(1, N_carried):
+            aa[i, j] = aa[i, j - 1] + bb[i, j]
+
+
+def test_map_over_carried_loop_terminates():
+    """A map whose whole body is a loop-carried LoopRegion cannot be fissioned: there is one component
+    and it IS the nested SDFG, so fission can only rebuild the same pattern a level deeper. It used to
+    do exactly that, ~490 times, until the recursion limit (TSVC s1119); the iterator also leaked into
+    the parent's symbol mapping, where nothing defined it."""
+    sdfg = map_over_carried_loop.to_sdfg(simplify=True)
+    before = copy.deepcopy(sdfg)
+    assert sdfg.apply_transformations_repeated(MapFission) == 0
+    sdfg.validate()
+    # Rejected means untouched: same nesting depth, same node count, no leftover scaffolding.
+    assert len(list(sdfg.all_sdfgs_recursive())) == len(list(before.all_sdfgs_recursive()))
+    assert sum(len(s.nodes()) for s in sdfg.all_states()) == sum(len(s.nodes()) for s in before.all_states())
+
+
+def test_symbol_use_index_agrees_with_the_per_loop_scan():
+    """``symbol_use_sites`` indexes the whole SDFG once so a caller asking about many loops does not
+    re-walk it per loop. The batched answer must equal the unbatched one for every counter."""
+    from dace.transformation.passes.analysis import loop_analysis
+    sdfg = map_over_carried_loop.to_sdfg(simplify=True)
+    use_sites, descriptor_symbols = loop_analysis.symbol_use_sites(sdfg)
+    checked = 0
+    for nested in sdfg.all_sdfgs_recursive():
+        inner_sites, inner_descs = loop_analysis.symbol_use_sites(nested)
+        for loop in [b for b in nested.all_control_flow_blocks() if isinstance(b, dace.sdfg.state.LoopRegion)]:
+            batched = loop_analysis.counter_used_outside_loop(loop.loop_variable,
+                                                              loop,
+                                                              nested,
+                                                              use_sites=inner_sites,
+                                                              descriptor_symbols=inner_descs)
+            assert batched == loop_analysis.counter_used_outside_loop(loop.loop_variable, loop, nested)
+            checked += 1
+    assert checked
+
+
+def test_counter_read_after_its_loop_is_not_internal():
+    """A counter observed after the loop must keep its declaration and its outbound propagation. The
+    predicate that decides this is the one codegen uses before scoping a counter into its for-init."""
+    from dace.transformation.passes.analysis import loop_analysis
+    sdfg = dace.SDFG('counter_escapes')
+    sdfg.add_array('A', [1], dace.float64)
+    sdfg.add_symbol('k', dace.int64)
+    loop = dace.sdfg.state.LoopRegion('loop', 'k < 10', 'k', 'k = 0', 'k = k + 1')
+    sdfg.add_node(loop, is_start_block=True)
+    loop.add_state('body', is_start_block=True)
+    after = sdfg.add_state('after')
+    sdfg.add_edge(loop, after, dace.InterstateEdge(assignments={'kk': 'k'}))  # reads k AFTER the loop
+
+    assert loop_analysis.counter_used_outside_loop('k', loop, sdfg)
+    # and with nothing reading it, the same counter is internal
+    sdfg2 = dace.SDFG('counter_local')
+    sdfg2.add_array('A', [1], dace.float64)
+    sdfg2.add_symbol('k', dace.int64)
+    loop2 = dace.sdfg.state.LoopRegion('loop', 'k < 10', 'k', 'k = 0', 'k = k + 1')
+    sdfg2.add_node(loop2, is_start_block=True)
+    loop2.add_state('body', is_start_block=True)
+    assert not loop_analysis.counter_used_outside_loop('k', loop2, sdfg2)
+
+
+def test_nested_loop_iterator_is_not_mapped_at_the_parent():
+    """``nest_sdfg_control_flow`` wraps a LoopRegion into a nested SDFG. The loop iterator is scoped to
+    that region, so it must appear in neither the new node's symbol mapping nor the enclosing SDFG's
+    free symbols -- mapping it makes it free at a boundary nothing defines."""
+    from dace.transformation.helpers import nest_sdfg_control_flow
+    sdfg = map_over_carried_loop.to_sdfg(simplify=True)
+    nsdfg = next(n for st in sdfg.all_states() for n in st.nodes() if isinstance(n, nodes.NestedSDFG))
+    loop_vars = {
+        b.loop_variable
+        for b in nsdfg.sdfg.all_control_flow_blocks() if isinstance(b, dace.sdfg.state.LoopRegion)
+    }
+    assert loop_vars
+
+    nest_sdfg_control_flow(nsdfg.sdfg)
+    sdfg.validate()
+    for inner in nsdfg.sdfg.all_sdfgs_recursive():
+        assert not (loop_vars & {str(s) for s in inner.free_symbols})
+        for st in inner.all_states():
+            for node in st.nodes():
+                if isinstance(node, nodes.NestedSDFG):
+                    assert not (loop_vars & node.symbol_mapping.keys())
+
+
+N_border = dace.symbol('N_border')
+M_border = 4  # a literal: a symbolic inner extent only adds a heap-allocated variable-length transient
+
+
+@dace.program
+def border_copied_out_of_map(a: dace.float64[N_border, M_border], b: dace.float64[N_border, M_border],
+                             c: dace.float64[N_border, M_border]):
+    for i in dace.map[0:N_border]:
+        t = c[i, :] * 2.0
+        a[i, :] = t
+        b[i, :] = t + 1.0
+
+
+def test_border_access_node_read_inside_and_copied_out():
+    """A border transient that is read inside the map AND copied out through ``map_exit`` is neither a source
+    nor a sink of the fissioned subgraph. Keying the boundary rewiring on source/sink membership left that
+    copy unreplaced, so removing the outer map dropped it: the write to ``a`` was silently lost and its
+    AccessNode left isolated, which the validator then rejected (TSVC s152/s221/s241/s243)."""
+    sdfg = border_copied_out_of_map.to_sdfg(simplify=True)
+    state = sdfg.states()[0]
+    map_entry = next(n for n in state.nodes() if isinstance(n, nodes.MapEntry) and state.entry_node(n) is None)
+    assert MapFission.can_be_applied_to(sdfg, expr_index=0, map_entry=map_entry)
+    MapFission.apply_to(sdfg, expr_index=0, map_entry=map_entry)
+    sdfg.validate()
+
+    # The copy out of the border transient must survive, now as a copy outside the fissioned maps.
+    awrite = next(n for n in state.nodes() if isinstance(n, nodes.AccessNode) and n.data == 'a')
+    assert [e for e in state.in_edges(awrite) if isinstance(e.src, nodes.AccessNode)]
+
+    n, m = 6, M_border
+    rng = np.random.default_rng(7)
+    cval = rng.random((n, m))
+    aval, bval = np.zeros((n, m)), np.zeros((n, m))
+    sdfg(a=aval, b=bval, c=cval, N_border=n)
+    assert np.allclose(aval, cval * 2.0)
+    assert np.allclose(bval, cval * 2.0 + 1.0)
+
+
+def test_border_access_node_copied_into_map():
+    """Mirror shape: the border transient is filled by a copy IN through ``map_entry`` and read by two
+    components. The rewiring prepended the map's own range to the inner memlet, which both added a dimension
+    the outer container does not have and, for a map not starting at zero, indexed the border transient past
+    its extent. The outer memlet already spans the map range, so it is the copy."""
+    sdfg = dace.SDFG('border_copied_into_map')
+    sdfg.add_array('c', [N_border, M_border], dace.float64)
+    sdfg.add_array('a', [N_border, M_border], dace.float64)
+    sdfg.add_array('b', [N_border, M_border], dace.float64)
+    sdfg.add_transient('t', [M_border], dace.float64)
+    state = sdfg.add_state()
+    cnode, anode, bnode = state.add_read('c'), state.add_write('a'), state.add_write('b')
+    tnode = state.add_access('t')
+    me, mx = state.add_map('outer', dict(i='1:N_border'))
+    state.add_memlet_path(cnode,
+                          me,
+                          tnode,
+                          memlet=dace.Memlet(data='c', subset=f'i, 0:{M_border}', other_subset=f'0:{M_border}'))
+    for label, code, dst, name in (('scale', 'y = x * 2.0', anode, 'a'), ('shift', 'y = x + 1.0', bnode, 'b')):
+        ime, imx = state.add_map(label, dict(j=f'0:{M_border}'))
+        tasklet = state.add_tasklet(label, {'x': None}, {'y': None}, code)
+        state.add_memlet_path(tnode, ime, tasklet, dst_conn='x', memlet=dace.Memlet('t[j]'))
+        state.add_memlet_path(tasklet, imx, mx, dst, src_conn='y', memlet=dace.Memlet(f'{name}[i, j]'))
+    sdfg.validate()
+
+    n, m = 6, M_border
+    rng = np.random.default_rng(3)
+    cval = rng.random((n, m))
+    expected_a, expected_b = cval * 2.0, cval + 1.0
+    aval, bval = np.zeros((n, m)), np.zeros((n, m))
+    sdfg(a=aval, b=bval, c=cval, N_border=n)
+    assert np.allclose(aval[1:], expected_a[1:])
+    assert np.allclose(bval[1:], expected_b[1:])
+
+    assert MapFission.can_be_applied_to(sdfg, expr_index=0, map_entry=me)
+    MapFission.apply_to(sdfg, expr_index=0, map_entry=me)
+    sdfg.validate()
+
+    aval, bval = np.zeros((n, m)), np.zeros((n, m))
+    sdfg(a=aval, b=bval, c=cval, N_border=n)
+    assert np.allclose(aval[1:], expected_a[1:])
+    assert np.allclose(bval[1:], expected_b[1:])
+
+
 if __name__ == '__main__':
     test_subgraph()
     test_nested_sdfg()
@@ -1093,3 +1264,9 @@ if __name__ == '__main__':
     test_conditional_component_fission_two()
     test_conditional_component_fission_three()
     test_conditional_component_fission_single_is_noop()
+    test_map_over_carried_loop_terminates()
+    test_symbol_use_index_agrees_with_the_per_loop_scan()
+    test_counter_read_after_its_loop_is_not_internal()
+    test_nested_loop_iterator_is_not_mapped_at_the_parent()
+    test_border_access_node_read_inside_and_copied_out()
+    test_border_access_node_copied_into_map()

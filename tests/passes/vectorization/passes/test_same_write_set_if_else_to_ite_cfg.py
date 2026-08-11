@@ -13,11 +13,11 @@ The third assertion uses ``sdfg.compile()`` end-to-end. Per the project rule,
 the reference is an unfolded scalar Python evaluation — not a different
 SDFG variant.
 """
-import os
-
 import numpy as np
+import pytest
 
 import dace
+from dace.config import set_temporary
 from dace.properties import CodeBlock
 from dace.sdfg.state import ConditionalBlock, ControlFlowRegion
 from dace.transformation.passes.vectorization.same_write_set_if_else_to_ite_cfg import (
@@ -25,8 +25,18 @@ from dace.transformation.passes.vectorization.same_write_set_if_else_to_ite_cfg 
     _symbol_has_external_consumer,
 )
 
-# This pass emits ``merge(...)`` tasklets which need ``dace/ITE.h``.
-os.environ.setdefault("DACE_compiler_cpu_args", "")
+
+@pytest.fixture(autouse=True)
+def blank_cpu_args():
+    """This pass emits ``merge(...)`` tasklets which need ``dace/ITE.h``.
+
+    Scoped to this module rather than written into ``os.environ`` at import time: a marker
+    expression only DESELECTS, so the module is still imported in every xdist worker of every
+    lane, and ``Config.get`` reads the environment ahead of the config -- which pinned empty
+    compiler flags process-wide and left nothing able to restore them.
+    """
+    with set_temporary('compiler', 'cpu', 'args', value=''):
+        yield
 
 
 def _build_same_write_if_else_sdfg():
@@ -549,18 +559,20 @@ def test_promote_gather_indices_rewrites_nested_subscript():
     sdfg = dace.SDFG("gather_cond")
     sdfg.add_array("w", [n, n], dace.float64)
     sdfg.add_array("idx", [n], dace.int64)
+    sdfg.add_symbol("i", dace.int64)  # index symbols must be in scope to hoist idx[i] onto the edge
+    sdfg.add_symbol("k", dace.int64)
     s0 = sdfg.add_state("s0", is_start_block=True)
     s1 = sdfg.add_state("s1")
     edge = sdfg.add_edge(s0, s1, dace.InterstateEdge(assignments={"w_index": "w[idx[i], k]"}))
 
     p = SameWriteSetIfElseToITECFG()
-    new_rhs = p._promote_gather_indices(sdfg, edge, "w[idx[i], k]")
+    new_rhs = p._promote_gather_indices(sdfg, [edge], "w[idx[i], k]")
     assert new_rhs == "w[_gidx_0, k]", new_rhs
     # The nested index was promoted to a fresh int symbol defined on the edge.
     assert edge.data.assignments.get("_gidx_0") == "idx[i]"
     assert "_gidx_0" in sdfg.symbols and sdfg.symbols["_gidx_0"] == dace.int64
     # No-op on an affine (non-gather) read -- the subset has no nested subscript.
-    assert p._promote_gather_indices(sdfg, edge, "w[i, k]") == "w[i, k]"
+    assert p._promote_gather_indices(sdfg, [edge], "w[i, k]") == "w[i, k]"
 
 
 def test_promote_gather_indices_noop_without_edge():

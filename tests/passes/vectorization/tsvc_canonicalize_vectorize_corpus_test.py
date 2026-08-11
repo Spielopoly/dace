@@ -34,6 +34,7 @@ os.environ.setdefault("UCX_VFS_ENABLE", "n")
 import numpy as np
 import pytest
 
+from dace.libraries.tileops._dispatch import detect_host_isa
 from dace.sdfg import nodes as nd
 from dace.transformation.passes.canonicalize import canonicalize
 from dace.transformation.passes.vectorization.config import VectorizeConfig
@@ -45,13 +46,18 @@ from tests.corpus.tsvc.tsvc_numpy import REFERENCES
 _KERNELS = [k.name for k in tsvc.collect()]
 
 # Round-robin knob sets (valid combinations only; see VectorizeCPU /
-# VectorizeCPUMultiDim constructors).
+# VectorizeCPUMultiDim constructors). The SIMD ISA is the HOST's best runnable one
+# (``detect_host_isa`` -> AVX512 / AVX2 / ARM_SVE / ARM_NEON / SCALAR), NOT a
+# hardcoded AVX-512: vectorization enforces arch-native, so a forced non-host ISA
+# would SIGILL at runtime (see ``dace.libraries.tileops._dispatch.host_supported_isas``).
+_HOST_ISA = detect_host_isa()
 _MULTIDIM_KNOBS = [
-    dict(target_isa="AVX512", remainder_strategy="masked_tail", branch_mode="merge"),
+    dict(target_isa=_HOST_ISA, remainder_strategy="masked_tail", branch_mode="merge"),
     dict(target_isa="SCALAR", remainder_strategy="scalar_postamble", branch_mode="merge"),
-    dict(target_isa="AVX512", remainder_strategy="full_mask", branch_mode="merge"),
+    dict(target_isa=_HOST_ISA, remainder_strategy="full_mask", branch_mode="merge"),
     dict(target_isa="SCALAR", remainder_strategy="masked_tail", branch_mode="fp_factor"),
 ]
+
 
 def _assert_matches(name: str, got: dict, ref: dict, stage: str):
     """Assert every float output matches the reference, ``nan``/``inf`` equal.
@@ -99,8 +105,8 @@ def _vectorize_and_check(name, sdfg, kernel, arrays, ck, ref, vec_pass):
 @pytest.mark.parametrize("idx,name", list(enumerate(_KERNELS)))
 def test_tsvc_canonicalize(idx, name):
     """Canonicalize -> verify e2e against numpy. Canonicalization alone is
-    value-preserving; this is the first of the three corpus paths (this, then
-    ``+legacy`` / ``+multidim`` vectorize). ``_canonicalized`` asserts the
+    value-preserving; this is the first of the two corpus paths (this, then
+    ``+multidim`` vectorize). ``_canonicalized`` asserts the
     post-canon output matches the reference."""
     _canonicalized(name, tag="canon")
 

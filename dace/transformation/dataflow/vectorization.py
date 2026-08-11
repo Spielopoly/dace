@@ -52,7 +52,7 @@ class Vectorization(transformation.SingleStateTransformation):
         if not isinstance(tasklet, nodes.Tasklet):
             return False
 
-        param = symbolic.pystr_to_symbolic(map_entry.map.params[-1])
+        param = map_entry.map.params[-1]
         found = False
 
         # Strided maps cannot be vectorized
@@ -86,7 +86,7 @@ class Vectorization(transformation.SingleStateTransformation):
                         for ex in expr:
                             ex = symbolic.pystr_to_symbolic(ex)
                             symbols = ex.free_symbols
-                            if param in symbols:
+                            if any(str(sym) == param for sym in symbols):
                                 if array.strides[idx] == 1:
                                     found = True
                                 else:
@@ -94,7 +94,7 @@ class Vectorization(transformation.SingleStateTransformation):
                     else:
                         expr = symbolic.pystr_to_symbolic(expr)
                         symbols = expr.free_symbols
-                        if param in symbols:
+                        if any(str(sym) == param for sym in symbols):
                             if array.strides[idx] == 1:
                                 found = True
                             else:
@@ -130,7 +130,12 @@ class Vectorization(transformation.SingleStateTransformation):
         if self.strided_map:
             new_range = [dim_from, dim_to - vector_size + 1, vector_size]
         else:
-            new_range = [dim_from // vector_size, ((dim_to + 1) // vector_size) - 1, dim_skip]
+            # int_floor, never `//`: `(dim_to + 1) // vector_size` is a sum numerator, the shape
+            # sympy splits into separately-truncating terms once the floor is dropped by sym2cpp.
+            new_range = [
+                symbolic.int_floor(dim_from, vector_size),
+                symbolic.int_floor(dim_to + 1, vector_size) - 1, dim_skip
+            ]
 
         # Create preamble non-vectorized map (replacing the original map)
         if create_preamble:

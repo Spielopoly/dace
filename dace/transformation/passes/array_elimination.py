@@ -1,4 +1,5 @@
 # Copyright 2019-2024 ETH Zurich and the DaCe authors. All rights reserved.
+import copy
 from collections import defaultdict
 from typing import Any, Callable, Dict, List, Optional, Set
 
@@ -13,6 +14,7 @@ from dace.transformation.dataflow import (RedundantArray, RedundantReadSlice, Re
                                           SqueezeViewRemove, UnsqueezeViewRemove, RemoveSliceView)
 from dace.transformation.passes import analysis as ap
 from dace.transformation.transformation import SingleStateTransformation
+from ordered_set import OrderedSet
 
 
 def _state_has_read_write_sibling_carrier(state: SDFGState, exclude_data: str) -> bool:
@@ -111,7 +113,7 @@ class ArrayElimination(ppl.Pass):
             return None
         for state in reversed(state_order):
             # Find all data descriptors that will no longer be used after this state
-            removable_data: Set[str] = set(
+            removable_data: OrderedSet[str] = OrderedSet(
                 s for s in access_sets if state in access_sets[s] and not (access_sets[s] & reachable[state]) - {state})
 
             # Find duplicate access nodes as an ordered list
@@ -246,7 +248,12 @@ class ArrayElimination(ppl.Pass):
                                     # The memlets do not match, skip the node.
                                     continue
                             else:
-                                state.add_edge(edge.src, edge.src_conn, first_node, edge.dst_conn, edge.data)
+                                # Fresh Memlet per edge: re-attaching the object leaves one Memlet on
+                                # two edges, and a later subset write through one of them turns the
+                                # other (an empty ordering edge with dst_conn=None) into an invalid
+                                # non-empty edge.
+                                state.add_edge(edge.src, edge.src_conn, first_node, edge.dst_conn,
+                                               copy.deepcopy(edge.data))
                         else:
                             if edge.src_conn == 'views':
                                 other_edges = list(state.out_edges_by_connector(first_node, 'views'))
@@ -258,7 +265,8 @@ class ArrayElimination(ppl.Pass):
                                     # The memlets do not match, skip the node.
                                     continue
                             else:
-                                state.add_edge(first_node, edge.src_conn, edge.dst, edge.dst_conn, edge.data)
+                                state.add_edge(first_node, edge.src_conn, edge.dst, edge.dst_conn,
+                                               copy.deepcopy(edge.data))
                     # Remove merged node and associated edges
                     state.remove_node(node)
                     removed_nodes.add(node)

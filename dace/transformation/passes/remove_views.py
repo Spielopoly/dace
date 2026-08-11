@@ -207,7 +207,9 @@ def _delinearize_flat(flat, astrides: List[int], array_shape: List[int]):
     """
     if len(array_shape) == 1:
         return [flat]
-    return [(flat // astr) % shp for astr, shp in zip(astrides, array_shape)]
+    # int_floor, never `//`: `//` builds sympy floor(), which sympy distributes and sym2cpp then
+    # prints without the floor, so each term truncates separately and the index lands off by one.
+    return [symbolic.int_floor(flat, astr) % shp for astr, shp in zip(astrides, array_shape)]
 
 
 def _reshape_subset(
@@ -664,7 +666,7 @@ class RemoveViews(ppl.Pass):
                 else:
                     self._rewrite_memlets(state, vnode, viewed_node, view_edge, viewed_subset, mapping, is_viewed_src)
                     self._rewrite_interstate_edges(sdfg, vnode.data, _rw_1)
-                    self._reconnect_edges(state, vnode, viewed_node, view_edge, is_viewed_src)
+                    self._reconnect_edges(state, vnode, view_edge, is_viewed_src)
                     state.remove_node(vnode)
                     self._cleanup_isolated_viewed_node(state, viewed_node)
                     removed.add(vnode.data)
@@ -702,7 +704,7 @@ class RemoveViews(ppl.Pass):
                     self._rewrite_memlets(state, vnode, viewed_node, view_edge, viewed_subset, mapping_1b,
                                           is_viewed_src)
                     self._rewrite_interstate_edges(sdfg, vnode.data, _rw_1b)
-                    self._reconnect_edges(state, vnode, viewed_node, view_edge, is_viewed_src)
+                    self._reconnect_edges(state, vnode, view_edge, is_viewed_src)
                     state.remove_node(vnode)
                     self._cleanup_isolated_viewed_node(state, viewed_node)
                     removed.add(vnode.data)
@@ -788,14 +790,18 @@ class RemoveViews(ppl.Pass):
                               f' other_subset=None'
                               f' -> other_subset={m.other_subset}')
 
-    def _reconnect_edges(self, state, view_node, viewed_node, view_edge, is_viewed_src):
-        # Reconnect to the IMMEDIATE endpoint of the view edge. This is the
-        # viewed AccessNode in the common case, but when the view edge crosses
-        # a map scope boundary (MapEntry/MapExit ``views`` connector), the
-        # scope node must stay on the path -- reconnecting to the distant
-        # viewed AccessNode would bypass the scope node, orphaning it
-        # (MapExit with in_degree 0 -> "Leftover nodes in queue" in
-        # scope_dict()).
+    def _reconnect_edges(self, state, view_node, view_edge, is_viewed_src):
+        """Splice ``view_node`` out of its own edges, then drop the defining edge.
+
+        The replacement endpoint is the view edge's IMMEDIATE neighbour, never the viewed
+        AccessNode ``_classify_view`` resolved: when the view is staged through a Map
+        (``A -> MapEntry -> V``, ``V -> MapExit -> A``) the memlet path's far end is the outer
+        AccessNode while the connector on ``view_edge`` belongs to the scope node. Attaching that
+        connector to the outer node bypasses the scope, mints a bogus ``IN_``/``OUT_`` connector on
+        an AccessNode, and leaves the scope node's own connector pair with no edge -- the
+        "Dangling in-connector" validation failure. For a view edge that really does start (or end)
+        at the viewed AccessNode the neighbour IS that node, so the direct case is unchanged.
+        """
         if is_viewed_src:
             neighbor, neighbor_conn = view_edge.src, view_edge.src_conn
             for e in list(state.out_edges(view_node)):
@@ -1040,7 +1046,7 @@ class RemoveViews(ppl.Pass):
         self._rewrite_interstate_edges(sdfg, vnode.data, _rw_lin)
 
         # -- reconnect and remove -------------------------------------------
-        self._reconnect_edges(state, vnode, viewed_node, view_edge, is_viewed_src)
+        self._reconnect_edges(state, vnode, view_edge, is_viewed_src)
         state.remove_node(vnode)
         self._cleanup_isolated_viewed_node(state, viewed_node)
         if _DEBUGPRINT:

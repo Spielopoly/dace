@@ -7,11 +7,14 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <new>  // std::align_val_t (aligned heap-array allocation)
+#include <type_traits>  // std::is_trivially_destructible (aligned deallocation guard)
 #include <numeric>
 #include <tuple>
 
 // The order in which these are included matters - sorting them
 // alphabetically causes compilation to fail.
+#include "alloc.h"
 #include "comm.h"
 #include "complex.h"
 #include "copy.h"

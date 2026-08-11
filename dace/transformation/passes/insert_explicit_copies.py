@@ -1,7 +1,5 @@
 # Copyright 2019-2026 ETH Zurich and the DaCe authors. All rights reserved.
-"""Pass replacing implicit copy patterns (e.g. a path between two access nodes
-without an intermediate tasklet) with explicit ``CopyLibraryNode`` instances.
-"""
+"""Pass replacing implicit copy patterns with explicit ``CopyLibraryNode`` instances."""
 import copy
 from typing import Any, Dict, Optional
 
@@ -11,19 +9,27 @@ from dace.sdfg import SDFG
 from dace.sdfg import utils as sdutils
 from dace.sdfg.state import SDFGState
 from dace.transformation import pass_pipeline as ppl, transformation
+from dace.libraries.standard.helper import CPU_RESIDENT_STORAGES, GPU_RESIDENT_STORAGES
 from dace.libraries.standard.nodes.copy_node import CopyLibraryNode
 
 
 def _derive_matching_dst_subset(src_subset: subsets.Range, dst_desc: data.Data) -> subsets.Range:
-    """Destination subset for a copy memlet that omits it: the full array when the
-    volumes are not provably unequal, else ``src_subset``.
+    """Derive the absent side of a copy memlet.
+
+    A copy edge that names only one side moves ``src_subset``'s volume; the legacy generator
+    (``cpp.memlet_copy_to_absolute_strides``) drives the copy shape from that known side. So the
+    derived side is a region of ``src_subset``'s shape at the array origin -- EXCEPT when the whole
+    destination array provably holds exactly that volume, which is the reshape case (a ``[20]`` into a
+    ``[4, 5]``): there the full array is the intended target. A merely *unprovable* equality
+    (``i + 1`` vs ``20``, symbolic) is NOT a reshape -- taking the full array would copy the wrong
+    element count (and read out of bounds on the smaller side), so it falls to ``src_subset``.
 
     :param src_subset: the known (source) side of the copy.
     :param dst_desc: descriptor whose subset is being derived.
     :returns: the destination :class:`~dace.subsets.Range`.
     """
     dst_range = subsets.Range.from_array(dst_desc)
-    if symbolic.equal(src_subset.num_elements(), dst_range.num_elements()) is not False:
+    if symbolic.equal(src_subset.num_elements(), dst_range.num_elements()) is True:
         return dst_range
     return src_subset
 
@@ -34,29 +40,18 @@ class InsertExplicitCopies(ppl.Pass):
     """Replaces implicit copy patterns with ``CopyLibraryNode`` instances.
 
     Detected patterns:
-    - ``AccessNode -> AccessNode`` (direct copy edge) -- lifted to a libnode.
-    - an ``AccessNode <-> View <-> AccessNode`` data-movement edge -- lifted to a libnode with
-      the View as a normal endpoint (treated like an array).
-    - ``AccessNode -> (MapEntry)+ -> AccessNode`` (stage-in) -- libnode placed
-      inside the innermost map scope, wired directly to the MapEntry's output
-      connector.
-    - ``AccessNode -> (MapExit)+ -> AccessNode`` (stage-out) -- symmetric;
-      libnode inside the map scope, output connector wired directly to the outermost
-      MapExit.
+    - ``AccessNode -> AccessNode`` (direct copy edge).
+    - ``AccessNode <-> View <-> AccessNode`` data-movement edge -- View treated as a normal array endpoint.
+    - ``AccessNode -> (MapEntry)+ -> AccessNode`` (stage-in) -- libnode placed inside the innermost map
+      scope, wired to the MapEntry output connector.
+    - ``AccessNode -> (MapExit)+ -> AccessNode`` (stage-out) -- symmetric, wired to the outermost MapExit.
     """
 
     # Storages whose copies CopyLibraryNode can lower. Other storages
     # (e.g. TensorCore_*, FPGA_*, Snitch_*) belong to custom codegen
     # targets that handle copies via their own ``copy_memory`` hook.
-    _STANDARD_STORAGES = frozenset({
-        dtypes.StorageType.Default,
-        dtypes.StorageType.Register,
-        dtypes.StorageType.CPU_Heap,
-        dtypes.StorageType.CPU_Pinned,
-        dtypes.StorageType.CPU_ThreadLocal,
-        dtypes.StorageType.GPU_Global,
-        dtypes.StorageType.GPU_Shared,
-    })
+    _STANDARD_STORAGES = (CPU_RESIDENT_STORAGES | GPU_RESIDENT_STORAGES
+                          | {dtypes.StorageType.Default, dtypes.StorageType.Register})
 
     def modifies(self) -> ppl.Modifies:
         return ppl.Modifies.States | ppl.Modifies.Nodes | ppl.Modifies.Edges
@@ -68,7 +63,7 @@ class InsertExplicitCopies(ppl.Pass):
         return set()
 
     def apply_pass(self, sdfg: SDFG, pipeline_results: Dict[str, Any]) -> Optional[int]:
-        """Lift every implicit copy in ``sdfg`` to a ``CopyLibraryNode``.
+        """Lift every implicit copy in ``sdfg`` (and nested SDFGs) to a ``CopyLibraryNode``.
 
         :param sdfg: The SDFG to transform, recursively including nested SDFGs.
         :param pipeline_results: Results of previously applied passes (unused).
@@ -105,6 +100,10 @@ class InsertExplicitCopies(ppl.Pass):
             if memlet.wcr is not None:
                 continue
 
+            # A set binds a pointer, not data: lifting it drops the ``set`` connector.
+            if edge.dst_conn == 'set':
+                continue
+
             src_desc = sdfg.arrays[src_node.data]
             dst_desc = sdfg.arrays[dst_node.data]
 
@@ -120,26 +119,30 @@ class InsertExplicitCopies(ppl.Pass):
                     or not isinstance(dst_desc, (data.Array, data.Scalar)):
                 continue
 
-            # Custom-target storages (e.g. TensorCore_A/B/Accumulator from
-            # the tensor_cores sample) are handled by their own codegen.
+            # Custom-target storages are handled by their own codegen, not CopyLibraryNode.
             if (src_desc.storage not in self._STANDARD_STORAGES or dst_desc.storage not in self._STANDARD_STORAGES):
+                continue
+
+            # A dtype-converting copy is a cast, not a byte move: CopyLibraryNode (memcpy)
+            # cannot express it, so leave it for tasklet lowering (mirrors _lift_staging_edge).
+            if src_desc.dtype != dst_desc.dtype:
                 continue
 
             src_name = src_node.data
             dst_name = dst_node.data
 
-            # Resolve src and dst subset. Self-copy: subset is the dst side;
-            # otherwise the memlet path maps ``data`` to an endpoint.
-            if src_name == dst_name:
-                src_subset, dst_subset = memlet.other_subset, memlet.subset
-            else:
-                src_subset = memlet.get_src_subset(edge, state)
-                dst_subset = memlet.get_dst_subset(edge, state)
+            # Resolve src and dst subset. ``get_src_subset`` / ``get_dst_subset`` are the only correct
+            # readers of the ``subset`` / ``other_subset`` pair: which side ``subset`` names is carried
+            # by the memlet's own ``_is_data_src`` flag, NOT derivable from the endpoint names. A
+            # self-copy is no exception -- both endpoints match ``memlet.data``, so the flag is what
+            # decides, and ``try_initialize`` defaults it to src-relative. This is what the legacy
+            # generator lowers a copy edge with (``cpp.memlet_copy_to_absolute_strides``); reading
+            # the pair positionally instead reverses every src-relative self-copy.
+            src_subset = memlet.get_src_subset(edge, state)
+            dst_subset = memlet.get_dst_subset(edge, state)
 
-            # Fill in either side that wasn't carried by the memlet, deriving
-            # a matching range on the absent side from the array shape when
-            # the volumes line up (common for implicit copies between
-            # different-shaped but same-volume arrays).
+            # Derive any side the memlet did not carry from the array shape (handles
+            # implicit copies between different-shaped but same-volume arrays).
             if src_subset is None:
                 src_subset = _derive_matching_dst_subset(dst_subset, src_desc)
             if dst_subset is None:
@@ -149,6 +152,10 @@ class InsertExplicitCopies(ppl.Pass):
             in_memlet.dynamic = memlet.dynamic
             out_memlet = Memlet(data=dst_name, subset=copy.deepcopy(dst_subset))
             out_memlet.dynamic = memlet.dynamic
+            # ``allow_oob`` is the author's waiver of the src/dst volume check (``validation.py``
+            # honours it the same way); dropping it here turns a legal copy into an expansion error.
+            in_memlet.allow_oob = memlet.allow_oob
+            out_memlet.allow_oob = memlet.allow_oob
 
             label = f"copy_{src_name}_to_{dst_name}"
             libnode = CopyLibraryNode(name=label)
@@ -164,10 +171,8 @@ class InsertExplicitCopies(ppl.Pass):
     def _replace_map_staging_copies(self, state: SDFGState) -> int:
         """Lift stage-in / stage-out copies through ``MapEntry`` / ``MapExit`` to ``CopyLibraryNode``.
 
-        The libnode is placed inside the map scope: for stage-in it keeps the
-        per-iteration memlet on the MapEntry side and a descriptor-derived
-        memlet on the inner AccessNode; stage-out is symmetric. Chained
-        MapEntries / MapExits are followed via ``memlet_path``.
+        The libnode sits inside the map scope; chained MapEntries / MapExits are followed via
+        ``memlet_path``.
 
         :param state: The state to scan (owning SDFG is ``state.sdfg``).
         :returns: Number of libnodes inserted.
@@ -190,9 +195,12 @@ class InsertExplicitCopies(ppl.Pass):
         :returns: True iff the edge was lifted.
         """
         sdfg = state.sdfg
-        # For stage-in the inner side is edge.dst (AccessNode), for stage-out edge.src.
+        # Inner side: edge.dst for stage-in, edge.src for stage-out.
         inner_node = edge.dst if stage_in else edge.src
         if not isinstance(inner_node, nodes.AccessNode) or edge.data.is_empty():
+            return False
+        # A set binds a pointer, not data: lifting it drops the ``set`` connector.
+        if edge.dst_conn == 'set':
             return False
         inner_desc = sdfg.arrays[inner_node.data]
         if isinstance(inner_desc, data.View):
@@ -208,8 +216,7 @@ class InsertExplicitCopies(ppl.Pass):
             return False
 
         outer_memlet = edge.data
-        # The inner Memlet may be dst-relative (``data == inner_node.data``,
-        # outer-side subset in ``other_subset``); resolve the subset in the
+        # The memlet may be dst-relative (subset in ``other_subset``); resolve it in the
         # outer array's index space via ``get_src/dst_subset``.
         if stage_in:
             outer_subset = outer_memlet.get_src_subset(edge, state) or outer_memlet.subset
@@ -218,7 +225,15 @@ class InsertExplicitCopies(ppl.Pass):
         outer_side_memlet = Memlet(data=outer.data, subset=copy.deepcopy(outer_subset))
         outer_side_memlet.dynamic = outer_memlet.dynamic
         outer_side_memlet.wcr = outer_memlet.wcr
-        inner_subset = _derive_matching_dst_subset(outer_subset, inner_desc)
+        # When the memlet names both sides that mapping IS the copy; deriving one retargets the write.
+        if stage_in:
+            inner_subset = outer_memlet.get_dst_subset(edge, state)
+        else:
+            inner_subset = outer_memlet.get_src_subset(edge, state)
+        if inner_subset is None or outer_memlet.other_subset is None:
+            inner_subset = _derive_matching_dst_subset(outer_subset, inner_desc)
+        else:
+            inner_subset = copy.deepcopy(inner_subset)
         inner_memlet = Memlet(data=inner_node.data, subset=inner_subset)
         label = (f"copy_{outer.data}_to_{inner_node.data}" if stage_in else f"copy_{inner_node.data}_to_{outer.data}")
         libnode = CopyLibraryNode(name=label)

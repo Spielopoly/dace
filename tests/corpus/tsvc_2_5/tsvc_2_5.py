@@ -14,6 +14,7 @@ Source contracts:
 * Each kernel pairs with a numpy oracle in ``reference_python``.
 """
 from math import sqrt, exp
+from typing import Dict, Optional
 
 import dace
 import numpy as np
@@ -25,10 +26,17 @@ ITERATIONS = dace.symbol("ITERATIONS")
 S = dace.symbol("S")  # symbolic stride (TSVC-2 carries one too; we reuse the name)
 SSYM = dace.symbol("SSYM")  # symbolic stride for the strided gather/scatter family
 K = dace.symbol("K")  # symbolic offset
+# Thresholds compared against DATA, kept apart from the index offset ``K``: one symbol cannot be
+# both, and sharing it made the kernels below vacuous. ``K`` must be >= 2 to be a useful offset
+# (``i % K``), but the arrays are ``standard_normal``, so at 3 no element ever cleared the bar --
+# the predicated store stored nothing and the search never found anything.
+KMASK = dace.symbol("KMASK")  # predicated-store threshold: bound so ~half the lanes are active
+KFIND = dace.symbol("KFIND")  # early-exit search threshold: bound so a hit exists, past index 0
 M = dace.symbol("M")  # quasi-affine `N // M` denominator
 T = dace.symbol("T")  # symbolic tile size (single-level tiling)
-T1 = dace.symbol("T1")  # symbolic outer tile size (two-level tiling)
-T2 = dace.symbol("T2")  # symbolic inner tile size (two-level tiling)
+T1 = dace.symbol("T1")  # symbolic outer tile size (two- and three-level tiling)
+T2 = dace.symbol("T2")  # symbolic middle tile size (two- and three-level tiling)
+T3 = dace.symbol("T3")  # symbolic inner tile size (three-level tiling)
 LEN_R7 = dace.symbol("LEN_R7")  # reroll length; bound to a multiple of the 7x reroll factor
 
 # ==========================================================================
@@ -291,12 +299,16 @@ def fission_dep_sym_offset(a: dace.float64[LEN_1D], b: dace.float64[LEN_1D], x: 
 
 @dace.program
 def jacobi2d_tiled_const(a: dace.float64[LEN_2D, LEN_2D], b: dace.float64[LEN_2D, LEN_2D]):
-    """2D Jacobi 5-point stencil pre-tiled, constant tile size 64. Outer
-    ``ii``/``jj`` walk tile origins, inner ``i``/``j`` the in-tile coords."""
-    for ii in range(1, LEN_2D - 1 - 64, 64):
-        for jj in range(1, LEN_2D - 1 - 64, 64):
-            for i in range(ii, ii + 64):
-                for j in range(jj, jj + 64):
+    """2D Jacobi 5-point stencil pre-tiled, constant tile size 8. Outer
+    ``ii``/``jj`` walk tile origins, inner ``i``/``j`` the in-tile coords.
+
+    The tile constant has to FIT ``LEN_2D``: at 64 against ``LEN_2D = 32`` the outer range is
+    ``range(1, -33, 64)``, i.e. empty, and the kernel ran zero iterations -- a gate entry any
+    miscompilation passes. At 8 it walks a 3x3 grid of tiles."""
+    for ii in range(1, LEN_2D - 1 - 8, 8):
+        for jj in range(1, LEN_2D - 1 - 8, 8):
+            for i in range(ii, ii + 8):
+                for j in range(jj, jj + 8):
                     b[i, j] = 0.2 * (a[i, j] + a[i - 1, j] + a[i + 1, j] + a[i, j - 1] + a[i, j + 1])
 
 
@@ -314,11 +326,14 @@ def jacobi2d_tiled_sym(a: dace.float64[LEN_2D, LEN_2D], b: dace.float64[LEN_2D, 
 @dace.program
 def jacobi2d_double_tiled_const(a: dace.float64[LEN_2D, LEN_2D], b: dace.float64[LEN_2D, LEN_2D]):
     """2D Jacobi 5-point stencil with two levels of constant tiling
-    (outer tile 64, inner tile 8). Anchors the two-level untile pass."""
-    for ii in range(1, LEN_2D - 1 - 64, 64):
-        for jj in range(1, LEN_2D - 1 - 64, 64):
-            for iii in range(ii, ii + 64, 8):
-                for jjj in range(jj, jj + 64, 8):
+    (outer tile 16, inner tile 8). Anchors the two-level untile pass.
+
+    Outer tile sized to fit ``LEN_2D`` for the same reason as
+    :func:`jacobi2d_tiled_const`: at 64 the outer range was empty."""
+    for ii in range(1, LEN_2D - 1 - 16, 16):
+        for jj in range(1, LEN_2D - 1 - 16, 16):
+            for iii in range(ii, ii + 16, 8):
+                for jjj in range(jj, jj + 16, 8):
                     for i in range(iii, iii + 8):
                         for j in range(jjj, jjj + 8):
                             b[i, j] = 0.2 * (a[i, j] + a[i - 1, j] + a[i + 1, j] + a[i, j - 1] + a[i, j + 1])
@@ -335,6 +350,42 @@ def jacobi2d_double_tiled_sym(a: dace.float64[LEN_2D, LEN_2D], b: dace.float64[L
                     for i in range(iii, iii + T2):
                         for j in range(jjj, jjj + T2):
                             b[i, j] = 0.2 * (a[i, j] + a[i - 1, j] + a[i + 1, j] + a[i, j - 1] + a[i, j + 1])
+
+
+@dace.program
+def jacobi2d_triple_tiled_const(a: dace.float64[LEN_2D, LEN_2D], b: dace.float64[LEN_2D, LEN_2D]):
+    """2D Jacobi 5-point stencil with three levels of constant tiling
+    (16 / 8 / 4). Anchors the three-level untile cascade: each axis needs
+    three fixpoint collapses before the canonical unit-stride nest is back.
+
+    Tiles sized to fit ``LEN_2D`` for the same reason as
+    :func:`jacobi2d_tiled_const`: an outer tile above ``LEN_2D - 2``
+    leaves an empty outer range and a vacuous kernel."""
+    for ii in range(1, LEN_2D - 1 - 16, 16):
+        for jj in range(1, LEN_2D - 1 - 16, 16):
+            for iii in range(ii, ii + 16, 8):
+                for jjj in range(jj, jj + 16, 8):
+                    for iiii in range(iii, iii + 8, 4):
+                        for jjjj in range(jjj, jjj + 8, 4):
+                            for i in range(iiii, iiii + 4):
+                                for j in range(jjjj, jjjj + 4):
+                                    b[i, j] = 0.2 * (a[i, j] + a[i - 1, j] + a[i + 1, j] + a[i, j - 1] + a[i, j + 1])
+
+
+@dace.program
+def jacobi2d_triple_tiled_sym(a: dace.float64[LEN_2D, LEN_2D], b: dace.float64[LEN_2D, LEN_2D]):
+    """Three-level tiling with symbolic tiles ``T1`` / ``T2`` / ``T3``. Every
+    rung's divisibility (``T1 % T2``, ``T2 % T3``) is unprovable, so the untile
+    records it as a tracked assumption instead of refusing."""
+    for ii in range(1, LEN_2D - 1 - T1, T1):
+        for jj in range(1, LEN_2D - 1 - T1, T1):
+            for iii in range(ii, ii + T1, T2):
+                for jjj in range(jj, jj + T1, T2):
+                    for iiii in range(iii, iii + T2, T3):
+                        for jjjj in range(jjj, jjj + T2, T3):
+                            for i in range(iiii, iiii + T3):
+                                for j in range(jjjj, jjjj + T3):
+                                    b[i, j] = 0.2 * (a[i, j] + a[i - 1, j] + a[i + 1, j] + a[i, j - 1] + a[i, j + 1])
 
 
 @dace.program
@@ -365,6 +416,44 @@ def heat3d_tiled_sym(a: dace.float64[LEN_3D, LEN_3D, LEN_3D], b: dace.float64[LE
                             b[k, j, i] = 0.125 * (a[k + 1, j, i] - 2.0 * a[k, j, i] + a[k - 1, j, i]) + \
                                          0.125 * (a[k, j + 1, i] - 2.0 * a[k, j, i] + a[k, j - 1, i]) + \
                                          0.125 * (a[k, j, i + 1] - 2.0 * a[k, j, i] + a[k, j, i - 1]) + a[k, j, i]
+
+
+@dace.program
+def heat3d_double_tiled_const(a: dace.float64[LEN_3D, LEN_3D, LEN_3D], b: dace.float64[LEN_3D, LEN_3D, LEN_3D]):
+    """3D 7-point heat stencil with two levels of constant tiling (8 / 4) on
+    all three axes -- the 3D sibling of :func:`jacobi2d_double_tiled_const`,
+    nine loops deep. Outer tile sized to fit ``LEN_3D``."""
+    for kk in range(1, LEN_3D - 1 - 8, 8):
+        for jj in range(1, LEN_3D - 1 - 8, 8):
+            for ii in range(1, LEN_3D - 1 - 8, 8):
+                for kkk in range(kk, kk + 8, 4):
+                    for jjj in range(jj, jj + 8, 4):
+                        for iii in range(ii, ii + 8, 4):
+                            for k in range(kkk, kkk + 4):
+                                for j in range(jjj, jjj + 4):
+                                    for i in range(iii, iii + 4):
+                                        b[k, j, i] = 0.125 * (a[k + 1, j, i] - 2.0 * a[k, j, i] + a[k - 1, j, i]) + \
+                                                     0.125 * (a[k, j + 1, i] - 2.0 * a[k, j, i] + a[k, j - 1, i]) + \
+                                                     0.125 * (a[k, j, i + 1] - 2.0 * a[k, j, i] + a[k, j, i - 1]) + \
+                                                     a[k, j, i]
+
+
+@dace.program
+def heat3d_double_tiled_sym(a: dace.float64[LEN_3D, LEN_3D, LEN_3D], b: dace.float64[LEN_3D, LEN_3D, LEN_3D]):
+    """Two-level 3D heat tiling with symbolic outer ``T1`` and inner ``T2``."""
+    for kk in range(1, LEN_3D - 1 - T1, T1):
+        for jj in range(1, LEN_3D - 1 - T1, T1):
+            for ii in range(1, LEN_3D - 1 - T1, T1):
+                for kkk in range(kk, kk + T1, T2):
+                    for jjj in range(jj, jj + T1, T2):
+                        for iii in range(ii, ii + T1, T2):
+                            for k in range(kkk, kkk + T2):
+                                for j in range(jjj, jjj + T2):
+                                    for i in range(iii, iii + T2):
+                                        b[k, j, i] = 0.125 * (a[k + 1, j, i] - 2.0 * a[k, j, i] + a[k - 1, j, i]) + \
+                                                     0.125 * (a[k, j + 1, i] - 2.0 * a[k, j, i] + a[k, j - 1, i]) + \
+                                                     0.125 * (a[k, j, i + 1] - 2.0 * a[k, j, i] + a[k, j, i - 1]) + \
+                                                     a[k, j, i]
 
 
 # ==========================================================================
@@ -402,10 +491,10 @@ def masked_store_const(a: dace.float64[LEN_1D], b: dace.float64[LEN_1D], mask: d
 
 @dace.program
 def masked_store_sym(a: dace.float64[LEN_1D], b: dace.float64[LEN_1D], threshold_data: dace.float64[LEN_1D]):
-    """Predicated store keyed on symbolic threshold ``K`` (double scalar):
-    ``if threshold_data[i] > K: a[i] = b[i]``."""
+    """Predicated store keyed on symbolic threshold ``KMASK`` (double scalar):
+    ``if threshold_data[i] > KMASK: a[i] = b[i]``."""
     for i in dace.map[0:LEN_1D]:
-        if threshold_data[i] > K:
+        if threshold_data[i] > KMASK:
             a[i] = b[i]
 
 
@@ -535,13 +624,13 @@ def ext_break_post_body(a: dace.float64[LEN_1D], b: dace.float64[LEN_1D], c: dac
 
 @dace.program
 def ext_break_capture(a: dace.float64[LEN_1D], out_index: dace.int64[1], out_value: dace.float64[1]):
-    """TSVC ``s332`` with symbolic threshold ``K`` (double): find first ``i``
-    with ``a[i] > K``, capture index + value, break. The exit-edge scalar rebind
+    """TSVC ``s332`` with symbolic threshold ``KFIND`` (double): find first ``i``
+    with ``a[i] > KFIND``, capture index + value, break. The exit-edge scalar rebind
     is what ``EarlyExitToFindIndex`` reconstructs as an argmin-of-index."""
     out_index[0] = -1
     out_value[0] = -1.0
     for i in range(LEN_1D):
-        if a[i] > K:
+        if a[i] > KFIND:
             out_index[0] = i
             out_value[0] = a[i]
             break
@@ -1006,6 +1095,90 @@ def fission_scatter_2body(b: dace.float64[LEN_1D], e: dace.float64[LEN_1D], a: d
         e[idx[i]] = c[i] + 1.0
 
 
+# ==========================================================================
+#  %W  Generalized 2-D wavefront + disjoint-image challenge kernels
+# ==========================================================================
+#
+# The generalized ``WavefrontSkew`` targets 2-D affine wavefronts whose only
+# legal parallel front is a skewed diagonal, plus disjoint-image self-reads that
+# are already parallel without any skew. The last two are SAFETY counter-cases:
+# a parallel-outer / sequential-inner map-of-scans and a sequential-outer /
+# parallel-inner column stencil that the pass must NOT rewrite into a wavefront.
+
+
+@dace.program
+def wf_north_west(a: dace.float64[LEN_2D, LEN_2D]):
+    """Sum-diagonal wavefront: ``a[i, j] = a[i, j] + a[i-1, j] + a[i, j-1]``.
+    North ``(1, 0)`` + west ``(0, 1)`` deps serialize both loops; the parallel
+    front is the ``i + j`` anti-diagonal, so ``WavefrontSkew`` must skew before
+    ``LoopToMap`` can fire."""
+    for i in range(1, LEN_2D):
+        for j in range(1, LEN_2D):
+            a[i, j] = a[i, j] + a[i - 1, j] + a[i, j - 1]
+
+
+@dace.program
+def wf_diff_skew(a: dace.float64[LEN_2D, LEN_2D]):
+    """Difference-diagonal wavefront: ``a[i, j] = a[i, j] + a[i-1, j] + a[i-1, j+1]``.
+    Deps ``(1, 0)`` and ``(1, -1)`` make the legal skew the ``i - j`` difference
+    diagonal (not the anti-diagonal); ``j`` stops at ``N-2`` so ``j+1`` stays in
+    bounds."""
+    for i in range(1, LEN_2D):
+        for j in range(0, LEN_2D - 1):
+            a[i, j] = a[i, j] + a[i - 1, j] + a[i - 1, j + 1]
+
+
+@dace.program
+def wf_triangular(a: dace.float64[LEN_2D, LEN_2D]):
+    """Triangular-domain wavefront: north+west recurrence over the upper triangle
+    ``j >= i``. The skew must honour the triangular iteration space; the parallel
+    front is the ``i + j`` anti-diagonal clipped to ``j >= i``."""
+    for i in range(1, LEN_2D):
+        for j in range(i, LEN_2D):
+            a[i, j] = a[i, j] + a[i - 1, j] + a[i, j - 1]
+
+
+@dace.program
+def disjoint_halves_gather(a: dace.float64[LEN_1D], c: dace.float64[LEN_1D]):
+    """Disjoint self-gather: ``a[i] = a[i] + a[i + LEN_1D//2] * c[i]`` over the
+    lower half. The read set ``[H, 2H)`` is disjoint from the write set
+    ``[0, H)``, so despite reading ``a`` the loop is fully parallel -- no skew,
+    just ``LoopToMap``."""
+    for i in range(LEN_1D // 2):
+        a[i] = a[i] + a[i + LEN_1D // 2] * c[i]
+
+
+@dace.program
+def halo_broadcast(a: dace.float64[LEN_1D], scale: dace.float64):
+    """Fixed-cell (halo) carrier read: ``a[i] = a[i] * scale + a[0]``. The read of
+    ``a[0]`` is a constant cell never written by any ``i >= 1``, so it is disjoint
+    from the write set and the loop is parallel."""
+    for i in range(1, LEN_1D):
+        a[i] = a[i] * scale + a[0]
+
+
+@dace.program
+def safety_map_of_scans(b: dace.float64[LEN_2D, LEN_2D], a: dace.float64[LEN_2D, LEN_2D]):
+    """SAFETY (must stay parallel-outer / sequential-inner): each row is an
+    independent prefix scan ``b[i, j] = b[i, j-1] + a[i, j]``. The correct
+    schedule is parallel ``i``, sequential ``j``; ``WavefrontSkew`` must REFUSE to
+    skew it (the ``i`` axis is already a map of scans)."""
+    for i in range(LEN_2D):
+        for j in range(1, LEN_2D):
+            b[i, j] = b[i, j - 1] + a[i, j]
+
+
+@dace.program
+def safety_column_stencil(a: dace.float64[LEN_2D, LEN_2D], bb: dace.float64[LEN_2D, LEN_2D]):
+    """SAFETY (must stay sequential-outer / parallel-inner): pure column
+    recurrence ``a[i, j] = a[i-1, j] + bb[i, j]``. Row ``i`` needs row ``i-1``; the
+    inner ``j`` is parallel and the outer ``i`` sequential. ``WavefrontSkew`` must
+    REFUSE to skew it into a diagonal front."""
+    for i in range(1, LEN_2D):
+        for j in range(LEN_2D):
+            a[i, j] = a[i - 1, j] + bb[i, j]
+
+
 __all__ = [
     "ext_strided_load_ssym",
     "ext_strided_load_2",
@@ -1031,8 +1204,12 @@ __all__ = [
     "jacobi2d_tiled_sym",
     "jacobi2d_double_tiled_const",
     "jacobi2d_double_tiled_sym",
+    "jacobi2d_triple_tiled_const",
+    "jacobi2d_triple_tiled_sym",
     "heat3d_tiled_const",
     "heat3d_tiled_sym",
+    "heat3d_double_tiled_const",
+    "heat3d_double_tiled_sym",
     "ecrad_clamped_reduction",
     "masked_store_const",
     "masked_store_sym",
@@ -1072,6 +1249,13 @@ __all__ = [
     "loop_to_map_threshold_gather",
     "fission_gather_2body",
     "fission_scatter_2body",
+    "wf_north_west",
+    "wf_diff_skew",
+    "wf_triangular",
+    "disjoint_halves_gather",
+    "halo_broadcast",
+    "safety_map_of_scans",
+    "safety_column_stencil",
 ]
 
 
@@ -1091,10 +1275,21 @@ SIZES = {
     "S": 4,
     "SSYM": 3,
     "K": 3,
+    # Data thresholds over ``standard_normal`` arrays: 0 leaves ~half the lanes active (both mask
+    # polarities, crossing tile boundaries). ``KFIND`` is the anchor ``_place_break_at_middle``
+    # builds ``ext_break_capture``'s input around, so the first search hit lands at LEN_1D // 2
+    # (not at the natural random-draw index) -- past the start either way, so a search that
+    # always answers 0 is caught.
+    "KMASK": 0,
+    "KFIND": 2,
     "M": 4,
     "T": 4,
+    # Tile cascade: each rung must divide the one above it, or the source nest's own inner tile
+    # overshoots (and so does its numpy oracle). T1 also has to stay below LEN_3D - 2 so the
+    # 3D outer tile range is not empty.
     "T1": 8,
     "T2": 4,
+    "T3": 2,
     # The reroll kernels are valid as written, but a non-multiple-of-7 tail triggers a
     # *separate, unfixed* canonicalize reroll-remainder bug (TODO). Bind their dedicated
     # length to a multiple of 7 so the suite isn't blocked on that fix; revisit once it lands.
@@ -1102,27 +1297,54 @@ SIZES = {
 }
 
 
-def make_inputs(program, seed: int = 1234):
+def make_inputs(program, seed: int = 1234, sizes: Optional[Dict[str, int]] = None):
     """Allocate inputs for one kernel from its ``@dace.program`` annotations.
 
-    Array extents are the kernel's declared shapes evaluated at :data:`SIZES`;
+    Array extents are the kernel's declared shapes evaluated at ``sizes``;
     float arrays are random, integer arrays are a permutation of ``range(n)`` so
     gather/scatter indices stay in bounds, and scalars are random floats. The
     same values feed both the numpy oracle and the compiled SDFG.
 
+    :param sizes: symbol table the extents are evaluated at, defaulting to :data:`SIZES`.
+        A caller that runs the kernel at another dataset size passes the same table it
+        binds the SDFG's symbols to.
     :returns: ``(arrays, scalars)`` keyed by parameter name.
     """
     import inspect
+    sizes = sizes if sizes is not None else SIZES
     rng = np.random.default_rng(seed)
     arrays, scalars = {}, {}
     for name, par in inspect.signature(program.f).parameters.items():
         ann = par.annotation
         if getattr(ann, "shape", None):  # dace array descriptor
-            shape = tuple(int(dace.symbolic.evaluate(d, SIZES)) for d in ann.shape)
+            shape = tuple(int(dace.symbolic.evaluate(d, sizes)) for d in ann.shape)
             if np.issubdtype(ann.dtype.as_numpy_dtype(), np.integer):
                 arrays[name] = rng.permutation(shape[0]).astype(ann.dtype.as_numpy_dtype())
             else:
                 arrays[name] = rng.standard_normal(shape).astype(ann.dtype.as_numpy_dtype())
         else:  # scalar
             scalars[name] = float(rng.standard_normal())
+    _place_break_at_middle(program.f.__name__, arrays, sizes)
     return arrays, scalars
+
+
+#: See :func:`tests.corpus.tsvc.tsvc._place_break_at_middle` -- the tsvc_2_5 siblings of
+#: ``s481``/``s482``/``s332`` need the same midpoint nudge so their sequential-reference-vs-
+#: canonicalize speedup ratio measures the find-first + clipped-body lowering instead of an early
+#: break the plain random draw already gave the sequential arm for free.
+def _place_break_at_middle(name: str, arrays: Dict[str, np.ndarray], sizes: Dict[str, int]) -> None:
+    """Rewrite the break-predicate array in place so the exit fires at ``LEN_1D // 2``."""
+    mid = sizes["LEN_1D"] // 2
+    if name == 'ext_break_find_first':  # break on d[i] < 0.0
+        d = arrays['d']
+        d[:mid] = np.abs(d[:mid])
+        d[mid] = -abs(d[mid]) - 1.0
+    elif name == 'ext_break_post_body':  # break on c[i] > b[i]
+        b, c = arrays['b'], arrays['c']
+        c[:mid] = np.minimum(c[:mid], b[:mid])
+        c[mid] = b[mid] + 1.0
+    elif name == 'ext_break_capture':  # break on a[i] > KFIND
+        a = arrays['a']
+        kfind = sizes['KFIND']
+        a[:mid] = kfind - np.abs(a[:mid]) - 1.0
+        a[mid] = kfind + abs(a[mid]) + 1.0

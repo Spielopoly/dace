@@ -29,7 +29,7 @@ variable -- so it fires only on the re-rolled tile/remainder shape and its kin,
 never on unrelated adjacent loops.
 """
 import re
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
 
 import sympy
 
@@ -62,7 +62,7 @@ def _int_floor_to_sympy(expr):
     which is exactly what an adjacency check between a tile bound and a
     remainder start needs.
     """
-    return expr.replace(lambda x: hasattr(x, 'func') and x.func.__name__ == 'int_floor' and len(x.args) == 2,
+    return expr.replace(lambda x: x.func.__name__ == 'int_floor' and len(x.args) == 2,
                         lambda x: sympy.floor(x.args[0] / x.args[1]))
 
 
@@ -78,7 +78,7 @@ def _symbolically_equal(a, b) -> bool:
         diff = symbolic.simplify(symbolic.pystr_to_symbolic(a) - symbolic.pystr_to_symbolic(b))
         if diff == 0:
             return True
-        return sympy.simplify(_int_floor_to_sympy(diff)) == 0
+        return symbolic.simplify(_int_floor_to_sympy(diff)) == 0
     except Exception:
         return False
 
@@ -89,13 +89,13 @@ def _normalize(text: str, loop_var: str) -> str:
     return re.sub(r'\b%s\b' % re.escape(loop_var), _ITER_PLACEHOLDER, text)
 
 
-def _canon_data(name: str, local_scratch: set) -> str:
+def _canon_data(name: str, local_scratch: dict) -> str:
     """Map a body-local scratch transient to the canonical placeholder; leave
     carried / external names (accumulator, arrays) untouched."""
     return _SCRATCH_PLACEHOLDER if name in local_scratch else name
 
 
-def _node_key(node, loop_var: str, local_scratch: set) -> Tuple:
+def _node_key(node, loop_var: str, local_scratch: dict) -> Tuple:
     """A structural key for a body node, iterator- and scratch-name-independent."""
     if isinstance(node, nodes.AccessNode):
         return ('access', _canon_data(node.data, local_scratch))
@@ -211,7 +211,7 @@ class FuseConsecutiveLoops(ppl.Pass):
         sig2 = self._state_signature(s2, second.loop_variable, self._local_scratch(second, s2))
         return sig1 == sig2
 
-    def _local_scratch(self, loop: LoopRegion, body_state: SDFGState) -> set:
+    def _local_scratch(self, loop: LoopRegion, body_state: SDFGState) -> dict:
         """Transient data names used ONLY inside ``body_state`` -- i.e. not
         referenced by any other block of the owning SDFG (not carried across
         iterations, not read/written outside the loop). These are frontend
@@ -220,22 +220,22 @@ class FuseConsecutiveLoops(ppl.Pass):
         root = loop
         while root.parent_graph is not None:
             root = root.parent_graph
-        external = set()
+        external: dict = {}
         for st in root.all_states():
             if st is body_state:
                 continue
             for n in st.nodes():
                 if isinstance(n, nodes.AccessNode):
-                    external.add(n.data)
-        local = set()
+                    external[n.data] = None
+        local: dict = {}
         for n in body_state.nodes():
             if isinstance(n, nodes.AccessNode) and n.data not in external:
                 desc = root.arrays.get(n.data)
                 if desc is not None and desc.transient:
-                    local.add(n.data)
+                    local[n.data] = None
         return local
 
-    def _state_signature(self, state: SDFGState, loop_var: str, local_scratch: set) -> Tuple:
+    def _state_signature(self, state: SDFGState, loop_var: str, local_scratch: dict) -> Tuple:
         """An iterator- and scratch-name-independent structural signature of a
         body state: its sorted node keys and its sorted edge descriptors
         (endpoints, connectors, memlet data/subset/wcr)."""
@@ -245,10 +245,12 @@ class FuseConsecutiveLoops(ppl.Pass):
             subset = _normalize(str(e.data.subset), loop_var) if (e.data and e.data.subset is not None) else ''
             data_name = _canon_data(e.data.data, local_scratch) if (e.data is not None and e.data.data) else ''
             wcr = str(e.data.wcr) if e.data is not None else ''
-            # Connectors are None for AccessNode endpoints; coerce to '' so the
-            # signature tuples stay sortable (None < str raises TypeError).
-            edge_sig.append((_node_key(e.src, loop_var, local_scratch), e.src_conn or '',
-                             _node_key(e.dst, loop_var, local_scratch), e.dst_conn or '', data_name, subset, wcr))
+            # Connectors are the only raw fields here, and a memlet-path edge carries None while a
+            # View's carries 'views'. Two edges whose endpoints canonicalize alike then reach a
+            # None-vs-str comparison in the sort below, so spell an absent connector like the rest.
+            src_key = _node_key(e.src, loop_var, local_scratch)
+            dst_key = _node_key(e.dst, loop_var, local_scratch)
+            edge_sig.append((src_key, e.src_conn or '', dst_key, e.dst_conn or '', data_name, subset, wcr))
         return (tuple(node_sig), tuple(sorted(edge_sig)))
 
     def _merge(self, cfg: ControlFlowRegion, first: LoopRegion, second: LoopRegion, link) -> None:

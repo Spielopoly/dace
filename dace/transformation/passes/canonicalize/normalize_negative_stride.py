@@ -31,7 +31,7 @@ Out of scope:
   through the new positive-iterator form.
 * While loops (no ``loop_variable``).
 """
-from typing import Optional, Set
+from typing import Dict, Optional
 
 import dace
 from dace import SDFG, properties, symbolic
@@ -50,23 +50,23 @@ def _is_negative(value) -> bool:
         s = symbolic.simplify(value)
     except Exception:
         return False
-    return getattr(s, 'is_number', False) and getattr(s, 'is_negative', False)
+    return s.is_number and s.is_negative
 
 
 def _next_id(sdfg: SDFG) -> int:
     """Lowest ``<N>`` no existing ``_loop_pos_<N>`` symbol uses anywhere in the SDFG tree."""
-    used: Set[int] = set()
+    used: Dict[int, None] = {}
     for sd in sdfg.all_sdfgs_recursive():
         for s in list(sd.symbols.keys()) + list(sd.free_symbols):
             if s.startswith(_POS_ITER_PREFIX):
                 tail = s[len(_POS_ITER_PREFIX):]
                 if tail.isdigit():
-                    used.add(int(tail))
+                    used[int(tail)] = None
         for cfg in sd.all_control_flow_regions():
             if isinstance(cfg, LoopRegion) and cfg.loop_variable and cfg.loop_variable.startswith(_POS_ITER_PREFIX):
                 tail = cfg.loop_variable[len(_POS_ITER_PREFIX):]
                 if tail.isdigit():
-                    used.add(int(tail))
+                    used[int(tail)] = None
     n = 0
     while n in used:
         n += 1
@@ -110,7 +110,7 @@ class NormalizeNegativeStride(ppl.Pass):
         if start is None or end is None:
             return False
         try:
-            trip = symbolic.simplify((start - end) // (-stride) + 1)
+            trip = symbolic.simplify(symbolic.int_floor(start - end, -stride) + 1)
         except Exception:
             return False
 
@@ -140,9 +140,8 @@ class NormalizeNegativeStride(ppl.Pass):
             for e in in_edges_into_start:
                 e.data.assignments[old_var] = sub_expr
         else:
-            entry = loop.add_state(f"{loop.label}_neg_inv_entry")
+            entry = loop.add_state(f"{loop.label}_neg_inv_entry", is_start_block=True)
             loop.add_edge(entry, body_start, dace.InterstateEdge(assignments={old_var: sub_expr}))
-            loop.start_block = loop.node_id(entry)
 
         # Rewrite the LoopRegion's iteration descriptors to drive ``new_var`` forward.
         loop.loop_variable = new_var

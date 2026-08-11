@@ -25,6 +25,7 @@ os.environ.setdefault("OMPI_MCA_pml", "ob1")
 os.environ.setdefault("OMPI_MCA_btl", "self,vader")
 os.environ.setdefault("UCX_VFS_ENABLE", "n")
 
+import re
 import shutil
 
 import numpy as np
@@ -36,6 +37,7 @@ from dace.transformation.interstate import LoopToMap
 from dace.transformation.dataflow.wcr_conversion import AugAssignToWCR
 from dace.transformation.passes.vectorization.vectorize_gpu import VectorizeGPU
 from dace.transformation.passes.vectorization.config import VectorizeConfig
+from dace.transformation.passes.canonicalize.finalize import offload_to_gpu
 from dace.libraries.tileops import TileReduce
 
 _HAS_NVCC = shutil.which("nvcc") is not None
@@ -71,12 +73,18 @@ _PROGRAMS = {"sum": (_vsum16, "Sum"), "max": (_vmax16, "Max"), "min": (_vmin16, 
 
 
 def _vectorized(prog):
-    """@dace.program -> simplify + AugAssignToWCR + LoopToMap + VectorizeGPU (half2 GPU)."""
+    """@dace.program -> simplify + AugAssignToWCR + LoopToMap + GPU-offload + VectorizeGPU (half2 GPU).
+
+    ``VectorizeGPU`` assumes an already-offloaded SDFG (it never schedules / offloads itself), so we
+    run the canonicalize-GPU offload (:func:`offload_to_gpu`) FIRST -- mirroring the production
+    ``finalize_for_target(sdfg, 'gpu')`` path -- before vectorizing the resident ``GPU_Device`` map.
+    """
     sdfg = prog.to_sdfg(simplify=True)
     # min/max loop-carried -> WCR writes here; sum already map+WCR from frontend, unaffected.
     sdfg.apply_transformations_repeated(AugAssignToWCR)
     sdfg.apply_transformations_repeated(LoopToMap)
     sdfg.simplify()
+    offload_to_gpu(sdfg)
     VectorizeGPU(VectorizeConfig(widths=(2, ))).apply_pass(sdfg, {})
     return sdfg
 
@@ -120,13 +128,25 @@ def test_emits_block_reduce_and_single_atomic(kind):
     from thread 0 with the op's reduction functor; the per-thread atomic is suppressed."""
     cu = _device_code(_vectorized(_PROGRAMS[kind][0]))
     suffix = _PROGRAMS[kind][1]
-    assert "cub::BlockReduce<dace::float16, 32>" in cu, "block reduce not typed to the 32-thread block"
+    # The block-reduce is typed to the reduction map's block thread count -- compile-time
+    # constants chosen by gpu_block_size_selection (not fixed magic numbers). All THREE block
+    # dimensions are spelled: the 1-D ``BlockReduce<T, N>`` form assumes threadIdx.y/z == 0 and
+    # mis-maps threads whenever the block is 2-D/3-D.
+    assert re.search(r"cub::BlockReduce<dace::float16,\s*\d+,\s*cub::BLOCK_REDUCE_WARP_REDUCTIONS,\s*\d+,\s*\d+>", cu), \
+        "block reduce not emitted / not typed to a constant-thread block"
     assert ".Reduce(" in cu, "cub block Reduce call missing"
     assert f"dace::ReductionType::{suffix}" in cu, f"block reduce not using the {suffix} functor"
     assert "reduce_atomic" in cu, "thread-0 atomic to the global accumulator missing"
     assert "threadIdx.x == 0" in cu, "atomic not guarded to a single thread per block"
     assert "__shared__" in cu, "block-reduce temp storage not in shared memory"
-    assert "folded by GPU block reduction" in cu, "per-thread atomic not suppressed"
+    # Per-thread atomic suppressed: the covered WCR write lands in this thread's REGISTER partial
+    # (``__bpart_*``) instead, and every ``reduce_atomic`` in the TU sits under a thread-0 guard --
+    # so the TU commits one atomic per block, never one per thread.
+    assert re.search(
+        r"__bpart_\S+\[[^\]]*\]\s*=\s*dace::_wcr_fixed<dace::ReductionType::%s,\s*dace::float16>\(\)\(" % suffix,
+        cu), "per-thread atomic not suppressed into a register partial"
+    assert cu.count("reduce_atomic") == cu.count("threadIdx.x == 0"), \
+        "a reduce_atomic outside the thread-0 block-fold guard = one atomic per thread"
 
 
 @pytest.mark.skipif(not _HAS_NVCC, reason="nvcc not available; compile check skipped")
@@ -149,16 +169,21 @@ def _run_inputs(kind, nval):
 @pytest.mark.gpu
 @pytest.mark.parametrize("kind", list(_PROGRAMS))
 def test_runs_exact_multiblock(kind):
+    import cupy
     sdfg = _vectorized(_PROGRAMS[kind][0])
     sdfg.name = f"gpu_block_reduction_run_{kind}"
     shutil.rmtree(os.path.join(".dacecache", sdfg.name), ignore_errors=True)
     csdfg = sdfg.compile()
-    for nval in (64, 257, 1000, 4000):  # up to ~63 blocks (int_ceil(N, 64))
+    # Even extents only: width-2 half2 tiling under assume_even requires N % 2 == 0 (an odd N
+    # trips the even-extent guard). Sizes span several thread-blocks / a non-block-aligned tail.
+    for nval in (64, 258, 1024, 4000):
         a, ref = _run_inputs(kind, nval)
-        out = np.zeros(1, dtype=np.float16)
-        csdfg(A=a.copy(), out=out, N=nval)
+        dA = cupy.asarray(a)  # GPU_Global inputs need device arrays
+        dout = cupy.zeros(1, dtype=cupy.float16)
+        csdfg(A=dA, out=dout, N=nval)
         exp = np.float16(ref(a))
-        assert out[0] == exp, f"{kind} N={nval}: {float(out[0])} != {float(exp)}"
+        got = dout.get()[0]
+        assert got == exp, f"{kind} N={nval}: {float(got)} != {float(exp)}"
 
 
 if __name__ == "__main__":

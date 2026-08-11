@@ -20,9 +20,10 @@ not a concern.
 """
 import ast
 import copy
+import re
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from dace import SDFG, SDFGState, properties, symbolic
+from dace import SDFG, SDFGState, dtypes, properties, symbolic
 from dace.sdfg import nodes, InterstateEdge
 from dace.sdfg.state import ControlFlowRegion, LoopRegion
 from dace.transformation import pass_pipeline as ppl
@@ -205,29 +206,57 @@ def _hoist_invariant_child_regions(loop: LoopRegion) -> int:
     }
     hoistable.sort(key=lambda n: order_map.get(n, 0))
 
-    # Surgery: remove each hoistable child from ``loop`` and insert it as a
+    # Surgery: splice each hoistable child out of ``loop`` and insert it as a
     # new node in ``parent`` before ``loop``. The chain becomes:
     #   ... -> h1 -> h2 -> ... -> loop -> ...
+    moved = 0
     for child in hoistable:
-        _move_region_before(parent, loop, child)
+        moved += _move_region_before(parent, loop, child)
 
-    return len(hoistable)
+    return moved
 
 
-def _move_region_before(parent: ControlFlowRegion, loop: Any, child: Any) -> None:
-    """Relocate ``child`` from inside ``loop`` to ``parent``, chained right
-    before ``loop``. Incoming edges to ``loop`` now go to ``child`` first,
-    and a new unconditional edge ``child -> loop`` is added.
+def _move_region_before(parent: ControlFlowRegion, loop: Any, child: Any) -> int:
+    """Splice ``child`` out of ``loop``'s body and re-insert it in ``parent``, chained right
+    before ``loop``. Incoming edges to ``loop`` now go to ``child`` first, and a new
+    unconditional edge ``child -> loop`` is added.
+
+    :returns: 1 if the child was moved, 0 if the hoist was refused.
     """
-    # Detach internal edges touching child inside loop.
-    for e in list(loop.in_edges(child)) + list(loop.out_edges(child)):
+    in_edges = loop.in_edges(child)
+    out_edges = loop.out_edges(child)
+    successor = out_edges[0].dst if out_edges else None
+    start_before = loop.start_block
+    was_start = (start_before is child)
+
+    # Only a child on a plain unconditional chain can be lifted out. Branching predecessors or
+    # successors have no single replacement edge; a condition means the child does not run every
+    # iteration (so hoisting changes semantics anyway); and an assignment on either edge would be
+    # lost with the edge that carries it.
+    if len(in_edges) > 1 or len(out_edges) > 1:
+        return 0
+    if any(not e.data.is_unconditional() or e.data.assignments for e in in_edges + out_edges):
+        return 0
+    # A self-looping child is its own cycle, so it does not run exactly once per iteration.
+    if successor is child:
+        return 0
+    # An entry-less child is already dead code; leave it to dead-state elimination.
+    if not in_edges and not was_start:
+        return 0
+    # Removing the body's entry with nothing to take its place orphans everything after it.
+    if was_start and successor is None and loop.number_of_nodes() > 1:
+        return 0
+
+    for e in in_edges + out_edges:
         loop.remove_edge(e)
-    was_start = (loop.start_block is child)
+    # Close the gap the child leaves behind, or the rest of the body becomes unreachable.
+    if in_edges and successor is not None:
+        loop.add_edge(in_edges[0].src, successor, InterstateEdge())
+    new_start = successor if was_start else start_before
     loop.remove_node(child)
-    if was_start and loop.nodes():
-        # Pick any remaining node as the new start_block; if none remains,
-        # the caller will add an empty hull state. The setter takes a node ID.
-        loop.start_block = loop.node_id(loop.nodes()[0])
+    # Removing the body's entry clears the region's start block, so name its replacement.
+    if loop.number_of_nodes() > 0:
+        loop.start_block = loop.node_id(new_start)
 
     parent.add_node(child, ensure_unique_name=True)  # reparented into shared CFG; wired by object ref
     # Reroute parent's incoming edges into loop through child.
@@ -235,6 +264,7 @@ def _move_region_before(parent: ControlFlowRegion, loop: Any, child: Any) -> Non
         parent.remove_edge(e)
         parent.add_edge(e.src, child, e.data)
     parent.add_edge(child, loop, InterstateEdge())
+    return 1
 
 
 def _region_free_symbols(region: Any) -> Set[str]:
@@ -281,12 +311,9 @@ def _region_has_work(region: Any) -> bool:
 def _region_has_side_effect(region: Any) -> bool:
     if isinstance(region, SDFGState):
         for n in region.nodes():
-            if isinstance(n, nodes.Tasklet):
-                if getattr(n, "side_effects", False):
-                    return True
-            if isinstance(n, nodes.LibraryNode):
-                if getattr(n, "has_side_effects", False):
-                    return True
+            if isinstance(n, nodes.CodeNode) and not isinstance(n, nodes.NestedSDFG) and n.has_side_effects(
+                    region.sdfg):
+                return True
             for oe in region.out_edges(n):
                 if oe.data is not None and oe.data.wcr is not None:
                     return True
@@ -317,20 +344,26 @@ def _written_data_in_region(region: ControlFlowRegion) -> Set[str]:
     return written
 
 
+def write_edge_count(state: SDFGState, node: nodes.AccessNode) -> int:
+    """Number of value-carrying in-edges of ``node`` (empty memlets are ordering, not writes);
+    counts edges, not nodes, since several producers can write one AccessNode."""
+    return sum(1 for e in state.in_edges(node) if e.data is not None and not e.data.is_empty())
+
+
 def _region_writer_counts(region: ControlFlowRegion) -> Dict[str, int]:
-    """Per-data count of writer AccessNodes across every state of ``region``.
+    """Per-data count of writes across every state of ``region``.
 
     Used to reject hoisting an invariant assignment (e.g. ``s = 0.0``) whose
     target is *also* written elsewhere in the loop (e.g. an inner-loop
-    accumulation ``s = s + a[i, j]``): moving the init to the preheader would
-    stop it re-running per iteration, so later iterations would see the carried
-    value instead of the constant.
+    accumulation ``s = s + a[i, j]``, or a ``Reduce`` node accumulating into the
+    same scalar): moving the init to the preheader would stop it re-running per
+    iteration, so later iterations would see the carried value instead of the
+    constant.
     """
     counts: Dict[str, int] = {}
     for state in region.all_states():
         for n in state.data_nodes():
-            if state.in_degree(n) > 0:
-                counts[n.data] = counts.get(n.data, 0) + 1
+            counts[n.data] = counts.get(n.data, 0) + write_edge_count(state, n)
     return counts
 
 
@@ -415,11 +448,8 @@ def _is_tasklet_invariant(
             return False
 
     out_data = oe.dst.data
-    # Count writers to this data in the whole state.
-    writers = 0
-    for n in state.data_nodes():
-        if n.data == out_data and state.in_degree(n) > 0:
-            writers += 1
+    # Count writes to this data in the whole state.
+    writers = sum(write_edge_count(state, n) for n in state.data_nodes() if n.data == out_data)
     if writers != 1:
         return False
     # ...and across the whole loop region: if ``out_data`` is written anywhere
@@ -438,12 +468,21 @@ def _is_tasklet_invariant(
 
 
 def _code_free_symbols(tasklet: nodes.Tasklet) -> Set[str]:
-    """Free symbols that appear in the tasklet code AST, minus its connectors."""
+    """Free symbols that appear in the tasklet code, minus its connectors.
+
+    Non-Python code has no AST, so fall back to a plain identifier scan (an over-approximation,
+    safe since the caller only refuses to hoist); an empty set would instead let a C++ tasklet
+    reading its own map parameter get hoisted out of the map that defines it.
+    """
     syms: Set[str] = set()
     code = tasklet.code
     if code is None:
         return syms
     stmts = code.code
+    if tasklet.language != dtypes.Language.Python:
+        text = stmts if isinstance(stmts, str) else str(stmts)
+        connectors = set(tasklet.in_connectors.keys()) | set(tasklet.out_connectors.keys())
+        return set(re.findall(r'[A-Za-z_]\w*', text)) - connectors
     if isinstance(stmts, str):
         try:
             stmts = [ast.parse(stmts)]

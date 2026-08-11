@@ -9,6 +9,7 @@ reference-BLAS libraries via ``ctypes.util.find_library``, so ``is_installed()``
 """
 import ctypes.util
 import os
+import warnings
 
 import numpy as np
 import pytest
@@ -17,6 +18,7 @@ import dace
 from dace.libraries.blas import Gemm
 from dace.libraries.blas import environments as blas_envs
 from dace.libraries.blas.environments import OpenBLAS
+from dace.libraries.blas.environments import openblas as openblas_env
 
 #: Every BLAS-providing environment DaCe ships.
 ALL_BLAS_ENVIRONMENTS = [OpenBLAS, blas_envs.IntelMKL, blas_envs.cuBLAS, blas_envs.rocBLAS]
@@ -48,9 +50,8 @@ def test_some_blas_environment_detected_when_a_blas_is_present():
     if not _system_has_a_blas():
         pytest.skip('no BLAS library installed on this machine')
     detected = {env.__name__: env.is_installed() for env in ALL_BLAS_ENVIRONMENTS}
-    assert any(detected.values()), (
-        f'a BLAS library is loadable but no DaCe BLAS environment detected it: {detected}. '
-        'DaCe cannot build any BLAS library node in this configuration.')
+    assert any(detected.values()), (f'a BLAS library is loadable but no DaCe BLAS environment detected it: {detected}. '
+                                    'DaCe cannot build any BLAS library node in this configuration.')
 
 
 def test_openblas_single_library_is_detected():
@@ -63,7 +64,7 @@ def test_openblas_single_library_is_detected():
     libs = OpenBLAS.cmake_libraries()
     assert libs, 'OpenBLAS.is_installed() is True but cmake_libraries() is empty'
 
-    if OpenBLAS._mode() == 'single':
+    if OpenBLAS._mode() == 'direct_link':
         # A single libopenblas -> headers live off the default include path, so an include
         # dir with cblas.h must be provided, and we must NOT require find_package(BLAS)
         # (CMake can't satisfy it for an off-path spack/conda install -> configure would fail).
@@ -73,6 +74,40 @@ def test_openblas_single_library_is_detected():
             f'resolved include dirs lack cblas.h: {includes}'
         assert not OpenBLAS.cmake_packages(), \
             'single libopenblas must link directly, not require find_package(BLAS)'
+
+
+def test_openblas_threading_flavor_is_probed_and_never_fatal():
+    """The threading flavor must be reported, and a non-OpenMP one must stay a warning.
+
+    spack's ``threads=openmp``/``threads=pthreads``/``threads=none`` all install a file named
+    ``libopenblas.so``, so only ``openblas_get_parallel()`` distinguishes them -- and a pthreads
+    build silently wrecks timings, spawning a pool separate from libgomp's that oversubscribes the
+    machine inside DaCe's OpenMP maps. Detecting that must never break a build: it is a performance
+    problem, not a correctness one.
+    """
+    if not ctypes.util.find_library('openblas'):
+        pytest.skip('libopenblas not loadable (run `spack load openblas` / not installed)')
+
+    code, config, path = openblas_env._openblas_threading_flavor()
+    if code is None:
+        pytest.skip('OpenBLAS too old to export openblas_get_parallel(), or not dlopen-able here')
+    assert code in openblas_env.OPENBLAS_PARALLEL_NAMES, f'undocumented openblas_get_parallel() code {code}'
+    assert config, f'openblas_get_parallel() returned {code} but openblas_get_config() gave {config!r}'
+    assert path, 'threading flavor probed but the library path was not reported'
+
+    # Whatever the flavor, the environment stays usable -- warn, never raise, never go empty.
+    # The warning is emitted at most once per process, so an earlier test may already have spent
+    # it; clear the cache to make this check independent of test order.
+    openblas_env._warn_unless_openmp_threaded.cache_clear()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter('always')
+        libs = OpenBLAS.cmake_libraries()
+        OpenBLAS.cmake_libraries()  # lru_cache => the flavor warning must not repeat
+    assert libs, f'OpenBLAS resolves to the {openblas_env.OPENBLAS_PARALLEL_NAMES[code]} build but was disabled'
+    flavor_warnings = [w for w in caught if 'openblas_get_config' in str(w.message)]
+    assert len(flavor_warnings) <= 1, f'threading-flavor warning repeated: {[str(w.message) for w in caught]}'
+    if code != 2:
+        assert flavor_warnings, f'{openblas_env.OPENBLAS_PARALLEL_NAMES[code]} OpenBLAS was not warned about'
 
 
 @pytest.mark.skipif(not OpenBLAS.is_installed(), reason='OpenBLAS not installed on this machine')

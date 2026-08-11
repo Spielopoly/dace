@@ -8,9 +8,10 @@ It composes standalone passes in order, applied once:
     recurrence / reduction loops become inline straight-line code rather than
     atomically-parallelized maps.
 0b. :class:`~dace.transformation.passes.parallelization_prep.BestEffortLoopPeeling`
-    -- search front/back/both peels of 1..``peel_limit`` boundary iterations, keep
-    the one that unblocks the most maps, revert if none helps. Runs before scalar
-    fission so the freshly-introduced straight-line bodies' scalars get renamed.
+    -- index-set-split a loop at a point derived from its body (an ``if i == x``
+    guard, a broadcast read's conflicting index), and peel a wrapping body modulo
+    to its floor-correct affine form. Runs before scalar fission so the
+    freshly-introduced straight-line bodies' scalars get renamed.
 1.  ``PrivatizeScalars`` -- privatize loop-local scalars (drop false carried deps).
 2.  ``SymbolPropagation`` + ``ConstantPropagation`` -- peeling / unrolling fold
     concrete iteration indices into the bodies; propagating them simplifies
@@ -20,11 +21,15 @@ It composes standalone passes in order, applied once:
 4.  ``AugAssignToWCR`` -- rewrite ``arr[S] += x`` (incl. the copy-wrapped form)
     into a write-conflict-resolution write so the reduction loop maps.
 5.  ``LoopToReduce`` -- lift pure accumulator loops to ``Reduce`` library nodes.
-6.  :class:`~dace.transformation.passes.accumulator_to_map_and_reduce.AccumulatorToMapAndReduce`
-    -- rewrite scalar accumulators with computed deltas or extra body side-effects
-    into a per-iteration buffer-writing Map + ``Reduce`` libnode; what ``LoopToReduce``
-    refuses still parallelizes via the Map.
-7.  ``LoopToMap`` -- parallelize every loop now free of loop-carried dependencies.
+6.  ``LoopToMap`` -- parallelize every loop now free of loop-carried dependencies.
+
+``AccumulatorToMapAndReduce`` deliberately does NOT run here. It parallelizes the
+accumulator loops ``LoopToReduce`` refuses, but pays for them with a per-iteration
+``(trip,)`` buffer plus a second ``Reduce`` pass over it -- more memory traffic than
+the scalar accumulation it replaces, and on cloudsc a net slowdown. Its Map-with-WCR
+pattern also partly undoes stage 4 (``AugAssignToWCR`` creates the WCR; that pattern
+rewrites it back into buffer + ``Reduce``). The canonicalization pipeline still runs
+it, where the surrounding fusion/lift stages can consume the ``Reduce``.
 
 The pipeline runs once: every stage is idempotent or internally exhaustive, so
 there is nothing to re-apply. It is modelled on the canonicalization pipeline
@@ -87,10 +92,9 @@ class ParallelizePipeline(ppl.Pass):
         return set()
 
     def _stages(self) -> List[ppl.Pass]:
-        from dace.transformation.dataflow.wcr_conversion import AugAssignToWCR
+        from dace.transformation.dataflow.wcr_conversion import AugAssignToWCR, WCRToAugAssign
         from dace.transformation.dataflow.trivial_tasklet_elimination import TrivialTaskletElimination
         from dace.transformation.interstate.loop_to_map import LoopToMap
-        from dace.transformation.passes.accumulator_to_map_and_reduce import AccumulatorToMapAndReduce
         from dace.transformation.passes.constant_propagation import ConstantPropagation
         from dace.transformation.passes.loop_to_reduce import LoopToReduce
         from dace.transformation.passes.pattern_matching import PatternMatchAndApplyRepeated
@@ -150,13 +154,11 @@ class ParallelizePipeline(ppl.Pass):
             PrivatizeScalars(),
             PatternMatchAndApplyRepeated([TrivialTaskletElimination()]),
             PatternMatchAndApplyRepeated([AugAssignToWCR()]),
+            # Closes the AugAssignToWCR round-trip: the WCR write goes back to an in-body
+            # augassign, now without the frontend copy chain -- the shape ``LoopToReduce``'s
+            # matcher claims. ``LoopToReduce`` no longer normalizes on its own behalf.
+            PatternMatchAndApplyRepeated([WCRToAugAssign()]),
             LoopToReduce(),
-            # Scalar-accumulator loops whose body has extra side-effects (or whose
-            # delta is a computed expression rather than a clean array slice) escape
-            # ``LoopToReduce``. ``AccumulatorToMapAndReduce`` rewrites them into a
-            # buffer-writing Map + ``Reduce`` libnode, exposing the per-iteration
-            # part for ``LoopToMap`` below.
-            AccumulatorToMapAndReduce(),
             PatternMatchAndApplyRepeated([LoopToMap()]),
         ]
 

@@ -1607,14 +1607,14 @@ def s421_d_single(a: dace.float64[LEN_1D], flat_2d_array: dace.float64[LEN_1D]):
 
 @tsvc_kernel(args={'a': 'F1', 'flat_2d_array': 'FL2'}, params={}, regime='1d')
 @dace.program
-def s422_d_single(a: dace.float64[LEN_1D], flat_2d_array: dace.float64[LEN_1D * LEN_1D]):
+def s422_d_single(a: dace.float64[LEN_1D], flat_2d_array: dace.float64[LEN_2D * LEN_2D]):
     for i in range(LEN_1D):
         flat_2d_array[4 + i] = flat_2d_array[8 + i] + a[i]
 
 
 @tsvc_kernel(args={'a': 'F1', 'flat_2d_array': 'FL2'}, params={}, regime='1d')
 @dace.program
-def s423_d_single(a: dace.float64[LEN_1D], flat_2d_array: dace.float64[LEN_1D * LEN_1D]):
+def s423_d_single(a: dace.float64[LEN_1D], flat_2d_array: dace.float64[LEN_2D * LEN_2D]):
     vl = 64
     for i in range(LEN_1D - 1):
         flat_2d_array[i + 1] = flat_2d_array[vl + i] + a[i]
@@ -1921,8 +1921,41 @@ def allocate(kernel: TSVCKernel, l1: int, l2: int, rng: np.random.Generator) -> 
             arrays[name] = np.array((np.arange(int(np.prod(shape))) % max(shape)).astype(np_dtype).reshape(shape),
                                     copy=True)
         else:
-            arrays[name] = np.array(rng.random(shape).astype(np_dtype), copy=True)
+            # Uniform on [-1, 1), NOT [0, 1): TSVC is full of ``if (a[i] < 0.)`` guards, and
+            # non-negative inputs take only the false side of every one of them. For s1279 and
+            # s277 that side is the whole body, so the kernel became a no-op and the gate compared
+            # inputs against inputs -- green for any miscompilation. Straddling zero also exercises
+            # both polarities of every mask the vectorizer generates.
+            arrays[name] = np.array((rng.random(shape) * 2.0 - 1.0).astype(np_dtype), copy=True)
+    _place_break_at_middle(kernel, arrays, l1)
     return arrays
+
+
+#: Early-exit kernels whose break condition, under the plain uniform draw above, fires within the
+#: first few indices: the sequential reference does O(few) work while canonicalize's find-first +
+#: min-reduce + clipped-body lowering always does O(3*LEN_1D), so the ratio compares a favorable
+#: case for the sequential arm against an unfavorable one for canonicalize instead of measuring the
+#: lowering itself. Nudging the break to fire at the midpoint (deterministically, not by seed luck)
+#: makes both arms do comparable work. Only the break-predicate array is touched, and only for
+#: indices on the "no exit yet" side of the midpoint plus the midpoint itself; every other index
+#: (including the whole tail past the midpoint, which the break makes unreachable) keeps its
+#: original random draw.
+def _place_break_at_middle(kernel: TSVCKernel, arrays: Dict[str, np.ndarray], l1: int) -> None:
+    """Rewrite the break-predicate array in place so the exit fires at ``l1 // 2``."""
+    mid = l1 // 2
+    if kernel.name == 's481_d_single':  # break on d[i] < 0.0
+        d = arrays['d']
+        d[:mid] = np.abs(d[:mid])
+        d[mid] = -abs(d[mid]) - 1.0
+    elif kernel.name == 's482_d_single':  # break on c[i] > b[i]
+        b, c = arrays['b'], arrays['c']
+        c[:mid] = np.minimum(c[:mid], b[:mid])
+        c[mid] = b[mid] + 1.0
+    elif kernel.name == 's332_d_single':  # break on a[i] > threshold
+        a = arrays['a']
+        threshold = kernel.params.get('threshold', 0)
+        a[:mid] = threshold - np.abs(a[:mid]) - 1.0
+        a[mid] = threshold + abs(a[mid]) + 1.0
 
 
 def scalar_params(kernel: TSVCKernel, l1: int) -> Dict[str, int]:

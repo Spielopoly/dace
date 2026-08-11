@@ -13,7 +13,7 @@ import numpy as np
 
 
 def _is_complex(dtype):
-    if hasattr(dtype, "is_complex") and callable(dtype.is_complex):
+    if isinstance(dtype, dtypes.typeclass):
         return dtype.is_complex()
     else:
         return dtype in [np.complex64, np.complex128]
@@ -507,7 +507,10 @@ class CSRMV(dace.sdfg.nodes.LibraryNode):
 
     # Global properties
     implementations = {"pure": ExpandCSRMVPure, "MKL": ExpandCSRMVMKL, "cuSPARSE": ExpandCSRMVCuSPARSE}
-    default_implementation = None
+    # The ``sparse`` library has no config-schema entry, so an unset node resolved to nothing and
+    # raised "No implementation or default implementation specified" at codegen. ``pure`` is the
+    # dependency-free CPU lowering (row map over an nnz map).
+    default_implementation = "pure"
 
     # Object fields
     alpha = properties.Property(allow_none=False,

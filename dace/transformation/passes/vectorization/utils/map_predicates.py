@@ -4,13 +4,14 @@
 Policy (locked): ``assert_X`` siblings kept alongside their ``X`` counterparts; every
 loud-failure helper stays available. Removing them shifts silent corruption into the pipeline.
 """
-from typing import Tuple
+import ast
+from typing import Any, Dict, Optional, Tuple
 
 import sympy
 
 import dace
 from dace import SDFGState, symbolic
-from dace.sdfg.state import BreakBlock, ConditionalBlock
+from dace.sdfg.state import BreakBlock, ConditionalBlock, LoopRegion
 from dace.transformation.passes.vectorization.utils.symbolic_polymorphism import free_symbols
 
 
@@ -64,6 +65,28 @@ def _sdfg_has_self_recurrent_assign(root_sdfg: dace.SDFG) -> bool:
     return False
 
 
+def _inner_syms_for(node: dace.nodes.NestedSDFG, param_syms: set) -> set:
+    """The nest's own names for ``param_syms``, read off its ``symbol_mapping``.
+
+    A body NSDFG rebinds names across its boundary (``symbol_mapping = {_j: _loop_it_1}``), so an
+    OUTER param name matched against an INNER condition is a name-identity coincidence. Every
+    caller crossing the boundary must translate first.
+
+    :param node: the nested-SDFG node whose boundary is being crossed.
+    :param param_syms: outer names to translate.
+    :returns: the inner names bound to an expression over any of ``param_syms``.
+    """
+    inner = set()
+    for inner_key, outer_val in node.symbol_mapping.items():
+        try:
+            free = {str(s) for s in dace.symbolic.pystr_to_symbolic(str(outer_val)).free_symbols}
+        except Exception:  # noqa: BLE001 -- unparseable mapping expr: cannot bind, skip
+            continue
+        if param_syms & free:
+            inner.add(inner_key)
+    return inner
+
+
 def _loop_bound_uses_symbols(region, param_syms: set) -> bool:
     """True if ``region``'s init / condition / update references any name in ``param_syms``."""
     for code in (region.loop_condition, region.init_statement, region.update_statement):
@@ -81,7 +104,6 @@ def _loop_bound_uses_symbols(region, param_syms: set) -> bool:
 def _sdfg_loops_depend_on_symbols(sdfg: dace.SDFG, param_syms: set) -> bool:
     """True if some ``LoopRegion`` in ``sdfg`` (descending nested SDFGs, remapping ``param_syms``
     through each ``symbol_mapping``) has a bound referencing a symbol in ``param_syms``."""
-    from dace.sdfg.state import LoopRegion
     for region in sdfg.all_control_flow_regions(recursive=False):
         if isinstance(region, LoopRegion) and _loop_bound_uses_symbols(region, param_syms):
             return True
@@ -89,12 +111,7 @@ def _sdfg_loops_depend_on_symbols(sdfg: dace.SDFG, param_syms: set) -> bool:
         for node in state.nodes():
             if not isinstance(node, dace.nodes.NestedSDFG):
                 continue
-            inner_syms = {
-                inner_key
-                for inner_key, outer_val in node.symbol_mapping.items()
-                if param_syms & {str(s)
-                                 for s in dace.symbolic.pystr_to_symbolic(str(outer_val)).free_symbols}
-            }
+            inner_syms = _inner_syms_for(node, param_syms)
             if inner_syms and _sdfg_loops_depend_on_symbols(node.sdfg, inner_syms):
                 return True
     return False
@@ -113,33 +130,146 @@ def map_body_has_param_dependent_loop(state: SDFGState, map_entry: dace.nodes.Ma
     for node in state.all_nodes_between(map_entry, state.exit_node(map_entry)):
         if not isinstance(node, dace.nodes.NestedSDFG):
             continue
-        inner_syms = {
-            inner_key
-            for inner_key, outer_val in node.symbol_mapping.items()
-            if params & {str(s)
-                         for s in dace.symbolic.pystr_to_symbolic(str(outer_val)).free_symbols}
-        }
+        inner_syms = _inner_syms_for(node, params)
         if inner_syms and _sdfg_loops_depend_on_symbols(node.sdfg, inner_syms):
             return True
     return False
 
 
-def is_tile_eligible(state: SDFGState, map_entry: dace.nodes.MapEntry) -> bool:
+def map_body_has_inner_loop(state: SDFGState, map_entry: dace.nodes.MapEntry) -> bool:
+    """True if the innermost map's body still contains a sequential loop (a ``LoopRegion``).
+
+    The tile emitter lane-widens a body by rewriting its *dataflow*: each scalar operation becomes
+    a width-W tile op. A ``LoopRegion`` is not dataflow -- it is a sequential trip counter over a
+    carried state, and the tile pipeline has no unroller to flatten one away. Tiling it would give
+    W lanes ONE shared counter and ONE shared carry, i.e. run the recurrence for the tile BASE index
+    and apply lane 0's answer to all W lanes. That is exactly the shape of polybench adi's
+    tridiagonal sweeps, deriche's IIR filter passes, and lu's triangular update -- all genuine
+    carried recurrences, none of them lane-parallel at any width.
+
+    So the vectorizable map is a LEAF: no inner map (:func:`is_innermost_map`) and no loop.
+
+    CONDITIONALS ARE DELIBERATELY NOT REFUSED HERE. A branch is lowerable by MASKING -- evaluate
+    both sides and select per lane -- which is what the ``TileMaskGen`` / ``TileITE`` machinery
+    exists for, so ``if a[i] > 0: c[i] = ...`` vectorizes fine (18 TSVC kernels: s271, s441, vif,
+    ...). The branches that genuinely cannot be masked are already refused, precisely, by
+    :func:`map_body_has_tiled_param_dependent_branch` (a guard over a param about to be strided,
+    where striding rebinds the param to the tile base) -- a targeted gate, not a blanket one.
+
+    :param state: The state containing the map entry.
+    :param map_entry: The (assumed innermost) map entry to test.
+    :returns: ``True`` if the body carries a loop at any nesting depth.
+    """
+    for node in state.all_nodes_between(map_entry, state.exit_node(map_entry)):
+        if not isinstance(node, dace.nodes.NestedSDFG):
+            continue
+        for region in node.sdfg.all_control_flow_regions(recursive=True):
+            if isinstance(region, LoopRegion):
+                return True
+    return False
+
+
+def _sdfg_conditions_depend_on_symbols(sdfg: dace.SDFG, param_syms: set) -> bool:
+    """True if some ``ConditionalBlock`` in ``sdfg`` (descending nested SDFGs, remapping
+    ``param_syms`` through each ``symbol_mapping``) has a guard constraining a symbol in
+    ``param_syms``. Mirror of :func:`_sdfg_loops_depend_on_symbols` for guards instead of bounds."""
+    # Function-local: utils/ is the leaf layer (utils/__init__ eagerly imports this module), so a
+    # module-level edge to a pass module would close the cycle the package already dodges.
+    # branch_normalization.py:669 defers the same module for the same reason.
+    from dace.transformation.passes.vectorization.same_write_set_if_else_to_ite_cfg import condition_guards_symbols
+    for region in sdfg.all_control_flow_regions(recursive=False):
+        if isinstance(region, ConditionalBlock) and condition_guards_symbols(region, param_syms):
+            return True
+    for state in sdfg.all_states():
+        for node in state.nodes():
+            if not isinstance(node, dace.nodes.NestedSDFG):
+                continue
+            if _inner_syms_for(node, param_syms) and _sdfg_conditions_depend_on_symbols(
+                    node.sdfg, _inner_syms_for(node, param_syms)):
+                return True
+    return False
+
+
+def map_body_has_tiled_param_dependent_branch(state: SDFGState, map_entry: dace.nodes.MapEntry,
+                                              iter_vars: Tuple[str, ...]) -> bool:
+    """True if the map body has a conditional whose guard constrains one of ``iter_vars``.
+
+    Sibling of :func:`map_body_has_param_dependent_loop`, refused for the same reason. Tiling
+    rebinds the TILED params from per-iteration index to TILE BASE, so a guard over one
+    (``if i + 1 < mid``, TSVC s276) is evaluated ONCE per tile and lane 0 decides for all W lanes
+    -- silently mis-predicating every lane whose own value of the guard differs. No single scalar
+    branch honours W divergent predicates, exactly as no single strided loop honours W divergent
+    bounds.
+
+    ``iter_vars`` is the caller's ``params[-K:]``, NOT every param: tiling rebinds nothing else. A
+    guard over a non-tiled leading param of the same merged ``(j, i)`` map, over an enclosing map's
+    param, or over an enclosing sequential loop variable (``for jk: for jl: if jk > 1``, the
+    cloudsc level guard) is uniform across the tiled lanes and must stay tileable -- hence an
+    explicit set rather than :func:`condition_guards_iteration_symbol`, whose breadth (every
+    enclosing iteration symbol) is right for if-conversion and wrong here.
+
+    :param state: state holding ``map_entry``.
+    :param map_entry: the candidate map.
+    :param iter_vars: the params that will be strided to the tile width.
+    :returns: ``True`` if the map must be left scalar.
+    """
+    params = {str(p) for p in iter_vars}
+    for node in state.all_nodes_between(map_entry, state.exit_node(map_entry)):
+        if not isinstance(node, dace.nodes.NestedSDFG):
+            continue
+        inner_syms = _inner_syms_for(node, params)
+        if inner_syms and _sdfg_conditions_depend_on_symbols(node.sdfg, inner_syms):
+            return True
+    return False
+
+
+def is_tile_eligible(state: SDFGState, map_entry: dace.nodes.MapEntry, K: Optional[int] = None) -> bool:
     """True if an (assumed innermost) ``map_entry`` can be safely tiled/vectorized.
 
     Refuses a body with a self-referential loop-carried recurrence (``k = f(k)``, e.g. TSVC
     s141's ``k = (k + i) + 1`` feeding ``flat_2d_array[k]``): per-iteration recurrence → map
     stays scalar, refused REGARDLESS of use. Also refuses a body whose nested loop bound depends
     on a tiled map param (triangular ``for i in range(1, j+1)``, TSVC s232): W lanes need divergent
-    trip counts a single tiled loop cannot honour. Graceful-refuse gate: ineligible map left as
-    correct scalar rather than tiled incorrectly.
+    trip counts a single tiled loop cannot honour. Same for a body whose conditional guards one of
+    the params about to be strided (``if i + 1 < mid``, TSVC s276): striding rebinds that param to
+    the TILE BASE, so lane 0's answer is applied to all W lanes. Graceful-refuse gate: ineligible
+    map left as correct scalar rather than tiled incorrectly.
+
+    ``K`` scopes the guard check to ``params[-K:]``, the only params striding rebinds. Without it
+    every param counts, which refuses a lane-uniform guard over a merged map's leading dim
+    (``for jk: for jl: if jk > 1``, cloudsc) -- correct but needlessly scalar.
+
+    (A provably-too-small tiled dim -- extent < the tile width -- is refused by the width-aware
+    passes ``MarkTileDims`` / ``SplitMapForTileRemainder``, not here: this predicate is width
+    agnostic, and the same map may be tiled at width 1 (a scalar tail) but not at width 8.)
     """
     for node in state.all_nodes_between(map_entry, state.exit_node(map_entry)):
         if isinstance(node, dace.nodes.NestedSDFG) and _sdfg_has_self_recurrent_assign(node.sdfg):
             return False
     if map_body_has_param_dependent_loop(state, map_entry):
         return False
+    params = list(map_entry.map.params)
+    iter_vars = tuple(params[-K:]) if K else tuple(params)
+    if map_body_has_tiled_param_dependent_branch(state, map_entry, iter_vars):
+        return False
     return True
+
+
+def map_body_has_foreign_language_tasklet(state: SDFGState, map_entry: dace.nodes.MapEntry) -> bool:
+    """True if the map's body holds a tasklet whose code is NOT Python (recursively).
+
+    The tile emitters rewrite a body via its Python AST, so a non-Python tasklet cannot be
+    widened; its free symbols are also invisible to ``get_free_symbols``, which can drop a map
+    parameter it reads from raw code text out of a nested SDFG's symbol mapping.
+    """
+    for node in state.all_nodes_between(map_entry, state.exit_node(map_entry)):
+        if isinstance(node, dace.nodes.Tasklet) and node.language != dace.dtypes.Language.Python:
+            return True
+        if isinstance(node, dace.nodes.NestedSDFG) and any(
+                isinstance(n, dace.nodes.Tasklet) and n.language != dace.dtypes.Language.Python
+                for n, _ in node.sdfg.all_nodes_recursive()):
+            return True
+    return False
 
 
 def map_body_has_library_node(state: SDFGState, map_entry: dace.nodes.MapEntry) -> bool:
@@ -224,7 +354,9 @@ def _map_body_per_lane_subsets(state: SDFGState, map_entry: dace.nodes.MapEntry)
                             yield e.data.subset, node.sdfg, ist, inner_iter
 
 
-def map_body_is_tile_lowerable(state: SDFGState, map_entry: dace.nodes.MapEntry) -> bool:
+def map_body_is_tile_lowerable(state: SDFGState,
+                               map_entry: dace.nodes.MapEntry,
+                               scan_cache: Optional[Dict[int, Any]] = None) -> bool:
     """True unless the body has a per-lane WRITE the tile emitter cannot soundly lower.
 
     A tile iter-var nested inside a non-affine function -- ``a[i mod K]`` (a residue-scan seed),
@@ -244,12 +376,26 @@ def map_body_is_tile_lowerable(state: SDFGState, map_entry: dace.nodes.MapEntry)
     :func:`_map_body_per_lane_subsets`), a superset of the true W lane vars: it can only refuse
     MORE, never fewer.
     """
-    from dace.transformation.passes.vectorization.utils.tile_access import PerDimKind, classify_tile_access
+    from dace.transformation.passes.vectorization.utils.tile_access import (PerDimKind, classify_tile_access,
+                                                                            build_symbol_definition_map)
+    # One symbol-definition map per body, not per subset. Building it scans every interstate edge and
+    # scalar write in the body, and a large tiled state yields many subsets that all share the same
+    # body -- rebuilding per subset made this predicate quadratic in the state size, enough to look
+    # like a hang on a two-level tiled stencil. Scoped to this call, so no pass can mutate the body
+    # out from under it.
+    sym_defs_cache: Dict[Tuple[int, int], Dict[str, Any]] = {}
     for subset, inner_sdfg, inner_state, iter_vars in _map_body_per_lane_subsets(state, map_entry):
+        key = (id(inner_sdfg), id(inner_state))
+        if key not in sym_defs_cache:
+            sym_defs_cache[key] = build_symbol_definition_map(inner_sdfg, inner_state, scan_cache=scan_cache)
         try:
-            rec = classify_tile_access(subset, iter_vars=iter_vars, inner_sdfg=inner_sdfg, state=inner_state)
+            rec = classify_tile_access(subset,
+                                       iter_vars=iter_vars,
+                                       inner_sdfg=inner_sdfg,
+                                       state=inner_state,
+                                       sym_defs=sym_defs_cache[key])
         except Exception:  # noqa: BLE001 -- a store we cannot classify, we cannot prove injective:
-            return False    # fail closed, keep the map scalar (bit-exact) rather than risk a race.
+            return False  # fail closed, keep the map scalar (bit-exact) rather than risk a race.
         for d, kind in enumerate(rec.per_dim_kind):
             if kind is not PerDimKind.GATHER:
                 continue
@@ -267,25 +413,80 @@ def map_body_is_tile_lowerable(state: SDFGState, map_entry: dace.nodes.MapEntry)
     return True
 
 
-def is_vectorizable_map(state: SDFGState, map_entry: dace.nodes.MapEntry) -> bool:
-    """Innermost AND tile-eligible AND no library node inside AND body tile-lowerable: the
-    shared tile-candidate gate.
+def _tasklet_mixes_statements_with_conditional(tasklet: dace.nodes.Tasklet) -> bool:
+    """A Python tasklet body that mixes straight-line statements with a control-flow STATEMENT.
+
+    ``SplitTasklets`` lowers only a ONE-statement body to single-op SSA and declines everything
+    else, and ``NormalizeMaskedWriteTasklets`` only rewrites a body that is a LONE bare ``if``.
+    A body like correlation's ``out = sqrt(inp / N)`` followed by ``if out <= 0.1: out = 1.0``
+    falls through both: it survives as a scalar Python statement whose connectors the widener then
+    swaps for tile pointers, emitting ``double* / int``. Neither pass owns it, so the map itself
+    must not be a tile candidate.
+    """
+    if tasklet.language is not dace.dtypes.Language.Python:
+        return False
+    try:
+        body = ast.parse(tasklet.code.as_string).body
+    except (SyntaxError, ValueError):
+        return False  # not the shape modelled here; other gates decide
+    return len(body) > 1 and any(isinstance(s, (ast.If, ast.For, ast.While)) for s in body)
+
+
+def map_body_has_mixed_conditional_tasklet(state: SDFGState, map_entry: dace.nodes.MapEntry) -> bool:
+    """True if the map body (including inside body NestedSDFGs) holds a tasklet neither
+    ``SplitTasklets`` nor ``NormalizeMaskedWriteTasklets`` can lower -- see
+    :func:`_tasklet_mixes_statements_with_conditional`."""
+    for node in state.all_nodes_between(map_entry, state.exit_node(map_entry)):
+        if isinstance(node, dace.nodes.Tasklet):
+            if _tasklet_mixes_statements_with_conditional(node):
+                return True
+        elif isinstance(node, dace.nodes.NestedSDFG):
+            for inner, _ in node.sdfg.all_nodes_recursive():
+                if isinstance(inner, dace.nodes.Tasklet) and _tasklet_mixes_statements_with_conditional(inner):
+                    return True
+    return False
+
+
+def is_vectorizable_map(state: SDFGState,
+                        map_entry: dace.nodes.MapEntry,
+                        K: Optional[int] = None,
+                        scan_cache: Optional[Dict[int, Any]] = None) -> bool:
+    """Innermost AND tile-eligible AND no library node inside AND a loop-free body AND body
+    tile-lowerable: the shared tile-candidate gate.
 
     All tile passes select through this predicate so an un-vectorizable map (non-innermost,
-    recurrence-indexed, wrapping an opaque library node, or carrying a per-lane access the tile
-    emitter cannot soundly widen -- see :func:`map_body_is_tile_lowerable`) is refused
+    recurrence-indexed, wrapping an opaque library node or a non-Python tasklet, or carrying a
+    per-lane access the tile emitter cannot soundly widen -- see :func:`map_body_is_tile_lowerable`) is refused
     CONSISTENTLY -- never tiled by one pass while another skips it (the desync that strides a map
     by W over a body that stays scalar).
 
     The cheap structural gates (``is_innermost_map`` / ``is_tile_eligible``) run FIRST so a
     non-innermost or ineligible map short-circuits before the expensive per-write body
     classification.
+
+    :param state: state holding ``map_entry``.
+    :param map_entry: the candidate map.
+    :param K: number of innermost dims the CALLER would tile (``len(widths)``). Only the last K
+        params get strided, so only a guard over those is per-lane; pass it and a guard over a
+        non-tiled leading param stays tileable. ``None`` scopes to every param -- correct but
+        conservative, for callers that do not tile.
+    :param scan_cache: optional dict memoizing the whole-SDFG symbol-definition scan by SDFG identity
+        across calls, so a per-map selection loop is not O(maps^2). The caller MUST keep it only for
+        a span during which the SDFG is NOT mutated (see :func:`build_symbol_definition_map`). Default
+        ``None`` disables the cache (identical behavior to before).
+    :returns: ``True`` if every tile pass may treat this map as a candidate.
     """
-    if not (is_innermost_map(state, map_entry) and is_tile_eligible(state, map_entry)):
+    if not (is_innermost_map(state, map_entry) and is_tile_eligible(state, map_entry, K)):
         return False
     if map_body_has_library_node(state, map_entry):
         return False
-    return map_body_is_tile_lowerable(state, map_entry)
+    if map_body_has_foreign_language_tasklet(state, map_entry):
+        return False
+    if map_body_has_inner_loop(state, map_entry):
+        return False
+    if map_body_has_mixed_conditional_tasklet(state, map_entry):
+        return False
+    return map_body_is_tile_lowerable(state, map_entry, scan_cache=scan_cache)
 
 
 def is_gpu_resident_map(state: SDFGState, map_entry: dace.nodes.MapEntry) -> bool:

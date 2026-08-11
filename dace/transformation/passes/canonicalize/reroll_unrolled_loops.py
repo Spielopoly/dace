@@ -18,7 +18,7 @@ overlapping pure writes). Anything else is left untouched.
 """
 
 import re
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import dace
 from dace import symbolic
@@ -55,7 +55,7 @@ def _offset_of_index(index_expr: str, loop_var: str) -> Optional[int]:
         expr = symbolic.pystr_to_symbolic(index_expr)
     except Exception:
         return None
-    if loop_var not in {str(s) for s in expr.free_symbols}:
+    if loop_var not in (str(s) for s in expr.free_symbols):
         return None
     return _const_int(expr - symbolic.pystr_to_symbolic(loop_var))
 
@@ -186,11 +186,11 @@ class RerollUnrolledLoops(ppl.Pass):
         """
         if subset is None:
             return None, True
-        names = {str(s) for s in subset.free_symbols}
+        names = dict.fromkeys(str(s) for s in subset.free_symbols)
         if loop_var in names:
             off = _index_offset(subset, loop_var)
             return (off, off is not None)
-        lane_syms = names & set(sym_offset)
+        lane_syms = dict.fromkeys(n for n in names if n in sym_offset)
         if lane_syms:
             if len(lane_syms) != 1:
                 return None, False
@@ -203,12 +203,15 @@ class RerollUnrolledLoops(ppl.Pass):
     _ASSOC_SYMPY_KIND = {'Add': '+', 'Mul': '*', 'Min': 'min', 'Max': 'max'}
 
     def _associative_op_kind(self, node) -> Optional[str]:
-        """If ``node`` is a binary associative-op tasklet over ``__in1, __in2``,
+        """If ``node`` is a binary associative-op tasklet over its two inputs,
         return its op kind (``'+'``, ``'*'``, ``'min'``, ``'max'``); else ``None``.
 
         Lifts the tasklet RHS to a :mod:`dace.symbolic` expression -- sympy's
         ``Add`` / ``Mul`` / ``Min`` / ``Max`` are associative by construction,
         so we don't need to enumerate parenthesisation or whitespace variants.
+        The operands are the tasklet's own connectors rather than a fixed
+        ``__in1``/``__in2`` pair: the frontend names a binop's inputs that way
+        but a ``min``/``max`` call's ``__in_a``/``__in_b``.
         """
         if not isinstance(node, nodes.Tasklet):
             return None
@@ -222,7 +225,8 @@ class RerollUnrolledLoops(ppl.Pass):
             expr = symbolic.pystr_to_symbolic(rhs.strip())
         except Exception:
             return None
-        if {str(s) for s in expr.free_symbols} != {'__in1', '__in2'}:
+        conns = dict.fromkeys(node.in_connectors)
+        if len(conns) != 2 or dict.fromkeys(str(s) for s in expr.free_symbols) != conns:
             return None
         if len(expr.args) != 2:
             return None
@@ -259,25 +263,104 @@ class RerollUnrolledLoops(ppl.Pass):
                 expr = symbolic.pystr_to_symbolic(rhs.strip())
             except Exception:
                 return False
-            return {str(s) for s in expr.free_symbols} == {'__inp'}
+            return dict.fromkeys(str(s) for s in expr.free_symbols) == dict.fromkeys(['__inp'])
         return False
 
-    def _shared_nodes(self, state: SDFGState) -> Set:
+    def _carried_accumulator_op(self, state: SDFGState, acc: str) -> Optional[str]:
+        """Op kind of a lane's ``acc = acc OP x`` update, or ``None`` if it is not that shape.
+
+        ``acc`` must be read once at the top of ``state``, combined by exactly one associative
+        tasklet, and handed to the write through transparent spine carriers only.
+        """
+        acc_nodes = [n for n in state.nodes() if isinstance(n, nodes.AccessNode) and n.data == acc]
+        src = [n for n in acc_nodes if state.in_degree(n) == 0]
+        snk = [n for n in acc_nodes if state.out_degree(n) == 0]
+        if len(acc_nodes) != 2 or len(src) != 1 or len(snk) != 1 or state.out_degree(src[0]) != 1:
+            return None
+        node = state.out_edges(src[0])[0].dst
+        op = self._associative_op_kind(node)
+        if op is None:
+            return None
+        while node is not snk[0]:
+            out = state.out_edges(node)
+            if len(out) != 1:
+                return None
+            node = out[0].dst
+            if node is not snk[0] and not (self._is_transparent_spine(state, node) and state.in_degree(node) == 1):
+                return None
+        return op
+
+    def _accumulators_folded_once(self, loop: LoopRegion, accs: Dict[str, None], op: str) -> bool:
+        """Whether the loop's per-lane accumulators are consumed by ONE binary ``op`` tree.
+
+        Sound re-roll of ``s0 OP= f(i); ...; s(m-1) OP= f(i+(m-1)g)`` into lane 0 alone relies on
+        the dropped accumulators keeping their pre-loop value and re-entering through that fold,
+        so their only use after the loop must be a single ``m``-leaf tree of the SAME op (FP
+        policy: reassociation is sanctioned WITHIN a reduction combining op).
+        """
+        sdfg = loop.sdfg
+        body = dict.fromkeys(loop.all_control_flow_blocks(recursive=True))
+        if any(a in e.data.free_symbols for e in sdfg.all_interstate_edges(recursive=True) for a in accs):
+            return False
+        leaves: Dict = {}
+        seen_names: Dict[str, None] = {}
+        host: Dict[SDFGState, None] = {}
+        for st in sdfg.all_states():
+            if st in body:
+                continue
+            for n in st.nodes():
+                if not (isinstance(n, nodes.AccessNode) and n.data in accs and st.out_degree(n) > 0):
+                    continue
+                # An unroll REMAINDER loop accumulating into the same lane with the same op does
+                # not consume the folded value, it contributes one more term to it.
+                if self._carried_accumulator_op(st, n.data) == op:
+                    continue
+                if st.out_degree(n) != 1 or n.data in seen_names:
+                    return False
+                leaves[n] = None
+                seen_names[n.data] = None
+                host[st] = None
+        if len(leaves) != len(accs) or len(host) != 1:
+            return False
+        state = next(iter(host))
+        # Forward closure over the fold: ``op`` tasklets chained through single-consumer scalars.
+        # A consumer that is not such a tasklet ends the walk -- it is the tree root leaving the
+        # fold -- and the counting check below rejects it if the fold was not complete.
+        ops: Dict = {}
+        inside = dict.fromkeys(leaves)
+        frontier = list(leaves)
+        while frontier:
+            t = state.out_edges(frontier.pop())[0].dst
+            if self._associative_op_kind(t) != op or state.in_degree(t) != 2 or state.out_degree(t) != 1:
+                continue
+            if t in ops:  # its other operand reached it first
+                continue
+            ops[t] = None
+            nxt = state.out_edges(t)[0].dst
+            if not isinstance(nxt, nodes.AccessNode) or state.out_degree(nxt) > 1:
+                return False
+            inside[nxt] = None
+            if state.out_degree(nxt) == 1:
+                frontier.append(nxt)
+        # ``m - 1`` binary ops over ``m`` single-consumer leaves, every operand internal: one tree.
+        return len(ops) == len(accs) - 1 and all(e.src in inside for t in ops for e in state.in_edges(t))
+
+    def _shared_nodes(self, state: SDFGState) -> Dict:
         """Boundary access nodes of a state (external arrays + read-only sources).
 
         :param state: The body state.
         :returns: The AccessNodes the lane traversal must stop at.
         """
-        shared = set()
+        shared: Dict = {}
         for n in state.nodes():
             if not isinstance(n, nodes.AccessNode):
                 continue
             desc = state.sdfg.arrays.get(n.data)
             if (desc is not None and not desc.transient) or state.in_degree(n) == 0 or state.out_degree(n) == 0:
-                shared.add(n)
+                shared[n] = None
         return shared
 
-    def _lane_nodes(self, state: SDFGState, lane_edges: List, shared: Set) -> Set:
+    def _lane_nodes(self, state: SDFGState, lane_edges: List, shared: Dict) -> Dict:
         """Internal (non-shared) nodes reachable from a lane's boundary edges.
 
         :param state: The body state.
@@ -285,7 +368,7 @@ class RerollUnrolledLoops(ppl.Pass):
         :param shared: Access nodes shared across lanes (excluded from the walk).
         :returns: The set of internal nodes that belong only to this lane.
         """
-        seen: Set = set()
+        seen: Dict = {}
         frontier = []
         for e in lane_edges:
             for n in (e.src, e.dst):
@@ -295,7 +378,7 @@ class RerollUnrolledLoops(ppl.Pass):
             n = frontier.pop()
             if n in seen:
                 continue
-            seen.add(n)
+            seen[n] = None
             for e in state.in_edges(n):
                 if e.src not in shared:
                     frontier.append(e.src)
@@ -337,9 +420,9 @@ class RerollUnrolledLoops(ppl.Pass):
                 if off is not None:
                     edge_offsets[st][edge] = off
 
-        all_offsets = set(sym_offset.values())
+        all_offsets = dict.fromkeys(sym_offset.values())
         for st in states:
-            all_offsets |= set(edge_offsets[st].values())
+            all_offsets.update(dict.fromkeys(edge_offsets[st].values()))
         if not all_offsets:
             return False
 
@@ -375,8 +458,8 @@ class RerollUnrolledLoops(ppl.Pass):
         #    value. The classifier verifies the shared nodes are uniformly one
         #    associative op; the rewrite then collapses the tree to lane 0.
         shared = {st: self._shared_nodes(st) for st in states}
-        lane_nodes: Dict[SDFGState, Dict[int, Set]] = {st: {} for st in states}
-        merge_nodes: Dict[SDFGState, Set] = {st: set() for st in states}
+        lane_nodes: Dict[SDFGState, Dict[int, Dict]] = {st: {} for st in states}
+        merge_nodes: Dict[SDFGState, Dict] = {st: {} for st in states}
         codes: Dict[int, List[str]] = {d: [] for d in distinct}
         for st in states:
             per_lane_edges: Dict[int, List] = {d: [] for d in distinct}
@@ -385,17 +468,20 @@ class RerollUnrolledLoops(ppl.Pass):
             # Walk each lane independently, recording which lanes reach each node.
             visited_by: Dict = {}
             for d in distinct:
-                for n in self._lane_nodes(st, per_lane_edges[d], shared[st]):
-                    visited_by.setdefault(n, set()).add(d)
+                # sorted by node id: ``_lane_nodes`` returns a set of NODE objects (hashed by id(), so its
+                # order varies with allocation), and this insertion order decides which node ``merge_op``
+                # locks onto below -- i.e. whether the re-roll fires at all.
+                for n in sorted(self._lane_nodes(st, per_lane_edges[d], shared[st]), key=st.node_id):
+                    visited_by.setdefault(n, {})[d] = None
             # Classify: a node reached by exactly one lane is part of that lane's
             # unique component; a node reached by >=2 lanes is a merge candidate
             # and must be an associative binary-op tasklet.
-            per_lane_unique: Dict[int, Set] = {d: set() for d in distinct}
-            merges: Set = set()
+            per_lane_unique: Dict[int, Dict] = {d: {} for d in distinct}
+            merges: Dict = {}
             merge_op: Optional[str] = None
             for n, lanes_visiting in visited_by.items():
                 if len(lanes_visiting) == 1:
-                    per_lane_unique[next(iter(lanes_visiting))].add(n)
+                    per_lane_unique[next(iter(lanes_visiting))][n] = None
                 else:
                     op = self._associative_op_kind(n)
                     if op is None:
@@ -404,14 +490,49 @@ class RerollUnrolledLoops(ppl.Pass):
                         merge_op = op
                     elif merge_op != op:
                         return False  # mixed ops in the merge tree
-                    merges.add(n)
+                    merges[n] = None
             lane_nodes[st] = per_lane_unique
             merge_nodes[st] = merges
             for d in distinct:
+                # Which arrays a lane reads, not just what its tasklets say. Boundary AccessNodes are
+                # excluded from a lane component by construction, so on code alone two lanes reading
+                # DIFFERENT arrays look identical and the re-roll drops a real access. ``_lane_sig``
+                # below folds in the read names for the same reason.
+                codes[d].extend(sorted(e.src.data for e in per_lane_edges[d] if isinstance(e.src, nodes.AccessNode)))
+                codes[d].extend(sorted(e.dst.data for e in per_lane_edges[d] if isinstance(e.dst, nodes.AccessNode)))
                 codes[d].extend(n.code.as_string for n in per_lane_unique[d] if isinstance(n, nodes.Tasklet))
         codes = {d: sorted(c) for d, c in codes.items()}
         if not codes[0] or any(codes[d] != codes[0] for d in distinct[1:]):
             return False
+
+        # Per-lane carried accumulators -- the ``s0 OP= f(i); s1 OP= f(i+g); ...; s = s0 OP s1 ...``
+        # reduction shape. A lane whose private component writes a shared container at a LOOP-
+        # INVARIANT subset leaves a carried value live past the loop; dropping the lane moves its
+        # accumulation into lane 0, so the value only survives when every such accumulator is
+        # folded after the loop by one tree of the same associative op. Without that proof the
+        # re-roll silently rewrites what the lanes computed (``c[0] = s0; c[1] = s1``).
+        carried: Dict[int, Dict[str, SDFGState]] = {d: {} for d in distinct}
+        for st in states:
+            for d in distinct:
+                for n in lane_nodes[st][d]:
+                    for e in st.out_edges(n):
+                        if isinstance(e.dst, nodes.AccessNode) and e.dst in shared[st] and e not in edge_offsets[st]:
+                            carried[d][e.dst.data] = st
+        acc: Dict[int, Tuple[str, SDFGState]] = {}
+        for d in distinct:
+            if len(carried[d]) > 1:
+                return False
+            for name, st in carried[d].items():
+                acc[d] = (name, st)
+        if acc:
+            names = dict.fromkeys(name for name, _ in acc.values())
+            if len(acc) != m or len(names) != m:
+                return False
+            ops = dict.fromkeys(self._carried_accumulator_op(st, name) for name, st in acc.values())
+            if len(ops) != 1 or next(iter(ops)) is None:
+                return False
+            if not self._accumulators_folded_once(loop, names, next(iter(ops))):
+                return False
 
         # Re-roll: drop every lane but offset 0 -- its unique nodes in each state,
         # the per-lane interstate symbol assignments. Then collapse the merge
@@ -419,8 +540,8 @@ class RerollUnrolledLoops(ppl.Pass):
         # has only one live input; splice it (consumers of its output read from
         # that one input directly), and delete the merge tasklet + its output
         # AccessNode. Finally, rewrite the loop to step ``g``.
-        drop_offsets = set(distinct[1:])
-        drop_syms = {s for s, o in sym_offset.items() if o in drop_offsets}
+        drop_offsets = dict.fromkeys(distinct[1:])  # already sorted -- dict.fromkeys keeps that order
+        drop_syms = dict.fromkeys(s for s, o in sym_offset.items() if o in drop_offsets)
         for st in states:
             for d in drop_offsets:
                 for edge in list(edge_offsets[st]):
@@ -509,7 +630,7 @@ class RerollUnrolledLoops(ppl.Pass):
         # (in-degree 0) and a sink (out-degree 0) AccessNode in the state, scalar,
         # and the loop's only sink -> the reduction has no other output.
         sinks = [n for n in st.nodes() if isinstance(n, nodes.AccessNode) and st.out_degree(n) == 0]
-        sources = {n.data for n in st.nodes() if isinstance(n, nodes.AccessNode) and st.in_degree(n) == 0}
+        sources = dict.fromkeys(n.data for n in st.nodes() if isinstance(n, nodes.AccessNode) and st.in_degree(n) == 0)
         if len(sinks) != 1 or sinks[0].data not in sources:
             return False
         acc_desc = st.sdfg.arrays.get(sinks[0].data)
@@ -520,13 +641,13 @@ class RerollUnrolledLoops(ppl.Pass):
         reached_by: Dict = {}
         for d in distinct:
             frontier = [e.dst for e in per_lane_edges[d]]
-            seen: Set = set()
+            seen: Dict = {}
             while frontier:
                 n = frontier.pop()
                 if n in seen:
                     continue
-                seen.add(n)
-                reached_by.setdefault(n, set()).add(d)
+                seen[n] = None
+                reached_by.setdefault(n, {})[d] = None
                 for e in st.out_edges(n):
                     frontier.append(e.dst)
 
@@ -552,8 +673,8 @@ class RerollUnrolledLoops(ppl.Pass):
         def _lane_sig(d: int) -> Tuple:
             reads = sorted(e.src.data for e in per_lane_edges[d])
             priv = sorted(n.code.as_string for n, offs in reached_by.items()
-                          if offs == {d} and isinstance(n, nodes.Tasklet) and self._associative_op_kind(n) != fold_op
-                          and not self._is_transparent_spine(st, n))
+                          if len(offs) == 1 and d in offs and isinstance(n, nodes.Tasklet)
+                          and self._associative_op_kind(n) != fold_op and not self._is_transparent_spine(st, n))
             return (tuple(reads), tuple(priv))
 
         sig0 = _lane_sig(0)
@@ -568,16 +689,16 @@ class RerollUnrolledLoops(ppl.Pass):
         # Finally collapse each fold tasklet that lost a term to its one surviving
         # input. Lane 0's private ops (reached from offset 0) and the carried
         # accumulator spine are untouched.
-        drop_offsets = set(distinct[1:])
+        drop_offsets = dict.fromkeys(distinct[1:])  # already sorted -- dict.fromkeys keeps that order
         for d in distinct[1:]:
             for edge in per_lane_edges[d]:
                 if edge in st.edges():
                     st.remove_edge(edge)
         for n in list(st.nodes()):
             offs = reached_by.get(n)
-            if offs and offs <= drop_offsets:
+            if offs and all(o in drop_offsets for o in offs):
                 st.remove_node(n)
-        self._collapse_merge_tree(st, {n for n in st.nodes() if self._associative_op_kind(n) == fold_op})
+        self._collapse_merge_tree(st, dict.fromkeys(n for n in st.nodes() if self._associative_op_kind(n) == fold_op))
         for n in list(st.nodes()):
             if isinstance(n, nodes.AccessNode) and st.degree(n) == 0:
                 st.remove_node(n)
@@ -585,7 +706,7 @@ class RerollUnrolledLoops(ppl.Pass):
         self._rewrite_step(loop, loop_var, g, m)
         return True
 
-    def _collapse_merge_tree(self, state: SDFGState, merges: Set) -> None:
+    def _collapse_merge_tree(self, state: SDFGState, merges: Dict) -> None:
         """Splice each surviving merge tasklet to passthrough its one live input.
 
         After the dropped-lane nodes are removed, each merge tasklet in the
@@ -607,7 +728,10 @@ class RerollUnrolledLoops(ppl.Pass):
             from dace.sdfg.utils import dfs_topological_sort
             order = [n for n in dfs_topological_sort(state) if n in merges]
         except Exception:
-            order = list(merges)
+            # ``merges`` is a set of NODE objects -- hashed by id(), so raw iteration order varies with
+            # allocation (not even PYTHONHASHSEED-stable). Order is load-bearing here (see the comment
+            # above: a later merge must see its collapsed predecessors), so fall back to a stable key.
+            order = sorted(merges, key=state.node_id)
         for m in order:
             if m not in state.nodes():
                 continue
@@ -646,14 +770,15 @@ class RerollUnrolledLoops(ppl.Pass):
         :returns: ``True`` if some array appears both as a read source and a
                   write destination among the lane boundary edges.
         """
-        reads, writes = set(), set()
+        reads: Dict = {}
+        writes: Dict = {}
         for st in states:
             for edge in edge_offsets[st]:
                 if isinstance(edge.src, nodes.AccessNode):
-                    reads.add(edge.src.data)
+                    reads[edge.src.data] = None
                 if isinstance(edge.dst, nodes.AccessNode):
-                    writes.add(edge.dst.data)
-        return bool(reads & writes)
+                    writes[edge.dst.data] = None
+        return any(a in writes for a in reads)
 
     def _rewrite_step(self, loop: LoopRegion, loop_var: str, g: int, m: int) -> None:
         """Rewrite a step-``S`` loop to step ``g`` over the flattened range.

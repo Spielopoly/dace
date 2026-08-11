@@ -15,7 +15,9 @@ def _test_kernel_transient(persistent: bool):
     sdfg = nested.to_sdfg()
     sdfg.apply_gpu_transformations()
 
-    top_sdfg = dace.SDFG('transient')
+    # Distinct per variant: these differ only in generated code, so sharing a name would put them in
+    # one build folder and let two of them clobber each other's build when run in parallel.
+    top_sdfg = dace.SDFG('kernel_transient_persistent' if persistent else 'kernel_transient')
     top_sdfg.arg_names = ['A']
     top_sdfg.add_datadesc('A', copy.deepcopy(sdfg.arrays['A']))
     state = top_sdfg.add_state()
@@ -24,7 +26,15 @@ def _test_kernel_transient(persistent: bool):
     state.add_edge(n, 'A', w, None, dace.Memlet('A'))
 
     if persistent:
-        sdfg.arrays['gpu_A'].lifetime = dace.AllocationLifetime.Persistent
+        arrays = sdfg.cfg_list[-1].arrays
+        if dace.Config.get('compiler', 'cuda', 'implementation') == 'experimental':
+            # Special case for ExperimentalCUDACodeGen, where transient GPU_Global arrays
+            # Are moved out of the kernel, name is not equal to "gpu_A" anymore, but has the
+            # form local_{counter}_gpuA
+            target_name = next(k for k in arrays if "gpu_A" in k)
+        else:
+            target_name = "gpu_A"
+        arrays[target_name].lifetime = dace.AllocationLifetime.Persistent
 
     a = np.random.rand(128, 64)
     expected = np.copy(a)
@@ -47,10 +57,19 @@ def _test_transient(persistent: bool):
             A[i, :] = gpu_A
 
     sdfg = transient.to_sdfg()
+    sdfg.name = 'nested_transient_persistent' if persistent else 'nested_transient'
     sdfg.apply_gpu_transformations()
 
     if persistent:
-        sdfg.cfg_list[-1].arrays['gpu_A'].lifetime = dace.AllocationLifetime.Persistent
+        arrays = sdfg.cfg_list[-1].arrays
+        if dace.Config.get('compiler', 'cuda', 'implementation') == 'experimental':
+            # Special case for ExperimentalCUDACodeGen, where transient GPU_Global arrays
+            # Are moved out of the kernel, name is not equal to "gpu_A" anymore, but has the
+            # form local_{counter}_gpuA
+            target_name = next(k for k in arrays if "gpu_A" in k)
+        else:
+            target_name = "gpu_A"
+        arrays[target_name].lifetime = dace.AllocationLifetime.Persistent
 
     a = np.random.rand(128, 64)
     expected = np.copy(a)
@@ -78,6 +97,7 @@ def _test_double_transient(persistent: bool):
 
     # Simplify, but do not inline
     sdfg = transient.to_sdfg(simplify=False)
+    sdfg.name = 'double_transient_persistent' if persistent else 'double_transient'
     for node, _ in sdfg.all_nodes_recursive():
         if isinstance(node, dace.nodes.NestedSDFG):
             node.no_inline = True
@@ -87,7 +107,15 @@ def _test_double_transient(persistent: bool):
     sdfg.apply_gpu_transformations()
 
     if persistent:
-        sdfg.cfg_list[-1].arrays['gpu_A'].lifetime = dace.AllocationLifetime.Persistent
+        arrays = sdfg.cfg_list[-1].arrays
+        if dace.Config.get('compiler', 'cuda', 'implementation') == 'experimental':
+            # Special case for ExperimentalCUDACodeGen, where transient GPU_Global arrays
+            # Are moved out of the kernel, name is not equal to "gpu_A" anymore, but has the
+            # form local_{counter}_gpuA
+            target_name = next(k for k in arrays if "gpu_A" in k)
+        else:
+            target_name = "gpu_A"
+        arrays[target_name].lifetime = dace.AllocationLifetime.Persistent
 
     a = np.random.rand(128, 64)
     expected = np.copy(a)

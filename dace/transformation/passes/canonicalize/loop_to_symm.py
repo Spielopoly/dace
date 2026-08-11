@@ -112,7 +112,9 @@ class LoopToSymm(ppl.Pass):
         body = state.all_nodes_between(me, mx)
         if body is None or len(body) != 1:
             return None
-        nsdfg = next(iter(body))
+        # ``all_nodes_between`` returns a SET; the len==1 guard above makes this pick unambiguous today, but
+        # take it by a stable key so relaxing the guard cannot silently make the choice hash-order dependent.
+        nsdfg = min(body, key=state.node_id)
         if not isinstance(nsdfg, nodes.NestedSDFG):
             return None
 
@@ -144,14 +146,14 @@ class LoopToSymm(ppl.Pass):
             return None
         # p_col is the point axis of the slice-WCR; p_row is its triangular axis.
         p_col, p_row = None, None
-        params = set(me.map.params)
+        params = dict.fromkeys(me.map.params)
         for i, ax in enumerate(tri):
             b, e, _ = ax
             if _eq(b, e) and str(b) in params:
                 p_col = str(b)
                 p_row_axis = tri[1 - i]
                 # the other axis must be the triangle 0:p_row for some param p_row
-                for cand in params - {p_col}:
+                for cand in sorted(p for p in params if p != p_col):  # stable order regardless of dict order
                     if _is_lower_tri(p_row_axis, cand):
                         p_row = cand
                 break
@@ -167,11 +169,11 @@ class LoopToSymm(ppl.Pass):
 
         # Symmetric operand A: read on its lower triangle [p_row, 0:p_row] and its
         # [p_row, p_row] diagonal (and nowhere else).
-        a = self._find_symmetric(ins, p_row, exclude={c})
+        a = self._find_symmetric(ins, p_row, exclude=dict.fromkeys([c]))
         if a is None:
             return None
         # Matrix B: read at [p_row, p_col] and on the column [0:p_row, p_col].
-        b = self._find_b(ins, p_row, p_col, exclude={c, a})
+        b = self._find_b(ins, p_row, p_col, exclude=dict.fromkeys([c, a]))
         if b is None:
             return None
         # alpha, beta: two distinct scalar (length-1) inputs.
@@ -226,15 +228,15 @@ class LoopToSymm(ppl.Pass):
     def _replace(self, sdfg: SDFG, state: SDFGState, me: nodes.MapEntry, match: SymmMatch) -> None:
         from dace.libraries.blas.nodes.symm import Symm
         mx = state.exit_node(me)
-        nsdfg = next(iter(state.all_nodes_between(me, mx)))
+        nsdfg = min(state.all_nodes_between(me, mx), key=state.node_id)  # set -> stable pick (see _match)
         # One read AccessNode per array feeding the map; the frontend may stage the
         # same array through several duplicate read nodes -- keep one, drop the rest.
         reads = {e.data.data: e.src for e in state.in_edges(me) if isinstance(e.src, nodes.AccessNode)}
         writes = {e.data.data: e.dst for e in state.out_edges(mx) if isinstance(e.dst, nodes.AccessNode)}
-        boundary = ({e.src
-                     for e in state.in_edges(me) if isinstance(e.src, nodes.AccessNode)}
-                    | {e.dst
-                       for e in state.out_edges(mx) if isinstance(e.dst, nodes.AccessNode)})
+        boundary = dict.fromkeys([
+            *(e.src for e in state.in_edges(me) if isinstance(e.src, nodes.AccessNode)),
+            *(e.dst for e in state.out_edges(mx) if isinstance(e.dst, nodes.AccessNode)),
+        ])
 
         node = Symm(me.map.label + "_symm", side="L", uplo="L", alpha=1, beta=1, alpha_input=True, beta_input=True)
         state.add_node(node)

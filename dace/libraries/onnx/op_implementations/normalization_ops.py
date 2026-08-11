@@ -50,14 +50,19 @@ def LogSoftmax(input, output):
 # ============================================================================
 
 
+def _layernorm_first_axis(node, X):
+    # The attribute is absent in opsets that predate it; ONNX defaults it to -1.
+    axis = node.axis if hasattr(node, 'axis') else -1
+    return axis if axis >= 0 else len(X.shape) + axis
+
+
 def _layernorm_axis(node, X):
-    axis = node.axis if hasattr(node, 'axis') and node.axis >= 0 else len(X.shape) + node.axis
-    return tuple(range(axis, len(X.shape)))
+    return tuple(range(_layernorm_first_axis(node, X), len(X.shape)))
 
 
 def _layernorm_norm_size(node, X):
-    axis = node.axis if hasattr(node, 'axis') and node.axis >= 0 else len(X.shape) + node.axis
-    return int(np.prod([X.shape[i] for i in range(axis, len(X.shape))]))
+    first = _layernorm_first_axis(node, X)
+    return int(np.prod([X.shape[i] for i in range(first, len(X.shape))]))
 
 
 def _layernorm_epsilon(node, X):
@@ -212,8 +217,13 @@ class PureDropout(ONNXForward):
         }} else {{
             // Training mode: apply dropout
 
-            // Initialize random seed
+            // Initialize random seed. Device code cannot use std::time or dynamically
+            // initialized function-scope statics; seed from the device clock instead.
+        #if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
+            uint64_t rng_state = {seed if seed is not None else 'uint64_t(clock64())'};
+        #else
             static uint64_t rng_state = {seed if seed is not None else 'uint64_t(std::time(nullptr))'};
+        #endif
 
             // Scale factor for remaining values (1 / (1 - ratio))
             {dtype_str} scale = ({dtype_str})(1.0 / (1.0 - ratio));

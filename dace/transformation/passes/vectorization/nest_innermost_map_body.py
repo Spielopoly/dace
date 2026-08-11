@@ -11,6 +11,8 @@ from dace import properties, symbolic
 from dace.sdfg.graph import SubgraphView
 from dace.transformation import pass_pipeline as ppl
 from dace.transformation.helpers import nest_state_subgraph
+from dace.transformation.interstate import InlineMultistateSDFG, InlineSDFG
+from dace.transformation.interstate.expand_nested_sdfg_inputs import ExpandNestedSDFGInputs
 from dace.transformation.passes.vectorization.lower_reduction_wcr import lower_reduction_wcr_in_body
 from dace.transformation.passes.vectorization.split_map_for_tile_remainder import (SCALAR_TAIL_MARKER,
                                                                                    TILE_K1_TAIL_MARKER)
@@ -27,7 +29,8 @@ class NestInnermostMapBodyIntoNSDFG(ppl.Pass):
     """Nest each innermost map body into a NestedSDFG in place.
 
     Post: every innermost map contains exactly one NestedSDFG (no bare-tasklet
-    bodies). Maps whose innermost trip is provably a multiple of ``vector_width``
+    bodies) and that NestedSDFG holds no further nesting -- the tile passes only
+    see one level down. Maps whose innermost trip is provably a multiple of ``vector_width``
     skipped by default (no remainder needed; wrapping perturbs downstream
     strided/gather detection). ``nest_provably_divisible=True`` nests them anyway
     — masked-tail tile path needs a body NSDFG for the tile iteration mask.
@@ -36,6 +39,14 @@ class NestInnermostMapBodyIntoNSDFG(ppl.Pass):
     CATEGORY: str = "Vectorization Preparation"
 
     vector_width = properties.Property(dtype=int, default=8, allow_none=False)
+    tiled_dims = properties.Property(
+        dtype=int,
+        default=1,
+        allow_none=False,
+        desc="Number of innermost dims the orchestrator will tile (``len(widths)``). Only forwarded "
+        "to the shared ``is_vectorizable_map`` gate, so this pass agrees with the tile passes on "
+        "which maps are candidates -- a map this pass declines to nest but a later pass strides is "
+        "exactly the desync that gate exists to prevent.")
     nest_provably_divisible = properties.Property(
         dtype=bool,
         default=False,
@@ -44,10 +55,11 @@ class NestInnermostMapBodyIntoNSDFG(ppl.Pass):
         "this: its provably-divisible interior still needs a NestedSDFG body "
         "for the tile iteration mask.")
 
-    def __init__(self, vector_width: int = 8, nest_provably_divisible: bool = False):
+    def __init__(self, vector_width: int = 8, nest_provably_divisible: bool = False, tiled_dims: int = 1):
         super().__init__()
         self.vector_width = vector_width
         self.nest_provably_divisible = nest_provably_divisible
+        self.tiled_dims = tiled_dims
 
     def modifies(self) -> ppl.Modifies:
         return ppl.Modifies.Nodes | ppl.Modifies.States | ppl.Modifies.AccessNodes
@@ -137,19 +149,26 @@ class NestInnermostMapBodyIntoNSDFG(ppl.Pass):
 
         :param sdfg: The SDFG to transform in place.
         :param _: Unused pipeline results.
-        :returns: Number of maps nested, or ``None`` if none.
+        :returns: Maps nested plus body-interior NestedSDFGs inlined, or ``None`` if neither.
         """
-        nested = 0
-        nested_bodies = []
-        # Only innermost maps mutated -> iteration safe under in-place nesting
-        # (``nest_state_subgraph`` leaves outer maps untouched).
+        # Phase 1 -- SELECT (read-only). Classify every innermost map against the UNMUTATED SDFG. A
+        # shared ``scan_cache`` memoizes ``build_symbol_definition_map``'s whole-SDFG symbol scan by
+        # SDFG identity, so classifying N innermost maps is O(N), not O(N^2) (each call would else
+        # re-scan the entire SDFG -- the quadratic that made this pass slow on wide SDFGs). The cache
+        # is sound ONLY because nothing is nested in this phase: the SDFG is constant throughout.
+        scan_cache: dict = {}
+        # Annotated: an untyped list infers its elements as ``Any``, which silently disables the type
+        # checker over every loop below that consumes them.
+        selected: list[tuple[dace.SDFGState, dace.nodes.MapEntry, set[dace.nodes.Node]]] = []
+        candidates: list[tuple[dace.SDFGState, dace.nodes.MapEntry]] = []
         for n, g in list(sdfg.all_nodes_recursive()):
             if not isinstance(n, dace.nodes.MapEntry):
                 continue
             if not isinstance(g, dace.SDFGState):
                 continue
-            if not is_vectorizable_map(g, n):
+            if not is_vectorizable_map(g, n, self.tiled_dims, scan_cache=scan_cache):
                 continue
+            candidates.append((g, n))
             # Provably-divisible -> no remainder, leave un-nested (matches old
             # behaviour). ``nest_provably_divisible`` overrides: masked-tail interior
             # is divisible by design but needs a body NSDFG for the mask.
@@ -174,6 +193,13 @@ class NestInnermostMapBodyIntoNSDFG(ppl.Pass):
             }
             if not body_nodes:
                 continue
+            selected.append((g, n, body_nodes))
+
+        # Phase 2 -- NEST (mutate). Each nesting is body-local, so nesting order is independent and
+        # the phase-1 node sets stay valid across the loop (``nest_state_subgraph`` leaves sibling
+        # maps untouched).
+        nested_bodies = []
+        for g, n, body_nodes in selected:
             subgraph = SubgraphView(g, body_nodes)
             nsdfg_node = nest_state_subgraph(g.sdfg, g, subgraph, name=f"{n.label}_body")
             self._strip_boundary_other_subsets(g, nsdfg_node)
@@ -183,7 +209,7 @@ class NestInnermostMapBodyIntoNSDFG(ppl.Pass):
             # boundary WCR (no in-body TileReduce fold).
             is_tail = n.map.label.endswith(SCALAR_TAIL_MARKER) or n.map.label.endswith(TILE_K1_TAIL_MARKER)
             nested_bodies.append((nsdfg_node, is_tail))
-            nested += 1
+        nested = len(nested_bodies)
         if nested:
             # WCR sink that flowed from a tasklet now flows from the new NSDFG.
             # CPU codegen only emits WCR for AccessNode sources -> interpose a
@@ -200,6 +226,31 @@ class NestInnermostMapBodyIntoNSDFG(ppl.Pass):
             # boundary WCR untouched. A postamble tail keeps the per-iteration boundary WCR.
             for nsdfg_node, is_tail in nested_bodies:
                 lower_reduction_wcr_in_body(nsdfg_node.sdfg, tiled=not is_tail)
+
+        # Phase 3 -- FLATTEN the body interior. The walker never descends into a NestedSDFG *inside*
+        # a body, and neither lane-dep rule in ``WidenAccesses`` matches a NestedSDFG producer. A
+        # body holding one is therefore tiled around compute nothing sees: the map strides by W, the
+        # nested compute still runs once at the tile base, and a reduction addend stays a scalar so
+        # no ``TileReduce`` forms -- TSVC s4115/s4116 read ``0.0``. One flat unit is the
+        # postcondition the tile passes rely on, so establish it here. Reachable only now: while the
+        # body sat in the map scope ``InlineMultistateSDFG`` refused (``entry_node`` guard), and a
+        # gather index on an interstate edge (``ip_index = ip[i]``) keeps the body multi-state, out
+        # of ``InlineSDFG``'s reach. Safe by the phase-1 gate: ``is_vectorizable_map`` admits only
+        # innermost, loop-free bodies, so no sibling body NSDFG can be un-nested here.
+        #
+        # ``ExpandNestedSDFGInputs`` FIRST: ``InlineMultistateSDFG.can_be_applied`` refuses any NSDFG
+        # whose boundary subsets are not the full ``Range.from_array`` (its ``apply`` cannot offset
+        # inner memlets), so a per-iteration connector (``a[i]``) would make the inline a silent
+        # no-op and leave the body nested. Expanding widens those subsets and rebases the inner
+        # memlets, which is exactly the precondition the inline checks.
+        flattened = 0
+        for g, n in candidates:
+            for node in g.all_nodes_between(n, g.exit_node(n)):
+                if isinstance(node, dace.nodes.NestedSDFG):
+                    node.sdfg.apply_transformations_repeated(ExpandNestedSDFGInputs, permissive=False, validate=False)
+                    flattened += node.sdfg.apply_transformations_repeated(
+                        [InlineSDFG, InlineMultistateSDFG], permissive=False, validate=False) or 0
+
         assert_invariant(no_memlet_dim_mismatch(sdfg), "NestInnermostMapBodyIntoNSDFG",
                          "memlet subset and other_subset have matching dimensionality")
-        return nested or None
+        return (nested + flattened) or None

@@ -6,11 +6,13 @@ API for SDFG analysis and manipulation Passes, as well as Pipelines that contain
 from dace import properties, serialize
 from dace.sdfg import SDFG, SDFGState, graph as gr, nodes, utils as sdutil
 
+import inspect
 from enum import Flag, auto
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Set, Type, Union
 from dataclasses import dataclass
 
 from dace.sdfg.state import ConditionalBlock, ControlFlowRegion
+from dace.sdfg.validation import InvalidSDFGError
 
 
 def unique_dependencies(passes: Iterable['Pass']) -> List[Union[Type['Pass'], 'Pass']]:
@@ -68,6 +70,9 @@ class Pass:
     """
 
     CATEGORY: str = 'Helper'
+
+    #: Set to True by the ``dace.transformation.explicit_cf_compatible`` decorator
+    __explicit_cf_compatible__: bool = False
 
     def depends_on(self) -> List[Union[Type['Pass'], 'Pass']]:
         """
@@ -143,7 +148,7 @@ class Pass:
 
         # Ignore abstract classes.
         result = subclasses | subsubclasses
-        result = set(sc for sc in result if not getattr(sc, '__abstractmethods__', False))
+        result = set(sc for sc in result if not inspect.isabstract(sc))
 
         return result
 
@@ -565,6 +570,13 @@ class Pipeline(Pass):
                         applied_passes[old_pass] |= self._modified
                 applied_passes[pass_to_apply] = Modifies.Nothing
 
+    #: Validate the SDFG after every subpass that reported a modification. A debugging aid:
+    #: it attributes an invalid SDFG to the subpass that produced it instead of to the whole
+    #: pipeline. Off by default because it costs a full validate per modifying subpass. Not a
+    #: ``Property`` on purpose -- it is a transient debugging switch, not pipeline state to
+    #: serialize. A subclass that overrides ``apply_subpass`` opts out of it.
+    validate_subpasses: bool = False
+
     def apply_subpass(self, sdfg: SDFG, p: Pass, state: Dict[str, Any]) -> Optional[Any]:
         """
         Apply a pass from the pipeline. This method is meant to be overridden by subclasses.
@@ -574,7 +586,17 @@ class Pipeline(Pass):
         :param state: The pipeline results state.
         :return: The pass return value.
         """
-        return p.apply_pass(sdfg, state)
+        retval = p.apply_pass(sdfg, state)
+        # A pass returns None exactly when it did not modify the SDFG, so it cannot have
+        #  invalidated anything -- only a modifying subpass is worth the check.
+        if self.validate_subpasses and retval is not None:
+            try:
+                sdfg.validate()
+            except InvalidSDFGError as err:
+                raise InvalidSDFGError(
+                    f'Validation failed after applying {type(p).__name__}. '
+                    f'{type(err).__name__}: {err}', sdfg, None) from err
+        return retval
 
     def apply_pass(self, sdfg: SDFG, pipeline_results: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         state = pipeline_results

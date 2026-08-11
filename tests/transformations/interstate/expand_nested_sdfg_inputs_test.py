@@ -29,9 +29,7 @@ def test_expand_nested_sdfg_inputs():
                               f"found {len(nsdfgs)}.")
     nsdfg, parent_state = nsdfgs[0]
 
-    sdfg.save("before.sdfg")
     ExpandNestedSDFGInputs().apply_to(sdfg=parent_state.sdfg, nested_sdfg=nsdfg)
-    sdfg.save("after.sdfg")
     print("here")
 
     sdfg.validate()
@@ -133,12 +131,10 @@ def test_expand_nested_sdfg_inputs_column_scalar_uncollapse_e2e():
     # -------------------------
     # Apply transformation
     # -------------------------
-    sdfg.save("before_column_scalar_uncollapse.sdfg")
     ExpandNestedSDFGInputs().apply_to(
         sdfg=parent_state.sdfg,
         nested_sdfg=nsdfg,
     )
-    sdfg.save("after_column_scalar_uncollapse.sdfg")
 
     sdfg.validate()
 
@@ -222,7 +218,10 @@ def test_expand_terminates_on_wcr_reduction_out_edge():
     # Full (already-widened) in-edge -- nothing to widen there.
     st.add_memlet_path(st.add_read("A"), me, nsdfg, dst_conn="a", memlet=dace.Memlet("A[0:M]"))
     # The only non-full edge: a WCR reduction out-edge (a single-element slot).
-    st.add_memlet_path(nsdfg, mx, st.add_write("out"), src_conn="o",
+    st.add_memlet_path(nsdfg,
+                       mx,
+                       st.add_write("out"),
+                       src_conn="o",
                        memlet=dace.Memlet("out[i]", wcr="lambda x, y: x + y"))
     sdfg.validate()
 

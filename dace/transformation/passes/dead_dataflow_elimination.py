@@ -143,8 +143,11 @@ class DeadDataflowElimination(ppl.ControlFlowRegionPass):
                                 if not leaf.data.is_empty():
                                     predecessor_nsdfgs[leaf.src].add(leaf.src_conn)
 
-                            # Pruning connectors on tasklets sometimes needs to change their code
-                            elif isinstance(leaf.src, nodes.Tasklet):
+                            # Pruning connectors on tasklets sometimes needs to change their code.
+                            # A ``None`` src_conn is a dependency/empty edge with no connector to
+                            # prune, so skip the type-inference hint (which cannot infer a type for a
+                            # missing connector and would raise) and just drop the memlet path below.
+                            elif isinstance(leaf.src, nodes.Tasklet) and leaf.src_conn is not None:
                                 ctype = infer_types.infer_out_connector_type(sdfg, state, leaf.src, leaf.src_conn)
                                 # Add definition
                                 if leaf.src.code.language == dtypes.Language.CPP:
@@ -226,7 +229,7 @@ class DeadDataflowElimination(ppl.ControlFlowRegionPass):
             # Library nodes must not have any side effects to be considered dead
             if self.skip_library_nodes:
                 return False
-            return not node.has_side_effects
+            return not node.has_side_effects(sdfg)
         elif isinstance(node, nodes.Tasklet):
             # If a tasklet has any callbacks, mark as "live" due to potential side effects
             return not node.has_side_effects(sdfg)
@@ -259,7 +262,7 @@ class DeadDataflowElimination(ppl.ControlFlowRegionPass):
 
                 for l in state.memlet_tree(e).leaves():
                     # If data is connected to a side-effect tasklet/library node, cannot remove
-                    if _has_side_effects(l.src, sdfg):
+                    if isinstance(l.src, nodes.CodeNode) and l.src.has_side_effects(sdfg):
                         return False
 
                     # If data is connected to a tasklet through a pointer and more than 1 element is accessed,
@@ -293,13 +296,3 @@ class DeadDataflowElimination(ppl.ControlFlowRegionPass):
 
         # Any other case can be marked as dead
         return True
-
-
-def _has_side_effects(node, sdfg):
-    try:
-        return node.has_side_effects(sdfg)
-    except (AttributeError, TypeError):
-        try:
-            return node.has_side_effects
-        except AttributeError:
-            return False

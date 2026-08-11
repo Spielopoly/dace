@@ -226,7 +226,7 @@ class FuseChainedScalarReductions(ppl.Pass):
 
         # Group steps that share the same accumulator/slot/op and form a linear chain.
         chains: List[Tuple[type, List[_Step]]] = []
-        used = set()
+        used: dict = {}
         for step in all_steps:
             if step in used:
                 continue
@@ -250,7 +250,7 @@ class FuseChainedScalarReductions(ppl.Pass):
                         or _binop_op(cur.binop) is not op_type or cur in used):
                     break
                 chain.append(cur)
-                used.add(cur)
+                used[cur] = None
                 nxt = steps_by_read.get(cur.write_final)
                 cur = nxt
                 guard += 1
@@ -297,7 +297,11 @@ class FuseChainedScalarReductions(ppl.Pass):
         for idx in range(1, len(inc_edges)):
             left_edge = inc_edges[idx - 1] if cur_scalar_node is None else None
             right_edge = inc_edges[idx]
-            fold_t = st.add_tasklet(f'_fuse_red_{idx}', {'__in1', '__in2'}, {'__out'},
+            # Ordered dicts, not set literals: ``add_tasklet`` turns a set into the connector dict, so the
+            # set's hash order becomes the in_connectors order and codegen emits the connector declarations
+            # in that order -- byte-different C for the same input on every run. ``dict.fromkeys`` is the
+            # declared ``Dict[str, typeclass]`` form and matches what the set branch builds ({k: None}).
+            fold_t = st.add_tasklet(f'_fuse_red_{idx}', dict.fromkeys(['__in1', '__in2']), dict.fromkeys(['__out']),
                                     f'__out = (__in1 {op_str} __in2)')
             if cur_scalar_node is None:
                 st.add_edge(left_edge.src, left_edge.src_conn, fold_t, '__in1', copy.deepcopy(left_edge.data))
@@ -332,16 +336,16 @@ class FuseChainedScalarReductions(ppl.Pass):
         #    step wrote (which the next step read). ``remove_node`` drops incident edges,
         #    so the surviving first-step accumulation feeds ``term`` alone. ``term`` and
         #    the loop-carried input node (chain[0].acc_read_node) are preserved.
-        to_remove = set()
+        to_remove: dict = {}
         for s in chain[1:]:
-            to_remove.add(s.binop)
-            to_remove.update(s.write_copies)
-            to_remove.update(s.write_intermediates)
+            to_remove[s.binop] = None
+            to_remove.update(dict.fromkeys(s.write_copies))
+            to_remove.update(dict.fromkeys(s.write_intermediates))
         # Intermediate accumulator nodes: every step's write target except the terminal.
         for s in chain[:-1]:
-            to_remove.add(s.write_final)
-        to_remove.discard(term)
-        to_remove.discard(chain[0].acc_read_node)
+            to_remove[s.write_final] = None
+        to_remove.pop(term, None)
+        to_remove.pop(chain[0].acc_read_node, None)
         for n in list(to_remove):
             if n in st.nodes():
                 st.remove_node(n)

@@ -8,6 +8,7 @@ the OMP runtime privatizes the variable per thread and tree-reduces at the
 end, so an extra atomic add is strictly wasted work.
 """
 import os
+import re
 import shutil
 
 import numpy as np
@@ -280,6 +281,32 @@ def test_per_operator_suppresses_atomic_on_covered_target(op_name, wcr, expected
     assert not bad, f"{op_name}: per-iter atomic on covered target:\n" + "\n".join(bad)
 
 
+@pytest.mark.parametrize("op_name,wcr,expected_op,dtype,init,gen_input,oracle,compare",
+                         PER_OP_CASES,
+                         ids=[c[0] for c in PER_OP_CASES])
+def test_per_operator_reduction_clause_carries_simd(op_name, wcr, expected_op, dtype, init, gen_input, oracle, compare):
+    """The reduction clause is combined with ``simd``, except on ``min``/``max``.
+
+    Without ``simd`` the loop body is one serialized dependence chain -- measured 1.4x end to end
+    on a rerolled tsvc s352 dot at 8 threads, 2.4x on the bare kernel. The clause itself already
+    sanctions reassociation inside the combining op, so vector partial accumulators are legal for
+    every arithmetic/bitwise/logical operator. ``min``/``max`` are excluded for the same reason
+    ``dace/runtime/include/dace/reduction.h`` excludes them: no vectorizer folds the NaN-swallowing
+    select without reassociating comparisons, and clang warns about the transform it refused.
+    """
+    sdfg = _build_op_sdfg(op_name, wcr, dtype, init)
+    _, src = _compile_and_read_src(sdfg)
+    pragma_lines = [l for l in src.splitlines() if "reduction(" in l and "#pragma omp" in l and "declare" not in l]
+    assert pragma_lines, f"{op_name}: no reduction pragma emitted"
+    wants_simd = expected_op not in ("min", "max")
+    for line in pragma_lines:
+        assert (" simd " in line) == wants_simd, (
+            f"{op_name}: expected simd={wants_simd} on the combined construct; got: {line.strip()}")
+        # A bare ``if(...)`` on a combined ``parallel for simd`` binds to the simd part too on GCC
+        # and silently devectorizes; only the ``if(parallel: ...)`` form would be safe here.
+        assert not re.search(r"\bif\s*\(", line), f"{op_name}: if-clause on a combined construct: {line.strip()}"
+
+
 def test_unsupported_op_falls_back_to_atomic():
     """A WCR op outside _REDUCTION_TO_OMP_OP (here subtraction, which OpenMP
     does NOT support as a reduction operator -- ``a - b`` is not associative)
@@ -301,10 +328,18 @@ def test_length_one_array_target_falls_back_to_atomic():
     (it needs a scalar VARIABLE). Detection must refuse this case; the atomic
     path must fire instead. ``PrivatizeReductionAccumulator`` is the upstream
     rewrite that converts such targets into a transient ``Scalar``; without
-    it, atomic is the correct fallback."""
+    it, atomic is the correct fallback.
+
+    ``acc`` is deliberately NOT transient. ``compiler.cpu.implementation`` defaults to
+    ``experimental_readable``, whose pipeline runs ``ConvertLengthOneArraysToScalars`` before
+    codegen -- so a length-1 TRANSIENT array never reaches the reduction detector as an Array at
+    all; it arrives as a genuine ``double acc;`` for which ``reduction(+:acc)`` is both legal and
+    what we want. That conversion is ``transient_only``, because a non-transient descriptor is the
+    call contract, so a non-transient length-1 array is the case that still reaches the detector as
+    a pointer -- i.e. the one this test is about."""
     sdfg = dace.SDFG("wcr_len1_array_target")
     sdfg.add_array("src", [N], dace.float64)
-    sdfg.add_array("acc", [1], dace.float64, transient=True)  # length-1 Array, NOT Scalar
+    sdfg.add_array("acc", [1], dace.float64)  # length-1 Array, NOT Scalar, NOT transient
     sdfg.add_array("out", [1], dace.float64)
 
     init = sdfg.add_state("init", is_start_block=True)

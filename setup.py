@@ -32,11 +32,14 @@ try:
         output = subprocess.check_output([cmake_path, '--version']).decode('utf-8')
         cmake_version = tuple(int(t) for t in output.splitlines()[0].split(' ')[-1].split('.'))
         # If version meets minimum requirements, CMake is not necessary
-        if cmake_version >= (3, 17):
+        if cmake_version >= (3, 18):
             cmake_requires = []
 except (subprocess.CalledProcessError, OSError, IndexError, ValueError):
     # Any failure in getting the CMake version counts as "not found"
     pass
+
+# Ninja generates the build for generated code (see dace/codegen/compiler.py). Any version will do.
+ninja_requires = [] if shutil.which('ninja') else ['ninja']
 
 with open("README.md", "r") as fp:
     long_description = fp.read()
@@ -68,11 +71,15 @@ setup(
     },
     include_package_data=True,
     install_requires=[
-        'numpy', 'ml_dtypes', 'networkx >= 2.5, <= 3.5', 'astunparse', 'sympy >= 1.9', 'pyyaml', 'ply', 'fparser >= 0.1.3, != 0.2.3',
-        'dill', 'pyreadline;platform_system=="Windows"', 'packaging', 'typing-extensions'
-    ] + cmake_requires,
+        'numpy >= 1.26', 'ml_dtypes', 'networkx >= 2.5, <= 3.5', 'astunparse', 'sympy >= 1.9', 'pyyaml', 'ply',
+        'fparser >= 0.1.3, != 0.2.3', 'dill', 'pyreadline;platform_system=="Windows"', 'packaging', 'typing-extensions',
+        'ordered-set >= 4.0.0', 'pygments'
+    ] + cmake_requires + ninja_requires,
     extras_require={
         'ml': ['onnx', 'torch', 'onnxsim', 'onnxscript', 'onnxruntime', 'protobuf', 'ninja'],
+        # Optional: exact-integer polyhedral engine for the WavefrontSkew canonicalization pass
+        # (schedule legality + skewed loop bounds). Absent => the pass degrades to a no-op.
+        'polyhedral': ['islpy'],
         'testing': [
             'coverage',
             'pytest-cov',
@@ -84,6 +91,9 @@ setup(
             'ipykernel',
             'nbconvert',
             'pytest-timeout',
+            # Plotting the corpus perf results (tests/perf/plot_corpus_perf.py); analysis only,
+            # never imported by dace itself.
+            'matplotlib',
         ],
         'ml-testing': [
             'coverage', 'pytest-cov', 'scipy', 'absl-py', 'opt_einsum', 'pymlir', 'click', 'ipykernel', 'nbconvert',
@@ -91,6 +101,7 @@ setup(
         ],
         'docs': ['jinja2<3.2.0', 'sphinx-autodoc-typehints', 'sphinx-rtd-theme>=0.5.1'],
         'linting': ['pre-commit==4.1.0', 'yapf==0.43.0'],
+        'fastgraph': ['rustworkx'],
     },
     entry_points={
         'console_scripts': [

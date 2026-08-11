@@ -1,5 +1,6 @@
 # Copyright 2019-2026 ETH Zurich and the DaCe authors. All rights reserved.
 """Tests for :class:`MemsetLibraryNode` and its pure / CPU / CUDA expansions."""
+import contextlib
 from typing import Optional, Sequence
 
 import dace
@@ -49,7 +50,7 @@ def _get_multi_dim_sdfg(implementation: Optional[str], gpu: bool = True) -> dace
 
 
 def test_memset_pure_1d_cpu():
-    """The ``pure`` expansion zeros the CPU slice and leaves the rest unchanged."""
+    """``pure`` zeros the 1D CPU slice, leaving the rest unchanged."""
     sdfg = _get_sdfg("pure", gpu=False)
     sdfg.name += "_pure_cpu"
     sdfg.validate()
@@ -66,7 +67,7 @@ def test_memset_pure_1d_cpu():
 
 
 def test_memset_pure_3d_cpu():
-    """The ``pure`` expansion zeros a 3D CPU sub-block and leaves the rest unchanged."""
+    """``pure`` zeros the 3D CPU sub-block, leaving the rest unchanged."""
     sdfg = _get_multi_dim_sdfg("pure", gpu=False)
     sdfg.name += "_pure_cpu_multi_dim"
     sdfg.validate()
@@ -83,7 +84,7 @@ def test_memset_pure_3d_cpu():
 
 @pytest.mark.gpu
 def test_memset_pure_1d_gpu():
-    """The ``pure`` expansion zeros the GPU slice and leaves the rest unchanged."""
+    """``pure`` zeros the 1D GPU slice, leaving the rest unchanged."""
     import cupy as cp
 
     sdfg = _get_sdfg("pure", gpu=True)
@@ -103,7 +104,7 @@ def test_memset_pure_1d_gpu():
 
 @pytest.mark.gpu
 def test_memset_pure_3d_gpu():
-    """The ``pure`` expansion zeros a 3D GPU sub-block and leaves the rest unchanged."""
+    """``pure`` zeros the 3D GPU sub-block, leaving the rest unchanged."""
     import cupy as cp
 
     sdfg = _get_multi_dim_sdfg("pure", gpu=True)
@@ -122,7 +123,7 @@ def test_memset_pure_3d_gpu():
 
 @pytest.mark.gpu
 def test_memset_cuda_1d_gpu():
-    """The ``CUDA`` expansion zeros the GPU slice and leaves the rest unchanged."""
+    """``CUDA`` zeros the 1D GPU slice, leaving the rest unchanged."""
     import cupy as cp
 
     sdfg = _get_sdfg("CUDA", gpu=True)
@@ -142,7 +143,7 @@ def test_memset_cuda_1d_gpu():
 
 @pytest.mark.gpu
 def test_memset_cuda_3d_gpu():
-    """The ``CUDA`` expansion zeros a 3D GPU sub-block and leaves the rest unchanged."""
+    """``CUDA`` zeros the 3D GPU sub-block, leaving the rest unchanged."""
     import cupy as cp
 
     sdfg = _get_multi_dim_sdfg("CUDA", gpu=True)
@@ -161,7 +162,7 @@ def test_memset_cuda_3d_gpu():
 
 @pytest.mark.gpu
 def test_memset_cuda_rejects_cpu_storage():
-    """The ``CUDA`` expansion targeting a CPU array is rejected."""
+    """``CUDA`` targeting a CPU array is rejected."""
     sdfg = _get_sdfg("CUDA", gpu=False)
     sdfg.name += "_cuda_cpu"
     sdfg.validate()
@@ -172,7 +173,7 @@ def test_memset_cuda_rejects_cpu_storage():
 
 
 def test_memset_auto_routes_non_contiguous_to_pure_cpu():
-    """Auto routes a non-contiguous CPU subset to ``pure`` (the single-call ``memset`` would zero outside the region)."""
+    """Auto routes a non-contiguous CPU subset to ``pure`` (a single ``memset`` would zero outside the region)."""
     sdfg = _make_memset_sdfg(None, (10, 20), "2:8, 5:15", gpu=False, name="memset_noncontig_cpu_auto")
     sdfg.validate()
     sdfg.expand_library_nodes()
@@ -235,7 +236,6 @@ def test_memset_register_inside_kernel_routes_to_sequential():
     sdfg.add_array('R', [4], dace.float64, dace.StorageType.Register, transient=True)
     state = sdfg.add_state('s')
 
-    # Wrap inside a GPU_Device map scope
     me, mx = state.add_map('kernel', dict(i='0:1'), schedule=dace.dtypes.ScheduleType.GPU_Device)
     r = state.add_access('R')
     memset_node = MemsetLibraryNode(name='memset_r')
@@ -256,6 +256,121 @@ def test_memset_register_inside_kernel_routes_to_sequential():
 
     # It should fall back to an internal loop/unrolled tasklet chain inside the device state
     assert any(isinstance(n, dace.nodes.Tasklet) for n, _ in sdfg.all_nodes_recursive())
+
+
+def test_memset_single_gpu_shared_inside_kernel_expands_clean():
+    """A single-element memset targeting GPU-resident storage *inside* a GPU kernel is valid device
+    code (a device-side ``_out = 0``) and must expand cleanly. Regression: the ``tasklet`` guard fired
+    on exactly this valid case, and its error path dereferenced the output *name* (a ``str``) as
+    ``inp.storage`` -> ``AttributeError``."""
+    sdfg = dace.SDFG('memset_shared_inside_kernel')
+    sdfg.add_array('s', [1], dace.float64, dace.StorageType.GPU_Shared, transient=True)
+    state = sdfg.add_state('s')
+
+    me, mx = state.add_map('kernel', dict(i='0:1'), schedule=dace.dtypes.ScheduleType.GPU_Device)
+    s_acc = state.add_access('s')
+    memset_node = MemsetLibraryNode(name='memset_s')
+    state.add_node(memset_node)
+    state.add_memlet_path(me, memset_node, memlet=dace.Memlet())
+    state.add_edge(memset_node, MemsetLibraryNode.OUTPUT_CONNECTOR_NAME, s_acc, None, dace.Memlet('s[0]'))
+    state.add_memlet_path(s_acc, mx, memlet=dace.Memlet())
+
+    sdfg.expand_library_nodes()  # must not raise
+
+    assert any(isinstance(n, dace.nodes.Tasklet) and '= 0' in n.code.as_string
+               for n, _ in sdfg.all_nodes_recursive()), "Expected a scalar zero-assignment tasklet."
+
+
+def test_memset_tasklet_rejects_gpu_storage_from_host_scope():
+    """The single-element ``tasklet`` expansion emits ``_out = 0`` in its own scope; from host scope it
+    cannot target GPU-resident storage (a scalar assignment cannot write device memory), so it must
+    raise a clean ``ValueError``. Regression: the guard tested the wrong side, letting this host->GPU
+    case through instead of rejecting it."""
+    sdfg = _make_memset_sdfg("tasklet", (1, ), "0:1", gpu=True, name="memset_tasklet_host_gpu")
+    sdfg.validate()
+    with pytest.raises(ValueError):
+        sdfg.expand_library_nodes()
+
+
+def test_memset_pure_strided_map_matches_array():
+    """A ``pure`` memset over a strided subset must give the mapped tasklet the same collapsed
+    extent as the wrapper array descriptor. Regression: ``map_lengths`` was recomputed from
+    ``out_subset.size()`` instead of the collapsed shape used for the array, so the map bounds
+    could diverge from the array rank/extent."""
+    sdfg = _make_memset_sdfg(None, (9, ), "0:9:3", gpu=False, name="memset_strided_cpu")
+    sdfg.validate()
+    sdfg.expand_library_nodes()
+    sdfg.validate()  # a diverged map/array would fail validation here
+    exe = sdfg.compile()
+
+    B = np.ones((9, ), dtype=np.float64)
+    exe(B=B)
+
+    expected = np.ones((9, ), dtype=np.float64)
+    expected[0:9:3] = 0  # indices 0, 3, 6
+    np.testing.assert_array_equal(B, expected)
+
+
+@contextlib.contextmanager
+def _pinned_transfer_threshold(value):
+    """Pin ``compiler.cpu.parallel_transfer_min_elements`` so Auto selection is deterministic."""
+    orig = dace.config.Config.get("compiler", "cpu", "parallel_transfer_min_elements")
+    dace.config.Config.set("compiler", "cpu", "parallel_transfer_min_elements", value=value)
+    try:
+        yield
+    finally:
+        dace.config.Config.set("compiler", "cpu", "parallel_transfer_min_elements", value=orig)
+
+
+def _cpu_memset_sdfg(extent, name):
+    """Single-state CPU_Heap ``MemsetLibraryNode`` zeroing ``0:extent``."""
+    sdfg = dace.SDFG(name)
+    sdfg.add_array("dst", [extent], dace.float64, dace.dtypes.StorageType.CPU_Heap)
+    state = sdfg.add_state("s")
+    libnode = MemsetLibraryNode(name="ms")
+    state.add_edge(libnode, MemsetLibraryNode.OUTPUT_CONNECTOR_NAME, state.add_access("dst"), None,
+                   dace.Memlet(f"dst[0:{extent}]"))
+    sdfg.validate()
+    return sdfg, libnode
+
+
+def _generated_code(sdfg):
+    return "\n".join(obj.code for obj in sdfg.generate_code())
+
+
+def test_memset_below_threshold_emits_memset():
+    """A constant-size CPU memset below the threshold lowers to a single ``memset``, not an OpenMP loop."""
+    with _pinned_transfer_threshold(1024):
+        sdfg, libnode = _cpu_memset_sdfg(100, "memset_below_threshold")
+        sdfg.expand_library_nodes(recursive=True)
+        assert libnode.implementation == 'CPU'
+        code = _generated_code(sdfg)
+        assert 'memset(' in code
+        assert '#pragma omp parallel for' not in code
+
+
+def test_memset_at_threshold_emits_omp_parallel_for():
+    """A constant-size CPU memset at/above the threshold lowers to an OpenMP element map, not ``memset``."""
+    with _pinned_transfer_threshold(1024):
+        sdfg, libnode = _cpu_memset_sdfg(4096, "memset_at_threshold")
+        sdfg.expand_library_nodes(recursive=True)
+        assert libnode.implementation == 'pure'
+        code = _generated_code(sdfg)
+        assert '#pragma omp parallel for' in code
+        assert 'memset(' not in code
+
+
+def test_memset_symbolic_size_emits_omp_parallel_for():
+    """A symbolic (compile-time-unknown) CPU memset size is assumed large, so it takes the same
+    OpenMP-parallel path as a large constant, never the single-call ``memset``."""
+    with _pinned_transfer_threshold(1024):
+        n = dace.symbol('N_memset_symbolic')
+        sdfg, libnode = _cpu_memset_sdfg(n, "memset_symbolic_size")
+        sdfg.expand_library_nodes(recursive=True)
+        assert libnode.implementation == 'pure'
+        code = _generated_code(sdfg)
+        assert '#pragma omp parallel for' in code
+        assert 'memset(' not in code
 
 
 if __name__ == "__main__":

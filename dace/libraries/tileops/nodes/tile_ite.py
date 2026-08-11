@@ -26,6 +26,7 @@ from typing import Optional, Tuple
 
 import dace
 from dace import library, properties
+from dace.codegen.cppunparse import pyexpr2cpp
 from dace.sdfg import nodes
 from dace.transformation.transformation import ExpandTransformation
 
@@ -84,7 +85,8 @@ class ExpandTileITEPure(ExpandTransformation):
             ``? :`` context so its ``cast`` is ``None``.
             """
             if kind == _SYMBOL:
-                return f"({cast})({expr})" if cast else f"({expr})"
+                cpp = pyexpr2cpp(expr)
+                return f"({cast})({cpp})" if cast else f"({cpp})"
             if kind == _TILE:
                 return f"{conn}[{off}]"
             # Scalar operand: descriptor-aware reference (a tile-shape Array
@@ -201,6 +203,9 @@ class TileITE(nodes.LibraryNode):
     :cvar default_implementation: ``"pure"``.
     """
 
+    # The backend below is chosen from the vectorizer's ``target_isa``, not from the target
+    # device, so device auto-selection must not overwrite it.
+    auto_select_implementation = False
     implementations = {
         "pure": ExpandTileITEPure,
         "cutile": ExpandTileITECutile,

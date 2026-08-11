@@ -1,5 +1,5 @@
 # Copyright 2019-2026 ETH Zurich and the DaCe authors. All rights reserved.
-"""Public vectorization passes: the multi-dim CPU/GPU tile-op vectorizer.
+"""Public vectorization passes: the multi-dim CPU/GPU/cuTile tile-op vectorizer.
 
 The pipeline entry points (``VectorizeMultiDim`` / ``VectorizeCPUMultiDim`` /
 ``VectorizeGPUMultiDim`` / ``VectorizeCuTile``) are exported LAZILY via :pep:`562`
@@ -10,28 +10,20 @@ that cycle. Deferring it means importing a vectorization *submodule* does not dr
 in the whole pipeline, while ``from ...vectorization import VectorizeCPUMultiDim``
 still works on demand.
 """
-import importlib
-
 # Importing this module registers the ``"vectorized"`` implementation on the
 # standard ``Reduce`` library node (schedule-aware dispatcher). Cycle-safe.
-from . import reduce_expansion  # noqa: F401
-
-#: Lazily-exported pipeline entry points, mapped to their defining submodule.
-_PIPELINE_EXPORTS = {
-    "VectorizeMultiDim": "vectorize_multi_dim",
-    "VectorizeCPUMultiDim": "vectorize_multi_dim",
-    "VectorizeGPUMultiDim": "vectorize_multi_dim",
-    "VectorizeCuTile": "vectorize_cutile",
-}
-
+from dace.transformation.passes.vectorization import reduce_expansion  # noqa: F401
 
 def __getattr__(name):
     """Lazily resolve the pipeline entry points (breaks the interstate import cycle)."""
-    if name in _PIPELINE_EXPORTS:
-        module = importlib.import_module(f"{__name__}.{_PIPELINE_EXPORTS[name]}")
-        return getattr(module, name)
+    if name == "VectorizeCuTile":
+        from dace.transformation.passes.vectorization.vectorize_cutile import VectorizeCuTile
+        return VectorizeCuTile
+    if name in {"VectorizeMultiDim", "VectorizeCPUMultiDim", "VectorizeGPUMultiDim"}:
+        from dace.transformation.passes.vectorization import vectorize_multi_dim
+        if name == "VectorizeMultiDim":
+            return vectorize_multi_dim.VectorizeMultiDim
+        if name == "VectorizeCPUMultiDim":
+            return vectorize_multi_dim.VectorizeCPUMultiDim
+        return vectorize_multi_dim.VectorizeGPUMultiDim
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
-
-def __dir__():
-    return sorted(list(globals()) + list(_PIPELINE_EXPORTS))

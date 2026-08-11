@@ -16,7 +16,9 @@ import pytest
 
 import dace
 from dace.libraries.sort.nodes.scatter_conflict_check import ScatterConflictCheck
-from dace.transformation.passes.scatter_conflict_guard import (GuardScatterConflicts, insert_scatter_guard)
+from dace.transformation.passes.scatter_conflict_guard import (GuardScatterConflicts, insert_scatter_guard,
+                                                               scatter_index_domain,
+                                                               scatter_index_is_provably_injective)
 
 N = dace.symbol('N')
 
@@ -53,6 +55,32 @@ def _has_conflict_check(sdfg: dace.SDFG) -> bool:
 
 def _make_permutation(n: int, seed: int) -> np.ndarray:
     return np.random.default_rng(seed).permutation(n).astype(np.int32)
+
+
+def _function_body(code: str, header: str) -> str:
+    """The brace-matched body of the first function in ``code`` whose text starts with ``header``."""
+    start = code.index(header)
+    open_brace = code.index('{', start)
+    depth = 0
+    for i in range(open_brace, len(code)):
+        if code[i] == '{':
+            depth += 1
+        elif code[i] == '}':
+            depth -= 1
+            if depth == 0:
+                return code[open_brace:i + 1]
+    raise AssertionError(f"Unbalanced braces after {header!r}")
+
+
+def _lines_inside_a_function(code: str, needle: str) -> list:
+    """Lines containing ``needle`` that sit at nonzero brace depth (i.e. inside some function)."""
+    depth = 0
+    found = []
+    for line in code.splitlines():
+        if depth > 0 and needle in line:
+            found.append(line.strip())
+        depth += line.count('{') - line.count('}')
+    return found
 
 
 # -- Per-TSVC tests -----------------------------------------------------------
@@ -180,6 +208,198 @@ def test_guard_refuses_double_emit():
         insert_scatter_guard(sdfg, 'ip')
 
 
+# -- Tag array: DaCe-owned transient, allocated outside the program body ------
+
+
+def test_tag_array_is_a_persistent_transient_sized_by_the_scatter_domain():
+    """The conflict check's tag array is a real descriptor sized by ``a``'s domain, not a
+    runtime-sized buffer the libnode ``new``s behind DaCe's back."""
+    sdfg = tsvc_vas.to_sdfg(simplify=True)
+    assert str(scatter_index_domain(sdfg, 'ip')) == 'N'
+    insert_scatter_guard(sdfg, 'ip')
+    sdfg.validate()
+
+    owner = sdfg.arrays['_scatter_guard_owner_ip']
+    assert owner.transient
+    assert owner.dtype == dace.int64
+    assert str(owner.shape[0]) == 'N'  # the scattered array's domain, no runtime max(ip)
+    assert owner.lifetime == dace.dtypes.AllocationLifetime.Persistent
+    assert owner.storage == dace.dtypes.StorageType.CPU_Heap  # the check is host code everywhere
+
+
+def test_generated_guard_has_no_raw_new_and_no_include_in_the_program_body():
+    """The timed program body holds no allocation and no preprocessor include: the tag array is
+    allocated once in ``__dace_init``, and only two full sweeps over ``ip`` remain (the
+    ``max(ip)`` sizing sweep is gone)."""
+    sdfg = tsvc_vas.to_sdfg(simplify=True)
+    insert_scatter_guard(sdfg, 'ip')
+    code = sdfg.generate_code()[0].clean_code
+
+    body = _function_body(code, f'void __program_{sdfg.name}_internal')
+    assert 'new ' not in body, body
+    assert '#include' not in body, body
+    assert body.count('_i < _N') == 2, body  # tag pass + verify pass, no max pass
+
+    assert not _lines_inside_a_function(code, '#include'), _lines_inside_a_function(code, '#include')
+    init = _function_body(code, f'__dace_init_{sdfg.name}(')
+    assert '__0__scatter_guard_owner_ip = new' in init, init
+
+
+def test_generated_guard_or_reduce_pass_carries_simd():
+    """The OR-reduce verify pass is bitwise-or, which is simd-safe (see
+    dace/runtime/include/dace/reduction.h); its pragma must carry simd, and never a bare
+    ``if()`` clause (GCC binds a combined construct's ``if()`` to simd, silently devectorizing)."""
+    sdfg = tsvc_vas.to_sdfg(simplify=True)
+    insert_scatter_guard(sdfg, 'ip')
+    code = sdfg.generate_code()[0].clean_code
+
+    reduce_lines = _lines_inside_a_function(code, 'reduction(|:_c)')
+    assert reduce_lines, code
+    for line in reduce_lines:
+        assert line.startswith('#pragma omp parallel for simd'), line
+        assert 'if(' not in line and 'if (' not in line, line
+
+
+def test_tag_array_omitted_when_no_scatter_target_is_visible():
+    """No derivable domain (no scatter loop to read a target extent from) -> no tag descriptor;
+    the libnode keeps its runtime-sized buffer rather than guessing a bound."""
+    sdfg = dace.SDFG('no_scatter_target')
+    sdfg.add_array('ip', [8], dace.int32)
+    sdfg.add_state('s0')
+    assert scatter_index_domain(sdfg, 'ip') is None
+    insert_scatter_guard(sdfg, 'ip')
+    sdfg.validate()
+    assert _has_conflict_check(sdfg)
+    assert '_scatter_guard_owner_ip' not in sdfg.arrays
+
+
+# -- Lever 1: static-injective elision ----------------------------------------
+
+
+@dace.program
+def scatter_affine_identity(a: dace.float64[N], b: dace.float64[N]):
+    """``ip[i] = i`` produced in-SDFG (identity permutation), then ``a[ip[i]] = b[i]``."""
+    ip = np.empty(N, np.int64)
+    for i in range(N):
+        ip[i] = i
+    for i in range(N):
+        a[ip[i]] = b[i]
+
+
+@dace.program
+def scatter_affine_strided(a: dace.float64[2 * N], b: dace.float64[N]):
+    """``ip[i] = 2*i + 1`` (injective affine over ``[0, N)``), then ``a[ip[i]] = b[i]``."""
+    ip = np.empty(N, np.int64)
+    for i in range(N):
+        ip[i] = 2 * i + 1
+    for i in range(N):
+        a[ip[i]] = b[i]
+
+
+@dace.program
+def scatter_mod_producer(a: dace.float64[N], b: dace.float64[N]):
+    """``ip[i] = i % 3`` (non-injective) -- genuinely conflicts; the guard must be kept."""
+    ip = np.empty(N, np.int64)
+    for i in range(N):
+        ip[i] = i % 3
+    for i in range(N):
+        a[ip[i]] = b[i]
+
+
+def build_constant_idx_scatter_sdfg(values) -> dace.SDFG:
+    """Build a minimal SDFG whose ``ip`` array is also a compile-time constant.
+
+    Used to exercise the constant-array branch of
+    :func:`scatter_index_is_provably_injective` without a producer loop.
+
+    :param values: The integer values baked into the ``ip`` constant.
+    :returns: An SDFG with an ``ip`` :class:`~dace.data.Array` descriptor whose contents
+              are registered as a compile-time constant.
+    """
+    sdfg = dace.SDFG('const_idx_scatter')
+    sdfg.add_array('ip', [len(values)], dace.int64)
+    sdfg.add_constant('ip', np.asarray(values, dtype=np.int64))
+    sdfg.add_state('s0')
+    return sdfg
+
+
+def test_affine_identity_producer_elides_guard():
+    """An in-SDFG identity producer ``ip[i] = i`` is provably injective: the guard is elided
+    (no ``ScatterConflictCheck`` node) and the plain scatter is value-correct vs numpy."""
+    sdfg = scatter_affine_identity.to_sdfg(simplify=True)
+    assert scatter_index_is_provably_injective(sdfg, 'ip')
+    assert insert_scatter_guard(sdfg, 'ip') is None  # elided -> no guard symbol
+    assert not _has_conflict_check(sdfg)
+    sdfg.validate()
+
+    n = 40
+    b = np.random.default_rng(11).random(n)
+    a = np.zeros(n)
+    a_ref = np.zeros(n)
+    for i in range(n):
+        a_ref[i] = b[i]
+    sdfg(a=a, b=b, N=n)
+    assert np.allclose(a, a_ref)
+
+
+def test_strided_affine_producer_elides_guard():
+    """A strided injective producer ``ip[i] = 2*i + 1`` is provably injective: guard elided,
+    value-correct vs numpy."""
+    sdfg = scatter_affine_strided.to_sdfg(simplify=True)
+    assert scatter_index_is_provably_injective(sdfg, 'ip')
+    assert insert_scatter_guard(sdfg, 'ip') is None
+    assert not _has_conflict_check(sdfg)
+    sdfg.validate()
+
+    n = 16
+    b = np.random.default_rng(12).random(n)
+    a = np.zeros(2 * n)
+    a_ref = np.zeros(2 * n)
+    for i in range(n):
+        a_ref[2 * i + 1] = b[i]
+    sdfg(a=a, b=b, N=n)
+    assert np.allclose(a, a_ref)
+
+
+def test_conflicting_param_idx_keeps_guard():
+    """A parameter ``ip`` (unknown runtime contents) is NOT provably injective: the guard is
+    kept, and with a permutation the guarded scatter is value-correct vs numpy."""
+    sdfg = tsvc_vas.to_sdfg(simplify=True)
+    assert not scatter_index_is_provably_injective(sdfg, 'ip')
+    insert_scatter_guard(sdfg, 'ip')
+    assert _has_conflict_check(sdfg)
+    sdfg.validate()
+
+    n = 32
+    ip = _make_permutation(n, seed=13)
+    b = np.random.default_rng(14).random(n)
+    a = np.zeros(n)
+    a_ref = np.zeros(n)
+    for i in range(n):
+        a_ref[ip[i]] = b[i]
+    sdfg(a=a, b=b, ip=ip, N=n)
+    assert np.allclose(a, a_ref)
+
+
+def test_non_injective_producer_not_provably_injective():
+    """A non-affine producer ``ip[i] = i % 3`` can collide: the analysis refuses to prove
+    injectivity (soundness first), so the guard would be kept rather than elided."""
+    sdfg = scatter_mod_producer.to_sdfg(simplify=True)
+    assert not scatter_index_is_provably_injective(sdfg, 'ip')
+
+
+def test_constant_permutation_idx_is_injective():
+    """A compile-time constant ``ip`` holding a permutation is provably injective."""
+    sdfg = build_constant_idx_scatter_sdfg([3, 0, 2, 1])
+    assert scatter_index_is_provably_injective(sdfg, 'ip')
+
+
+def test_constant_duplicate_idx_not_injective():
+    """A compile-time constant ``ip`` with a repeated value is NOT injective."""
+    sdfg = build_constant_idx_scatter_sdfg([0, 1, 1, 2])
+    assert not scatter_index_is_provably_injective(sdfg, 'ip')
+
+
 # -- Abort-on-duplicate (subprocess; SIGABRT/SIGILL is expected) --------------
 
 _DUPLICATE_ABORT_SCRIPT = textwrap.dedent(f"""
@@ -215,7 +435,7 @@ def test_duplicate_idx_aborts_the_process():
     """Running the guarded SDFG with a duplicate ``ip`` traps before returning.
 
     Spawns a fresh Python subprocess so the SIGABRT/SIGILL/SIGTRAP from
-    ``__builtin_trap()`` doesn't kill the test runner. The subprocess prints
+    ``std::abort()`` doesn't kill the test runner. The subprocess prints
     a marker only if the abort *didn't* fire; we check the marker is absent
     AND the subprocess exited abnormally (non-zero return / signal).
     """
@@ -227,4 +447,22 @@ def test_duplicate_idx_aborts_the_process():
 
 
 if __name__ == '__main__':
-    sys.exit(pytest.main([__file__, '-v']))
+    test_s4113_permutation_runs_cleanly()
+    test_s491_permutation_runs_cleanly()
+    test_vas_permutation_runs_cleanly()
+    test_guard_states_inserted_before_scatter()
+    test_guard_pass_emits_for_each_named_idx()
+    test_guard_refuses_non_integer_idx()
+    test_guard_refuses_unknown_idx_name()
+    test_guard_refuses_double_emit()
+    test_tag_array_is_a_persistent_transient_sized_by_the_scatter_domain()
+    test_generated_guard_has_no_raw_new_and_no_include_in_the_program_body()
+    test_generated_guard_or_reduce_pass_carries_simd()
+    test_tag_array_omitted_when_no_scatter_target_is_visible()
+    test_affine_identity_producer_elides_guard()
+    test_strided_affine_producer_elides_guard()
+    test_conflicting_param_idx_keeps_guard()
+    test_non_injective_producer_not_provably_injective()
+    test_constant_permutation_idx_is_injective()
+    test_constant_duplicate_idx_not_injective()
+    test_duplicate_idx_aborts_the_process()

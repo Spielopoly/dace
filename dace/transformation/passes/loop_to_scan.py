@@ -54,7 +54,7 @@ from dace.transformation.passes.analysis import loop_analysis
 # Re-export the supported associative ops via :class:`ScanOp`; the matcher recognises
 # the same four ops the libnode expansions cover.
 from dace.libraries.standard.nodes.scan import (Scan, ScanOp, INPUT_CONNECTOR_NAME, OUTPUT_CONNECTOR_NAME,
-                                                INIT_CONNECTOR_NAME)
+                                                INIT_CONNECTOR_NAME, in_connector, out_connector, init_connector)
 
 #: Map AST BinOp class -> ScanOp.
 _BINOP_TO_SCAN_OP = {
@@ -137,7 +137,9 @@ class _Scan(NamedTuple):
     # :class:`NormalizeNegativeStride` normalises the loop. With ``coef == -1``,
     # ``k_w`` / ``k_r`` hold the array constants (i.e. the array index visited
     # at the first iteration), and the rewrite emits seed-add Map subscripts
-    # ``k_w - i`` instead of ``iter_start + k_w + i``.
+    # ``k_w - i`` instead of ``iter_start + k_w + i``. The reverse seed is not
+    # applied there but folded into the delta heads beforehand (one seed
+    # ``k_r - k`` per residue class ``k``; see :func:`_emit_seed_fold`).
     coef: int = 1
 
 
@@ -324,73 +326,66 @@ class LoopToScan(ppl.Pass):
         except Exception:  # noqa: BLE001 -- oracle refuses exotic shapes -> not a keepable map
             return False
 
-    def _specialize_scan_under_stride_guard(self, parent: ControlFlowRegion, loop: LoopRegion, guard: str, sdfg: SDFG):
+    def _specialize_scan_under_stride_guard(self, parent: ControlFlowRegion, loop: LoopRegion, guard: str, sdfg: SDFG,
+                                            infos: List['_Scan']):
         """Replace a symbolic-stride scan ``loop`` with ``if (guard) { scan } else
         { original sequential loop }`` via :func:`specialize_loop_under_condition`.
+
+        ``sdfg`` is the SDFG OWNING ``loop`` (see :func:`_collect_loops`), which is what
+        gets handed to the ``_lift`` callback -- the specialization keeps both clones in
+        ``parent``, so the owner is unchanged by the splice.
 
         The true-branch clone is re-matched and lifted to the ``Scan`` pipeline;
         the else-branch clone is pinned sequential (``LoopToMap`` / a re-run of
         this pass leave it alone). ``guard`` is the ``stride >= 1`` predicate from
         :func:`_symbolic_stride_guard` under which the residue-class scan is valid.
+
+        When the guard is provably redundant (:func:`_stride_guard_is_statically_dischargeable`
+        -- the iteration span is no wider than the stride, so the loop carries no recurrence
+        at all), drop the conditional and lift the loop to a BARE MAP via
+        :func:`_lift_proven_doall_to_map`.
+
+        The bare form must be a ``Map``, never an unconditional residue-class ``Scan``. The
+        proof discharges the guard by covering the ``stride <= 0`` case with "the span is then
+        ``<= 0``, so the loop is empty" -- vacuous for a Map (an empty Map runs no iterations),
+        but NOT for a Scan: ``dace::scan::strided_inclusive_*`` calls ``std::abort()`` on
+        ``stride <= 0`` before it ever looks at the element count, so an unconditional Scan
+        would kill the process on the very inputs the proof calls harmless (TSVC ``s174``:
+        ``a[i + M] = a[i] + b[i]`` over ``i in [0, M)`` aborts at the legal ``M == 0``, where
+        the reference is a no-op). A Map is correct for every value the guard admitted and
+        every value it excluded, which is exactly what dropping the fallback requires.
         """
         from dace.transformation.passes.loop_specialization import specialize_loop_under_condition
 
-        def _lift(par_loop: LoopRegion, par_region: ControlFlowRegion, _owner: SDFG):
-            par_infos = _match_all(par_loop, sdfg)
+        def _lift(par_loop: LoopRegion, par_region: ControlFlowRegion, owner: SDFG):
+            par_infos = _match_all(par_loop, owner)
             if par_infos and not self.lift_nested_scan:
                 par_infos = [
                     info for info in par_infos
-                    if not (info.inner_loop is not None and self._inner_loop_parallelizable(info.inner_loop, sdfg))
+                    if not (info.inner_loop is not None and self._inner_loop_parallelizable(info.inner_loop, owner))
                 ]
             for info in par_infos:
-                _rewrite(par_region, par_loop, info, sdfg)
+                _rewrite(par_region, par_loop, info, owner)
 
+        if _stride_guard_is_statically_dischargeable(infos) and _lift_proven_doall_to_map(parent, loop, sdfg):
+            return
         specialize_loop_under_condition(loop, guard, _lift, sdfg)
 
     def apply_pass(self, sdfg: SDFG, _pipeline_results) -> Optional[int]:
-        # Whole-SDFG preprocess: strip frontend ``__out = __inp`` copy tasklets so the
-        # matcher sees the bare ``out[i+1] = out[i] + delta[i]`` shape. Without this the
-        # carry hides behind an ``assign_NN`` copy node on the write side.
-        from dace.transformation.dataflow.trivial_tasklet_elimination import TrivialTaskletElimination
-        from dace.transformation.dataflow.wcr_conversion import WCRToAugAssign
-        from dace.transformation.passes.pattern_matching import PatternMatchAndApplyRepeated
-        # Normalise reductions written as WCR edges back to in-body augmented
-        # assignment so the matcher sees a uniform tasklet shape. No-op on SDFGs
-        # whose pre-existing reductions are already in augassign form (the
-        # common case for canonicalised Fortran frontends).
-        PatternMatchAndApplyRepeated([WCRToAugAssign()]).apply_pass(sdfg, {})
-        PatternMatchAndApplyRepeated([TrivialTaskletElimination()]).apply_pass(sdfg, {})
+        """Lift carried-dependence loops to ``Scan`` library nodes.
 
-        # NOTE: D4 (CleanAccessNode + CleanTasklet) is deliberately NOT applied
-        # here. LoopToScan's matcher already handles the frontend's scalar-
-        # slice intermediates via ``_chase_forward_to_accum`` and friends;
-        # the existing WCR/TrivialTasklet preprocess above is sufficient.
-        # Running the clean folds in addition (in either order vs WCR) is
-        # redundant work and previously regressed the
-        # ``for_1133_shape_reverse_engineered`` case by stripping
-        # intermediates the matcher relies on.
+        :returns: The number of scans lifted, or ``None`` when none was -- in which case the
+                  SDFG is left untouched.
 
-        # Normalise backward-iterating loops (``range(N, 0, -1)`` shape; cloudsc
-        # ``for_1079`` is the canonical case) to forward iteration. ``LoopToScan``'s
-        # matcher only handles ``stride == 1``; rather than build sign-flip handling
-        # into every gate, delegate to the dedicated canonicalisation pass once up
-        # front so subsequent analysis sees only positive-stride loops.
-        # ``NormalizeNegativeStride`` rebinds the old iterator on the body entry
-        # iedge (``jm = N - _loop_pos_X``) rather than rewriting body memlets;
-        # follow up with ``SymbolPropagation`` so the body's subsets are expressed
-        # in the new positive-stride iterator and the matcher recognises them.
-        from dace.transformation.passes.canonicalize.normalize_negative_stride import NormalizeNegativeStride
-        from dace.transformation.passes.symbol_propagation import SymbolPropagation
-        if NormalizeNegativeStride().apply_pass(sdfg, {}):
-            SymbolPropagation().apply_pass(sdfg, {})
-
-        # Per-loop preprocess: fold adjacent content SDFGStates inside the body when the
-        # iedge between them is trivial (v5 -- the cloudsc ``pfsqrf`` shape). Whole-SDFG
-        # ``StateFusion`` doesn't reach into LoopRegion bodies via ``MatchPatterns``, so
-        # do a targeted body-local merge.
-        for loop, _ in _collect_loops(sdfg):
-            _fuse_body_states(loop)
-
+        ``apply_pass`` returning ``None`` means "did not modify the SDFG", and callers act
+        on it: the pipeline skips its per-stage ``validate()`` and leaves ``self._modified``
+        alone, so cached analyses are reused and a ``FixedPointPipeline`` stops iterating.
+        The body normalization the matcher needs (WCR-to-augassign, copy-tasklet folding,
+        negative-stride flipping, body-state fusion) therefore does NOT live here -- it is
+        :class:`~dace.transformation.passes.lift_preprocess.LiftPreprocess`, which the
+        canonicalization pipeline runs immediately before this pass and which a direct
+        caller must run itself.
+        """
         count = 0
         # Optional first pass: interchange the Map-wrapped carry shape.
         # Done up-front so the carry loop runs sequentially per-thread INSIDE
@@ -401,18 +396,20 @@ class LoopToScan(ppl.Pass):
         # sequential-per-thread form).
         interchanged_loop_ids = set()
         if self.interchange_carry_with_map:
-            for loop, parent in list(_collect_loops(sdfg)):
-                shape = _detect_carry_loop_with_inner_map(loop, sdfg)
+            for loop, parent, owner in list(_collect_loops(sdfg)):
+                shape = _detect_carry_loop_with_inner_map(loop, owner)
                 if shape is None:
                     continue
-                relocated = _rewrite_interchange_carry_with_map(shape, sdfg)
+                relocated = _rewrite_interchange_carry_with_map(shape, owner)
                 if relocated is None:
                     continue
                 if isinstance(relocated, LoopRegion):
                     interchanged_loop_ids.add(id(relocated))
                 count += 1
 
-        for loop, parent in _collect_loops(sdfg):
+        # ``owner`` -- NOT ``sdfg`` -- is what every matcher and rewrite below gets: a loop
+        # inside a NestedSDFG names ITS OWN SDFG's arrays. See :func:`_collect_loops`.
+        for loop, parent, owner in _collect_loops(sdfg):
             if id(loop) in interchanged_loop_ids:
                 continue
             if loop.pinned_sequential:
@@ -420,7 +417,7 @@ class LoopToScan(ppl.Pass):
                 # specialization (below); re-matching it would recurse into
                 # another if/else. Leave it as the original sequential loop.
                 continue
-            infos = _match_all(loop, sdfg, allow_multi_slot=True)
+            infos = _match_all(loop, owner, allow_multi_slot=True)
             # Multi-slot shape (several independent scans on distinct constant
             # slots of one carrier -- ``acc[0,i]``, ``acc[1,i]``, ...): the shared
             # body can't go through the per-info ``_rewrite`` path (ambiguous
@@ -428,7 +425,7 @@ class LoopToScan(ppl.Pass):
             # leave it sequential if it isn't a clean forward-flat slot set.
             if infos and _is_multi_slot(infos):
                 if _multi_slot_liftable(infos):
-                    _rewrite_multi_slot(parent, loop, infos, sdfg)
+                    _rewrite_multi_slot(parent, loop, infos, owner)
                     count += 1
                     continue
                 # Not a clean forward-flat slot set (e.g. the nested cloudsc
@@ -447,7 +444,7 @@ class LoopToScan(ppl.Pass):
             if infos and not self.lift_nested_scan:
                 infos = [
                     info for info in infos
-                    if not (info.inner_loop is not None and self._inner_loop_parallelizable(info.inner_loop, sdfg))
+                    if not (info.inner_loop is not None and self._inner_loop_parallelizable(info.inner_loop, owner))
                 ]
             if infos:
                 guard = _symbolic_stride_guard(infos)
@@ -459,11 +456,11 @@ class LoopToScan(ppl.Pass):
                     # rather than lift unconditionally: a violating runtime value
                     # (stride 0 -> a degenerate in-place update) degrades to the
                     # sequential fallback and still computes correctly.
-                    self._specialize_scan_under_stride_guard(parent, loop, guard, sdfg)
+                    self._specialize_scan_under_stride_guard(parent, loop, guard, owner, infos)
                     count += 1
                     continue
                 for info in infos:
-                    _rewrite(parent, loop, info, sdfg)
+                    _rewrite(parent, loop, info, owner)
                     count += 1
                 continue
             # The COMPOSITE-BODY shape (cloudsc ``for_1133``): outer body has
@@ -473,9 +470,9 @@ class LoopToScan(ppl.Pass):
             # AccessNodes at the chain endpoints, leaving intermediate
             # transients untouched) and emits the standard
             # ``Scan`` + seed-add via the nested-scan helpers.
-            comp = _match_composite_body(loop, sdfg)
+            comp = _match_composite_body(loop, owner)
             if comp is not None:
-                if _rewrite_composite_body(parent, loop, comp, sdfg):
+                if _rewrite_composite_body(parent, loop, comp, owner):
                     count += 1
                     continue
             # No array-carry match; try scalar-carry (TSVC s3112: scalar accumulator
@@ -483,9 +480,9 @@ class LoopToScan(ppl.Pass):
             # exclusive with array-carry by construction -- array-carry needs the
             # carrier read+written at offset (i + k_r) / (i + k_w), scalar-carry
             # needs a SCALAR carrier read+written at constant subset [0].
-            sc = _match_scalar_carry(loop, sdfg)
+            sc = _match_scalar_carry(loop, owner)
             if sc is not None:
-                _rewrite_scalar_carry(parent, loop, sc, sdfg)
+                _rewrite_scalar_carry(parent, loop, sc, owner)
                 count += 1
         if count > 0:
             # Narrow the freshly-emitted state-level memlets on the new
@@ -500,11 +497,20 @@ class LoopToScan(ppl.Pass):
 
 
 def _collect_loops(sdfg: SDFG):
+    """``(loop, parent_graph, owner_sdfg)`` for every named loop, nested SDFGs included.
+
+    ``owner_sdfg`` is the SDFG whose ``arrays`` the loop's memlets name -- for a loop
+    inside a NestedSDFG that is the INNER SDFG, not ``sdfg``. Every matcher and rewrite
+    below resolves descriptors and allocates its scan buffers there; handing them the
+    top-level ``sdfg`` instead allocates ``_scan_out_<out>`` in the wrong descriptor
+    repository and the states emitted next to the loop then reference a name their own
+    SDFG has never heard of.
+    """
     out: List = []
     for sd in sdfg.all_sdfgs_recursive():
         for region in sd.all_control_flow_regions():
             if isinstance(region, LoopRegion) and region.loop_variable:
-                out.append((region, region.parent_graph))
+                out.append((region, region.parent_graph, sd))
     return out
 
 
@@ -563,6 +569,15 @@ def _descend_to_content_state_candidates(loop: LoopRegion):
         # the rewrite step also mutates any sibling branch's writes (see
         # ``_mutate_sibling_branches_to_zero_delta`` -- emitted post-match).
         for cb in cond_blocks:
+            # Only a TOTAL conditional. A ``Scan`` writes every element of the carrier, so it can
+            # stand in for a conditional only when some branch runs on every path. With no ``else``
+            # the false path leaves the element untouched, and the nearest a scan can express is a
+            # zero delta -- which still writes ``out[j] = out[j-1]`` and so flattens the untouched
+            # elements to the seed instead of preserving them. TSVC s275
+            # (``if aa[0,i] > 0: for j: aa[j,i] = aa[j-1,i] + bb[j,i]*cc[j,i]``) is that shape: its
+            # unguarded columns came out constant down the column.
+            if not any(cond is None for cond, _ in cb.branches):
+                continue
             for cond, branch in cb.branches:
                 branch_state, deeper = _descend_to_content_state(branch)
                 if branch_state is None or deeper is not None:
@@ -835,15 +850,28 @@ def _match_all(loop: LoopRegion, sdfg: SDFG, allow_multi_slot: bool = False) -> 
     infos_per_array: Dict[str, int] = {}
     for s in matched:
         infos_per_array[s.out_name] = infos_per_array.get(s.out_name, 0) + 1
+    # The subset counted must be the one on the CARRIER's side of the edge. An AccessNode ->
+    # AccessNode copy names the DESTINATION in ``data`` and parks the carrier's own range in
+    # ``other_subset``, so reading ``.subset`` blindly reports the destination's scalar slot
+    # ``0`` for every read and collapses ``a[i]``, ``a[i-1]`` and ``a[i-2]`` into ONE distinct
+    # subset -- the guard then "proves" a one-step recurrence that is not there and TSVC s322
+    # (``a[i] = a[i] + a[i-1]*b[i] + a[i-2]*c[i]``) is lifted to a scan, off by max|diff| 3.1.
+    # Only reachable on a SECOND canonicalize: the first run reads the carrier through
+    # ``_assign_*`` tasklets, whose memlets are already written from the carrier's side, and the
+    # AccessNode -> AccessNode form the later cleanup leaves behind is what flips the side.
     carrier_reads: Dict[str, set] = {name: set() for name in carrier_set}
     for st in loop.all_states():
         for n in st.data_nodes():
             if n.data not in carrier_set:
                 continue
             for e in st.out_edges(n):
-                if e.data is None or e.data.subset is None:
+                if e.data is None or e.data.is_empty():
                     continue
-                carrier_reads[n.data].add(str(e.data.subset))
+                sub = e.data.get_src_subset(e, st)
+                # No carrier-side range spelled out means the whole array is read; say so rather
+                # than skipping the edge, which would under-count the distinct reads.
+                carrier_reads[n.data].add(
+                    str(sub) if sub is not None else str(subsets.Range.from_array(st.sdfg.arrays[n.data])))
     for name, subs in carrier_reads.items():
         allowed = infos_per_array.get(name, 1) if allow_multi_slot else 1
         if len(subs) > allowed:
@@ -921,6 +949,9 @@ def _match_one_carrier(loop: LoopRegion, sdfg: SDFG, state: SDFGState, out_name:
         if len(out_edges_t) != 1:
             continue
         k_r = symbolic.simplify(k_w - scan_stride if write_coef == 1 else k_w + scan_stride)
+        if not carrier_reads_admissible(state, out_name, loop.loop_variable, write_axis, write_others, k_w, k_r,
+                                        write_coef):
+            continue
         candidates.append(
             _Scan(
                 op=op,
@@ -1010,6 +1041,9 @@ def _match_multi_slot(loop: LoopRegion, sdfg: SDFG, state: SDFGState, out_name: 
         if len(out_edges_t) != 1:
             continue
         k_r = symbolic.simplify(k_w - scan_stride if write_coef == 1 else k_w + scan_stride)
+        if not carrier_reads_admissible(state, out_name, loop.loop_variable, write_axis, write_others, k_w, k_r,
+                                        write_coef):
+            continue
         candidates.append(
             _Scan(
                 op=op,
@@ -2332,6 +2366,30 @@ def _iter_write_edges(state: SDFGState, name: str) -> List[Any]:
     return edges
 
 
+def _provably_nonpositive(expr) -> bool:
+    """``True`` iff ``expr`` is provably ``<= 0`` under the canonicalize nonnegative-symbol
+    contract (see :mod:`~dace.transformation.passes.canonicalize.assume_symbols_nonnegative`).
+
+    Plain ``expr.is_nonpositive`` is too weak on the expressions scan strides actually take:
+    ``int_floor`` / ``int_ceil`` are DaCe ``sympy.Function`` subclasses with no sign rule, so
+    a shift stride like ``-int_floor(LEN_1D, 2)`` reads as sign-UNKNOWN and gets mislabelled
+    an admissible symbolic scan stride (TSVC ``s1421``: ``b[i] = b[half + i] + a[i]`` is a pure
+    ``+half`` read-ahead over a disjoint region, not a recurrence). Rewrite them to SymPy's
+    ``floor`` / ``ceiling`` -- which DO propagate sign -- over nonnegative-rebuilt free symbols,
+    then test. Only *provable* nonpositivity is reported; a sign that stays unknown (a bare
+    symbolic stride ``K``, which may be ``0`` or positive) yields ``False``.
+    """
+    if not isinstance(expr, sympy.Basic):
+        return False
+    if expr.is_nonpositive is True:
+        return True
+    rebuilt = expr.subs({s: sympy.Symbol(s.name, nonnegative=True, integer=True) for s in expr.free_symbols})
+    rebuilt = rebuilt.replace(lambda n: isinstance(n, symbolic.int_floor), lambda n: sympy.floor(n.args[0] / n.args[1]))
+    rebuilt = rebuilt.replace(lambda n: isinstance(n, symbolic.int_ceil),
+                              lambda n: sympy.ceiling(n.args[0] / n.args[1]))
+    return rebuilt.is_nonpositive is True
+
+
 def _admissible_scan_stride(diff):
     """Return the scan stride if ``diff`` (``= k_w - k_r`` in iteration order) is an
     admissible positive stride, else ``None``.
@@ -2352,8 +2410,13 @@ def _admissible_scan_stride(diff):
         return None
     if diff.is_Integer:
         return int(diff) if int(diff) >= 1 else None
-    # Symbolic: admit an integer-typed stride whose sign is not provably non-positive.
-    if diff.is_integer and diff.is_nonpositive is not True:
+    # Symbolic: admit an integer-typed stride whose sign is not provably non-positive. A
+    # provably ``<= 0`` stride can never satisfy the residue-class scan's ``stride >= 1``
+    # validity condition, so specializing it would only ever emit a dead scan branch behind
+    # an always-false guard, leaving the pinned sequential fallback to run every time.
+    # Refusing the match instead lets the loop reach ``LoopToMap``, whose own dependency
+    # proof lifts it to an unconditional Map when the read/write regions are disjoint.
+    if diff.is_integer and not _provably_nonpositive(diff):
         return diff
     return None
 
@@ -2377,6 +2440,78 @@ def _symbolic_stride_guard(infos: List['_Scan']) -> Optional[str]:
                 seen.add(cond)
                 conds.append(cond)
     return ' && '.join(conds) if conds else None
+
+
+def _stride_guard_is_statically_dischargeable(infos: List['_Scan']) -> bool:
+    """Whether the ``stride >= 1`` guard :func:`_symbolic_stride_guard` would emit is
+    provably redundant -- i.e. the loop is DOALL for EVERY symbol value, so a bare ``Map``
+    is correct and the sequential fallback is never observably taken.
+
+    This licenses a bare ``Map`` ONLY (see :meth:`LoopToScan._specialize_scan_under_stride_guard`);
+    it does NOT license an unconditional residue-class ``Scan``, whose runtime aborts on
+    ``stride <= 0`` -- one of the very cases this proof discharges as harmless.
+
+    The guard is dischargeable when, for every matched scan contributing a guard term
+    (symbolic stride whose sign is not provably positive), the loop's iteration span is
+    provably no wider than that stride: ``iter_end - iter_start + 1 <= scan_stride``.
+
+    That inequality is exactly the DOALL condition for the apparent recurrence. Two
+    iterations ``i`` and ``i'`` conflict only if their write/read indices coincide,
+    ``i' + scan_stride == i`` with both in range -- which needs ``scan_stride`` strictly
+    less than the span ``iter_end - iter_start + 1``. When the span is ``<= scan_stride``
+    no such pair exists, so the loop carries no true recurrence at all (TSVC ``s173``:
+    ``a[i + LEN_1D//2] = a[i] + b[i]`` over ``i in [0, LEN_1D//2)`` -- the write region
+    ``a[half..2*half)`` is disjoint from the read region ``a[0..half)``). It is then
+    unconditionally DOALL: for ``scan_stride >= 1`` no two in-range iterations are
+    ``scan_stride`` apart, so every iteration is independent, and for ``scan_stride <= 0``
+    the span is ``<= scan_stride <= 0`` so the loop is empty and any parallel form is
+    vacuously correct. Either way a bare ``Map`` is bit-exact for all values, so the runtime
+    guard and its pinned sequential fallback can be dropped.
+
+    Restricted to the ``iter_start`` / ``iter_end`` (inclusive) the matcher records; the
+    proof uses :func:`loop_analysis._provably_le`, which is sound (never a guess),
+    respects the codebase's nonnegative symbols, and handles the ``Min`` / ``Max`` clamp
+    shapes a range split leaves behind. Returns ``False`` unless at least one guard term
+    exists AND every guard term is discharged.
+    """
+    guarded = False
+    for info in infos:
+        s = info.scan_stride
+        if not (isinstance(s, sympy.Basic) and not s.is_Integer and s.is_positive is not True):
+            continue
+        guarded = True
+        if info.iter_start is None or info.iter_end is None:
+            return False
+        span_end = symbolic.simplify(info.iter_end)  # inclusive last index
+        span_top = symbolic.simplify(symbolic.pystr_to_symbolic(info.iter_start) + s - 1)
+        if not loop_analysis._provably_le(span_end, span_top):
+            return False
+    return guarded
+
+
+def _lift_proven_doall_to_map(parent: ControlFlowRegion, loop: LoopRegion, sdfg: SDFG) -> bool:
+    """Lift a loop already PROVEN DOALL to a bare ``Map``, bypassing ``LoopToMap``'s own
+    ``can_be_applied`` dependency test. :returns: whether the lift happened.
+
+    The caller's proof (:func:`_stride_guard_is_statically_dischargeable`) is what makes this
+    sound: ``LoopToMap`` refuses this shape because its subset test cannot see that the
+    apparent recurrence ``out[i + k_w] = out[i + k_r] + delta`` needs two in-range iterations
+    ``scan_stride`` apart, which the proven span bound rules out. Same contract as
+    ``WavefrontSkew._convert_inner_to_map``, which forces the lift off its own legality proof.
+
+    Returns ``False`` (rather than raising) if the surgery does not go through, so the caller
+    falls back to the sound guarded specialization: this runs on the scan matcher's whole
+    shape zoo (nested/composite bodies), which is wider than ``LoopToMap``'s comfort zone, and
+    declining to lift only costs the guard we would have dropped.
+    """
+    from dace.transformation.interstate.loop_to_map import LoopToMap
+    instance = LoopToMap()
+    instance.loop = loop
+    try:
+        instance.apply(parent, sdfg)
+    except Exception:  # noqa: BLE001 -- an exotic body LoopToMap cannot restructure; keep the guard
+        return False
+    return True
 
 
 def _find_scan_update_tasklet(state: SDFGState,
@@ -2574,14 +2709,20 @@ def _resolve_input(state: SDFGState, edge):
         desc = state.sdfg.arrays.get(src.data)
         if desc is None:
             return None, None
-        if not getattr(desc, 'transient', False):
+        if not desc.transient:
             return src.data, real_subset
         if state.in_degree(src) != 1 or state.out_degree(src) != 1:
             return None, None
         pred = state.in_edges(src)[0]
         if pred.data is None or pred.data.subset is None:
             return None, None
-        real_subset = pred.data.subset
+        # A cross-array copy memlet names one side in ``data`` and holds the other in
+        # ``other_subset``; when it names this (destination) node, the source position --
+        # the one being walked back to -- is in ``other_subset``, not ``subset``.
+        if pred.data.data == src.data and pred.data.other_subset is not None:
+            real_subset = pred.data.other_subset
+        else:
+            real_subset = pred.data.subset
         cur = pred
 
 
@@ -2652,6 +2793,27 @@ def _classify_subset(subset: subsets.Subset, loop_var: str):
     return scan_axis, offset, others, coef
 
 
+def carrier_reads_admissible(state: SDFGState, out_name: str, loop_var: str, scan_axis: int, write_others, k_w, k_r,
+                             write_coef) -> bool:
+    """True iff every same-slot read of ``out_name`` on the scan axis sits at the carry offset
+    ``k_r`` or the write offset ``k_w``. Any other offset is a second carried dependence the scan
+    cannot express (TSVC s322's ``a[i-2]`` reaching the update through the delta chain, unseen by
+    the per-tasklet guard)."""
+    for node in state.data_nodes():
+        if node.data != out_name:
+            continue
+        for edge in state.out_edges(node):
+            if edge.data is None or edge.data.is_empty():
+                continue
+            subset = edge.data.subset if edge.data.data == out_name else edge.data.other_subset
+            r_axis, k, r_others, r_coef = _classify_subset(subset, loop_var)
+            if r_axis != scan_axis or r_coef != write_coef or not _same_other_indices(r_others, write_others):
+                continue
+            if symbolic.simplify(k - k_w) != 0 and symbolic.simplify(k - k_r) != 0:
+                return False
+    return True
+
+
 def _same_other_indices(a, b) -> bool:
     """Compare two ``[(axis, expr), ...]`` lists for exact symbolic equality."""
     if len(a) != len(b):
@@ -2714,11 +2876,14 @@ def _rewrite(parent: ControlFlowRegion, loop: LoopRegion, info: _Scan, sdfg: SDF
     The body is always mutated to write the per-iteration delta to a 1-D transient
     (``_scan_in[loop_var - start]``); the post-loop chain follows one of two shapes:
 
-    * **1-D direct-write** (``out`` is 1-D and the matched write has no other-axis
-      indices). One state runs the ``Scan`` libnode with the optional ``_scan_init``
-      connector wired to ``out[start + k_r]``; the libnode's inclusive-with-init
-      semantics fold the seed in, so the scan output is written directly to
-      ``out[start + k_w : start + k_w + trip]`` and no seed-add Map is emitted.
+    * **1-D direct-write** (``out`` is 1-D, forward iteration, and the matched write
+      has no other-axis indices). One state runs the ``Scan`` libnode writing its
+      result directly to ``out[start + k_w : start + k_w + trip]`` -- no ``_scan_out``
+      transient and no seed-add Map. At ``scan_stride == 1`` the single pre-loop seed
+      rides the optional ``_scan_init`` connector wired to ``out[start + k_r]``; at
+      ``scan_stride > 1`` there is one seed PER RESIDUE CLASS, so an extra
+      ``min(stride, trip)``-wide fold state folds them into the delta heads instead
+      (:func:`_emit_seed_fold`).
     * **General path** (multi-dim ``out`` or non-empty other-axis indices). Two
       states: a Scan into a 1-D transient ``_scan_out``, then a seed-add Map that
       writes ``out[start + k_w + _i, ...] = seed OP _scan_out[_i]``.
@@ -2764,7 +2929,27 @@ def _rewrite(parent: ControlFlowRegion, loop: LoopRegion, info: _Scan, sdfg: SDF
     s_scan = parent.add_state(loop.label + '_scan')
     parent.add_edge(loop, s_scan, dace.InterstateEdge())
 
-    if _can_emit_direct_write(info, out_desc):
+    # Folding each residue class's seed into that class's delta HEAD before the scan
+    # runs makes the apply a plain copy rather than a seed-add. This is what keeps the
+    # lift BIT-EXACT: a seed-add computes ``seed OP (d0 OP d1 OP ...)`` whereas the
+    # sequential loop computes ``((seed OP d0) OP d1) OP ...``, and for floating-point
+    # ``+`` / ``*`` those two associations differ in the last ulp. Folding the seed in
+    # makes the libnode's own left-to-right class walk reproduce the sequential order
+    # exactly. Used by REVERSE iteration always, and by the FORWARD direct write when
+    # the stride is > 1: the ``Scan`` libnode's ``_scan_init`` connector is
+    # single-valued and unsupported with ``stride > 1``, while a residue-class scan
+    # needs one seed PER CLASS. The fold Map is only ``min(stride, trip)`` wide, so it
+    # costs O(number of classes), not another pass over the whole range.
+    direct = _can_emit_direct_write(info, out_desc)
+    if info.coef == -1 or (direct and info.scan_stride != 1):
+        s_fold = parent.add_state(loop.label + '_scan_seed_fold')
+        for e in list(parent.in_edges(s_scan)):
+            parent.remove_edge(e)
+            parent.add_edge(e.src, s_fold, e.data)
+        parent.add_edge(s_fold, s_scan, dace.InterstateEdge())
+        _emit_seed_fold(s_fold, sdfg, info, delta_buf, trip)
+
+    if direct:
         for e in out_edges:
             parent.remove_edge(e)
             parent.add_edge(s_scan, e.dst, e.data)
@@ -2814,10 +2999,12 @@ def _rewrite_multi_slot(parent: ControlFlowRegion, loop: LoopRegion, matched: Li
     one body, and chaining ``_rewrite`` reroutes the shared loop's out-edges
     once per slot. Instead: mutate every slot's write to its OWN 1-D delta buffer
     in place (severing that slot's carry), leaving a single carry-free delta-build
-    loop; then emit a per-slot ``Scan`` + seed-add chain after it. The slots are
-    disjoint (distinct constant ``other_indices``), so each seed-add reads the
-    still-live external seed ``acc[r, iter_start]`` and writes only ``acc[r, >
-    iter_start]`` -- never clobbering another slot's seed.
+    loop; then emit ONE multi-chain ``Scan`` after it -- one chain per slot, all in
+    a single state. The slots are disjoint (distinct constant ``other_indices``), so
+    every chain reads the still-live external seed ``acc[r, iter_start + k_r]``
+    through its own ``_scan_init`` connector and writes only ``acc[r, > iter_start]``
+    -- never clobbering another slot's seed, and never needing a ``_scan_out``
+    transient or a seed-add Map.
     """
     import dace
     out_name = matched[0].out_name
@@ -2838,22 +3025,19 @@ def _rewrite_multi_slot(parent: ControlFlowRegion, loop: LoopRegion, matched: Li
         slots.append((info, delta_buf))
 
     # The loop body is now a pure delta-build (no carry) -- a follow-up LoopToMap
-    # lifts it. Chain a Scan + seed-add per slot after it, then reroute the loop's
-    # original out-edges past the last apply state.
+    # lifts it. All slots that share a combining op ride ONE multi-chain ``Scan``
+    # (one OpenMP region for the whole group); a mixed-op slot set splits into one
+    # group per op, never into a sequential fallback.
     out_edges = list(parent.out_edges(loop))
-    prev = loop
+    groups: Dict[ScanOp, List[tuple]] = {}
     for info, delta_buf in slots:
-        scan_buf, _ = sdfg.add_array(f'{_SCAN_BUF_PREFIX}{out_name}', [trip],
-                                     out_desc.dtype,
-                                     transient=True,
-                                     find_new_name=True)
+        groups.setdefault(info.op, []).append((info, delta_buf))
+    prev = loop
+    for group in groups.values():
         s_scan = parent.add_state(loop.label + '_scan')
         parent.add_edge(prev, s_scan, dace.InterstateEdge())
-        s_apply = parent.add_state(loop.label + '_scan_apply')
-        parent.add_edge(s_scan, s_apply, dace.InterstateEdge())
-        _emit_scan(s_scan, sdfg, info, delta_buf, scan_buf, trip)
-        _emit_seed_add(s_apply, sdfg, info, scan_buf, trip)
-        prev = s_apply
+        _emit_multi_chain_scan(s_scan, sdfg, group, trip)
+        prev = s_scan
     for e in out_edges:
         parent.remove_edge(e)
         parent.add_edge(prev, e.dst, e.data)
@@ -3117,53 +3301,70 @@ def _scan_op_expression(op) -> str:
 
 def _can_emit_direct_write(info: _Scan, out_desc) -> bool:
     """Whether the scan output can be written straight into ``out`` -- skipping
-    the seed-add Map -- via :func:`_emit_scan_with_init_direct`. Requires a 1-D
-    output array, no other-axis indices, ``scan_stride == 1``, AND forward
-    iteration (``coef == 1``) so the write subset
+    the ``_scan_out`` transient and the seed-add Map -- via
+    :func:`_emit_scan_with_init_direct`. Requires a 1-D output array, no
+    other-axis indices, AND forward iteration (``coef == 1``) so the write subset
     ``out[start + k_w : start + k_w + trip]`` is a contiguous range walked in
-    iter order. Stride > 1 residue-class scans + reverse-iteration scans fall
-    through to the general 3-stage path (the reverse case needs an explicit Map
-    to write ``out[k_w - i]`` in array-reversed order from the iter-order
-    ``scan_buf``).
+    iter order.
+
+    Any positive ``scan_stride`` qualifies: a stride-``S`` residue-class scan
+    still writes every slot of that same contiguous range, just in ``S``
+    interleaved streams, and its ``S`` pre-loop seeds are folded into the delta
+    heads up front by :func:`_emit_seed_fold` instead of riding the libnode's
+    single-valued ``_scan_init`` connector.
+
+    Reverse-iteration scans fall through to the general 3-stage path: they need
+    an explicit Map to write ``out[k_w - i]`` in array-reversed order from the
+    iter-order ``scan_buf``.
     """
-    return (len(out_desc.shape) == 1 and not info.other_indices and info.scan_stride == 1 and info.coef == 1)
+    return len(out_desc.shape) == 1 and not info.other_indices and info.coef == 1
 
 
 def _emit_scan_with_init_direct(state: SDFGState, sdfg: SDFG, info: _Scan, delta_buf: str, trip: Any):
-    """1-D direct-write path: Scan reads ``delta_buf``, takes ``out[start + k_r]``
-    as its ``_scan_init`` seed, and writes the inclusive result directly into
-    ``out[start + k_w : start + k_w + trip]`` -- no seed-add Map.
+    """1-D direct-write path: Scan reads ``delta_buf`` and writes the inclusive
+    result directly into ``out[start + k_w : start + k_w + trip]`` -- neither a
+    ``_scan_out`` transient nor a seed-add Map.
 
-    The seed is materialised through a per-instance scalar transient so the
-    state has a clean ``out`` read -> seed scalar -> scan-init connector path;
-    a direct ``out``-to-init edge would force DaCe to view the same array as
-    both read and write source within one state which the read/write subset
+    At ``scan_stride == 1`` the single pre-loop seed ``out[start + k_r]`` rides the
+    libnode's ``_scan_init`` connector, materialised through a per-instance scalar
+    transient so the state has a clean ``out`` read -> seed scalar -> scan-init
+    connector path; a direct ``out``-to-init edge would force DaCe to view the same
+    array as both read and write source within one state which the read/write subset
     pair satisfies but is harder to reason about for downstream cleanup.
+
+    At ``scan_stride == S > 1`` there is one seed per residue class and the libnode's
+    ``_scan_init`` is single-valued (and unsupported with ``stride > 1``), so no init
+    connector is wired at all: :func:`_emit_seed_fold` has already folded each class's
+    seed into that class's delta head in a preceding state, which leaves the libnode's
+    strided output exactly the sequence the sequential loop stores. The write subset is
+    the same contiguous range either way -- the ``S`` classes interleave within it.
     """
     out_desc = sdfg.arrays[info.out_name]
-    seed_name, _ = sdfg.add_scalar(f'{_SEED_SCALAR_PREFIX}{info.out_name}',
-                                   out_desc.dtype,
-                                   transient=True,
-                                   find_new_name=True)
-    seed_axis_expr = symbolic.simplify(info.iter_start + info.k_r)
     write_start = symbolic.simplify(info.iter_start + info.k_w)
     write_end = symbolic.simplify(write_start + trip - 1)
 
-    out_seed_read = state.add_read(info.out_name)
-    seed_an = state.add_access(seed_name)
     delta_read = state.add_read(delta_buf)
     out_write = state.add_write(info.out_name)
     node = Scan(name=f'{state.label}_op', op=info.op, exclusive=False)
-    node.add_in_connector(INIT_CONNECTOR_NAME)
+    node.stride = info.scan_stride
     state.add_node(node)
 
-    state.add_edge(
-        out_seed_read, None, seed_an, None,
-        mm.Memlet(data=info.out_name,
-                  subset=subsets.Range([(seed_axis_expr, seed_axis_expr, 1)]),
-                  other_subset=subsets.Range([(0, 0, 1)])))
-    state.add_edge(seed_an, None, node, INIT_CONNECTOR_NAME, mm.Memlet(data=seed_name,
-                                                                       subset=subsets.Range([(0, 0, 1)])))
+    if info.scan_stride == 1:
+        seed_name, _ = sdfg.add_scalar(f'{_SEED_SCALAR_PREFIX}{info.out_name}',
+                                       out_desc.dtype,
+                                       transient=True,
+                                       find_new_name=True)
+        seed_axis_expr = symbolic.simplify(info.iter_start + info.k_r)
+        out_seed_read = state.add_read(info.out_name)
+        seed_an = state.add_access(seed_name)
+        node.add_in_connector(INIT_CONNECTOR_NAME)
+        state.add_edge(
+            out_seed_read, None, seed_an, None,
+            mm.Memlet(data=info.out_name,
+                      subset=subsets.Range([(seed_axis_expr, seed_axis_expr, 1)]),
+                      other_subset=subsets.Range([(0, 0, 1)])))
+        state.add_edge(seed_an, None, node, INIT_CONNECTOR_NAME,
+                       mm.Memlet(data=seed_name, subset=subsets.Range([(0, 0, 1)])))
     state.add_edge(delta_read, None, node, INPUT_CONNECTOR_NAME,
                    mm.Memlet(data=delta_buf, subset=subsets.Range([(0, trip - 1, 1)])))
     state.add_edge(node, OUTPUT_CONNECTOR_NAME, out_write, None,
@@ -3395,6 +3596,61 @@ def _emit_scan(state: SDFGState, sdfg: SDFG, info: _Scan, delta_buf: str, scan_b
                    mm.Memlet(data=scan_buf, subset=subsets.Range([(0, trip - 1, 1)])))
 
 
+def _emit_seed_fold(state: SDFGState, sdfg: SDFG, info: _Scan, delta_buf: str, trip: Any):
+    """Map over ``_k`` folding each residue class's pre-loop seed into that class's
+    delta HEAD -- ``delta_buf[_k] = out[<class _k's seed slot>] OP delta_buf[_k]``
+    for ``_k in [0, min(S, trip))``.
+
+    Class ``_k``'s first iteration is ``_i = _k`` and it reads the pre-loop value at
+    that class's seed slot, while ``delta_buf[_k]`` is exactly that iteration's delta,
+    so folding here makes the libnode's subsequent left-to-right class walk emit
+    ``((seed OP d0) OP d1) OP ...`` -- the sequential association, bit for bit.
+
+    Two callers:
+
+    * **reverse** (``coef == -1``): the seed slot is ``out[k_r - _k]`` (``k_r``/``k_w``
+      are array constants there). :func:`_emit_seed_add` then degenerates to a copy.
+    * **forward strided direct write** (``coef == 1``, ``S > 1``): the seed slot is
+      ``out[iter_start + k_r + _k]``, i.e. the ``S`` slots immediately below the scan's
+      write range. :func:`_emit_scan_with_init_direct` then needs no init connector.
+
+    The ``min(S, trip)`` clamp matters when the loop runs FEWER iterations than the
+    stride: only the first ``trip`` classes have any iteration at all, and
+    ``delta_buf`` is only ``trip`` long, so an unclamped ``0:S`` would write OOB.
+
+    Either way the seed slots are strictly OUTSIDE the scan's write range -- reverse
+    reads ``k_w + 1 .. k_w + S`` against a write range topping out at ``k_w``, forward
+    reads ``k_w - S .. k_w - 1`` against a write range starting at ``k_w`` -- so this
+    Map reads ``out`` where nothing in the rewritten chain ever writes it.
+    """
+    _k = symbolic.pystr_to_symbolic('_k')
+    out_desc = sdfg.arrays[info.out_name]
+    if info.coef == -1:
+        seed_axis_expr = symbolic.simplify(info.k_r - _k)
+    else:
+        seed_axis_expr = symbolic.simplify(info.iter_start + info.k_r + _k)
+    seed_subset = _build_subset(out_desc, info.scan_axis, seed_axis_expr, info.other_indices)
+    nclasses = symbolic.simplify(sympy.Min(info.scan_stride, trip))
+
+    op_expr = {
+        ScanOp.SUM: '__seed + __d',
+        ScanOp.PRODUCT: '__seed * __d',
+        ScanOp.MIN: 'min(__seed, __d)',
+        ScanOp.MAX: 'max(__seed, __d)',
+    }[info.op]
+    state.add_mapped_tasklet(
+        f'{state.label}_tasklet',
+        {'_k': f'0:{nclasses}'},
+        {
+            '__seed': mm.Memlet(data=info.out_name, subset=seed_subset),
+            '__d': mm.Memlet(data=delta_buf, subset=subsets.Range([('_k', '_k', 1)])),
+        },
+        f'__o = {op_expr}',
+        {'__o': mm.Memlet(data=delta_buf, subset=subsets.Range([('_k', '_k', 1)]))},
+        external_edges=True,
+    )
+
+
 def _emit_seed_add(state: SDFGState, sdfg: SDFG, info: _Scan, scan_buf: str, trip: Any):
     """Map over ``_i`` writing ``out[start + k_w + _i, ...] = seed OP scan_buf[_i]``.
 
@@ -3406,21 +3662,40 @@ def _emit_seed_add(state: SDFGState, sdfg: SDFG, info: _Scan, scan_buf: str, tri
     head of that class). The libnode has already run the ``S`` independent
     class scans into ``scan_buf``; this Map fans the ``S`` pre-loop seeds
     out by ``_i mod S``.
+
+    Reverse iteration (``coef == -1``) takes no seed here at all -- the per-class
+    seeds are folded into the delta heads up front by
+    :func:`_emit_seed_fold`, leaving this Map a plain copy into
+    ``out[k_w - _i, ...]``.
     """
     out_desc = sdfg.arrays[info.out_name]
     _i = symbolic.pystr_to_symbolic('_i')
     if info.coef == -1:
         # Reverse iteration: ``k_w`` / ``k_r`` are array constants (positions at
-        # iter 0). Seed reads from ``out[k_r]`` (pre-loop value, broadcast),
-        # write goes to ``out[k_w - _i]`` (i.e. iter 0 writes the highest array
-        # index, iter trip-1 writes the lowest).
-        seed_axis_expr = symbolic.simplify(info.k_r)
+        # iter 0), and the write goes to ``out[k_w - _i]`` (iter 0 writes the
+        # highest array index, iter trip-1 the lowest). Every residue class's seed
+        # was already folded into its delta head by :func:`_emit_seed_fold`
+        # -- which is what makes the reverse lift bit-exact, and which fans the
+        # seeds out per class rather than broadcasting one -- so ``scan_buf``
+        # already holds the final values and the apply is a straight copy.
         write_axis_expr = symbolic.simplify(info.k_w - _i)
-    elif info.scan_stride == 1:
+        state.add_mapped_tasklet(
+            f'{state.label}_tasklet',
+            {'_i': f'0:{trip}'},
+            {'__v': mm.Memlet(data=scan_buf, subset=subsets.Range([('_i', '_i', 1)]))},
+            '__o = __v',
+            {
+                '__o':
+                mm.Memlet(data=info.out_name,
+                          subset=_build_subset(out_desc, info.scan_axis, write_axis_expr, info.other_indices))
+            },
+            external_edges=True,
+        )
+        return
+    if info.scan_stride == 1:
         seed_axis_expr = symbolic.simplify(info.iter_start + info.k_r)
         write_axis_expr = symbolic.simplify(info.iter_start + info.k_w) + _i
     else:
-        import sympy
         class_idx = sympy.Mod(_i, info.scan_stride)
         seed_axis_expr = symbolic.simplify(info.iter_start + info.k_r + class_idx)
         write_axis_expr = symbolic.simplify(info.iter_start + info.k_w) + _i
@@ -3446,20 +3721,69 @@ def _emit_seed_add(state: SDFGState, sdfg: SDFG, info: _Scan, scan_buf: str, tri
     )
 
 
-def _build_subset(desc: data.Array, scan_axis: int, scan_expr, other_indices: List[Any]) -> subsets.Range:
-    """Synthesize an N-D single-point subset on ``desc`` with ``scan_expr`` on ``scan_axis``
-    and the loop-invariant exprs from ``other_indices`` on the rest. Used both for the
-    delta read in the build map and the seed/output writes in the apply map.
+def _build_subset(desc: data.Array, scan_axis: int, scan_expr, other_indices: List[Any], scan_hi=None) -> subsets.Range:
+    """Synthesize an N-D subset on ``desc`` covering ``scan_expr`` (a single point, or
+    ``scan_expr .. scan_hi`` when ``scan_hi`` is given) on ``scan_axis`` and the
+    loop-invariant exprs from ``other_indices`` on the rest. Used for the delta read in
+    the build map, the seed/output writes in the apply map, and the multi-chain Scan's
+    per-chain carrier slice.
     """
     other_map = {axis: expr for axis, expr in other_indices}
     rng = []
     for axis_idx in range(len(desc.shape)):
         if axis_idx == scan_axis:
-            rng.append((scan_expr, scan_expr, 1))
+            rng.append((scan_expr, scan_expr if scan_hi is None else scan_hi, 1))
         else:
             ex = other_map[axis_idx]
             rng.append((ex, ex, 1))
     return subsets.Range(rng)
+
+
+def _emit_multi_chain_scan(state: SDFGState, sdfg: SDFG, group: List[tuple], trip: Any):
+    """One multi-chain ``Scan`` for a group of independent same-op slot scans.
+
+    Chain ``c`` reads slot ``c``'s delta buffer, takes that slot's pre-loop seed
+    ``out[iter_start + k_r, ...]`` through ``_scan_init_c``, and writes the inclusive
+    result straight into ``out[iter_start + k_w .. + trip - 1, ...]``. No ``_scan_out``
+    transient and no seed-add Map: folding the seed into the accumulator is also what
+    keeps the association ``((seed OP d0) OP d1) OP ...``, i.e. the sequential order,
+    instead of the seed-add's ``seed OP (d0 OP d1 OP ...)``.
+
+    Each seed rides its own scalar transient so the state keeps a clean ``out`` read ->
+    seed scalar -> init connector path (see :func:`_emit_scan_with_init_direct`). The
+    seed slots sit strictly below every chain's write range, and the slots occupy
+    distinct constant ``other_indices``, so no chain can observe another's write.
+    """
+    node = Scan(name=f'{state.label}_op', op=group[0][0].op, exclusive=False, chains=len(group))
+    state.add_node(node)
+    out_write = state.add_write(group[0][0].out_name)
+    for chain, (info, delta_buf) in enumerate(group):
+        out_desc = sdfg.arrays[info.out_name]
+        write_start = symbolic.simplify(info.iter_start + info.k_w)
+        seed_axis_expr = symbolic.simplify(info.iter_start + info.k_r)
+        seed_name, _ = sdfg.add_scalar(f'{_SEED_SCALAR_PREFIX}{info.out_name}',
+                                       out_desc.dtype,
+                                       transient=True,
+                                       find_new_name=True)
+        seed_an = state.add_access(seed_name)
+        node.add_in_connector(init_connector(chain))
+        state.add_edge(
+            state.add_read(info.out_name), None, seed_an, None,
+            mm.Memlet(data=info.out_name,
+                      subset=_build_subset(out_desc, info.scan_axis, seed_axis_expr, info.other_indices),
+                      other_subset=subsets.Range([(0, 0, 1)])))
+        state.add_edge(seed_an, None, node, init_connector(chain),
+                       mm.Memlet(data=seed_name, subset=subsets.Range([(0, 0, 1)])))
+        state.add_edge(state.add_read(delta_buf), None, node, in_connector(chain),
+                       mm.Memlet(data=delta_buf, subset=subsets.Range([(0, trip - 1, 1)])))
+        state.add_edge(
+            node, out_connector(chain), out_write, None,
+            mm.Memlet(data=info.out_name,
+                      subset=_build_subset(out_desc,
+                                           info.scan_axis,
+                                           write_start,
+                                           info.other_indices,
+                                           scan_hi=symbolic.simplify(write_start + trip - 1))))
 
 
 def _rewrite_scalar_carry(parent: ControlFlowRegion, loop: LoopRegion, info: _ScalarCarryScan, sdfg: SDFG):

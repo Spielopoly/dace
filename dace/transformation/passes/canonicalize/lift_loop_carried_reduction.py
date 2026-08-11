@@ -38,14 +38,75 @@ any parallel reduction) when, for the accumulator ``A`` and the loop ``L``:
 
 The pre-loop value of ``A`` is the reduction seed in BOTH the sequential and the
 WCR form, so ``A`` need not be initialised for the lift to be sound.
+
+Dataflow surgery (``S`` = the accumulated element, invariant over ``idx``; ``OP`` = + * min max)::
+
+    BEFORE  --  A is read back every iteration => LoopToMap sees a loop-carried dep, refuses:
+
+        for idx in 0:KK                         (sequential LoopRegion)
+        |
+        +-- state:
+        |         A --A[S]--> [map_entry] --A[S]---.
+        |                                          v
+        |                                     ( tasklet )  __out = A[S] OP incr
+        |         incr ----> [map_entry] --incr--> ^
+        |                                          |
+        |                                     [map_exit] --A[S]--> A      (plain write, no WCR)
+
+    AFTER  --  read-back dropped, WCR carries the accumulation => LoopToMap parallelizes idx:
+
+        for idx in 0:KK                         (no loop-carried read of A)
+        |
+        +-- state:
+        |         incr ----> [map_entry] --incr--> ( tasklet )  __out = incr
+        |                                               |
+        |                                          [map_exit] ==A[S] (wcr: OP)==> A
+
+Algorithm (pseudocode)::
+
+    for each LoopRegion L with loop var `idx`, not pinned-sequential:
+        cand = []
+        for each map (me, mx) in L.body, each edge  mx --A[S]--> AccessNode(A)  with no WCR:
+            if idx in freesymbols(S):                 continue   # S must be invariant over idx
+            t = trace_to_reduction(mx_in edge)                   # A[S] OP incr  (direct or via copy)
+            if t is None:                             continue
+            (OP, operands) = reduction_op(t)                     # OP in {+, *, min, max} else None
+            acc = the operand that reads A at exactly S          # identify accumulator by dataflow
+            if A[S] is not read back exactly once as `acc`:  continue   # else recurrence, not reduction
+            cand += (me, mx, t, A, OP, S, read_edge)
+        for c in cand:
+            if A is read anywhere else in L.body (not the read-back):  continue   # not a PURE acc
+            if sizes_are_symbolic(L.tripcount, c.map.range):          continue   # cost undecidable
+            lift(c):
+                t.rhs      <- incr                                   # drop the accumulator operand
+                wcr(OP)    on  (t -> mx)  and  (mx -> A)             # accumulation moves to the WCR
+                delete       A -> me,  me -> t,  and the dead connectors / read AccessNode
+
+When to apply -- COST (measured, contour reduction, 4 threads, ~16.7M total elements)::
+
+    inner map |  pass ON  |  pass OFF |
+    ----------+-----------+-----------+---------------------------
+       8x8    |    73 ms  |   468 ms  |  ON  6.4x FASTER
+      16x16   |    62 ms  |   131 ms  |  ON  2.1x faster
+      32x32   |    57 ms  |    41 ms  |  ON  1.4x slower   <-- crossover
+      64x64   |    65 ms  |    23 ms  |  ON  2.8x slower
+     128x128  |    46 ms  |    18 ms  |  ON  2.6x slower
+
+The lift wins only when the inner parallel map is too small to fill the cores (a few hundred
+elements) while the reduction axis is large; past the crossover it just adds a WCR / atomic
+reduction over the loop axis on top of already-saturated parallelism and LOSES. That comparison
+needs concrete extents: with a SYMBOLIC size (the common case) the decision is undecidable, so
+``_sizes_are_concrete`` refuses the lift rather than gamble. A specialized program (constants
+substituted) with a small inner map is the case that still lifts.
 """
 import ast
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Tuple
 
-from dace import SDFG, nodes, properties
+from dace import SDFG, nodes, properties, symbolic
 from dace.sdfg import SDFGState
 from dace.sdfg.state import LoopRegion
 from dace.transformation import pass_pipeline as ppl
+from dace.transformation.passes.analysis import loop_analysis
 from dace.transformation.transformation import explicit_cf_compatible
 
 #: Python AST op -> WCR operator symbol for the associative/commutative reductions.
@@ -189,12 +250,32 @@ class LiftLoopCarriedReduction(ppl.Pass):
         reads_by_array = self._accumulator_reads(body_states)
         lifted = 0
         for cand in candidates:
-            allowed = {cand.read_edge}
-            if reads_by_array.get(cand.array, set()) - allowed:
+            if any(e != cand.read_edge for e in reads_by_array.get(cand.array, {})):
                 continue  # array read elsewhere in the loop -> not a pure accumulator
+            if not self._sizes_are_concrete(loop, cand):
+                continue  # symbolic extents -> cost undecidable, refuse (see module docstring)
             self._apply_lift(cand)
             lifted += 1
         return lifted
+
+    def _sizes_are_concrete(self, loop: LoopRegion, cand: _AccumulatorCandidate) -> bool:
+        """Whether both the inner (already-parallel) map's iteration space AND the reduction
+        loop's trip count are compile-time integer constants -- no free symbols.
+
+        The lift only PAYS OFF when the inner parallel work is too small to fill the cores while
+        the reduction axis is large; when the inner map is already large it merely adds a WCR /
+        atomic reduction over the loop axis on top of saturated parallelism, and MEASURES 3-4x
+        SLOWER (AB crossover ~ a few hundred inner elements). That size comparison is undecidable
+        for a SYMBOLIC extent -- the common case in real kernels (``N``, ``KLEV``) -- so lifting
+        there is a blind gamble that usually loses. Refuse unless every relevant extent is
+        concrete; a specialized program (constants substituted in) is still eligible."""
+        syms: Dict = dict.fromkeys(cand.map_entry.map.range.free_symbols)
+        for bound in (loop_analysis.get_init_assignment(loop), loop_analysis.get_loop_end(loop),
+                      loop_analysis.get_loop_stride(loop)):
+            if bound is None:
+                return False  # an unanalyzable loop bound is not a proven constant either
+            syms.update(dict.fromkeys(symbolic.pystr_to_symbolic(bound).free_symbols))
+        return not syms
 
     def _collect_candidates(self, body_states: List[SDFGState], itervar: str) -> List[_AccumulatorCandidate]:
         out: List[_AccumulatorCandidate] = []
@@ -207,7 +288,7 @@ class LiftLoopCarriedReduction(ppl.Pass):
                     array = exit_out.dst.data
                     if exit_out.data.wcr is not None or exit_out.data.data != array:
                         continue
-                    if itervar in {str(s) for s in exit_out.data.subset.free_symbols}:
+                    if itervar in (str(s) for s in exit_out.data.subset.free_symbols):
                         continue  # write subset must be invariant over the loop variable
                     cand = self._match_reduction(st, me, mx, exit_out, array)
                     if cand is not None:
@@ -231,14 +312,15 @@ class LiftLoopCarriedReduction(ppl.Pass):
         if tasklet is None:
             return None
         op, operands = _reduction_operands(tasklet)
-        operand_conns = {o.id for o in operands if isinstance(o, ast.Name) and o.id in tasklet.in_connectors}
+        operand_conns = dict.fromkeys(o.id for o in operands
+                                      if isinstance(o, ast.Name) and o.id in tasklet.in_connectors)
         # Accumulator read-back: map_entry -> tasklet, reading A at the write subset, into a
         # bare-Name reduction operand. Identify the accumulator by dataflow (which operand
         # reads exactly the written element), so the increment stays whatever the other
         # operand is -- and refuse ``out = out + out`` (both operands read A) as ambiguous.
         acc_edges = [
-            e for e in st.in_edges(tasklet) if e.src is me and e.dst_conn in operand_conns
-            and e.data.data == array and e.data.subset == write_subset
+            e for e in st.in_edges(tasklet)
+            if e.src is me and e.dst_conn in operand_conns and e.data.data == array and e.data.subset == write_subset
         ]
         if len(acc_edges) != 1:
             return None
@@ -252,21 +334,23 @@ class LiftLoopCarriedReduction(ppl.Pass):
             return None
         # the array read into the map entry feeding that accumulator connector
         me_in_conn = 'IN' + entry_out.src_conn[3:]
-        read_edges = [e for e in st.in_edges(me) if e.dst_conn == me_in_conn and isinstance(e.src, nodes.AccessNode)
-                      and e.src.data == array]
+        read_edges = [
+            e for e in st.in_edges(me)
+            if e.dst_conn == me_in_conn and isinstance(e.src, nodes.AccessNode) and e.src.data == array
+        ]
         if len(read_edges) != 1:
             return None
         return _AccumulatorCandidate(st, me, mx, tasklet, array, op, acc_conn, read_edges[0], entry_out, mx_in,
                                      exit_out)
 
-    def _accumulator_reads(self, body_states: List[SDFGState]) -> Dict[str, Set]:
+    def _accumulator_reads(self, body_states: List[SDFGState]) -> Dict[str, Dict]:
         """Every ``AccessNode(A) -> *`` read edge of each array A across the loop body."""
-        reads: Dict[str, Set] = {}
+        reads: Dict[str, Dict] = {}
         for st in body_states:
             for n in st.nodes():
                 if isinstance(n, nodes.AccessNode):
                     for e in st.out_edges(n):
-                        reads.setdefault(n.data, set()).add(e)
+                        reads.setdefault(n.data, {})[e] = None
         return reads
 
     def _apply_lift(self, c: _AccumulatorCandidate) -> None:

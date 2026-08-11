@@ -92,9 +92,11 @@ inline void avx512_arith_ps(float* out, __m512 va, __m512 vb, __mmask16 k) {
   else if constexpr (Op == '/')
     r = _mm512_div_ps(va, vb);
   else if constexpr (Op == 'm')
-    r = _mm512_min_ps(va, vb);
+    // VMINPS/VMINPD is (x < y) ? x : y, so the SECOND operand wins on NaN and on
+    // (+0,-0). ``std::min(a,b)`` is (b < a) ? b : a -- swap to match exactly.
+    r = _mm512_min_ps(vb, va);
   else
-    r = _mm512_max_ps(va, vb);
+    r = _mm512_max_ps(vb, va);
   _mm512_storeu_ps(out, _mm512_maskz_mov_ps(k, r));  // zero-fill inactive
 }
 template <char Op>
@@ -109,9 +111,11 @@ inline void avx512_arith_pd(double* out, __m512d va, __m512d vb, __mmask8 k) {
   else if constexpr (Op == '/')
     r = _mm512_div_pd(va, vb);
   else if constexpr (Op == 'm')
-    r = _mm512_min_pd(va, vb);
+    // VMINPS/VMINPD is (x < y) ? x : y, so the SECOND operand wins on NaN and on
+    // (+0,-0). ``std::min(a,b)`` is (b < a) ? b : a -- swap to match exactly.
+    r = _mm512_min_pd(vb, va);
   else
-    r = _mm512_max_pd(va, vb);
+    r = _mm512_max_pd(vb, va);
   _mm512_storeu_pd(out, _mm512_maskz_mov_pd(k, r));
 }
 }  // namespace detail
@@ -179,6 +183,84 @@ inline void tile_binop(T* __restrict__ out, const T* __restrict__ a, const T* __
       out[i] = mask[i] ? tile_apply<T, Op>(av, bv) : T(0);
     else
       out[i] = tile_apply<T, Op>(av, bv);
+  }
+}
+
+// ----------------------------- tile_fma -------------------------------
+// out[i] = fma(a, b, c) = a*b + c (single rounding). fp32/fp64 -> AVX-512 W-chunk
+// fused multiply-add (``_mm512_fmadd_p{s,d}``) + a scalar ``std::fma`` tail;
+// integer types / a no-AVX512 build take the scalar ``std::fma`` loop. ``std::fma``
+// everywhere (native FMA is single-rounded too) so pure and ISA agree bit-for-bit.
+template <typename T, int VLEN, bool BroadcastA, bool BroadcastB, bool BroadcastC, bool Masked>
+inline void tile_fma(T* __restrict__ out, const T* __restrict__ a, const T* __restrict__ b, const T* __restrict__ c,
+                     const bool* __restrict__ mask) {
+#if defined(__AVX512F__)
+  if constexpr (std::is_same<T, float>::value) {
+    constexpr int W = 16;
+    int i = 0;
+    for (; i + W <= VLEN; i += W) {
+      __m512 va = BroadcastA ? _mm512_set1_ps(a[0]) : _mm512_loadu_ps(a + i);
+      __m512 vb = BroadcastB ? _mm512_set1_ps(b[0]) : _mm512_loadu_ps(b + i);
+      __m512 vc = BroadcastC ? _mm512_set1_ps(c[0]) : _mm512_loadu_ps(c + i);
+      __m512 r = _mm512_fmadd_ps(va, vb, vc);  // va*vb + vc
+      if constexpr (Masked) {
+        __mmask16 k = 0;
+        for (int j = 0; j < W; ++j)
+          if (mask[i + j]) k |= __mmask16(1) << j;
+        _mm512_storeu_ps(out + i, _mm512_maskz_mov_ps(k, r));  // zero-fill inactive
+      } else {
+        _mm512_storeu_ps(out + i, r);
+      }
+    }
+    for (; i < VLEN; ++i) {
+      const float av = BroadcastA ? a[0] : a[i];
+      const float bv = BroadcastB ? b[0] : b[i];
+      const float cv = BroadcastC ? c[0] : c[i];
+      if constexpr (Masked)
+        out[i] = mask[i] ? std::fma(av, bv, cv) : 0.0f;
+      else
+        out[i] = std::fma(av, bv, cv);
+    }
+    return;
+  }
+  if constexpr (std::is_same<T, double>::value) {
+    constexpr int W = 8;
+    int i = 0;
+    for (; i + W <= VLEN; i += W) {
+      __m512d va = BroadcastA ? _mm512_set1_pd(a[0]) : _mm512_loadu_pd(a + i);
+      __m512d vb = BroadcastB ? _mm512_set1_pd(b[0]) : _mm512_loadu_pd(b + i);
+      __m512d vc = BroadcastC ? _mm512_set1_pd(c[0]) : _mm512_loadu_pd(c + i);
+      __m512d r = _mm512_fmadd_pd(va, vb, vc);  // va*vb + vc
+      if constexpr (Masked) {
+        __mmask8 k = 0;
+        for (int j = 0; j < W; ++j)
+          if (mask[i + j]) k |= __mmask8(1) << j;
+        _mm512_storeu_pd(out + i, _mm512_maskz_mov_pd(k, r));
+      } else {
+        _mm512_storeu_pd(out + i, r);
+      }
+    }
+    for (; i < VLEN; ++i) {
+      const double av = BroadcastA ? a[0] : a[i];
+      const double bv = BroadcastB ? b[0] : b[i];
+      const double cv = BroadcastC ? c[0] : c[i];
+      if constexpr (Masked)
+        out[i] = mask[i] ? std::fma(av, bv, cv) : 0.0;
+      else
+        out[i] = std::fma(av, bv, cv);
+    }
+    return;
+  }
+#endif
+  // Integer types / no-AVX512 build: scalar std::fma (bit-exact with the pure path).
+  for (int i = 0; i < VLEN; ++i) {
+    const T av = BroadcastA ? a[0] : a[i];
+    const T bv = BroadcastB ? b[0] : b[i];
+    const T cv = BroadcastC ? c[0] : c[i];
+    if constexpr (Masked)
+      out[i] = mask[i] ? T(std::fma(av, bv, cv)) : T(0);
+    else
+      out[i] = T(std::fma(av, bv, cv));
   }
 }
 
@@ -401,68 +483,16 @@ inline void tile_mask_gen(bool* __restrict__ out, IdxT base, IdxT ub) {
 // vector. Full reduction only -- a masked / single-axis / K>=2 reduce keeps the
 // ``pure`` per-lane expansion (the selector never routes those here).
 //
-// fp32 (W=16) / fp64 (W=8): accumulate the W-lane groups then collapse with the
-// AVX-512 one-shot ``_mm512_reduce_<op>_p{s,d}``; a scalar tail folds the
-// non-W-multiple remainder. Seeded from the first full group so no identity
-// constant is needed. Every other element type / a tile narrower than one group
-// uses the portable balanced log-depth tree (reducing in the same order as the
-// vectorized ``Reduce`` node). Self-contained -- no cross-ISA dispatch header.
+// Balanced log-depth pairwise fold (consecutive pairs (0,1)(2,3)...; an odd
+// trailing lane forwards unchanged), the SAME association as every sibling
+// backend and as the vectorized ``Reduce`` node's ``_dace_horizontal_tree``.
+// The AVX-512 one-shot ``_mm512_reduce_<op>_p{s,d}`` folds halves instead of
+// adjacent pairs; for ``+`` / ``*`` that is a different rounding order, so a
+// tile reduced on this backend stopped matching the scalar oracle bit-for-bit.
+// Over a compile-time-constant ``VLEN`` the loops unroll and the compiler
+// re-vectorises the partials, so the tree costs nothing here.
 template <typename T, int VLEN, char Op>
 inline T tile_reduce(const T* __restrict__ src) {
-#if defined(__AVX512F__)
-  if constexpr (std::is_same<T, double>::value && VLEN >= 8) {
-    __m512d acc = _mm512_loadu_pd(src);
-    int i = 8;
-    for (; i + 8 <= VLEN; i += 8) {
-      __m512d v = _mm512_loadu_pd(src + i);
-      if constexpr (Op == '+')
-        acc = _mm512_add_pd(acc, v);
-      else if constexpr (Op == '*')
-        acc = _mm512_mul_pd(acc, v);
-      else if constexpr (Op == 'm')
-        acc = _mm512_min_pd(acc, v);
-      else
-        acc = _mm512_max_pd(acc, v);
-    }
-    T s;
-    if constexpr (Op == '+')
-      s = _mm512_reduce_add_pd(acc);
-    else if constexpr (Op == '*')
-      s = _mm512_reduce_mul_pd(acc);
-    else if constexpr (Op == 'm')
-      s = _mm512_reduce_min_pd(acc);
-    else
-      s = _mm512_reduce_max_pd(acc);
-    for (; i < VLEN; ++i) s = tile_apply<T, Op>(s, src[i]);
-    return s;
-  }
-  if constexpr (std::is_same<T, float>::value && VLEN >= 16) {
-    __m512 acc = _mm512_loadu_ps(src);
-    int i = 16;
-    for (; i + 16 <= VLEN; i += 16) {
-      __m512 v = _mm512_loadu_ps(src + i);
-      if constexpr (Op == '+')
-        acc = _mm512_add_ps(acc, v);
-      else if constexpr (Op == '*')
-        acc = _mm512_mul_ps(acc, v);
-      else if constexpr (Op == 'm')
-        acc = _mm512_min_ps(acc, v);
-      else
-        acc = _mm512_max_ps(acc, v);
-    }
-    T s;
-    if constexpr (Op == '+')
-      s = _mm512_reduce_add_ps(acc);
-    else if constexpr (Op == '*')
-      s = _mm512_reduce_mul_ps(acc);
-    else if constexpr (Op == 'm')
-      s = _mm512_reduce_min_ps(acc);
-    else
-      s = _mm512_reduce_max_ps(acc);
-    for (; i < VLEN; ++i) s = tile_apply<T, Op>(s, src[i]);
-    return s;
-  }
-#endif
   T buf[VLEN];
   for (int i = 0; i < VLEN; ++i) buf[i] = src[i];
   int n = VLEN;

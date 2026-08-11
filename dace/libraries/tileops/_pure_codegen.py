@@ -8,6 +8,7 @@ pure expansion plugs in its own per-lane body via :func:`nested_loops`
 and uses :func:`tile_offset` to flatten the tile transient's index
 (register tiles are always row-major-contiguous).
 """
+import numbers
 from typing import List, Sequence
 
 
@@ -23,10 +24,51 @@ def ct_dtype_name(dtype) -> str:
     name = dtype.as_numpy_dtype().name
     return "bool_" if name == "bool" else name
 
+import sympy
+
+import dace
+
+# Legal ``_idx_<d>`` gather/scatter index dtypes (design section 10.4). Unsigned widths are
+# accepted because CSR/COO index arrays are commonly ``uint32``; ``gather_lane_offset`` casts
+# the read to ``long long`` so an unsigned index cannot wrap the signed address sum.
+GATHER_INDEX_DTYPES = (dace.int32, dace.int64, dace.uint32, dace.uint64)
+
+
+def constant_trip_count(width) -> bool:
+    """True iff ``width`` is a compile-time-constant integer loop bound.
+
+    A per-lane tile loop with a constant trip count (the register-tile /
+    vector width, e.g. ``2`` for an ``fp16x2`` fill) is safe to force-unroll:
+    the bound is known at code-gen time and never a runtime / symbolic value.
+    This guard keeps the ``#pragma unroll`` (see :func:`nested_loops`) off any
+    hypothetical symbolic-width loop, where an unroll pragma on a runtime bound
+    is meaningless. Tile widths are ``ListProperty(element_type=int)`` today, so
+    the common path is the plain ``int`` check; the sympy branch is defensive.
+
+    :param width: A per-tile-dim width (``int`` in practice; a sympy expression
+        is tolerated and accepted only when it is a concrete integer).
+    :returns: ``True`` for a compile-time-constant integer width, else ``False``.
+    """
+    if isinstance(width, numbers.Integral):
+        return True
+    import sympy
+    return isinstance(width, sympy.Basic) and bool(width.is_Integer)
+
 
 def nested_loops(widths: Sequence[int], body: str, indent: str = "    ") -> str:
     """Wrap ``body`` in a K-fold nested for-loop iterating per-dim
     lane indices ``__l0, __l1, ...``.
+
+    Each fixed-width lane loop is preceded by ``#pragma unroll`` (guarded by
+    :func:`constant_trip_count`): the trip count is the compile-time
+    register-tile width -- the vector width -- so a full unroll strips the loop
+    overhead of a broadcast / scalar-fill (e.g. the ``fp16`` constant-multiply
+    ``_c[__l] = float16(0.125)``) and lets the backend keep the tile in
+    registers. This mirrors the CPU map-unroll pragma (``cpu.py`` ``#pragma
+    unroll``) and the per-lane ``#pragma unroll`` the CUDA tile-op header emits;
+    the same pure tasklet body is emitted verbatim by both the CPU and CUDA
+    targets, so NVCC / Clang honour the pragma and GCC harmlessly ignores the
+    unknown pragma.
 
     :param widths: Per-tile-dim widths, innermost-last.
     :param body: The per-lane C++ body (already trailing-``;`` if
@@ -37,6 +79,8 @@ def nested_loops(widths: Sequence[int], body: str, indent: str = "    ") -> str:
     K = len(widths)
     lines = []
     for d, w in enumerate(widths):
+        if constant_trip_count(w):
+            lines.append(f"{indent * d}#pragma unroll")
         lines.append(f"{indent * d}for (std::size_t __l{d} = 0; __l{d} < {w}; ++__l{d}) {{")
     for line in body.splitlines():
         lines.append(f"{indent * K}{line}")
@@ -595,21 +639,6 @@ def resolve_gather_deps(idx_shape, widths):
     return tuple(deps)
 
 
-def _no_ipow(expr):
-    """Rewrite ``ipow(b, e)`` (dace's opaque integer-power function, e.g. from
-    ``RelaxIntegerPowers``) back to ``b**e`` so sympy comparisons see through it.
-
-    :param expr: A stride/shape entry (int or sympy expression).
-    :returns: The expression with every ``ipow`` replaced by ``Pow``.
-    """
-    import sympy
-
-    import dace
-    if not isinstance(expr, sympy.Basic):
-        return expr
-    return expr.replace(dace.symbolic.ipow, lambda b, e: b**e)
-
-
 def _strides_match_packed(shape, strides, order):
     """True when ``strides`` is the packed contiguous form for ``shape`` in
     ``order`` ("C" -- innermost-last, stride 1 on the last dim; or "F" --
@@ -636,7 +665,9 @@ def _strides_match_packed(shape, strides, order):
     expected = 1
     for d in order_range:
         try:
-            diff = dace.symbolic.simplify(_no_ipow(strides[d]) - expected)
+            # relax_ipow so the canonicalized packed-C stride ``ipow(N, 2)`` compares equal to
+            # ``N*N``; the opaque ``ipow`` never simplifies against ``expected`` (heat3d).
+            diff = dace.symbolic.simplify(dace.symbolic.relax_ipow(sympy.sympify(strides[d] - expected)))
             if diff != 0:
                 return False
         except Exception:  # noqa: BLE001 -- conservative refusal on un-comparable expressions.
@@ -730,17 +761,20 @@ def gather_lane_offset(deps, widths, conn):
 
     For the scalar case (``deps == ()``) returns ``conn[0]``.
 
+    The read is cast to ``long long``: callers sum it with affine terms that may
+    be negative, and an unsigned index dtype would make the whole sum wrap.
+
     :param deps: Sorted tuple of tile dim indices from :func:`resolve_gather_deps`.
     :param widths: Lib node's full tile widths.
     :param conn: The connector name (e.g. ``"_idx_0"``).
-    :returns: A CPP expression string of the form ``conn[<offset>]``.
+    :returns: A CPP expression string of the form ``(long long)conn[<offset>]``.
     """
     if not deps:
-        return f"{conn}[0]"
+        return f"(long long)({conn}[0])"
     parts = []
     for i, p in enumerate(deps):
         inner = 1
         for q in deps[i + 1:]:
             inner *= widths[q]
         parts.append(f"__l{p}" if inner == 1 else f"(__l{p} * {inner})")
-    return f"{conn}[{' + '.join(parts)}]"
+    return f"(long long)({conn}[{' + '.join(parts)}])"

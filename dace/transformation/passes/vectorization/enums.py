@@ -21,21 +21,29 @@ class ISA(str, enum.Enum):
     AVX2 = "AVX2"
     ARM_SVE = "ARM_SVE"
     ARM_NEON = "ARM_NEON"
-    SCALAR = "SCALAR"        #: portable scalar reference
-    CUDA = "CUDA"           #: GPU half2 (implies device=GPU)
+    SCALAR = "SCALAR"  #: portable scalar reference
+    CUDA = "CUDA"  #: GPU half2 (implies device=GPU)
+    CUDA_WARP = "CUDA_WARP"  #: GPU warp-collective tile ops (implies device=GPU)
     CUTILE = "CUTILE"       #: cuTile ``cuda.tile`` CuTile Python-backend
 
 
 class RemainderStrategy(str, enum.Enum):
     """How the tiler handles a map extent not divisible by the tile width."""
-    FULL_MASK = "full_mask"                #: single W-strided map, mask every tile
-    MASKED_TAIL = "masked_tail"            #: mask-free interior + masked boundary
+    FULL_MASK = "full_mask"  #: single W-strided map, mask every tile
+    MASKED_TAIL = "masked_tail"  #: mask-free interior + masked boundary
     SCALAR_POSTAMBLE = "scalar_postamble"  #: divisible interior + step-1 scalar tail (K=1 only)
+    BRANCHED_TAIL = "branched_tail"  #: GPU-only: ONE kernel with a control-flow branch,
+    #: if(full-tile)=vectorized tile body / else=scalar tail, over the fused tile range. K=1 only.
+    #: See :class:`~dace.transformation.passes.vectorization.fuse_branched_tail_remainder.FuseBranchedTailRemainder`.
+    BRANCHED_MASKED_TAIL = "branched_masked_tail"  #: GPU K=1 DEFAULT. Same one-kernel branch as
+    #: ``branched_tail``, but the ``else`` arm is a MASKED tile body, not a scalar lane loop: the
+    #: aligned iteration takes the mask-free (widened) arm and NO scalar remainder loop is emitted
+    #: for it. K=1 only, GPU only.
 
 
 class BranchMode(str, enum.Enum):
     """How a same-write-set ``if/else`` is lowered to a per-lane select."""
-    MERGE = "merge"          #: per-lane ``TileITE`` blend
+    MERGE = "merge"  #: per-lane ``TileITE`` blend
     FP_FACTOR = "fp_factor"  #: ``c*x + (1-c)*y`` tile-binop arithmetic (K=1 only)
 
 

@@ -46,10 +46,10 @@ from dace import SDFG, SDFGState, data, dtypes
 from dace.memlet import Memlet
 from dace.sdfg import nodes
 from dace.sdfg.state import ConditionalBlock, LoopRegion
-from dace.subsets import Range
 from dace.symbolic import symbol
 from dace.transformation import pass_pipeline as ppl, transformation
 from dace.transformation.helpers import unsqueeze_memlet
+from dace.transformation.passes.privatize_scatter_reduction import is_data_dependent_scatter_sink
 
 #: Reduction op -> the augassign op it normalizes to (``-`` accumulates like ``+``).
 _WCR_OP = {'+': '+', '-': '+', '*': '*', 'min': 'min', 'max': 'max'}
@@ -179,6 +179,22 @@ class NormalizeWCR(ppl.Pass):
         inner = nsdfg.sdfg
         oc_desc = inner.arrays.get(oc)
         if oc_desc is None:
+            return False
+
+        # Fail-safe refuse: never apply the drop-WCR / whole-buffer ``_nnr_out`` rewrite to a
+        # DATA-DEPENDENT MULTI-ELEMENT scatter sink (``hist[bin[i]] (op)= w``). That rewrite
+        # assumes the write covers all of ``oc`` and a write-only ``oc`` starts at the op
+        # identity -- true for a scalar accumulator, but a scatter writes exactly ONE element
+        # of a bounded ``oc`` per iteration, so materializing a per-iteration whole-array
+        # buffer reads its other n-1 elements back uninitialised (garbage histogram). This
+        # holds REGARDLESS of op (``+ - * / min max`` ...) and device: an un-privatised
+        # scatter -- GPU (where ``privatize_scatter_reductions`` is off), or a non-reducible
+        # op like ``-`` that ``PrivatizeScatterReduction`` refuses -- falls back to the
+        # correct per-element ``reduce_atomic`` / atomicAdd instead of a broken whole-buffer
+        # reduction. On CPU with a reducible op, ``PrivatizeScatterReduction`` runs first and
+        # surfaces the WCR (making the outer edge non-plain), so this method already no-ops
+        # there; the guard is the backstop for every path that pass does not cover.
+        if is_data_dependent_scatter_sink(nsdfg, oc):
             return False
 
         # (a) A scalar WCR edge inside the body writing `oc` into a pure-sink AccessNode.
@@ -373,8 +389,8 @@ class NormalizeWCR(ppl.Pass):
         outer_me = state.entry_node(nsdfg)
         outer_mx = state.exit_node(outer_me)
         dest = out_edge.data.data
-        dest_an = next((oe.dst for oe in state.out_edges(outer_mx) if oe.data is not None and oe.data.data == dest
-                        and isinstance(oe.dst, nodes.AccessNode)), None)
+        dest_an = next((oe.dst for oe in state.out_edges(outer_mx)
+                        if oe.data is not None and oe.data.data == dest and isinstance(oe.dst, nodes.AccessNode)), None)
         if dest_an is None:
             return False
         # Every tasklet input must trace to a direct nsdfg boundary connector fed by a
@@ -415,9 +431,14 @@ class NormalizeWCR(ppl.Pass):
                 # Non-scatter co-output (e.g. a scalar reduction sharing the tasklet) is
                 # recomputed into a dead scalar; DCE prunes it.
                 inner_desc = nsdfg.sdfg.arrays[oe.data.data]
-                dname, _ = state.sdfg.add_scalar('_wcrdead_' + oe.src_conn, inner_desc.dtype, transient=True,
+                dname, _ = state.sdfg.add_scalar('_wcrdead_' + oe.src_conn,
+                                                 inner_desc.dtype,
+                                                 transient=True,
                                                  find_new_name=True)
-                state.add_memlet_path(new_t, new_mx, state.add_access(dname), src_conn=oe.src_conn,
+                state.add_memlet_path(new_t,
+                                      new_mx,
+                                      state.add_access(dname),
+                                      src_conn=oe.src_conn,
                                       memlet=Memlet(data=dname, subset='0'))
 
         # Redirect the trapped nsdfg slice output to a dead transient (mirror dest's

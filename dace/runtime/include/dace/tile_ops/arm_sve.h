@@ -37,12 +37,11 @@
 //     compare each operand ``!= 0`` to a predicate, combine with the PREDICATE
 //     logicals ``svand_b_z`` / ``svorr_b_z`` (NOT the bitwise lane ops
 //     ``svand_s32`` / ``svorr_s32``), then ``svsel`` to ``T(1)`` / ``T(0)``.
-//   * Min / Max use ``svmin`` / ``svmax`` (FMIN / FMAX for fp), which follow
-//     IEEE-754 NaN propagation. This differs from the scalar header's
-//     ``std::min`` / ``std::max`` (a ``<``-based pick that returns the first
-//     arg on a NaN comparison). On NaN inputs the two backends can diverge;
-//     ``svminnm`` / ``svmaxnm`` are the NaN-quiet variants if exact parity is
-//     ever required.
+//   * Min / Max are a compare-select (``svcmplt`` + ``svsel``), NOT ``svmin`` /
+//     ``svmax``: FMIN / FMAX follow IEEE-754 NaN propagation and pick -0 over
+//     +0, whereas the scalar header's ``std::min`` / ``std::max`` are a
+//     ``<``-based pick that keeps the FIRST argument on an unordered or equal
+//     comparison. Integer SMIN / SMAX already match (total order).
 //   * Integer divide uses ``svdiv_s32`` / ``svdiv_s64`` (base-SVE SDIV). On
 //     AArch64 integer divide-by-zero yields 0 (no trap), vs. C's UB.
 //   * Gather / scatter use the element-scaled ``*index*`` forms (NOT the byte
@@ -56,6 +55,8 @@
 
 #include <arm_sve.h>
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <type_traits>
 
@@ -65,6 +66,43 @@
 
 namespace dace {
 namespace tileops {
+
+// Per-lane binary op (scalar reference semantics; matches the sibling backend
+// headers). The vector path uses ``sve_tile_apply`` below; this scalar form is
+// the ``%`` fallback and the per-lane combine of the horizontal ``tile_reduce``.
+template <typename T, char Op>
+inline T tile_apply(T a, T b) {
+  if constexpr (Op == '+')
+    return a + b;
+  else if constexpr (Op == '-')
+    return a - b;
+  else if constexpr (Op == '*')
+    return a * b;
+  else if constexpr (Op == '/')
+    return a / b;
+  else if constexpr (Op == '%')
+    return py_mod(a, b);  // Python/NumPy modulo (not C's); via the scalar path
+  else if constexpr (Op == 'm')
+    return std::min(a, b);
+  else if constexpr (Op == 'M')
+    return std::max(a, b);
+  else if constexpr (Op == '<')
+    return (a < b) ? T(1) : T(0);
+  else if constexpr (Op == 'l')
+    return (a <= b) ? T(1) : T(0);
+  else if constexpr (Op == '>')
+    return (a > b) ? T(1) : T(0);
+  else if constexpr (Op == 'g')
+    return (a >= b) ? T(1) : T(0);
+  else if constexpr (Op == '=')
+    return (a == b) ? T(1) : T(0);
+  else if constexpr (Op == '!')
+    return (a != b) ? T(1) : T(0);
+  else if constexpr (Op == '&')
+    return (a && b) ? T(1) : T(0);
+  else /* Or */
+    return (a || b) ? T(1) : T(0);
+}
 
 // ===========================================================================
 // 32-bit-lane (f32 / s32) primitives
@@ -109,15 +147,28 @@ inline svint32_t sve_div(svbool_t pg, svint32_t a, svint32_t b) { return svdiv_s
 inline svfloat64_t sve_div(svbool_t pg, svfloat64_t a, svfloat64_t b) { return svdiv_f64_x(pg, a, b); }
 inline svint64_t sve_div(svbool_t pg, svint64_t a, svint64_t b) { return svdiv_s64_x(pg, a, b); }
 
-inline svfloat32_t sve_min(svbool_t pg, svfloat32_t a, svfloat32_t b) { return svmin_f32_x(pg, a, b); }
+// FMIN/FMAX propagate NaN and pick -0 over +0; ``std::min(a,b)`` is
+// (b < a) ? b : a and ``std::max(a,b)`` is (a < b) ? b : a. Only a
+// compare-select reproduces that for fp (an operand swap does not: FMIN is
+// commutative on NaN). Integer SMIN/SMAX are already exact.
+inline svfloat32_t sve_min(svbool_t pg, svfloat32_t a, svfloat32_t b) { return svsel_f32(svcmplt_f32(pg, b, a), b, a); }
 inline svint32_t sve_min(svbool_t pg, svint32_t a, svint32_t b) { return svmin_s32_x(pg, a, b); }
-inline svfloat64_t sve_min(svbool_t pg, svfloat64_t a, svfloat64_t b) { return svmin_f64_x(pg, a, b); }
+inline svfloat64_t sve_min(svbool_t pg, svfloat64_t a, svfloat64_t b) { return svsel_f64(svcmplt_f64(pg, b, a), b, a); }
 inline svint64_t sve_min(svbool_t pg, svint64_t a, svint64_t b) { return svmin_s64_x(pg, a, b); }
 
-inline svfloat32_t sve_max(svbool_t pg, svfloat32_t a, svfloat32_t b) { return svmax_f32_x(pg, a, b); }
+inline svfloat32_t sve_max(svbool_t pg, svfloat32_t a, svfloat32_t b) { return svsel_f32(svcmplt_f32(pg, a, b), b, a); }
 inline svint32_t sve_max(svbool_t pg, svint32_t a, svint32_t b) { return svmax_s32_x(pg, a, b); }
-inline svfloat64_t sve_max(svbool_t pg, svfloat64_t a, svfloat64_t b) { return svmax_f64_x(pg, a, b); }
+inline svfloat64_t sve_max(svbool_t pg, svfloat64_t a, svfloat64_t b) { return svsel_f64(svcmplt_f64(pg, a, b), b, a); }
 inline svint64_t sve_max(svbool_t pg, svint64_t a, svint64_t b) { return svmax_s64_x(pg, a, b); }
+
+// ---- fused multiply-add: svmla_x(pg, c, a, b) == c + a*b (single rounding) ----
+// fp only -- the integer tile_fma path uses scalar ``std::fma`` (see tile_fma).
+inline svfloat32_t sve_mla(svbool_t pg, svfloat32_t c, svfloat32_t a, svfloat32_t b) {
+  return svmla_f32_x(pg, c, a, b);
+}
+inline svfloat64_t sve_mla(svbool_t pg, svfloat64_t c, svfloat64_t a, svfloat64_t b) {
+  return svmla_f64_x(pg, c, a, b);
+}
 
 // ---- comparisons -> svbool_t (active set = ``pg`` AND (a OP b)) ----
 inline svbool_t sve_cmplt(svbool_t pg, svfloat32_t a, svfloat32_t b) { return svcmplt_f32(pg, a, b); }
@@ -300,6 +351,50 @@ inline void tile_binop(T* __restrict__ out, const T* __restrict__ a, const T* __
     }
     sve_st1(pg, out + i, res);
   }
+}
+
+// ===========================================================================
+// tile_fma : out[i] = fma(a, b, c) = a*b + c (single rounding).
+// PRODUCER -> ZERO-FILL inactive (operand reads are in-tile, always safe).
+// float / double lower to the SVE fused multiply-add ``sve_mla(pg, c, a, b)``
+// (= c + a*b); integers use scalar ``std::fma`` so the pure and ISA lowerings
+// agree bit-for-bit (an integer SVE MLA would differ from the pure std::fma).
+// ===========================================================================
+template <typename T, bool BroadcastA, bool BroadcastB, bool BroadcastC, bool Masked>
+inline void tile_fma(T* __restrict__ out, const T* __restrict__ a, const T* __restrict__ b, const T* __restrict__ c,
+                     const bool* __restrict__ mask, int vlen) {
+  if constexpr (std::is_same<T, float>::value || std::is_same<T, double>::value) {
+    using VecT = decltype(sve_dup(T(0)));  // vec type for T, from the sve_dup overload set
+    const VecT zero = sve_dup(T(0));
+    for (int i = 0; i < vlen; i += sve_cnt<T>()) {
+      svbool_t pg = sve_whilelt<T>(i, vlen);
+      const VecT av = (!BroadcastA) ? sve_ld1(pg, a + i) : sve_dup(a[0]);
+      const VecT bv = (!BroadcastB) ? sve_ld1(pg, b + i) : sve_dup(b[0]);
+      const VecT cv = (!BroadcastC) ? sve_ld1(pg, c + i) : sve_dup(c[0]);
+      VecT res = sve_mla(pg, cv, av, bv);  // c + a*b
+      if constexpr (Masked) {
+        svbool_t m = sve_mask<T>(pg, mask, i);
+        res = sve_sel(m, res, zero);  // zero-fill in-tile-but-masked-off lanes
+      }
+      sve_st1(pg, out + i, res);
+    }
+  } else {
+    // Integer / other types: scalar std::fma to match the pure path bit-for-bit.
+    for (int i = 0; i < vlen; ++i) {
+      const T av = BroadcastA ? a[0] : a[i];
+      const T bv = BroadcastB ? b[0] : b[i];
+      const T cv = BroadcastC ? c[0] : c[i];
+      if constexpr (Masked)
+        out[i] = mask[i] ? T(std::fma(av, bv, cv)) : T(0);
+      else
+        out[i] = T(std::fma(av, bv, cv));
+    }
+  }
+}
+template <typename T, int VLEN, bool BroadcastA, bool BroadcastB, bool BroadcastC, bool Masked>
+inline void tile_fma(T* __restrict__ out, const T* __restrict__ a, const T* __restrict__ b, const T* __restrict__ c,
+                     const bool* __restrict__ mask) {
+  tile_fma<T, BroadcastA, BroadcastB, BroadcastC, Masked>(out, a, b, c, mask, VLEN);
 }
 
 // ===========================================================================

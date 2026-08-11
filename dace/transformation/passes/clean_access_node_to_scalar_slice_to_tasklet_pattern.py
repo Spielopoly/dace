@@ -110,25 +110,22 @@ class CleanAccessNodeToScalarSliceToTaskletPattern(ppl.Pass):
 
         return access_node, an2, tasklet
 
-    def _scalar_reused_elsewhere(self, sdfg: dace.SDFG, scalar_name: str, this_state: dace.SDFGState) -> bool:
-        """Return whether ``scalar_name`` appears in the read/write set of
-        any state other than ``this_state``, or in any interstate edge.
+    def _scalar_reused_elsewhere(self, sdfg: dace.SDFG, scalar_name: str, an_slice: dace.nodes.AccessNode) -> bool:
+        """Return whether ``scalar_name`` is used anywhere besides the matched
+        ``an_slice`` node -- another data node in the same state, a data node in
+        another state, or an interstate edge.
 
-        The structural match already guarantees the scalar's only uses in
-        ``this_state`` are the copy write + the single tasklet read, so a
-        reuse can only be in another state's data nodes or an interstate
-        edge's assignments / condition.
+        The same state can hold a second AccessNode reading the value this copy defines
+        (TSVC s255's rotated ``x``); dropping the scalar there leaves it uninitialised.
 
         :param sdfg: SDFG to scan.
         :param scalar_name: The scalar transient's data name.
-        :param this_state: The state the pattern was matched in (excluded).
+        :param an_slice: The matched scalar AccessNode (the only use that folds away).
         :returns: ``True`` if the scalar is read or written elsewhere.
         """
         for state in sdfg.all_states():
-            if state is this_state:
-                continue
             for dn in state.data_nodes():
-                if dn.data == scalar_name:
+                if dn.data == scalar_name and dn is not an_slice:
                     return True
         for ise in sdfg.all_interstate_edges():
             if any(str(s) == scalar_name for s in ise.data.free_symbols):
@@ -161,14 +158,19 @@ class CleanAccessNodeToScalarSliceToTaskletPattern(ppl.Pass):
             return None, None
         return an1.data, copy.deepcopy(ie.data.other_subset)
 
-    def _apply_recursive(self, sdfg: dace.SDFG):
+    def _apply_recursive(self, sdfg: dace.SDFG) -> int:
+        """Fold every matching pattern in ``sdfg`` and its nested SDFGs.
+
+        :returns: Number of patterns folded.
+        """
+        folded = 0
         for state in list(sdfg.all_states()):
             pre_transform_state_nodes = list(state.nodes())
             for node in pre_transform_state_nodes:
                 if node not in state.nodes():
                     continue
                 if isinstance(node, dace.nodes.NestedSDFG):
-                    self._apply_recursive(node.sdfg)
+                    folded += self._apply_recursive(node.sdfg)
                     continue
                 for e in list(state.out_edges(node)):
                     an1, an2, tasklet = self._check_pattern(state, e, node)
@@ -208,7 +210,7 @@ class CleanAccessNodeToScalarSliceToTaskletPattern(ppl.Pass):
                     if src_array_written_here:
                         continue
 
-                    reused = (not self.permissive) and self._scalar_reused_elsewhere(sdfg, an2.data, state)
+                    reused = (not self.permissive) and self._scalar_reused_elsewhere(sdfg, an2.data, an2)
 
                     if reused:
                         # Keep the scalar; replace the copy with an assignment
@@ -230,5 +232,14 @@ class CleanAccessNodeToScalarSliceToTaskletPattern(ppl.Pass):
                         state.add_edge(ie.src, ie.src_conn, oe.dst, oe.dst_conn,
                                        dace.memlet.Memlet(data=array_name, subset=read_subset))
 
+                    folded += 1
+
+        return folded
+
     def apply_pass(self, sdfg: dace.SDFG, _) -> Optional[int]:
-        self._apply_recursive(sdfg)
+        """Fold every ``A -> A_slice -> tasklet`` pattern in the SDFG hierarchy.
+
+        :returns: Number of patterns folded, or ``None`` if none matched.
+        """
+        folded = self._apply_recursive(sdfg)
+        return folded or None

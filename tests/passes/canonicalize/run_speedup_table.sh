@@ -3,7 +3,7 @@
 #
 # Single-click numerical-verification + speedup table for the canonicalize corpus.
 #
-# Times auto-opt (baseline), canon and fast-canon on EVERY polybench+npbench kernel,
+# Times auto-opt (baseline) and canon on EVERY polybench+npbench kernel,
 # checks each against its numpy reference, and writes a human-readable Markdown table
 # of speedups (plus a CSV and one JSON per kernel). Built for a dedicated benchmark
 # box: run it once and read perf_results/speedup_table.md.
@@ -28,6 +28,7 @@ cd "$repo_root"
 
 PYTHON="${PYTHON:-python}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"     # python harness defaults to 4 if unset
+export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-$OMP_NUM_THREADS}"  # BLAS pool = OMP pool
 out_dir="${OUT_DIR:-$here/perf_results}"
 markdown="${MARKDOWN:-$out_dir/speedup_table.md}"
 csv="${CSV:-$out_dir/speedup.csv}"

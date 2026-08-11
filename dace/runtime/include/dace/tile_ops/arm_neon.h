@@ -145,9 +145,13 @@ inline float32x4_t neon_binop_f32(float32x4_t a, float32x4_t b) {
   else if constexpr (Op == '/')
     return vdivq_f32(a, b);
   else if constexpr (Op == 'm')
-    return vminq_f32(a, b);
+    // FMIN/FMAX propagate NaN and pick -0 over +0; ``std::min(a,b)`` is
+    // (b < a) ? b : a and ``std::max(a,b)`` is (a < b) ? b : a. Only a
+    // compare-select reproduces that (operand swap does not: FMIN is
+    // commutative on NaN).
+    return vbslq_f32(vcltq_f32(b, a), b, a);
   else if constexpr (Op == 'M')
-    return vmaxq_f32(a, b);
+    return vbslq_f32(vcltq_f32(a, b), b, a);
   else if constexpr (Op == '<')
     return neon_select_0_1_f32(vcltq_f32(a, b));
   else if constexpr (Op == 'l')
@@ -173,9 +177,13 @@ inline float64x2_t neon_binop_f64(float64x2_t a, float64x2_t b) {
   else if constexpr (Op == '/')
     return vdivq_f64(a, b);
   else if constexpr (Op == 'm')
-    return vminq_f64(a, b);
+    // FMIN/FMAX propagate NaN and pick -0 over +0; ``std::min(a,b)`` is
+    // (b < a) ? b : a and ``std::max(a,b)`` is (a < b) ? b : a. Only a
+    // compare-select reproduces that (operand swap does not: FMIN is
+    // commutative on NaN).
+    return vbslq_f64(vcltq_f64(b, a), b, a);
   else if constexpr (Op == 'M')
-    return vmaxq_f64(a, b);
+    return vbslq_f64(vcltq_f64(a, b), b, a);
   else if constexpr (Op == '<')
     return neon_select_0_1_f64(vcltq_f64(a, b));
   else if constexpr (Op == 'l')
@@ -326,6 +334,61 @@ template <typename T, int VLEN, char Op, bool BroadcastA, bool BroadcastB, bool 
 inline void tile_binop(T* __restrict__ out, const T* __restrict__ a, const T* __restrict__ b,
                        const bool* __restrict__ mask) {
   tile_binop<T, Op, BroadcastA, BroadcastB, Masked>(out, a, b, mask, VLEN);
+}
+
+// ----------------------------- tile_fma -------------------------------
+// out[i] = fma(a, b, c) = a*b + c (single rounding). ZERO-FILL inactive (operand
+// reads are in-tile, always safe to evaluate). float / double lower to the NEON
+// fused multiply-add ``vfmaq_f{32,64}(vc, va, vb)`` -- OPERAND ORDER: this
+// computes ``vc + va*vb`` = a*b + c. Integers use scalar ``std::fma`` (so the
+// pure and ISA lowerings agree bit-for-bit -- an integer ``vmla`` would differ
+// from the double-based ``std::fma`` the pure path uses).
+template <typename T, bool BroadcastA, bool BroadcastB, bool BroadcastC, bool Masked>
+inline void tile_fma(T* __restrict__ out, const T* __restrict__ a, const T* __restrict__ b, const T* __restrict__ c,
+                     const bool* __restrict__ mask, int vlen) {
+  int i = 0;
+  if constexpr (std::is_same<T, float>::value) {
+    constexpr int W = 4;
+    const float32x4_t va_b = (BroadcastA) ? vdupq_n_f32(a[0]) : vdupq_n_f32(0.0f);
+    const float32x4_t vb_b = (BroadcastB) ? vdupq_n_f32(b[0]) : vdupq_n_f32(0.0f);
+    const float32x4_t vc_b = (BroadcastC) ? vdupq_n_f32(c[0]) : vdupq_n_f32(0.0f);
+    for (; i + W <= vlen; i += W) {
+      float32x4_t va = (!BroadcastA) ? vld1q_f32(a + i) : va_b;
+      float32x4_t vb = (!BroadcastB) ? vld1q_f32(b + i) : vb_b;
+      float32x4_t vc = (!BroadcastC) ? vld1q_f32(c + i) : vc_b;
+      float32x4_t vr = vfmaq_f32(vc, va, vb);  // vc + va*vb = a*b + c
+      if constexpr (Masked) vr = vbslq_f32(neon_mask4_u32(mask + i), vr, vdupq_n_f32(0.0f));
+      vst1q_f32(out + i, vr);
+    }
+  } else if constexpr (std::is_same<T, double>::value) {
+    constexpr int W = 2;
+    const float64x2_t va_b = (BroadcastA) ? vdupq_n_f64(a[0]) : vdupq_n_f64(0.0);
+    const float64x2_t vb_b = (BroadcastB) ? vdupq_n_f64(b[0]) : vdupq_n_f64(0.0);
+    const float64x2_t vc_b = (BroadcastC) ? vdupq_n_f64(c[0]) : vdupq_n_f64(0.0);
+    for (; i + W <= vlen; i += W) {
+      float64x2_t va = (!BroadcastA) ? vld1q_f64(a + i) : va_b;
+      float64x2_t vb = (!BroadcastB) ? vld1q_f64(b + i) : vb_b;
+      float64x2_t vc = (!BroadcastC) ? vld1q_f64(c + i) : vc_b;
+      float64x2_t vr = vfmaq_f64(vc, va, vb);  // vc + va*vb = a*b + c
+      if constexpr (Masked) vr = vbslq_f64(neon_mask2_u64(mask + i), vr, vdupq_n_f64(0.0));
+      vst1q_f64(out + i, vr);
+    }
+  }
+  // Scalar tail + integer / non-NEON T: std::fma per lane (bit-exact with pure).
+  for (; i < vlen; ++i) {
+    const T av = (!BroadcastA) ? a[i] : a[0];
+    const T bv = (!BroadcastB) ? b[i] : b[0];
+    const T cv = (!BroadcastC) ? c[i] : c[0];
+    if constexpr (Masked)
+      out[i] = mask[i] ? T(std::fma(av, bv, cv)) : T(0);
+    else
+      out[i] = T(std::fma(av, bv, cv));
+  }
+}
+template <typename T, int VLEN, bool BroadcastA, bool BroadcastB, bool BroadcastC, bool Masked>
+inline void tile_fma(T* __restrict__ out, const T* __restrict__ a, const T* __restrict__ b, const T* __restrict__ c,
+                     const bool* __restrict__ mask) {
+  tile_fma<T, BroadcastA, BroadcastB, BroadcastC, Masked>(out, a, b, c, mask, VLEN);
 }
 
 // ----------------------------- tile_ite -----------------------------

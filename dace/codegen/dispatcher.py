@@ -8,6 +8,7 @@ from dace.codegen.prettycode import CodeIOStream
 from dace.codegen.py.prettycode import PythonCodeIOStream
 from dace import attr_enum, config, data as dt, dtypes, nodes
 from dace.memlet import Memlet
+from dace.codegen import exceptions as cgx
 from dace.codegen import target
 from dace.sdfg import utils as sdutil, SDFG, SDFGState, ScopeSubgraphView
 from dace.sdfg.graph import MultiConnectorEdge
@@ -30,6 +31,7 @@ class DefinedType(attr_enum.ExtensibleAttributeEnum):
     Object = auto()  # An object moved by reference
     Stream = auto()  # A stream object moved by reference and accessed via a push/pop API
     StreamArray = auto()  # An array of Streams
+    GPUStream = auto()  # A backend GPU stream handle (e.g., cudaStream_t / hipStream_t)
 
 
 class DefinedMemlets:
@@ -94,12 +96,12 @@ class DefinedMemlets:
         for _, scope, can_access_parent in reversed(self._scopes):
             if name in scope:
                 err_str = "Shadowing variable {} from type {} to {}".format(name, scope[name], dtype)
-                if (allow_shadowing or config.Config.get_bool("compiler", "allow_shadowing")):
+                if (allow_shadowing or config.Config.get_bool("compiler", "allow_shadowing")
+                        or dtype == DefinedType.GPUStream):
                     if not allow_shadowing:
                         print("WARNING: " + err_str)
                 else:
-                    pass
-                    #raise cgx.CodegenError(err_str)
+                    raise cgx.CodegenError(err_str)
             if not can_access_parent:
                 break
         self._scopes[-1 - ancestor][1][name] = (dtype, ctype)
@@ -446,7 +448,7 @@ class TargetDispatcher(object):
 
         # If this node depends on any environments, register this for
         # generating header code later
-        if hasattr(node, "environments"):
+        if isinstance(node, nodes.CodeNode):
             self._used_environments |= node.environments
 
         # Check if the node satisfies any predicates that delegate to a

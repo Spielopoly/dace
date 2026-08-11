@@ -1,5 +1,5 @@
 # Copyright 2019-2026 ETH Zurich and the DaCe authors. All rights reserved.
-"""Numpy oracles for ``tsvc_2_5_core``.
+"""Numpy oracles for the TSVC 2.5 corpus kernels.
 
 One function per kernel, taking the same arguments as the DaCe / C++
 counterpart (input arrays in, output arrays in-place). Used by the
@@ -173,8 +173,8 @@ def _jacobi2d_tiled(b: np.ndarray, a: np.ndarray, t: int) -> None:
 
 
 def ref_jacobi2d_tiled_const(b: np.ndarray, a: np.ndarray) -> None:
-    """2D Jacobi 5-point stencil pre-tiled with constant tile size 64."""
-    _jacobi2d_tiled(b, a, 64)
+    """2D Jacobi 5-point stencil pre-tiled with constant tile size 8 (sized to fit ``LEN_2D``)."""
+    _jacobi2d_tiled(b, a, 8)
 
 
 def ref_jacobi2d_tiled_sym(b: np.ndarray, a: np.ndarray, t: int) -> None:
@@ -194,13 +194,36 @@ def _jacobi2d_double_tiled(b: np.ndarray, a: np.ndarray, t1: int, t2: int) -> No
 
 
 def ref_jacobi2d_double_tiled_const(b: np.ndarray, a: np.ndarray) -> None:
-    """2D Jacobi 5-point stencil pre-tiled with constant outer (64) and inner (8) tiles."""
-    _jacobi2d_double_tiled(b, a, 64, 8)
+    """2D Jacobi 5-point stencil pre-tiled with constant outer (16) and inner (8) tiles."""
+    _jacobi2d_double_tiled(b, a, 16, 8)
 
 
 def ref_jacobi2d_double_tiled_sym(b: np.ndarray, a: np.ndarray, t1: int, t2: int) -> None:
     """Two-level Jacobi tiling with symbolic outer ``t1`` and inner ``t2``."""
     _jacobi2d_double_tiled(b, a, t1, t2)
+
+
+def _jacobi2d_triple_tiled(b: np.ndarray, a: np.ndarray, t1: int, t2: int, t3: int) -> None:
+    n = a.shape[0]
+    for ii in range(1, n - 1 - t1, t1):
+        for jj in range(1, n - 1 - t1, t1):
+            for iii in range(ii, ii + t1, t2):
+                for jjj in range(jj, jj + t1, t2):
+                    for iiii in range(iii, iii + t2, t3):
+                        for jjjj in range(jjj, jjj + t2, t3):
+                            for i in range(iiii, iiii + t3):
+                                for j in range(jjjj, jjjj + t3):
+                                    b[i, j] = 0.2 * (a[i, j] + a[i - 1, j] + a[i + 1, j] + a[i, j - 1] + a[i, j + 1])
+
+
+def ref_jacobi2d_triple_tiled_const(b: np.ndarray, a: np.ndarray) -> None:
+    """2D Jacobi 5-point stencil pre-tiled three levels deep, constant tiles 16 / 8 / 4."""
+    _jacobi2d_triple_tiled(b, a, 16, 8, 4)
+
+
+def ref_jacobi2d_triple_tiled_sym(b: np.ndarray, a: np.ndarray, t1: int, t2: int, t3: int) -> None:
+    """Three-level Jacobi tiling with symbolic tiles ``t1`` / ``t2`` / ``t3``."""
+    _jacobi2d_triple_tiled(b, a, t1, t2, t3)
 
 
 def _heat3d_tiled(b: np.ndarray, a: np.ndarray, t: int) -> None:
@@ -226,6 +249,33 @@ def ref_heat3d_tiled_sym(b: np.ndarray, a: np.ndarray, t: int) -> None:
     _heat3d_tiled(b, a, t)
 
 
+def _heat3d_double_tiled(b: np.ndarray, a: np.ndarray, t1: int, t2: int) -> None:
+    n = a.shape[0]
+    for kk in range(1, n - 1 - t1, t1):
+        for jj in range(1, n - 1 - t1, t1):
+            for ii in range(1, n - 1 - t1, t1):
+                for kkk in range(kk, kk + t1, t2):
+                    for jjj in range(jj, jj + t1, t2):
+                        for iii in range(ii, ii + t1, t2):
+                            for k in range(kkk, kkk + t2):
+                                for j in range(jjj, jjj + t2):
+                                    for i in range(iii, iii + t2):
+                                        b[k, j,
+                                          i] = (0.125 * (a[k + 1, j, i] - 2.0 * a[k, j, i] + a[k - 1, j, i]) + 0.125 *
+                                                (a[k, j + 1, i] - 2.0 * a[k, j, i] + a[k, j - 1, i]) + 0.125 *
+                                                (a[k, j, i + 1] - 2.0 * a[k, j, i] + a[k, j, i - 1]) + a[k, j, i])
+
+
+def ref_heat3d_double_tiled_const(b: np.ndarray, a: np.ndarray) -> None:
+    """3D 7-point heat stencil pre-tiled two levels deep, constant tiles 8 / 4."""
+    _heat3d_double_tiled(b, a, 8, 4)
+
+
+def ref_heat3d_double_tiled_sym(b: np.ndarray, a: np.ndarray, t1: int, t2: int) -> None:
+    """Two-level 3D heat tiling with symbolic outer ``t1`` and inner ``t2``."""
+    _heat3d_double_tiled(b, a, t1, t2)
+
+
 # ECRAD-style clamped reduction
 
 
@@ -249,11 +299,11 @@ def ref_masked_store_const(a: np.ndarray, b: np.ndarray, mask: np.ndarray) -> No
             a[i] = b[i]
 
 
-def ref_masked_store_sym(a: np.ndarray, b: np.ndarray, threshold_data: np.ndarray, k: float) -> None:
-    """Predicated store: ``if threshold_data[i] > k: a[i] = b[i]``."""
+def ref_masked_store_sym(a: np.ndarray, b: np.ndarray, threshold_data: np.ndarray, kmask: float) -> None:
+    """Predicated store: ``if threshold_data[i] > kmask: a[i] = b[i]``."""
     n = a.shape[0]
     for i in range(n):
-        if threshold_data[i] > k:
+        if threshold_data[i] > kmask:
             a[i] = b[i]
 
 
@@ -335,15 +385,15 @@ def ref_break_post_body(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> None:
             break
 
 
-def ref_break_capture(a: np.ndarray, out_index: np.ndarray, out_value: np.ndarray, k: float) -> None:
-    """TSVC ``s332``: first ``i`` with ``a[i] > k`` -> capture index +
+def ref_break_capture(a: np.ndarray, out_index: np.ndarray, out_value: np.ndarray, kfind: float) -> None:
+    """TSVC ``s332``: first ``i`` with ``a[i] > kfind`` -> capture index +
     value, break. ``out_index``/``out_value`` stay at ``-1`` if no
-    element exceeds ``k``."""
+    element exceeds ``kfind``."""
     n = a.shape[0]
     out_index[0] = -1
     out_value[0] = -1.0
     for i in range(n):
-        if a[i] > k:
+        if a[i] > kfind:
             out_index[0] = i
             out_value[0] = a[i]
             break
@@ -616,3 +666,69 @@ def ref_fission_scatter_2body(b: np.ndarray, e: np.ndarray, a: np.ndarray, c: np
     ``e[idx[i]] = c[i]+1``."""
     b[idx] = a * 2.0
     e[idx] = c + 1.0
+
+
+# ---------------------------------------------------------------------------
+#  Generalized 2-D wavefront + disjoint-image challenge kernels
+# ---------------------------------------------------------------------------
+
+
+def ref_wf_north_west(a: np.ndarray) -> None:
+    """Sum-diagonal wavefront ``a[i,j] += a[i-1,j] + a[i,j-1]``. The in-place
+    reads of already-updated neighbours make the loop order significant, so the
+    oracle keeps the explicit sequential sweep."""
+    n = a.shape[0]
+    for i in range(1, n):
+        for j in range(1, n):
+            a[i, j] = a[i, j] + a[i - 1, j] + a[i, j - 1]
+
+
+def ref_wf_diff_skew(a: np.ndarray) -> None:
+    """Difference-diagonal wavefront ``a[i,j] += a[i-1,j] + a[i-1,j+1]`` over
+    ``j`` in ``[0, n-1)``. Depends only on the previous row, sequential over ``i``."""
+    n = a.shape[0]
+    for i in range(1, n):
+        for j in range(0, n - 1):
+            a[i, j] = a[i, j] + a[i - 1, j] + a[i - 1, j + 1]
+
+
+def ref_wf_triangular(a: np.ndarray) -> None:
+    """Triangular north+west wavefront ``a[i,j] += a[i-1,j] + a[i,j-1]`` over the
+    upper triangle ``j >= i`` (sequential sweep honouring the triangular bounds)."""
+    n = a.shape[0]
+    for i in range(1, n):
+        for j in range(i, n):
+            a[i, j] = a[i, j] + a[i - 1, j] + a[i, j - 1]
+
+
+def ref_disjoint_halves_gather(a: np.ndarray, c: np.ndarray) -> None:
+    """Disjoint self-gather ``a[i] += a[i+H]*c[i]`` over the lower half. Reads
+    ``[H, 2H)`` never overlap writes ``[0, H)``, so the vectorized form (upper
+    half read from the un-mutated ``a``) reproduces the sequential loop exactly."""
+    n = a.shape[0]
+    half = n // 2
+    a[:half] = a[:half] + a[half:2 * half] * c[:half]
+
+
+def ref_halo_broadcast(a: np.ndarray, scale: float) -> None:
+    """Fixed-cell carrier read ``a[i] = a[i]*scale + a[0]`` for ``i >= 1``.
+    ``a[0]`` is never written, so its snapshot equals the live value."""
+    a0 = a[0]
+    a[1:] = a[1:] * scale + a0
+
+
+def ref_safety_map_of_scans(b: np.ndarray, a: np.ndarray) -> None:
+    """Per-row prefix scan ``b[i,j] = b[i,j-1] + a[i,j]`` (rows independent,
+    columns carried)."""
+    n = b.shape[0]
+    for i in range(n):
+        for j in range(1, n):
+            b[i, j] = b[i, j - 1] + a[i, j]
+
+
+def ref_safety_column_stencil(a: np.ndarray, bb: np.ndarray) -> None:
+    """Column recurrence ``a[i,:] = a[i-1,:] + bb[i,:]`` (rows carried,
+    columns independent)."""
+    n = a.shape[0]
+    for i in range(1, n):
+        a[i, :] = a[i - 1, :] + bb[i, :]

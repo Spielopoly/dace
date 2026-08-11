@@ -965,5 +965,198 @@ def test_dynamic_bound_contiguity_per_overapprox(expansion_type, xp):
     assert xp.all(B_IN == 0.0)
 
 
+def _sdfg_with_shared_input_connector() -> dace.SDFG:
+    """A map whose single entry connector feeds BOTH a liftable copy and a compute tasklet.
+
+    One scope connector carrying several edges is the shape a Fortran body produces once its
+    statements are lifted into one map: every read of the same array goes through the connector
+    that was created for it. CLOUDSC arrives with two ``zqx`` edges on one MapEntry connector.
+    ``_get_sdfg`` above gives every path its own connector, so this is wired explicitly.
+    """
+    sdfg = dace.SDFG("shared_input_connector")
+    state = sdfg.add_state("body", is_start_block=True)
+    for name in ("A_IN", "A_OUT", "C_OUT"):
+        sdfg.add_array(name=name, shape=(DIM_SIZE, DIM_SIZE), dtype=dace.float64, transient=False)
+
+    map_entry, map_exit = state.add_map(name="shared_map",
+                                        ndrange={
+                                            "i": dace.subsets.Range([(0, DIM_SIZE - 1, 1)]),
+                                            "j": dace.subsets.Range([(0, DIM_SIZE - 1, 1)]),
+                                        })
+    map_entry.add_in_connector("IN_1")
+    map_entry.add_out_connector("OUT_1")
+    state.add_edge(state.add_access("A_IN"), None, map_entry, "IN_1",
+                   dace.memlet.Memlet(f"A_IN[0:{DIM_SIZE}, 0:{DIM_SIZE}]"))
+
+    # Path 1: the element-wise copy the pass lifts to a CopyLibraryNode.
+    copy_tasklet = state.add_tasklet(name="copy", inputs={"_in"}, outputs={"_out"}, code="_out = _in")
+    state.add_edge(map_entry, "OUT_1", copy_tasklet, "_in", dace.memlet.Memlet("A_IN[i, j]"))
+    # Path 2: compute, reading A_IN through the SAME entry connector. Must survive the lift.
+    compute_tasklet = state.add_tasklet(name="compute", inputs={"_in"}, outputs={"_out"}, code="_out = _in * 2.0")
+    state.add_edge(map_entry, "OUT_1", compute_tasklet, "_in", dace.memlet.Memlet("A_IN[i, j]"))
+
+    for index, (tasklet, out_name) in enumerate(((copy_tasklet, "A_OUT"), (compute_tasklet, "C_OUT"))):
+        conn = index + 1
+        map_exit.add_in_connector(f"IN_{conn}")
+        map_exit.add_out_connector(f"OUT_{conn}")
+        state.add_edge(tasklet, "_out", map_exit, f"IN_{conn}", dace.memlet.Memlet(f"{out_name}[i, j]"))
+        state.add_edge(map_exit, f"OUT_{conn}", state.add_access(out_name), None,
+                       dace.memlet.Memlet(f"{out_name}[0:{DIM_SIZE}, 0:{DIM_SIZE}]"))
+    sdfg.validate()
+    return sdfg
+
+
+@temporarily_disable_autoopt_and_serialization
+def test_lifting_a_copy_keeps_a_connector_its_other_edge_still_uses():
+    """Regression: a shared entry passthrough must block the lift, not be torn out from under it.
+
+    The pass refuses to lift a path whose passthrough connector is shared with other tasklets, but
+    it measured sharing with ``in_edges_by_connector`` alone. That reads the wrong side of a map
+    ENTRY: ``IN_x`` holds the single producer edge while ``OUT_x`` carries one edge per reader, so a
+    connector feeding both a copy and a compute tasklet counted as unshared. The lift then removed
+    the shared outer read edge together with the ``IN_1`` / ``OUT_1`` pair, leaving the compute
+    tasklet on a connector its map no longer had: ``InvalidSDFGNodeError: Memlet A_IN[i, j] coming
+    from nonexistent connector OUT_1``. Seen on CLOUDSC full_cpu (canon_cpu and canon_gpu) in the
+    parallelize phase's ``lift_copy`` stage, on two ``zqx`` edges sharing one MapEntry connector.
+    """
+    sdfg = _sdfg_with_shared_input_connector()
+    entry = next(n for n in sdfg.states()[0].nodes() if isinstance(n, dace.nodes.MapEntry))
+    state = sdfg.states()[0]
+    assert len(list(state.out_edges_by_connector(entry, "OUT_1"))) == 2
+
+    AssignmentAndCopyKernelToMemsetAndMemcpy().apply_pass(sdfg, {})
+    assert _get_num_memcpy_library_nodes(sdfg) == 0, "a shared entry passthrough must block the lift"
+
+    orphaned = [(str(e.src), e.src_conn, str(e.dst)) for st in sdfg.states() for e in st.edges()
+                if e.src_conn is not None and e.src_conn not in e.src.out_connectors]
+    assert not orphaned, f"edges left on a deleted out-connector: {orphaned}"
+    sdfg.validate()
+
+    A_IN = numpy.random.rand(DIM_SIZE, DIM_SIZE)
+    A_OUT = numpy.zeros_like(A_IN)
+    C_OUT = numpy.zeros_like(A_IN)
+    _expand_and_validate(sdfg, "pure")
+    sdfg(A_IN=A_IN, A_OUT=A_OUT, C_OUT=C_OUT)
+    assert numpy.allclose(A_OUT, A_IN)
+    assert numpy.allclose(C_OUT, 2.0 * A_IN)
+
+
+def test_dynamic_range_connector_shadowing_a_data_descriptor():
+    """A dynamic map range may be named after the scalar it reads; that name cannot become a symbol.
+
+    The Fortran frontend emits exactly this for CLOUDSC's ``DO JL=KIDIA,KFDIA``: a Scalar descriptor
+    ``kfdia`` feeding a dynamic-range connector also called ``kfdia``. Hoisting it to an SDFG symbol
+    raised ``FileExistsError: Cannot create symbol "kfdia", the name is used by a data descriptor``,
+    because the guard only consulted ``sdfg.symbols``. The pass must nest instead of hoisting.
+    """
+    sdfg = dace.SDFG("dynamic_range_connector_shadows_data")
+    sdfg.add_scalar("kfdia", dace.int64, transient=False)
+    sdfg.add_array("A_OUT", [DIM_SIZE], dace.float64, transient=False)
+    state = sdfg.add_state(is_start_block=True)
+
+    map_entry, map_exit = state.add_map("memset_map", {"i": "0:kfdia"})
+    map_entry.add_in_connector("kfdia")
+    state.add_edge(state.add_access("kfdia"), None, map_entry, "kfdia", dace.memlet.Memlet("kfdia[0]"))
+
+    tasklet = state.add_tasklet("memset", set(), {"_out"}, "_out = 0.0")
+    state.add_edge(map_entry, None, tasklet, None, dace.memlet.Memlet(None))
+    state.add_edge(tasklet, "_out", map_exit, "IN_A_OUT", dace.memlet.Memlet("A_OUT[i]"))
+    map_exit.add_in_connector("IN_A_OUT")
+    map_exit.add_out_connector("OUT_A_OUT")
+    state.add_edge(map_exit, "OUT_A_OUT", state.add_access("A_OUT"), None, dace.memlet.Memlet(f"A_OUT[0:{DIM_SIZE}]"))
+    sdfg.validate()
+
+    AssignmentAndCopyKernelToMemsetAndMemcpy().apply_pass(sdfg, {})
+
+    assert "kfdia" not in sdfg.symbols, "the shadowing dynamic range must not be hoisted to a symbol"
+    sdfg.validate()
+
+
+def _sdfg_with_a_sibling_ordering_edge(ordered: bool) -> dace.SDFG:
+    """A liftable memset that also sequences a sibling tasklet in the SAME map body.
+
+    ``ordered=False`` is the over-refusal control: byte-identical apart from the empty memlet,
+    and the pass must still lift it.
+    """
+    sdfg = dace.SDFG(f"sibling_ordering_{'dep' if ordered else 'free'}")
+    state = sdfg.add_state("body", is_start_block=True)
+    for name in ("A_OUT", "B_IN", "B_OUT"):
+        sdfg.add_array(name=name, shape=(DIM_SIZE, ), dtype=dace.float64, transient=False)
+
+    map_entry, map_exit = state.add_map(name="body_map", ndrange={"i": dace.subsets.Range([(0, DIM_SIZE - 1, 1)])})
+
+    fill = state.add_tasklet(name="fill", inputs={}, outputs={"_out": None}, code="_out = 0.0")
+    state.add_edge(map_entry, None, fill, None, dace.memlet.Memlet(None))
+    bump = state.add_tasklet(name="bump", inputs={"_in": None}, outputs={"_out": None}, code="_out = _in * 2.0")
+
+    # Added BEFORE the data edge, so a lift that picks the tasklet's output positionally reads THIS
+    # one -- an empty memlet whose ``subset`` is None -- rather than the write it means to measure.
+    if ordered:
+        state.add_edge(fill, None, bump, None, dace.memlet.Memlet())
+
+    map_entry.add_in_connector("IN_B")
+    map_entry.add_out_connector("OUT_B")
+    state.add_edge(state.add_access("B_IN"), None, map_entry, "IN_B", dace.memlet.Memlet(f"B_IN[0:{DIM_SIZE}]"))
+    state.add_edge(map_entry, "OUT_B", bump, "_in", dace.memlet.Memlet("B_IN[i]"))
+
+    for tasklet, out_name in ((fill, "A_OUT"), (bump, "B_OUT")):
+        map_exit.add_in_connector(f"IN_{out_name}")
+        map_exit.add_out_connector(f"OUT_{out_name}")
+        state.add_edge(tasklet, "_out", map_exit, f"IN_{out_name}", dace.memlet.Memlet(f"{out_name}[i]"))
+        state.add_edge(map_exit, f"OUT_{out_name}", state.add_access(out_name), None,
+                       dace.memlet.Memlet(f"{out_name}[0:{DIM_SIZE}]"))
+    sdfg.validate()
+    return sdfg
+
+
+@temporarily_disable_autoopt_and_serialization
+def test_a_body_ordering_edge_blocks_the_lift():
+    """Regression: a body node's happens-before must block the lift, not be torn out with it.
+
+    The lift deletes the tasklet and keeps only the map's access nodes, so every edge the tasklet
+    carries besides the two on the matched path is dropped; ``carry_ordering_edges`` re-attaches
+    the SCOPE nodes' ordering only, never a body node's. This shape is reachable only on a SECOND
+    canonicalize -- the first run's map body has no such sibling ordering yet -- and npbench
+    ``cavity_flow`` hit it as ``TypeError: 'NoneType' object is not iterable``, the empty memlet
+    picked up positionally as the tasklet's write and carrying no subset to do arithmetic on.
+    """
+    sdfg = _sdfg_with_a_sibling_ordering_edge(ordered=True)
+    state = sdfg.states()[0]
+    fill = next(n for n in state.nodes() if isinstance(n, dace.nodes.Tasklet) and n.label == "fill")
+
+    AssignmentAndCopyKernelToMemsetAndMemcpy().apply_pass(sdfg, {})
+
+    assert _get_num_memset_library_nodes(sdfg) == 0, "a body ordering edge must block the lift"
+    assert [(e.src.label, e.dst.label) for e in state.edges()
+            if e.data.is_empty() and e.src is fill] == [("fill", "bump")]
+    sdfg.validate()
+
+    A_OUT = numpy.ones(DIM_SIZE)
+    B_IN = numpy.arange(DIM_SIZE, dtype=numpy.float64)
+    B_OUT = numpy.zeros(DIM_SIZE)
+    sdfg(A_OUT=A_OUT, B_IN=B_IN, B_OUT=B_OUT)
+    assert numpy.allclose(A_OUT, 0.0)
+    assert numpy.allclose(B_OUT, 2.0 * B_IN)
+
+
+@temporarily_disable_autoopt_and_serialization
+def test_the_same_body_without_the_ordering_edge_still_lifts():
+    """Over-refusal control for :func:`test_a_body_ordering_edge_blocks_the_lift`."""
+    sdfg = _sdfg_with_a_sibling_ordering_edge(ordered=False)
+
+    AssignmentAndCopyKernelToMemsetAndMemcpy().apply_pass(sdfg, {})
+
+    assert _get_num_memset_library_nodes(sdfg) == 1, "only the ordering edge may block this lift"
+    sdfg.validate()
+
+    A_OUT = numpy.ones(DIM_SIZE)
+    B_IN = numpy.arange(DIM_SIZE, dtype=numpy.float64)
+    B_OUT = numpy.zeros(DIM_SIZE)
+    _expand_and_validate(sdfg, "pure")
+    sdfg(A_OUT=A_OUT, B_IN=B_IN, B_OUT=B_OUT)
+    assert numpy.allclose(A_OUT, 0.0)
+    assert numpy.allclose(B_OUT, 2.0 * B_IN)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

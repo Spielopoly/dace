@@ -162,6 +162,37 @@ class StageGlobalArrayThroughScalars(ppl.Pass):
                     return False
         return True
 
+    @classmethod
+    def _downstream_same_subset_write(cls, state: 'dace.SDFGState', bridge, array_name: str, subset_key: str) -> bool:
+        """True iff a LATER access node of ``array_name`` in this state rewrites ``subset_key``.
+
+        In a read-modify-write CHAIN (``zqlhs@k -> tasklet -> zqlhs@(k+1)``, all at one element) every
+        hop is a bridge, but only the LAST holds the array's final value -- the earlier ones carry
+        intermediate partial sums. Must be called BEFORE the producer / consumer rewiring detaches
+        ``bridge``, which is why the caller captures it up front.
+
+        The walk stops at an :class:`~dace.sdfg.nodes.ExitNode`: a write that leaves the scope is the
+        chain's DRAIN, not a competing in-scope writer, so following it would let the outer access
+        node masquerade as the overwrite and suppress the one hop that must publish.
+
+        A downstream write sourced from another AccessNode of the SAME array is a plain copy (a
+        drain, not an overwrite): only a Tasklet-produced write supersedes.
+        """
+        seen = {bridge}
+        stack = [e.dst for e in state.out_edges(bridge)]
+        while stack:
+            node = stack.pop()
+            if node in seen or isinstance(node, dace.nodes.ExitNode):
+                continue
+            seen.add(node)
+            if isinstance(node, dace.nodes.AccessNode) and node.data == array_name and any(
+                    not (isinstance(e.src, dace.nodes.AccessNode) and e.src.data == array_name)
+                    and cls._subset_key(cls._array_side_subset(e, array_name)) == subset_key
+                    for e in state.in_edges(node)):
+                return True
+            stack.extend(e.dst for e in state.out_edges(node))
+        return False
+
     def _find_outer_drain(self, state: 'dace.SDFGState', bridge, outermost_exit) -> Optional[dace.nodes.AccessNode]:
         """Locate the outer ``AccessNode`` the bridge currently drains into.
 
@@ -348,6 +379,11 @@ class StageGlobalArrayThroughScalars(ppl.Pass):
         shared_keys = write_keys & read_keys
         read_only_keys = read_keys - shared_keys
 
+        # Write subsets this bridge does NOT own the final value of: a later access node of the same
+        # array rewrites them (an intermediate hop of an RMW chain). Captured HERE because the
+        # rewiring below detaches the bridge from its consumers, erasing the downstream path.
+        superseded_keys = {k for k in write_keys if self._downstream_same_subset_write(state, bridge, array_name, k)}
+
         # Allocate one scalar per distinct subset (shared if RMW).
         scalar_nodes: Dict[str, dace.nodes.AccessNode] = {}
         for idx, k in enumerate(sorted(write_keys | read_keys)):
@@ -368,7 +404,7 @@ class StageGlobalArrayThroughScalars(ppl.Pass):
         # connector names rather than going through
         # :meth:`SDFGState.add_memlet_path`, which triggers propagation
         # the moment its empty-edge skeleton is in place.
-        for k in write_keys:
+        for k in sorted(write_keys):
             sn = scalar_nodes[k]
             for e in writes_by_key[k]["edges"]:
                 if e not in state.edges():
@@ -376,7 +412,7 @@ class StageGlobalArrayThroughScalars(ppl.Pass):
                 state.remove_edge(e)
                 state.add_edge(e.src, e.src_conn, sn, None, Memlet(f"{sn.data}[0]"))
 
-        for k in read_keys:
+        for k in sorted(read_keys):
             sn = scalar_nodes[k]
             for e in reads_by_key[k]["edges"]:
                 if e not in state.edges():
@@ -410,7 +446,11 @@ class StageGlobalArrayThroughScalars(ppl.Pass):
             if parent_nsdfg_node is not None and array_name in parent_nsdfg_node.out_connectors:
                 bridge_is_out_connector = True
         if entries and outer_drain is not None:
-            for k in write_keys:
+            # Same rule as the out-connector branch below: an intermediate hop of an RMW chain must
+            # not drain its partial value to the outer array, or every hop becomes an unordered
+            # writer of the same element. Inert for the distinct-subset fan-out (zsolqa), where no
+            # write subset is ever rewritten downstream.
+            for k in sorted(write_keys - superseded_keys):
                 self._add_scoped_path(state,
                                       src=scalar_nodes[k],
                                       scope_nodes=exits,
@@ -418,7 +458,7 @@ class StageGlobalArrayThroughScalars(ppl.Pass):
                                       array_name=array_name,
                                       subset=writes_by_key[k]["subset"])
 
-            for k in read_only_keys:
+            for k in sorted(read_only_keys):
                 self._add_scoped_path(state,
                                       src=outer_source,
                                       scope_nodes=list(reversed(entries)),
@@ -429,9 +469,19 @@ class StageGlobalArrayThroughScalars(ppl.Pass):
             # NSDFG out-connector path: each scalar still has to write back
             # to the bridge AccessNode so the NSDFG's outer view receives
             # the staged value. One ``scalar -> bridge`` edge per write_key.
-            for k in write_keys:
+            #
+            # EXCEPT a subset a later access node rewrites: in an RMW chain
+            # (cloudsc_four's ``zqlhs@k -> +zsolqb[.., k, ..] -> zqlhs@(k+1)``) every hop is a
+            # bridge, so publishing each one makes all of them unordered writers of the SAME
+            # element -- the intermediate partial sums race the real result and last-writer-wins
+            # silently drops the tail of the accumulation. Only the final hop publishes.
+            for k in sorted(write_keys - superseded_keys):
                 state.add_edge(scalar_nodes[k], None, bridge, None,
                                Memlet(data=array_name, subset=writes_by_key[k]["subset"]))
+            # A bridge whose every write is superseded published nothing, so the keep-alive below
+            # must not spare it -- it is now an ordinary detached bridge and has to be dropped like
+            # any other (an isolated access node fails ``no_isolated_access_nodes``).
+            bridge_is_out_connector = bool(write_keys - superseded_keys)
 
         # W x R cross-product dep edges (empty memlets) -- enforce
         # all-writes-before-all-reads ordering for cross-subset hops.

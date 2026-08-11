@@ -1,6 +1,6 @@
 # Copyright 2019-2022 ETH Zurich and the DaCe authors. All rights reserved.
 
-from typing import Set
+from typing import Optional, Set
 
 import copy
 import sympy
@@ -150,7 +150,11 @@ class NestedGPUDeviceMapLowering(ppl.Pass):
                         nsdfg.symbol_mapping[sym] = sym
 
         # Copy over nodes (and generate accesses when needed)
-        node_map = {n: copy.deepcopy(n) for n in map_inner_nodes}
+        # One memo for the whole clone: a scope's entry and exit share a single Map/Consume object,
+        # and a per-node deepcopy hands them one copy each -- an identity split that validate_state
+        # now rejects and that CPU codegen would otherwise turn into an unbalanced map brace.
+        memo = {}
+        node_map = {n: copy.deepcopy(n, memo) for n in map_inner_nodes}
         for v in node_map.values():
             if_body_state.add_node(v)
         for e in map_inner_edges:
@@ -354,11 +358,17 @@ class NestedGPUDeviceMapLowering(ppl.Pass):
         self,
         sdfg: SDFG,
         _,
-    ) -> None:
+    ) -> Optional[int]:
+        """Lower every nested ``GPU_Device`` map, repeating until a fixed point.
+
+        :returns: Total number of inner ``GPU_Device`` maps lowered, or ``None`` if none matched.
+        """
+        total_applied = 0
         num_applied = self._apply(sdfg)
         while num_applied > 0:
+            total_applied += num_applied
             num_applied = self._apply(sdfg)
         sdfg.validate()
         self._assert_no_nested_gpu_device_maps(sdfg)
 
-        return None
+        return total_applied or None

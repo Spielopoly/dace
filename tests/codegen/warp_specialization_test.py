@@ -71,6 +71,10 @@ def test_double_nest_thread_specialization_noncontiguous_blocks(block_size):
 
 
 @pytest.mark.gpu
+# This test forces every Map (outer + two inner) to GPU_Device, producing a
+# nested GPU_Device structure (dynamic parallelism) which the new codegen
+# rejects by design. Only the legacy codegen supports this pattern.
+@pytest.mark.old_gpu_codegen_only
 @pytest.mark.parametrize('block_size', [None, '64,8,1'])
 def test_thread_specialization_noncontiguous_blocks(block_size):
 
@@ -89,13 +93,15 @@ def test_thread_specialization_noncontiguous_blocks(block_size):
                     out = 6 + inp
 
     sdfg = thread_specialization.to_sdfg()
+    # Both parametrizations generate different code under the same name, so they would otherwise
+    # share one build folder and clobber each other's build when run in parallel.
+    sdfg.name = f"{sdfg.name}_{(block_size or 'default').replace(',', '_')}"
     sdfg.apply_gpu_transformations()
 
     # Ensure all nested maps set grid dimensions
     for n, _ in sdfg.all_nodes_recursive():
         if isinstance(n, dace.nodes.MapEntry):
             n.schedule = dace.ScheduleType.GPU_Device
-    sdfg.save("x1.sdfg")
 
     a = np.random.rand(128, 64)
     expected = np.copy(a)
@@ -109,7 +115,6 @@ def test_thread_specialization_noncontiguous_blocks(block_size):
         if isinstance(n, dace.nodes.MapEntry) and n.map.schedule == dace.dtypes.ScheduleType.GPU_Device
     })
     assert num_device_maps == 1
-    sdfg.save("x2.sdfg")
 
     if block_size is not None:
         with dace.config.set_temporary('compiler', 'cuda', 'default_block_size', value=block_size):

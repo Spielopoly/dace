@@ -97,10 +97,14 @@ def copy_state_contents(old_state: dace.SDFGState, new_state: dace.SDFGState) ->
         - Connections between the newly created nodes are preserved.
     """
     node_map = dict()
+    # One memo for the whole clone: a scope's entry and exit share a single Map/Consume object,
+    # and a per-node deepcopy hands them one copy each -- an identity split that validate_state
+    # now rejects and that CPU codegen would otherwise turn into an unbalanced map brace.
+    memo = {}
 
     # Copy all nodes
     for n in old_state.nodes():
-        c_n = copy.deepcopy(n)
+        c_n = copy.deepcopy(n, memo)
         node_map[n] = c_n
         new_state.add_node(c_n)
 
@@ -285,13 +289,18 @@ def move_branch_cfg_up_discard_conditions(if_block: ConditionalBlock, body_to_ta
     new_start_block = None
     new_end_block = None
 
+    # Read before the copy loop: the first copied node lands in ``graph`` disconnected,
+    # which makes ``graph.start_block`` ambiguous for every later iteration.
+    body_start_block = body_to_take.start_block
+    if_block_is_start = (graph.start_block is if_block)
+
     for node in body_to_take.nodes():
         # Copy over nodes
         copynode = copy.deepcopy(node)
         node_map[node] = copynode
         # Check if we need to have a new start state
-        start_block_case = (body_to_take.start_block == node) and (graph.start_block == if_block)
-        if body_to_take.start_block == node:
+        start_block_case = (body_start_block is node) and if_block_is_start
+        if body_start_block is node:
             assert new_start_block is None
             new_start_block = copynode
         if body_to_take.out_degree(node) == 0:
@@ -731,7 +740,11 @@ def duplicate_memlets_sharing_single_in_connector(state: dace.SDFGState, map_ent
                                                   if_subsets_are_not_equal: bool) -> bool:
     applied = False
     for _i, out_conn in enumerate(list(map_entry.out_connectors.keys())):
-        out_edges_of_out_conn = set(state.out_edges_by_connector(map_entry, out_conn))
+        # Ordered, not a set: the naming loop below allocates connector names first-come-wins, and
+        # ``MultiConnectorEdge`` hashes by id(), so a set would order it by allocation history --
+        # which varies run to run and would swap which edge keeps the base name.
+        out_edges_of_out_conn = sorted(state.out_edges_by_connector(map_entry, out_conn),
+                                       key=lambda e: (state.node_id(e.dst), e.dst_conn or ''))
         if len(out_edges_of_out_conn) > 1:
             if if_subsets_are_not_equal:
                 subsets = {e.data.subset for e in out_edges_of_out_conn}
@@ -749,11 +762,13 @@ def duplicate_memlets_sharing_single_in_connector(state: dace.SDFGState, map_ent
 
             # Need it to find unique names
             all_existing_connector_names = set()
-            for map_entry in parent_maps:
-                for in_conn in map_entry.in_connectors:
-                    all_existing_connector_names.add(in_conn[len("IN_"):])
-                for out_conn in map_entry.out_connectors:
-                    all_existing_connector_names.add(out_conn[len("OUT_"):])
+            # Distinct names: rebinding ``map_entry``/``out_conn`` here would clobber the enclosing
+            # loop variables for every later connector.
+            for pmap in parent_maps:
+                for conn in pmap.in_connectors:
+                    all_existing_connector_names.add(conn[len("IN_"):])
+                for conn in pmap.out_connectors:
+                    all_existing_connector_names.add(conn[len("OUT_"):])
 
             # Get the edge before the split, ensure all of them are the same
             prev_src_edge = None

@@ -7,6 +7,7 @@ dc_float = dc.float64
 dc_complex_float = dc.complex128
 
 SIZES = {'ny': 61, 'nx': 61, 'nit': 5, 'rho': 1.0, 'nu': 0.1, 'F': 1.0}
+PAPER_SIZES = {'ny': 101, 'nx': 101, 'nit': 50, 'rho': 1.0, 'nu': 0.1, 'F': 1.0}
 INPUT_ARGS = ('ny', 'nx')
 ARRAY_ARGS = ('u', 'v', 'p', 'dx', 'dy', 'dt')
 SCALARS = {}
@@ -51,10 +52,16 @@ def pressure_poisson_periodic_np(nit, p, dx, dy, b):
         pn[:] = p.copy()
         p[1:-1, 1:-1] = ((pn[1:-1, 2:] + pn[1:-1, 0:-2]) * dy**2 + (pn[2:, 1:-1] + pn[0:-2, 1:-1]) * dx**2) / (
             2 * (dx**2 + dy**2)) - dx**2 * dy**2 / (2 * (dx**2 + dy**2)) * b[1:-1, 1:-1]
-        p[1:-1, -1] = ((pn[1:-1, 0] + pn[1:-1, -2]) * dy**2 + (pn[2:, -1] + pn[0:-2, -1]) * dx**2) / (
-            2 * (dx**2 + dy**2)) - dx**2 * dy**2 / (2 * (dx**2 + dy**2)) * b[1:-1, -1]
-        p[1:-1, 0] = ((pn[1:-1, 1] + pn[1:-1, -1]) * dy**2 + (pn[2:, 0] + pn[0:-2, 0]) * dx**2) / (
-            2 * (dx**2 + dy**2)) - dx**2 * dy**2 / (2 * (dx**2 + dy**2)) * b[1:-1, 0]
+        p[1:-1, -1] = (
+            (pn[1:-1, 0] + pn[1:-1, -2]) * dy**2 +
+            (pn[2:, -1] + pn[0:-2, -1]) * dx**2) / (2 *
+                                                    (dx**2 + dy**2)) - dx**2 * dy**2 / (2 *
+                                                                                        (dx**2 + dy**2)) * b[1:-1, -1]
+        p[1:-1,
+          0] = ((pn[1:-1, 1] + pn[1:-1, -1]) * dy**2 +
+                (pn[2:, 0] + pn[0:-2, 0]) * dx**2) / (2 *
+                                                      (dx**2 + dy**2)) - dx**2 * dy**2 / (2 *
+                                                                                          (dx**2 + dy**2)) * b[1:-1, 0]
         p[-1, :] = p[-2, :]
         p[0, :] = p[1, :]
 
@@ -191,6 +198,7 @@ def kernel(u: dc_float[ny, nx], v: dc_float[ny, nx], dt: dc_float, dx: dc_float,
 CORPUS = dict(name='channel_flow',
               dwarf='structured_grids',
               sizes=SIZES,
+              paper_sizes=PAPER_SIZES,
               input_args=INPUT_ARGS,
               array_args=ARRAY_ARGS,
               scalars=SCALARS,

@@ -22,6 +22,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 import dace
+from tests.corpus.polybench.polybench import atol_for
 
 
 def _package():
@@ -55,23 +56,36 @@ def collect(name: Optional[str] = None) -> List[dict]:
 SIZE_CAP = 16
 
 
-def _capped_sizes(c: dict, cap: Optional[int] = SIZE_CAP) -> Dict[str, object]:
+def sizes_for(c: dict, preset: str = 'S') -> Dict[str, object]:
+    """The dataset symbols for ``preset``.
+
+    npbench declares several rows per benchmark (``S``/``M``/``L``/``paper`` in its ``bench_info``
+    JSON) and this port carried only ``S``, which is why a ``paper`` measurement was running S-sized
+    data. ``paper_sizes`` is that second row. A benchmark without one falls back to ``S``: a kernel
+    local to this corpus has no upstream paper row to copy.
+    """
+    if preset == 'paper':
+        return dict(c.get("paper_sizes") or c["sizes"])
+    return dict(c["sizes"])
+
+
+def _capped_sizes(c: dict, cap: Optional[int] = SIZE_CAP, preset: str = 'S') -> Dict[str, object]:
+    sizes = sizes_for(c, preset)
     if cap is None:
-        return dict(c["sizes"])
-    return {
-        k: (min(v, cap) if isinstance(v, int) and not isinstance(v, bool) else v)
-        for k, v in c["sizes"].items()
-    }
+        return sizes
+    return {k: (min(v, cap) if isinstance(v, int) and not isinstance(v, bool) else v) for k, v in sizes.items()}
 
 
-def make_inputs(c: dict, cap: Optional[int] = SIZE_CAP) -> Tuple[Dict[str, np.ndarray], Dict[str, object]]:
+def make_inputs(c: dict,
+                cap: Optional[int] = SIZE_CAP,
+                preset: str = 'S') -> Tuple[Dict[str, np.ndarray], Dict[str, object]]:
     """Initialize the named arrays at the dataset size; return ``(arrays, params)``
     where ``params`` holds the dataset symbols + any scalar kernel arguments.
 
-    ``cap`` clamps integer dataset symbols (default ``SIZE_CAP`` for a fast numerical
-    check); pass ``cap=None`` to use the full preset (e.g. the perf/speedup test, which
-    needs realistic sizes)."""
-    sizes = _capped_sizes(c, cap)
+    ``preset`` picks the dataset row (``S`` or ``paper``); ``cap`` clamps integer dataset
+    symbols on top of it (default ``SIZE_CAP`` for a fast numerical check). Pass ``cap=None``
+    to use the row as published (e.g. the perf/speedup test, which needs realistic sizes)."""
+    sizes = _capped_sizes(c, cap, preset)
     args = [sizes[a] for a in c["input_args"]]
     rets = c["initialize"](*args)
     if not isinstance(rets, tuple):
@@ -157,18 +171,20 @@ def outputs_match(ref: Dict[str, np.ndarray],
                   rtol: float = None,
                   atol: float = None) -> bool:
     """Compare reference vs candidate ``output_args`` with a DTYPE-AWARE tolerance
-    (:func:`_tol_for`): fp64 tight, fp32 fp32-appropriate, integers exact. Pass explicit
-    ``rtol`` / ``atol`` to override the per-array default."""
+    (:func:`_tol_for`): fp64 tight, fp32 fp32-appropriate, integers exact. The default
+    absolute term is raised to the array's reassociation floor -- see
+    ``polybench.REASSOC_SCALE``, whose copy of this comparison this one tracks. Pass
+    explicit ``rtol`` / ``atol`` to override the per-array default; an explicit ``atol``
+    is used as given."""
     for name, r in ref.items():
         g = got.get(name)
         if g is None:
             return False
         ra, ga = np.asarray(r), np.asarray(g)
         rt, at = _tol_for(ra.dtype)
+        at = atol if atol is not None else atol_for(ra, at)
         if rtol is not None:
             rt = rtol
-        if atol is not None:
-            at = atol
         if rt == 0.0 and at == 0.0:
             if not np.array_equal(ra, ga):
                 return False
