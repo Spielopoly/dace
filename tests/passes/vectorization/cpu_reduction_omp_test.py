@@ -118,13 +118,13 @@ def test_emits_omp_reduction_clause(kind):
 
 @pytest.mark.parametrize("kind", list(_PROGRAMS))
 def test_partial_folds_to_single_element(kind):
-    """The interposed reduction partial (``NormalizeWCRSource``'s ``_wcr_priv_*_acc`` on the
-    ``NSDFG -> AccessNode -[wcr]-> MapExit`` boundary) folds onto a single element -- a scalar,
-    not a widened tile buffer -- and the accumulator ``acc`` stays a true Scalar (required by
-    the OMP ``reduction`` clause)."""
+    """The interposed reduction partial on the
+    ``NSDFG -> AccessNode -[wcr]-> MapExit`` boundary folds onto a single
+    element, not a widened tile buffer. The accumulator ``acc`` stays a true
+    Scalar, as required by the OMP ``reduction`` clause."""
     sdfg = _vectorized(_PROGRAMS[kind][0])
     parts = [(k, d) for s in sdfg.all_sdfgs_recursive() for k, d in s.arrays.items()
-             if k.startswith("_wcr_priv") and k.endswith("_acc")]
+             if k.startswith("_wcr_priv") and (k.endswith("_acc") or ("_priv_acc_" in k and not k.endswith("_const")))]
     assert parts, "expected an interposed _wcr_priv reduction partial"
     for k, d in parts:
         assert d.total_size == 1, f"{k} reduction partial must fold onto a single element, got {d.total_size}"

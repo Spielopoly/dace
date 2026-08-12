@@ -29,6 +29,7 @@ import pytest
 
 import dace
 from dace import data, dtypes
+from dace.codegen.codeobject import CodeObject
 from dace.libraries.tileops import TileBinop
 from dace.libraries.tileops.nodes import TileIota
 from dace.sdfg import SDFG, nodes
@@ -191,6 +192,16 @@ def _build_tile_iota_sdfg() -> SDFG:
 # ============================================================
 # Inspection helpers
 # ============================================================
+
+
+def _generated_artifacts(sdfg: SDFG) -> Tuple[CodeObject, CodeObject]:
+    """Return the Cython host and aggregate cuTile build artifacts."""
+    code_objects = sdfg.generate_code()
+    host_objects = [co for co in code_objects if co.name == sdfg.name]
+    build_objects = [co for co in code_objects if co.target_type == "cutile_build"]
+    assert len(host_objects) == 1
+    assert len(build_objects) == 1
+    return host_objects[0], build_objects[0]
 
 
 def _all_map_entries(sdfg: SDFG) -> List[Tuple[nodes.MapEntry, dace.SDFGState]]:
@@ -601,13 +612,16 @@ class TestPipelineOrdering:
         sdfg.backend = dtypes.BackendLanguage.Python
 
     def test_full_sequence_k2_generates_cutile_code(self):
-        """Documented sequence on K=2 vadd -> Python backend cuTile code."""
+        """Documented K=2 sequence emits valid AOT cuTile artifacts."""
         sdfg = _build_vadd_k2_sdfg()
         self._run_full_sequence(sdfg)
         assert not any(isinstance(n, nodes.LibraryNode) for n, _ in sdfg.all_nodes_recursive())
         assert sdfg.backend == dtypes.BackendLanguage.Python
-        code_objects = sdfg.generate_code()
-        code = next(co for co in code_objects if co.name == sdfg.name).code
+        host, build = _generated_artifacts(sdfg)
+        assert host.language == "pyx" and host.linkable
+        assert build.language == "py" and build.target_type == "cutile_build"
+        assert not build.linkable
+        code = build.code
         assert "import cuda.tile as ct" in code
         assert "@ct.kernel" in code
         assert "ct.load(" in code
@@ -632,8 +646,7 @@ class TestPipelineOrdering:
         assert CuTileSetImplementations().apply_pass(sdfg, {}) == 9
         sdfg.expand_library_nodes()
         sdfg.backend = dtypes.BackendLanguage.Python
-        code_objects = sdfg.generate_code()
-        code = next(co for co in code_objects if co.name == sdfg.name).code
+        code = _generated_artifacts(sdfg)[1].code
         assert "import cuda.tile as ct" in code
 
     def test_storage_before_gpu_transforms_is_warned_noop_then_recovers(self):

@@ -1,20 +1,14 @@
 # Copyright 2019-2026 ETH Zurich and the DaCe authors. All rights reserved.
-"""Runtime scalars reach cuTile kernels as 1-element device arrays.
+"""Runtime scalars use exact exported cuTile scalar constraints.
 
-The ``cuda.tile`` launch boundary (1.5.0) cannot pass numeric scalars by
-value faithfully: by-value floats are typed float32 (silent f64 precision
-loss), Python ints >= 2**31 raise ``OverflowError`` (int32 typing), and
-numpy int scalars are rejected outright. The cuTile codegen therefore stages
-every float/int/uint Scalar and symbol as a dtype-preserving 1-element cupy
-array at the launch site and binds it as a scalar tile
-(``ct.load(name, (0,), shape=()).item()``) at kernel entry. Bool scalars stay by
-value (typed exactly as ``bool_``).
+The build-only module assigns an explicit ``ScalarConstraint`` for every
+read-only numeric scalar. The Cython host packs the matching fixed-width NumPy
+scalar, avoiding the demotion performed by the old runtime ``ct.launch`` path.
 
 Covers: f64 bit-exactness, int64 >= 2**31 (the old OverflowError case),
 uint64 >= 2**63, narrow ints (int8/int16 -- probed: cuda.tile accepts
-narrow-dtype 0-d tile loads, so no widening at the staging site), int symbols
-as sizes with non-divisible boundaries, bool args, and the structural
-launch-site/kernel-entry contract.
+narrow ints, int symbols as sizes with non-divisible boundaries, bool args,
+and the structural exported-ABI contract.
 """
 import itertools
 
@@ -70,7 +64,7 @@ def _shift_u64(x: dace.uint64[N], a: dace.uint64):
 
 
 @pytest.mark.gpu
-class TestScalarDeviceArrayRuntime:
+class TestScalarABIRuntime:
 
     def test_f64_scalar_bit_exact(self):
         """A non-f32-exact float64 scalar survives the kernel bit-exactly
@@ -109,8 +103,7 @@ class TestScalarDeviceArrayRuntime:
         np.testing.assert_array_equal(out, x + 2**31)
 
     def test_uint64_scalar_above_int64_range(self):
-        """A uint64 scalar >= 2**63 needs dtype-preserving staging (an int64
-        cast would overflow)."""
+        """A uint64 scalar >= 2**63 keeps its exact unsigned exported ABI."""
         csdfg = _cutile_compile(_shift_u64)
         n = 64
         big = np.uint64(2**63 + 12345)
@@ -119,8 +112,7 @@ class TestScalarDeviceArrayRuntime:
         np.testing.assert_array_equal(out, x + big)
 
     def test_int_symbol_as_size_non_divisible(self):
-        """The symbolic size N itself is an int symbol: it travels as a
-        device array and is used in-kernel (mask bound) as a 0-d tile."""
+        """The symbolic size N uses an exact scalar ABI in the mask bound."""
         csdfg = _cutile_compile(_scale_f64)
         for n in (1, 31, 100):  # all-tail, sub-width, and multi-tile+tail
             x = np.random.default_rng(n).random(n)
@@ -129,8 +121,7 @@ class TestScalarDeviceArrayRuntime:
 
     @pytest.mark.parametrize('dtype, np_dtype', [(dace.int8, np.int8), (dace.int16, np.int16)])
     def test_narrow_int_scalar_arg(self, dtype, np_dtype):
-        """int8/int16 scalars stage dtype-preserving and load as 0-d tiles
-        (probed: cuda.tile accepts narrow-dtype 0-d loads directly)."""
+        """int8/int16 scalars use matching narrow exported constraints."""
         cupy = pytest.importorskip('cupy')
         sdfg = _scalar_arg_sdfg(f'narrow_{np_dtype.__name__}_{next(_COUNTER)}', dtype)
         csdfg = sdfg.compile()
@@ -155,7 +146,7 @@ class TestScalarDeviceArrayRuntime:
 
 
 # =============================================================================
-# Structural tests (no GPU): launch-site staging + kernel-entry binding
+# Structural tests (no GPU): explicit constraints + exact host packing
 # =============================================================================
 
 
@@ -214,34 +205,42 @@ def _bool_scalar_sdfg(name: str, n: int = 64, tile_w: int = 32) -> dace.SDFG:
     return sdfg
 
 
-class TestLaunchSiteStaging:
-    """Generated code: numeric scalars staged as dtype-preserving 1-element
-    device arrays and rebound as 0-d tiles; bools stay by value."""
+class TestExportedScalarABI:
+    """Generated code uses matching explicit constraints and host packing."""
 
     @pytest.mark.parametrize('dtype, np_name', [
         (dace.float64, 'float64'),
         (dace.float32, 'float32'),
+        (dace.float16, 'float16'),
         (dace.int64, 'int64'),
         (dace.int32, 'int32'),
         (dace.int16, 'int16'),
         (dace.int8, 'int8'),
+        (dace.uint32, 'uint32'),
+        (dace.uint16, 'uint16'),
+        (dace.uint8, 'uint8'),
         (dace.uint64, 'uint64'),
     ])
-    def test_numeric_scalar_staged_and_tile_loaded(self, dtype, np_name):
+    def test_numeric_scalar_has_exact_constraint_and_packing(self, dtype, np_name):
         sdfg = _scalar_arg_sdfg(f'stage_{np_name}_{next(_COUNTER)}', dtype)
-        code = sdfg.generate_code()[0].code.replace(' ', '')
-        # Launch site: dtype-preserving device staging, no .item() unwrap.
-        assert f'cupy.asarray(a,dtype=numpy.{np_name}).reshape(1)' in code
-        assert 'a.item()' not in code
-        # Kernel entry: bound as a scalar tile (device-side .item()).
-        assert 'a_in=ct.load(a,(0,),shape=()).item()' in code
+        code_objects = sdfg.generate_code()
+        host = next(code.code for code in code_objects if code.language == 'pyx').replace(' ', '')
+        build = next(code.code for code in code_objects if code.target_type == 'cutile_build').replace(' ', '')
+        assert f'compilation.ScalarConstraint(ct.{np_name})' in build
+        assert f'numpy.{np_name}(__dace_raw_' in host
+        assert 'cupy.asarray(a' not in host
+        assert 'a_in=ct.load(a,(0,),shape=()).item()' not in build
+        assert 'a_in=a' in build
 
-    def test_bool_scalar_stays_by_value(self):
+    def test_bool_scalar_has_exact_constraint(self):
         sdfg = _bool_scalar_sdfg(f'stage_bool_{next(_COUNTER)}')
-        code = sdfg.generate_code()[0].code.replace(' ', '')
-        assert 'cupy.asarray(flag' not in code
-        assert 'ct.load(flag' not in code
-        assert 'flag.item()' in code  # 0-d-buffer unwrap at the launch site
+        code_objects = sdfg.generate_code()
+        host = next(code.code for code in code_objects if code.language == 'pyx').replace(' ', '')
+        build = next(code.code for code in code_objects if code.target_type == 'cutile_build').replace(' ', '')
+        assert 'compilation.ScalarConstraint(ct.bool_)' in build
+        assert 'numpy.bool_(__dace_raw_' in host
+        assert 'cupy.asarray(flag' not in host
+        assert 'ct.load(flag' not in build
 
 
 if __name__ == '__main__':

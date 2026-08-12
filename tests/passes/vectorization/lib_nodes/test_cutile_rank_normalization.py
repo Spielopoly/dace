@@ -65,10 +65,13 @@ def _scale3d(A: dace.float64[L, M, N], B: dace.float64[L, M, N]):
 
 
 def _lowered_code(prog, widths):
-    """Lower ``prog`` through ``VectorizeCuTile`` and return the generated code."""
+    """Return the lowered SDFG and aggregate cuTile build code."""
     sdfg = prog.to_sdfg(simplify=True)
     VectorizeCuTile(widths=widths).apply_pass(sdfg, {})
-    return sdfg, "".join(c.clean_code for c in sdfg.generate_code())
+    code_objects = sdfg.generate_code()
+    build_objects = [co for co in code_objects if co.target_type == "cutile_build"]
+    assert len(build_objects) == 1
+    return sdfg, build_objects[0].clean_code
 
 
 # ---------------------------------------------------------------------------
@@ -106,8 +109,9 @@ def test_pipeline_ndim_gt_k_tiles_are_rank_k():
     load and the store consumes the K-dim ``_src`` directly (no sink-side
     ``ct.reshape(_src, ...)`` squeeze)."""
     _, code = _lowered_code(_scale3d, widths=(8, 8))
-    assert "ct.reshape(ct.load(_src" in code
-    assert "ct.reshape(_src" not in code
+    compact = "".join(code.split())
+    assert "ct.reshape(ct.load(_src" in compact
+    assert "ct.reshape(_src" not in compact
 
 
 def test_store_rank_mismatch_raises():

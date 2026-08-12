@@ -130,14 +130,14 @@ def test_gpu_storage_read_only_scalar_stays_host():
 
 
 def test_gpu_storage_written_scalar_becomes_gpu_global():
-    """A WRITTEN non-transient scalar output is marked GPU_Global by
-    ``apply_gpu_storage`` (accepted edge case: the caller must then pass a
-    cupy 0-d buffer for it)."""
+    """A written scalar is promoted to one-element GPU program storage."""
     sdfg = _axpy_scalar_out.to_sdfg(simplify=False)
     sdfg.name = "gs_written_scalar"
     VectorizeCuTile(widths=(32, ), use_gpu_storage=True).apply_pass(sdfg, {})
 
     desc = sdfg.arrays["s"]
+    assert isinstance(desc, data.Array)
+    assert tuple(int(dim) for dim in desc.shape) == (1, )
     assert not desc.transient
     assert desc.storage == dtypes.StorageType.GPU_Global
 
@@ -241,9 +241,8 @@ def test_gpu_storage_rejects_host_arrays():
     x = rng.random(n)
     y = rng.random(n)
 
-    # Observed error: `RuntimeError: NumPy only supports stream=None` from
-    # cuda.tile/cupy when handed host arrays.
-    with pytest.raises(RuntimeError, match="NumPy"):
+    # The generated launch helper rejects host storage before invoking CUDA.
+    with pytest.raises(TypeError, match="must be a CUDA array"):
         csdfg(a=2.5, x=x, y=y, N=n)
 
 

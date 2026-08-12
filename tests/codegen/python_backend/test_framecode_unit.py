@@ -1,8 +1,6 @@
 # Copyright 2019-2026 ETH Zurich and the DaCe authors. All rights reserved.
 """Unit tests for dace/codegen/py/framecode.py — DaCePythonCodeGenerator and helpers."""
 
-import collections
-import copy
 from types import SimpleNamespace
 import pytest
 import numpy as np
@@ -15,12 +13,12 @@ from dace.codegen.py.prettycode import PythonCodeIOStream
 from dace.codegen.py.python_target import PythonCodeGen
 from dace.properties import CodeBlock
 from dace.sdfg import SDFG, nodes
-from dace.sdfg.state import ControlFlowRegion, LoopRegion, SDFGState
-
+from dace.sdfg.state import LoopRegion
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _make_sdfg(name: str = "test_sdfg") -> SDFG:
     """Create a minimal SDFG with one empty state."""
@@ -123,7 +121,6 @@ class TestInitAndSymbolResolution:
 
         with pytest.raises(ValueError, match='Cannot append code with language'):
             sdfg.append_init_code('int sentinel = 1;', language=dtypes.Language.CPP)
-
 
     def test_python_backend_default_map_schedule_becomes_sequential(self):
         """Default-scheduled maps are normalized to Sequential before Python dispatch."""
@@ -291,8 +288,10 @@ class TestInitAndSymbolResolution:
         codegen = DaCePythonCodeGenerator(sdfg)
 
         class HasUsedSymbols:
+
             def used_symbols(self, all_symbols=False):
                 return {"alpha", "beta"}
+
         obj = HasUsedSymbols()
         result = codegen.free_symbols(obj)
         assert result == {"alpha", "beta"}
@@ -329,7 +328,7 @@ class TestGenerateConstants:
         codegen = DaCePythonCodeGenerator(sdfg)
         stream = PythonCodeIOStream()
         codegen.generate_constants(sdfg, stream)
-        code = "import numpy\n" # Need to import numpy for the array literal because we only call generate_constants, not the full codegen pipeline which would add the import
+        code = "import numpy\n"  # Need to import numpy for the array literal because we only call generate_constants, not the full codegen pipeline which would add the import
         code += stream.getvalue()
         namespace = {}
         exec(code, namespace)
@@ -462,8 +461,10 @@ class TestGenerateFileheader:
 
         # Add a fake target with includes
         class FakeTarget:
+
             def get_includes(self):
                 return {"frame": ["json"]}
+
         codegen._dispatcher._used_targets.add(FakeTarget())
 
         stream = PythonCodeIOStream()
@@ -529,6 +530,7 @@ class TestGenerateFileheader:
             state_fields = []
 
         class FakeTarget:
+
             def get_includes(self):
                 return {"frame": ["numpy", "from math import sin", "import json"]}
 
@@ -705,8 +707,7 @@ class TestDetermineAllocationLifetime:
         """Persistent → top SDFG alloc + statestruct entry."""
         sdfg = dace.SDFG("lt_persist")
         sdfg.backend = dace.dtypes.BackendLanguage.Python
-        sdfg.add_array("T", [5], dace.float64, transient=True,
-                        lifetime=dtypes.AllocationLifetime.Persistent)
+        sdfg.add_array("T", [5], dace.float64, transient=True, lifetime=dtypes.AllocationLifetime.Persistent)
         state = sdfg.add_state("s0")
         state.add_access("T")
 
@@ -721,8 +722,7 @@ class TestDetermineAllocationLifetime:
         """SDFG lifetime → SDFG scope alloc."""
         sdfg = dace.SDFG("lt_sdfg")
         sdfg.backend = dace.dtypes.BackendLanguage.Python
-        sdfg.add_array("T", [5], dace.float64, transient=True,
-                        lifetime=dtypes.AllocationLifetime.SDFG)
+        sdfg.add_array("T", [5], dace.float64, transient=True, lifetime=dtypes.AllocationLifetime.SDFG)
         state = sdfg.add_state("s0")
         state.add_access("T")
 
@@ -734,8 +734,7 @@ class TestDetermineAllocationLifetime:
         """State lifetime, single state → state alloc."""
         sdfg = dace.SDFG("lt_state_single")
         sdfg.backend = dace.dtypes.BackendLanguage.Python
-        sdfg.add_array("T", [5], dace.float64, transient=True,
-                        lifetime=dtypes.AllocationLifetime.State)
+        sdfg.add_array("T", [5], dace.float64, transient=True, lifetime=dtypes.AllocationLifetime.State)
         state = sdfg.add_state("s0")
         state.add_access("T")
 
@@ -748,8 +747,7 @@ class TestDetermineAllocationLifetime:
         """State lifetime, multi state → SDFG alloc."""
         sdfg = dace.SDFG("lt_state_multi")
         sdfg.backend = dace.dtypes.BackendLanguage.Python
-        sdfg.add_array("T", [5], dace.float64, transient=True,
-                        lifetime=dtypes.AllocationLifetime.State)
+        sdfg.add_array("T", [5], dace.float64, transient=True, lifetime=dtypes.AllocationLifetime.State)
         s0 = sdfg.add_state("s0")
         s1 = sdfg.add_state("s1")
         sdfg.add_edge(s0, s1, dace.InterstateEdge())
@@ -765,8 +763,7 @@ class TestDetermineAllocationLifetime:
         """Unused transient → skipped."""
         sdfg = dace.SDFG("lt_unused")
         sdfg.backend = dace.dtypes.BackendLanguage.Python
-        sdfg.add_array("T", [5], dace.float64, transient=True,
-                        lifetime=dtypes.AllocationLifetime.Scope)
+        sdfg.add_array("T", [5], dace.float64, transient=True, lifetime=dtypes.AllocationLifetime.Scope)
         sdfg.add_state("s0")
         # No access node for T
 
@@ -816,8 +813,7 @@ class TestDetermineAllocationLifetime:
         """Global lifetime → statestruct + top SDFG alloc."""
         sdfg = dace.SDFG("lt_global")
         sdfg.backend = dace.dtypes.BackendLanguage.Python
-        sdfg.add_array("T", [5], dace.float64, transient=True,
-                        lifetime=dtypes.AllocationLifetime.Global)
+        sdfg.add_array("T", [5], dace.float64, transient=True, lifetime=dtypes.AllocationLifetime.Global)
         state = sdfg.add_state("s0")
         state.add_access("T")
 
@@ -831,8 +827,7 @@ class TestDetermineAllocationLifetime:
         sdfg = dace.SDFG("lt_scope")
         sdfg.backend = dace.dtypes.BackendLanguage.Python
         sdfg.add_array("A", [10], dace.float64)
-        sdfg.add_array("T", [10], dace.float64, transient=True,
-                        lifetime=dtypes.AllocationLifetime.Scope)
+        sdfg.add_array("T", [10], dace.float64, transient=True, lifetime=dtypes.AllocationLifetime.Scope)
         sdfg.add_array("B", [10], dace.float64)
         state = sdfg.add_state("s0")
         a = state.add_read("A")
@@ -1007,15 +1002,23 @@ class TestGenerateCode:
         code_objects = _generate_code_for(sdfg)
         assert len(code_objects) >= 1
 
-    def test_generate_code_valid_python(self):
-        """Generated code is valid Python that can be compiled."""
+    def test_generate_code_valid_cython(self, tmp_path):
+        """Generated host code compiles and runs as a Cython extension."""
         sdfg = _make_sdfg_with_tasklet("valid_py")
+        sdfg.build_folder = str(tmp_path / "valid_py")
         code_objects = _generate_code_for(sdfg)
-        code = code_objects[0].code
-        # Should be compilable Python
-        compile(code, "<generated>", "exec")
+        assert code_objects[0].language == "pyx"
 
-    @pytest.mark.skip(reason="Test is outdated. The codegen pipeline now generates multiple code objects, and imports them. This is more complicated than a simple exec test.")
+        compiled = sdfg.compile()
+        source = np.array([3.5], dtype=np.float64)
+        destination = np.zeros(1, dtype=np.float64)
+        compiled(A=source, B=destination)
+        np.testing.assert_array_equal(destination, source)
+
+    @pytest.mark.skip(
+        reason=
+        "Test is outdated. The codegen pipeline now generates multiple code objects, and imports them. This is more complicated than a simple exec test."
+    )
     def test_generate_code_executable(self):
         """Generated code is executable — function can be called."""
         sdfg = _make_sdfg_with_tasklet("exec_test")
@@ -1028,7 +1031,7 @@ class TestGenerateCode:
         assert callable(ns["exec_test"])
 
     def test_generate_code_with_loop_region(self):
-        """Code with a LoopRegion generates valid Python."""
+        """Code with a LoopRegion generates valid Cython host control flow."""
         sdfg = dace.SDFG("loop_sdfg")
         sdfg.backend = dace.dtypes.BackendLanguage.Python
         sdfg.add_array("A", [1], dace.float64)
@@ -1038,8 +1041,12 @@ class TestGenerateCode:
         init_state = sdfg.add_state("init")
 
         # Create a loop region (correct kwarg names: initialize_expr, update_expr)
-        loop = LoopRegion("myloop", condition_expr="i < N", loop_var="i",
-                          initialize_expr="i = 0", update_expr="i = i + 1", sdfg=sdfg)
+        loop = LoopRegion("myloop",
+                          condition_expr="i < N",
+                          loop_var="i",
+                          initialize_expr="i = 0",
+                          update_expr="i = i + 1",
+                          sdfg=sdfg)
         sdfg.add_node(loop)
         sdfg.add_edge(init_state, loop, dace.InterstateEdge())
 
@@ -1403,7 +1410,7 @@ class TestEdgeCasesAndErrors:
         code_objects = _generate_code_for(sdfg)
         assert len(code_objects) >= 1
         co = code_objects[0]
-        assert co.language == "py"
+        assert co.language == "pyx"
         assert co.title == "Frame"
         assert co.name == "co_props"
 
@@ -1418,7 +1425,7 @@ class TestEdgeCasesAndErrors:
         codegen = DaCePythonCodeGenerator(sdfg)
         stream = PythonCodeIOStream()
         codegen.generate_constants(sdfg, stream)
-        code = "import numpy\n" # Need to import numpy for the array literal because we only call generate_constants, not the full codegen pipeline which would add the import
+        code = "import numpy\n"  # Need to import numpy for the array literal because we only call generate_constants, not the full codegen pipeline which would add the import
         code += stream.getvalue()
         namespace = {}
         exec(code, namespace)
@@ -1438,15 +1445,13 @@ class TestEdgeCasesAndErrors:
         code = stream.getvalue()
         assert "PI = 3.14159" in code
 
-    @pytest.mark.parametrize(
-        ('value', 'expected_literal'),
-        [
-            ('hello world', "'hello world'"),
-            (True, 'True'),
-            (None, 'None'),
-            (3 + 4j, '(3+4j)'),
-        ],
-        ids=['string', 'bool', 'none', 'complex'])
+    @pytest.mark.parametrize(('value', 'expected_literal'), [
+        ('hello world', "'hello world'"),
+        (True, 'True'),
+        (None, 'None'),
+        (3 + 4j, '(3+4j)'),
+    ],
+                             ids=['string', 'bool', 'none', 'complex'])
     def test_scalar_constants_emit_valid_python_literals(self, value, expected_literal):
         """Scalar constants should be emitted as valid Python literals for exec()."""
         sdfg = dace.SDFG('scalar_literal')
@@ -1637,6 +1642,7 @@ class TestAdditionalFramecodeBranches:
         fake_reachability = {sdfg.cfg_id: {s0: {s0}, s1: {s1}}}
 
         class FakeReachability:
+
             def apply_pass(self, *_args, **_kwargs):
                 return fake_reachability
 
@@ -1668,6 +1674,7 @@ class TestAdditionalFramecodeBranches:
         codegen = DaCePythonCodeGenerator(sdfg)
 
         class FakeEdgeData:
+
             def new_symbols(self, *_args, **_kwargs):
                 return {"bad": None}
 
@@ -1808,8 +1815,7 @@ class TestCoverageBoostV2:
         """Line 388: transient name in edge free_symbols → appended to instances."""
         sdfg = dace.SDFG("edge_trans")
         sdfg.backend = dace.dtypes.BackendLanguage.Python
-        sdfg.add_array("T", [1], dace.float64, transient=True,
-                       lifetime=dtypes.AllocationLifetime.Scope)
+        sdfg.add_array("T", [1], dace.float64, transient=True, lifetime=dtypes.AllocationLifetime.Scope)
         sdfg.add_array("A", [1], dace.float64)
         s0 = sdfg.add_state("s0")
         s1 = sdfg.add_state("s1")
@@ -1835,16 +1841,13 @@ class TestCoverageBoostV2:
         """Line 428: Persistent transient with no access node → continue (skipped)."""
         sdfg = dace.SDFG("persist_unused")
         sdfg.backend = dace.dtypes.BackendLanguage.Python
-        sdfg.add_array("T", [2], dace.float64, transient=True,
-                       lifetime=dtypes.AllocationLifetime.Persistent)
+        sdfg.add_array("T", [2], dace.float64, transient=True, lifetime=dtypes.AllocationLifetime.Persistent)
         sdfg.add_state("s0")  # no access to T
 
         codegen = DaCePythonCodeGenerator(sdfg)
         codegen.determine_allocation_lifetime(sdfg)
         # T should NOT appear in to_allocate (skipped at line 428)
-        all_names = {entry[2].data
-                     for entries in codegen.to_allocate.values()
-                     for entry in entries}
+        all_names = {entry[2].data for entries in codegen.to_allocate.values() for entry in entries}
         assert "T" not in all_names
 
     # ------------------------------------------------------------------
@@ -1855,8 +1858,7 @@ class TestCoverageBoostV2:
         """Lines 477-478, 481: State lifetime multi-state path hit via mocked shared_transients."""
         sdfg = dace.SDFG("state_lt_ms")
         sdfg.backend = dace.dtypes.BackendLanguage.Python
-        sdfg.add_array("T", [5], dace.float64, transient=True,
-                       lifetime=dtypes.AllocationLifetime.State)
+        sdfg.add_array("T", [5], dace.float64, transient=True, lifetime=dtypes.AllocationLifetime.State)
         s0 = sdfg.add_state("s0")
         s1 = sdfg.add_state("s1")
         sdfg.add_edge(s0, s1, dace.InterstateEdge())
@@ -1878,8 +1880,7 @@ class TestCoverageBoostV2:
         """Lines 495-496: Scope lifetime transient in interstate edge → multistate=True."""
         sdfg = dace.SDFG("scope_lt_edge")
         sdfg.backend = dace.dtypes.BackendLanguage.Python
-        sdfg.add_array("T", [1], dace.float64, transient=True,
-                       lifetime=dtypes.AllocationLifetime.Scope)
+        sdfg.add_array("T", [1], dace.float64, transient=True, lifetime=dtypes.AllocationLifetime.Scope)
         sdfg.add_array("A", [1], dace.float64)
         s0 = sdfg.add_state("s0")
         s1 = sdfg.add_state("s1")
@@ -1904,8 +1905,7 @@ class TestCoverageBoostV2:
         """Lines 504, 514-515, 534, 537: Scope lifetime in two states → multistate=True."""
         sdfg = dace.SDFG("scope_lt_2s")
         sdfg.backend = dace.dtypes.BackendLanguage.Python
-        sdfg.add_array("T", [5], dace.float64, transient=True,
-                       lifetime=dtypes.AllocationLifetime.Scope)
+        sdfg.add_array("T", [5], dace.float64, transient=True, lifetime=dtypes.AllocationLifetime.Scope)
         s0 = sdfg.add_state("s0")
         s1 = sdfg.add_state("s1")
         sdfg.add_edge(s0, s1, dace.InterstateEdge())
@@ -1926,8 +1926,7 @@ class TestCoverageBoostV2:
         sdfg = dace.SDFG("two_maps_scope")
         sdfg.backend = dace.dtypes.BackendLanguage.Python
         sdfg.add_array("A", [10], dace.float64)
-        sdfg.add_array("T", [10], dace.float64, transient=True,
-                       lifetime=dtypes.AllocationLifetime.Scope)
+        sdfg.add_array("T", [10], dace.float64, transient=True, lifetime=dtypes.AllocationLifetime.Scope)
         sdfg.add_array("B", [10], dace.float64)
         state = sdfg.add_state("s0")
 
@@ -1951,9 +1950,7 @@ class TestCoverageBoostV2:
         monkeypatch.setattr(dace.SDFG, "shared_transients", lambda *_a, **_kw: [])
         codegen.determine_allocation_lifetime(sdfg)
         # T should be allocated at state level (common parent of me1 and me2 is the state)
-        all_names = {entry[2].data
-                     for entries in codegen.to_allocate.values()
-                     for entry in entries}
+        all_names = {entry[2].data for entries in codegen.to_allocate.values() for entry in entries}
         assert "T" in all_names
 
     # ------------------------------------------------------------------
@@ -1964,8 +1961,7 @@ class TestCoverageBoostV2:
         """Lines 553-570, 575: _can_allocate fails → traverse up until None → top_sdfg."""
         sdfg = dace.SDFG("alloc_trav")
         sdfg.backend = dace.dtypes.BackendLanguage.Python
-        sdfg.add_array("T", [4], dace.float64, transient=True,
-                       lifetime=dtypes.AllocationLifetime.Scope)
+        sdfg.add_array("T", [4], dace.float64, transient=True, lifetime=dtypes.AllocationLifetime.Scope)
         s0 = sdfg.add_state("s0")
         s0.add_access("T")
 
@@ -2003,8 +1999,7 @@ class TestCoverageBoostV2:
 
         codegen = DaCePythonCodeGenerator(sdfg)
         monkeypatch.setattr(dace.SDFG, "shared_transients", lambda *_a, **_kw: [])
-        monkeypatch.setattr(framecode_module.utils, "is_nonfree_sym_dependent",
-                            lambda *_: True)
+        monkeypatch.setattr(framecode_module.utils, "is_nonfree_sym_dependent", lambda *_: True)
         codegen.determine_allocation_lifetime(sdfg)
         # V should appear in per-state to_allocate entries
         assert len(codegen.to_allocate) > 0
@@ -2017,8 +2012,7 @@ class TestCoverageBoostV2:
         """Line 604: non-free sym dep with reachable instances → else (line 604) for declare."""
         sdfg = dace.SDFG("nonfree_reach")
         sdfg.backend = dace.dtypes.BackendLanguage.Python
-        sdfg.add_array("T", [4], dace.float64, transient=True,
-                       lifetime=dtypes.AllocationLifetime.Scope)
+        sdfg.add_array("T", [4], dace.float64, transient=True, lifetime=dtypes.AllocationLifetime.Scope)
         s0 = sdfg.add_state("s0", is_start_block=True)
         s1 = sdfg.add_state("s1")
         sdfg.add_edge(s0, s1, dace.InterstateEdge())
@@ -2027,8 +2021,7 @@ class TestCoverageBoostV2:
 
         codegen = DaCePythonCodeGenerator(sdfg)
         monkeypatch.setattr(dace.SDFG, "shared_transients", lambda *_a, **_kw: [])
-        monkeypatch.setattr(framecode_module.utils, "is_nonfree_sym_dependent",
-                            lambda *_: True)
+        monkeypatch.setattr(framecode_module.utils, "is_nonfree_sym_dependent", lambda *_: True)
         # Default reachability: s1 IS reachable from s0 → else branch (line 604)
         codegen.determine_allocation_lifetime(sdfg)
         entries = [t for vals in codegen.to_allocate.values() for t in vals]
@@ -2043,8 +2036,7 @@ class TestCoverageBoostV2:
         sdfg = dace.SDFG("alloc_state_nn")
         sdfg.backend = dace.dtypes.BackendLanguage.Python
         sdfg.add_array("A", [1], dace.float64)
-        sdfg.add_array("T", [1], dace.float64, transient=True,
-                       lifetime=dtypes.AllocationLifetime.Scope)
+        sdfg.add_array("T", [1], dace.float64, transient=True, lifetime=dtypes.AllocationLifetime.Scope)
         sdfg.add_array("B", [1], dace.float64)
         state = sdfg.add_state("s0")
         a_nd = state.add_read("A")
@@ -2075,11 +2067,9 @@ class TestCoverageBoostV2:
         codegen = DaCePythonCodeGenerator(sdfg)
 
         # First entry: deallocate=False → will trigger line 654 (continue)
-        codegen.to_allocate[state].append(
-            (sdfg, state, nodes.AccessNode("T"), True, False, False))
+        codegen.to_allocate[state].append((sdfg, state, nodes.AccessNode("T"), True, False, False))
         # Second entry: deallocate=True, state not None → line 656 (state.block_id)
-        codegen.to_allocate[state].append(
-            (sdfg, state, nodes.AccessNode("T"), False, False, True))
+        codegen.to_allocate[state].append((sdfg, state, nodes.AccessNode("T"), False, False, True))
 
         captured = {}
 
@@ -2088,8 +2078,7 @@ class TestCoverageBoostV2:
             captured["st"] = st
 
         codegen._dispatcher.dispatch_deallocate = fake_dispatch_dealloc
-        codegen.deallocate_arrays_in_scope(sdfg, sdfg, state,
-                                           PythonCodeIOStream(), PythonCodeIOStream())
+        codegen.deallocate_arrays_in_scope(sdfg, sdfg, state, PythonCodeIOStream(), PythonCodeIOStream())
 
         assert "state_id" in captured
         assert captured["state_id"] == state.block_id
@@ -2127,8 +2116,7 @@ class TestCoverageBoostV2:
         codegen.determine_allocation_lifetime(outer)
 
         # Mock generate_states so node dispatch is bypassed
-        monkeypatch.setattr(codegen, "generate_states",
-                            lambda s, gs, cs: set(s.states()))
+        monkeypatch.setattr(codegen, "generate_states", lambda s, gs, cs: set(s.states()))
         monkeypatch.setattr(codegen, "allocate_arrays_in_scope", lambda *_: None)
         monkeypatch.setattr(codegen, "deallocate_arrays_in_scope", lambda *_: None)
 
@@ -2169,8 +2157,11 @@ class TestCoverageBoostV2:
 
         init_state = sdfg.add_state("init")
 
-        loop = LoopRegion("loop_i", condition_expr="i < 5", loop_var="i",
-                          initialize_expr="i = 0", update_expr="i = i + 1",
+        loop = LoopRegion("loop_i",
+                          condition_expr="i < 5",
+                          loop_var="i",
+                          initialize_expr="i = 0",
+                          update_expr="i = i + 1",
                           sdfg=sdfg)
         sdfg.add_node(loop)
         sdfg.add_edge(init_state, loop, dace.InterstateEdge())
@@ -2215,8 +2206,7 @@ class TestCoverageBoostV2:
         a = ostate.add_read("A")
         b = ostate.add_write("B")
         # Map "k" in symbol_mapping so it's skipped in inner's generate_code
-        nsdfg = ostate.add_nested_sdfg(inner, {"X"}, {"Y"},
-                                       symbol_mapping={"k": "0"})
+        nsdfg = ostate.add_nested_sdfg(inner, {"X"}, {"Y"}, symbol_mapping={"k": "0"})
         ostate.add_edge(a, None, nsdfg, "X", dace.Memlet("A[0]"))
         ostate.add_edge(nsdfg, "Y", b, None, dace.Memlet("B[0]"))
 
@@ -2224,8 +2214,7 @@ class TestCoverageBoostV2:
         codegen = DaCePythonCodeGenerator(outer)
         codegen.determine_allocation_lifetime(outer)
 
-        monkeypatch.setattr(codegen, "generate_states",
-                            lambda s, gs, cs: set(s.states()))
+        monkeypatch.setattr(codegen, "generate_states", lambda s, gs, cs: set(s.states()))
         monkeypatch.setattr(codegen, "allocate_arrays_in_scope", lambda *_: None)
         monkeypatch.setattr(codegen, "deallocate_arrays_in_scope", lambda *_: None)
 
@@ -2276,8 +2265,7 @@ class TestCoverageBoostV2:
         sdfg = dace.SDFG("scope_lt_map")
         sdfg.backend = dace.dtypes.BackendLanguage.Python
         sdfg.add_array("A", [10], dace.float64)
-        sdfg.add_array("T", [1], dace.float64, transient=True,
-                       lifetime=dtypes.AllocationLifetime.Scope)
+        sdfg.add_array("T", [1], dace.float64, transient=True, lifetime=dtypes.AllocationLifetime.Scope)
         sdfg.add_array("B", [10], dace.float64)
         state = sdfg.add_state("s0")
         me, mx = state.add_map("m", {"i": "0:10"})
@@ -2293,7 +2281,5 @@ class TestCoverageBoostV2:
         monkeypatch.setattr(dace.SDFG, "shared_transients", lambda *_a, **_kw: [])
         codegen.determine_allocation_lifetime(sdfg)
         # T should be allocated at map entry scope
-        all_names = {entry[2].data
-                     for entries in codegen.to_allocate.values()
-                     for entry in entries}
+        all_names = {entry[2].data for entries in codegen.to_allocate.values() for entry in entries}
         assert "T" in all_names

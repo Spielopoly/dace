@@ -347,6 +347,8 @@ class ExpandReduceAuto(pm.ExpandTransformation):
         Dispatches to one of the existing expansions based on the node's schedule, which
         ``set_default_schedule_and_storage_types`` assigns before expansion:
 
+        * Python backend -> the pure map+WCR expansion, avoiding opaque C++
+          reduction tasklets.
         * ``Sequential`` (the node is nested in a parallel map) -> the sequential accumulator,
           whose combination order is fixed and therefore independent of the thread count. It needs
           an identity to seed the accumulator, so a node without one goes the parallel way.
@@ -366,6 +368,8 @@ class ExpandReduceAuto(pm.ExpandTransformation):
     @staticmethod
     def expansion(node: 'Reduce', state: SDFGState, sdfg: SDFG):
         ExpandReduceAuto.environments = []
+        if sdfg.backend == dtypes.BackendLanguage.Python:
+            return ExpandReducePure.expansion(node, state, sdfg)
         if node.schedule == dtypes.ScheduleType.Sequential and node.identity is not None:
             return ExpandReducePureSequentialDim.expansion(node, state, sdfg)
         if node.schedule in dtypes.GPU_SCHEDULES:

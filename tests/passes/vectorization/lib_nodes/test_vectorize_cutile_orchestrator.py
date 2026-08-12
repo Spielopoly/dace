@@ -6,11 +6,12 @@ Two layers:
 * **Structure / codegen tests (no GPU):** after
   ``VectorizeCuTile(widths=...).apply_pass(sdfg, {})`` the SDFG must carry no
   unexpanded tileops library nodes, use the Python backend, and generate
-  ``cuda.tile`` code (``import cuda.tile``, a ``@ct.kernel`` function,
-  ``ct.load(`` — masked stores under the default ``full_mask`` remainder
-  strategy emit ``ct.scatter(`` rather than ``ct.store(``). The orchestrator
-  API surface (eager config validation, ``strict`` forwarding) is covered here
-  too.
+  a linkable Cython host and one non-linkable aggregate ``cutile_build``
+  artifact. The latter contains ``import cuda.tile``, one ``@ct.kernel``
+  function, and ``ct.load(`` — masked stores under the default ``full_mask``
+  remainder strategy emit ``ct.scatter(`` rather than ``ct.store(``). The
+  orchestrator API surface (eager config validation, ``strict`` forwarding)
+  is covered here too.
 * **Runtime tests (``@pytest.mark.gpu``):** compile and run on GPU with CuPy
   arrays and compare against NumPy references — aligned and non-divisible
   sizes (masked remainder), K=2 ``(8, 4)`` 2-D kernels, symbolic sizes,
@@ -31,9 +32,9 @@ import pytest
 
 import dace
 from dace import dtypes
+from dace.codegen.codeobject import CodeObject
 from dace.sdfg import SDFG, nodes
 from dace.transformation.passes.vectorization import VectorizeCuTile
-
 
 # ============================================================
 # Fixture builders
@@ -161,14 +162,16 @@ def _build_no_anchor_sdfg(name: str) -> SDFG:
 # ============================================================
 
 
-def _generate_code(sdfg: SDFG) -> str:
-    """Generate Python-backend code for ``sdfg`` and return the main file text.
+def _generate_artifacts(sdfg: SDFG) -> Tuple[CodeObject, CodeObject]:
+    """Return the Cython host and aggregate cuTile build artifacts.
 
     :param sdfg: The (already lowered) SDFG.
-    :returns: The generated code of the main code object.
+    :returns: The host and build code objects.
     """
     code_objects = sdfg.generate_code()
-    return next(co for co in code_objects if co.name == sdfg.name).code
+    host = next(co for co in code_objects if co.name == sdfg.name)
+    build = next(co for co in code_objects if co.target_type == "cutile_build")
+    return host, build
 
 
 def _library_nodes(sdfg: SDFG) -> Sequence[nodes.LibraryNode]:
@@ -251,8 +254,8 @@ class TestOrchestratorStructure:
                 f"{name} storage is {sdfg.arrays[name].storage}, expected Default or CPU_Heap")
         # GPU_Global transient clones exist
         gpu_clones = {
-            name for name, desc in sdfg.arrays.items()
-            if desc.storage == dtypes.StorageType.GPU_Global and desc.transient
+            name
+            for name, desc in sdfg.arrays.items() if desc.storage == dtypes.StorageType.GPU_Global and desc.transient
         }
         assert len(gpu_clones) >= 3, f"Expected at least 3 GPU clones, found {gpu_clones}"
 
@@ -302,38 +305,47 @@ class TestOrchestratorStructure:
 
 
 class TestOrchestratorCodegen:
-    """Generated Python-backend code after the orchestrator."""
+    """Generated Cython-host and aggregate-build artifacts."""
 
-    def test_code_is_valid_python(self):
-        """Generated code parses with ast.parse."""
+    def test_artifact_split_and_valid_build_python(self):
+        """The host is Cython and the build-only module is valid Python."""
         sdfg = _build_vadd_sdfg("vcutile_code_valid")
         VectorizeCuTile(widths=(8, )).apply_pass(sdfg, {})
-        ast.parse(_generate_code(sdfg))
+        host, build = _generate_artifacts(sdfg)
+        assert host.language == "pyx" and host.linkable
+        assert build.language == "py"
+        assert build.target_type == "cutile_build" and not build.linkable
+        ast.parse(build.code)
 
-    def test_code_imports_cuda_tile(self):
-        """Generated code imports cuda.tile."""
+    def test_build_imports_cuda_tile_but_host_does_not(self):
+        """Only the isolated build module imports cuda.tile."""
         sdfg = _build_vadd_sdfg("vcutile_code_import")
         VectorizeCuTile(widths=(8, )).apply_pass(sdfg, {})
-        code = _generate_code(sdfg)
-        assert "import cuda.tile as ct" in code
+        host, build = _generate_artifacts(sdfg)
+        assert "import cuda.tile as ct" in build.code
+        assert "import cuda.tile" not in host.code
 
-    def test_code_has_kernel_function_and_launch(self):
-        """Generated code has a @ct.kernel function and a ct.launch call."""
+    def test_build_has_kernel_and_host_has_aot_launch(self):
+        """The build owns the kernel and the host launches its exported cubin."""
         sdfg = _build_vadd_sdfg("vcutile_code_kernel")
         VectorizeCuTile(widths=(8, )).apply_pass(sdfg, {})
-        code = _generate_code(sdfg)
-        assert "@ct.kernel" in code
-        kernel_idx = code.index("@ct.kernel")
-        assert code.index("def ", kernel_idx) > kernel_idx
-        assert "ct.launch(" in code
-        assert "ct.bid(0)" in code
+        host, build = _generate_artifacts(sdfg)
+        assert build.code.count("@ct.kernel") == 1
+        kernel_idx = build.code.index("@ct.kernel")
+        assert build.code.index("def ", kernel_idx) > kernel_idx
+        assert "ct.bid(0)" in build.code
+        assert "compilation.export_kernel(" in build.code
+        assert "__dace_cutile_launch_" in host.code
+        assert "cupy.cuda.get_current_stream()" in host.code
+        assert "(1, 1, 1)" in host.code
+        assert "ct.launch(" not in host.code and "ct.launch(" not in build.code
 
     def test_code_has_tile_load_and_store(self):
         """Generated code loads tiles; under the default full_mask remainder
         strategy with symbolic N the store is deterministically ct.scatter."""
         sdfg = _build_vadd_sdfg("vcutile_code_loadstore")
         VectorizeCuTile(widths=(8, )).apply_pass(sdfg, {})
-        code = _generate_code(sdfg)
+        code = _generate_artifacts(sdfg)[1].code
         assert "ct.load(" in code
         assert "ct.scatter(" in code
 
@@ -341,7 +353,7 @@ class TestOrchestratorCodegen:
         """The iteration mask uses arange(width) compared against N."""
         sdfg = _build_vadd_sdfg("vcutile_code_mask")
         VectorizeCuTile(widths=(8, )).apply_pass(sdfg, {})
-        code = _generate_code(sdfg)
+        code = _generate_artifacts(sdfg)[1].code
         assert "ct.arange(8" in code
         assert "< N" in code
 
@@ -349,7 +361,7 @@ class TestOrchestratorCodegen:
         """K=2 widths (8, 4): valid Python with cuTile primitives."""
         sdfg = _build_vadd2d_sdfg("vcutile_code_k2")
         VectorizeCuTile(widths=(8, 4)).apply_pass(sdfg, {})
-        code = _generate_code(sdfg)
+        code = _generate_artifacts(sdfg)[1].code
         ast.parse(code)
         assert "import cuda.tile as ct" in code
         assert "@ct.kernel" in code
@@ -364,7 +376,7 @@ class TestOrchestratorCodegen:
         """
         sdfg = _build_strides_sdfg("vcutile_code_strides")
         VectorizeCuTile(widths=(8, 4)).apply_pass(sdfg, {})
-        code = _generate_code(sdfg)
+        code = _generate_artifacts(sdfg)[1].code
         ast.parse(code)
         assert "import cuda.tile as ct" in code
         assert "@ct.kernel" in code
@@ -375,21 +387,19 @@ class TestOrchestratorCodegen:
         """int32 vadd generates valid cuTile code."""
         sdfg = _build_vadd_sdfg("vcutile_code_i32", dtype=dace.int32)
         VectorizeCuTile(widths=(8, )).apply_pass(sdfg, {})
-        code = _generate_code(sdfg)
+        code = _generate_artifacts(sdfg)[1].code
         ast.parse(code)
         assert "ct.load(" in code
 
-    @pytest.mark.skip(
-        reason="apply_gpu_transformations() stamps GPU_Device on ALL maps "
-        "(including the non-kernel host-only tasklet), but the Python "
-        "backend has no GPU_Device scope dispatcher. Mixed-SDFG codegen "
-        "is a known limitation of the GPU-transform-based pipeline."
-    )
+    @pytest.mark.skip(reason="apply_gpu_transformations() stamps GPU_Device on ALL maps "
+                      "(including the non-kernel host-only tasklet), but the Python "
+                      "backend has no GPU_Device scope dispatcher. Mixed-SDFG codegen "
+                      "is a known limitation of the GPU-transform-based pipeline.")
     def test_mixed_sdfg_codegen(self):
         """The mixed SDFG generates valid code containing a kernel."""
         sdfg = _build_mixed_sdfg("vcutile_code_mixed")
         VectorizeCuTile(widths=(8, )).apply_pass(sdfg, {})
-        code = _generate_code(sdfg)
+        code = _generate_artifacts(sdfg)[1].code
         ast.parse(code)
         assert "@ct.kernel" in code
 
@@ -403,7 +413,7 @@ class TestOrchestratorCodegen:
         """
         sdfg = _build_vadd_sdfg("vcutile_code_nest")
         VectorizeCuTile(widths=(8, )).apply_pass(sdfg, {})
-        code = _generate_code(sdfg)
+        code = _generate_artifacts(sdfg)[1].code
         ast.parse(code)
         assert "import cuda.tile as ct" in code
         assert "@ct.kernel" in code
@@ -578,12 +588,10 @@ class TestRuntimeMultiDim:
 class TestRuntimeMixed:
     """Mixed cuTile-kernel + host-state SDFG end-to-end."""
 
-    @pytest.mark.skip(
-        reason="apply_gpu_transformations() stamps GPU_Device on ALL maps "
-        "(including the non-kernel host-only tasklet), but the Python "
-        "backend has no GPU_Device scope dispatcher. Mixed-SDFG runtime "
-        "is a known limitation of the GPU-transform-based pipeline."
-    )
+    @pytest.mark.skip(reason="apply_gpu_transformations() stamps GPU_Device on ALL maps "
+                      "(including the non-kernel host-only tasklet), but the Python "
+                      "backend has no GPU_Device scope dispatcher. Mixed-SDFG runtime "
+                      "is a known limitation of the GPU-transform-based pipeline.")
     def test_mixed_sdfg_end_to_end(self):
         """A/B/C run through the kernel on GPU; D stays a host NumPy array."""
         sdfg = _build_mixed_sdfg("vcutile_rt_mixed")

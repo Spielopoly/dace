@@ -7,10 +7,9 @@ can stage a single ELEMENT of an array (``src_subset`` like ``aa[0, j]``); the
 binding must then load exactly that element as a scalar tile
 (``aa_const = ct.load(aa, (0, j), shape=()).item()``) — cuTile arrays are not
 subscriptable in-kernel and the propagated outer subset is a non-constant
-slice the cuda.tile compiler rejects. Numeric (float/int/uint) scalar sources
-also bind via a 0-d tile load (the launch site passes them as 1-element
-device arrays to keep f64 precision and full int64 range); bool scalars keep
-the plain rename (passed by value). Untraceable bridges must warn, not
+slice the cuda.tile compiler rejects. Numeric and bool scalar sources bind as
+plain renames; the aggregate AOT ABI exports their exact fixed-width types by
+value. Untraceable bridges must warn, not
 silently emit nothing.
 """
 import warnings as _warnings
@@ -117,9 +116,8 @@ class TestArrayElementBridge:
             code = _emit_bridge_binding(sdfg, state, bridge)
         assert "ct.load(aa, (0, 1,), shape=()).item()" in code
 
-    def test_float_scalar_source_binds_scalar_tile_load(self):
-        """A float scalar source is a 1-element device array at runtime and
-        binds via a 0-d tile load (f64 precision; by-value floats are f32)."""
+    def test_float_scalar_source_binds_exact_value(self):
+        """A float scalar source binds to its exact exported value."""
         sdfg = SDFG("bridge_scalar_src")
         sdfg.backend = dtypes.BackendLanguage.Python
         sdfg.add_scalar("alpha", dace.float64)
@@ -130,12 +128,10 @@ class TestArrayElementBridge:
         bridge = state.add_access("alpha_const")
         state.add_memlet_path(a_node, me, bridge, memlet=Memlet(data="alpha", subset="0"))
         code = _emit_bridge_binding(sdfg, state, bridge).replace(" ", "")
-        assert "alpha_const=ct.load(alpha,(0,),shape=()).item()" in code
+        assert "alpha_const=alpha" in code
 
-    def test_int_scalar_source_binds_scalar_tile_load(self):
-        """An integer scalar source is a 1-element device array at runtime too
-        (by-value ints are typed int32: OverflowError >= 2**31) and binds via
-        a 0-d tile load."""
+    def test_int_scalar_source_binds_exact_value(self):
+        """An integer scalar source binds to its exact exported value."""
         sdfg = SDFG("bridge_int_scalar_src")
         sdfg.backend = dtypes.BackendLanguage.Python
         sdfg.add_scalar("kk", dace.int64)
@@ -146,10 +142,10 @@ class TestArrayElementBridge:
         bridge = state.add_access("kk_const")
         state.add_memlet_path(a_node, me, bridge, memlet=Memlet(data="kk", subset="0"))
         code = _emit_bridge_binding(sdfg, state, bridge).replace(" ", "")
-        assert "kk_const=ct.load(kk,(0,),shape=()).item()" in code
+        assert "kk_const=kk" in code
 
     def test_bool_scalar_source_binds_bare_name(self):
-        """A bool scalar source keeps the plain rename (passed by value)."""
+        """A bool scalar source keeps the exact by-value rename."""
         sdfg = SDFG("bridge_bool_scalar_src")
         sdfg.backend = dtypes.BackendLanguage.Python
         sdfg.add_scalar("flag", dace.bool)

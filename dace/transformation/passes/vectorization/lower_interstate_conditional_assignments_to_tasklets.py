@@ -7,12 +7,13 @@ from dace.sdfg import ControlFlowRegion, nodes
 from dace.sdfg.state import BreakBlock, ConditionalBlock, LoopRegion
 from dace.transformation import pass_pipeline as ppl, transformation
 import dace.sdfg.utils as sdutil
+from dace.transformation.interstate.branch_elimination import BranchElimination
 
 
 @properties.make_properties
 @transformation.explicit_cf_compatible
 class LowerInterstateConditionalAssignmentsToTasklets(ppl.Pass):
-    """Demote free symbols of conditional-assignment tasklets to fp64 scalars.
+    """Demote free symbols of conditional-assignment tasklets to typed scalars.
 
     Tested as part of the vectorization pipeline.
     """
@@ -84,10 +85,12 @@ class LowerInterstateConditionalAssignmentsToTasklets(ppl.Pass):
                     free_conditional_symbols[additional_demote_sym] = None
 
             # We should demote all the free conditional symbols
+            public_symbols = {str(sym) for sym in cfg.sdfg.free_symbols}
             for conditional_sym in free_conditional_symbols:
                 sdfg = cfg.sdfg if not isinstance(cfg, SDFG) else cfg
-                # Cast all symbols to fp64
-                sdfg.symbols[conditional_sym] = dace.float64
+                if (conditional_sym in public_symbols
+                        or BranchElimination._symbol_required_as_symbol(sdfg, conditional_sym)):
+                    continue
                 sdutil.demote_symbol_to_scalar(sdfg, conditional_sym, dace.float64, None)
                 # Set-zero all of them
                 assert conditional_sym not in sdfg.symbols

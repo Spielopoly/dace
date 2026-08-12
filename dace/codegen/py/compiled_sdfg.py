@@ -1,11 +1,14 @@
 # Copyright 2019-2026 ETH Zurich and the DaCe authors. All rights reserved.
-"""Contains functionality to compile and invoke Python-generated SDFG code."""
+"""Contains functionality to load and invoke native Python-backend SDFGs."""
 
-import builtins
-import linecache
+import atexit
+import importlib.util
+from pathlib import Path
 import re
-import types
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
+import shutil
+import tempfile
+from types import ModuleType
+from typing import Any, Dict, List, Optional, Sequence, TYPE_CHECKING
 
 import numpy as np
 
@@ -20,6 +23,22 @@ if TYPE_CHECKING:
 #: excluded from return marshaling.
 _RETURN_ARRAY_RE = re.compile(r'^__return(_[0-9]+)?$')
 
+# CPython extension state is tied to the loaded shared-library image. Loading
+# the managed cache file twice may therefore alias module globals even when two
+# distinct module objects are requested. Keep one private image per compiled
+# handle for the process lifetime so persistent transients and instrumentation
+# state cannot leak between handles. Process-lifetime retention also avoids
+# deleting a loaded extension on platforms that lock shared libraries.
+_PRIVATE_EXTENSION_DIRS: List[Path] = []
+
+
+def _cleanup_private_extensions() -> None:
+    for directory in _PRIVATE_EXTENSION_DIRS:
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+atexit.register(_cleanup_private_extensions)
+
 
 def _is_return_array_name(name: str) -> bool:
     """Whether ``name`` is a genuine SDFG return-value array name.
@@ -30,104 +49,69 @@ def _is_return_array_name(name: str) -> bool:
     return _RETURN_ARRAY_RE.match(name) is not None
 
 
-def _build_aux_module(co: 'CodeObject') -> types.ModuleType:
-    """Build a Python module from a CodeObject without registering it in sys.modules."""
-    pseudo_filename = f'<dace_generated_module_{co.name}_{id(co)}>'
-    code_lines = co.code.splitlines(True)
-    linecache.cache[pseudo_filename] = (len(co.code), None, code_lines, pseudo_filename)
-    mod = types.ModuleType(co.name)
-    mod.__file__ = pseudo_filename
-    compiled = compile(co.code, pseudo_filename, 'exec')
-    exec(compiled, mod.__dict__)
-    return mod
+def _load_native_module(extension_path: Path, module_name: str) -> ModuleType:
+    """Load a Cython extension using its hashed internal module name."""
+    if not extension_path.is_file():
+        raise FileNotFoundError(f'Compiled Python extension does not exist: {extension_path}')
+    spec = importlib.util.spec_from_file_location(module_name, extension_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f'Cannot create an import specification for {extension_path}')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
-def _make_import_hook(aux_modules: Dict[str, types.ModuleType]):
-    """Build a replacement for ``__import__`` that resolves ``aux_modules`` first.
+def _load_isolated_native_module(extension_path: Path, module_name: str) -> ModuleType:
+    """Load a private extension image for one compiled-program handle.
 
-    Top-level absolute imports whose name matches an auxiliary module return
-    that module directly. All other imports fall through to the real importer,
-    so stdlib and third-party packages behave normally and ``sys.modules`` is
-    never touched for our generated modules.
+    :param extension_path: Validated extension in the managed build cache.
+    :param module_name: Internal CPython initialization name.
+    :returns: A module whose native globals are private to the caller.
     """
-    real_import = builtins.__import__
-
-    def __import__(name, globals=None, locals=None, fromlist=(), level=0):
-        if level == 0 and name in aux_modules:
-            return aux_modules[name]
-        return real_import(name, globals, locals, fromlist, level)
-
-    return __import__
+    private_dir = Path(tempfile.mkdtemp(prefix=f'dace-{module_name}-'))
+    private_path = private_dir / extension_path.name
+    try:
+        shutil.copy2(extension_path, private_path)
+        module = _load_native_module(private_path, module_name)
+    except Exception:
+        shutil.rmtree(private_dir, ignore_errors=True)
+        raise
+    _PRIVATE_EXTENSION_DIRS.append(private_dir)
+    return module
 
 
 class PythonCompiledSDFG:
-    """
-    A compiled SDFG object for the Python backend.
+    """A callable adapter around a compiled Python-backend extension."""
 
-    Unlike ``CompiledSDFG``, which loads a shared library via ctypes,
-    this class executes the generated Python source code directly using
-    ``exec()`` and extracts the callable function from the resulting
-    namespace.
-    """
-
-    def __init__(self, sdfg, code: str, *,
-                 aux_modules: Optional[Dict[str, types.ModuleType]] = None):
+    def __init__(self, sdfg, extension_path, module_name: str, *, code: str = ''):
         from dace.sdfg import SDFG
         self._sdfg: SDFG = sdfg
+        self._library_path = Path(extension_path).resolve()
         self._code: str = code
         self._initialized = False
         self._finalized = False
-        self._aux_modules: Dict[str, types.ModuleType] = aux_modules or {}
+        self._module_name = module_name
+        self._module = _load_isolated_native_module(self._library_path, module_name)
+        # This module-dictionary view is retained for instrumentation consumers.
+        self._namespace = self._module.__dict__
 
-        # Register generated source under a pseudo filename so inspect can
-        # retrieve source lines for nested/generated functions.
-        # This is necessary for features like CuTile that generate kernels and
-        # rely on inspect.getsource() to retrieve their source code for compilation.
-        pseudo_filename = (
-            f'<dace_generated_python_sdfg_{sdfg.name}_{id(self)}>'
-        )
-        code_lines = self._code.splitlines(True)
-        linecache.cache[pseudo_filename] = (len(self._code), None, code_lines,
-                            pseudo_filename)
-
-        # Build a custom builtins so that imports of auxiliary modules resolve
-        # locally instead of polluting sys.modules.
-        custom_builtins = dict(builtins.__dict__)
-        custom_builtins['__import__'] = _make_import_hook(self._aux_modules)
-
-        # Execute the generated code in an isolated namespace
-        self._namespace: Dict[str, Any] = {
-            '__builtins__': custom_builtins,
-            '__file__': pseudo_filename,
-        }
-        compiled_code = compile(self._code, pseudo_filename, 'exec')
-        exec(compiled_code, self._namespace)
-
-        # Extract the generated function (name matches the SDFG name)
         func_name = sdfg.name
-        if func_name not in self._namespace:
-            raise RuntimeError(
-                f"Generated Python code does not define function '{func_name}'"
-            )
-        self._func = self._namespace[func_name]
-        self._init = self._namespace.get(f'__dace_init_{func_name}')
-        self._exit = self._namespace.get(f'__dace_exit_{func_name}')
+        if not hasattr(self._module, func_name):
+            raise RuntimeError(f"Compiled Python extension does not define function '{func_name}'")
+        self._func = getattr(self._module, func_name)
+        self._init = getattr(self._module, f'__dace_init_{func_name}', None)
+        self._exit = getattr(self._module, f'__dace_exit_{func_name}', None)
 
         # --- Return-value metadata ---
         # Single return (__return) vs tuple return (__return_0, __return_1, ...)
         self._is_single_value_ret: bool = False
         if '__return' in self._sdfg.arrays:
-            assert not any(
-                _is_return_array_name(aname) and aname != '__return'
-                for aname in self._sdfg.arrays.keys()
-            )
+            assert not any(_is_return_array_name(aname) and aname != '__return' for aname in self._sdfg.arrays.keys())
             self._is_single_value_ret = True
 
         # Whether the SDFG has any genuine return arrays (cached for fast
         # __call__); tile transients sharing the __return prefix don't count.
-        self._has_returns: bool = any(
-            _is_return_array_name(aname) for aname in self._sdfg.arrays
-        )
+        self._has_returns: bool = any(_is_return_array_name(aname) for aname in self._sdfg.arrays)
 
         # Argument name list for positional arg conversion (includes __return*).
         # Computed lazily by _get_argnames() because arglist() can fail on
@@ -139,8 +123,10 @@ class PythonCompiledSDFG:
 
         # Create cached cfunc wrapper for profiler compatibility
         func = self._func
+
         def _cfunc_wrapper(_handle, *args, **kwargs):
             return func(*args, **kwargs)
+
         self._cfunc_cached = _cfunc_wrapper
 
         # Profiler compatibility: these attributes mirror the C++ CompiledSDFG
@@ -156,6 +142,16 @@ class PythonCompiledSDFG:
     @property
     def code(self) -> str:
         return self._code
+
+    @property
+    def library_path(self) -> Path:
+        """Managed path to the loaded native extension."""
+        return self._library_path
+
+    @property
+    def module(self) -> ModuleType:
+        """Loaded native extension module."""
+        return self._module
 
     @property
     def _cfunc(self):
@@ -194,17 +190,70 @@ class PythonCompiledSDFG:
         self._finalized = False
 
     def finalize(self):
-        if self._finalized:
+        if self._finalized or not self._initialized:
             return
-        if self._exit is not None:
-            self._exit()
-        # Clear persistent transients so that the next initialize() cycle
-        # starts fresh, matching the semantics of a full re-initialization.
-        # TODO: This needs to be part of the generated code, not here
-        if '__dace_persistent_transients' in self._namespace:
-            self._namespace['__dace_persistent_transients'].clear()
-        self._initialized = False
-        self._finalized = True
+        try:
+            if self._exit is not None:
+                self._exit()
+        finally:
+            # Clear persistent transients even when user exit code raises.
+            # TODO: Should be part of generated code, not here
+            persistent = getattr(self._module, '__dace_persistent_transients', None)
+            if persistent is not None:
+                persistent.clear()
+            self._initialized = False
+            self._finalized = True
+
+    def _ordered_call_arguments(self, args: tuple, kwargs: Dict[str, Any]) -> tuple:
+        """Return call arguments in the generated function's positional order.
+
+        Compiled-SDFG hooks receive a positional tuple and may invoke
+        :attr:`_cfunc` repeatedly. Normal generated calls have already been
+        bound to ``sdfg.arglist()`` order. The signature fallback preserves the
+        existing focused-fixture and undeclared-symbol paths where that arglist
+        cannot describe the native function.
+
+        :param args: Positional arguments for the native function.
+        :param kwargs: Marshalled keyword arguments for the native function.
+        :returns: Arguments suitable for the compiled-call hook interface.
+        """
+        try:
+            argnames = self._get_argnames()
+        except Exception:
+            argnames = []
+
+        if not args and set(kwargs) == set(argnames):
+            return tuple(kwargs[name] for name in argnames)
+
+        try:
+            import inspect
+            bound = inspect.signature(self._func).bind(*args, **kwargs)
+            bound.apply_defaults()
+            if bound.kwargs:
+                raise TypeError('Compiled-SDFG call hooks do not support keyword-only native arguments')
+            return bound.args
+        except (TypeError, ValueError):
+            # Let the native function report the original binding error when
+            # no hook consumes the arguments. Generated SDFG functions never
+            # reach this fallback because their arglist is exact.
+            return args
+
+    def _invoke_with_hooks(self, args: tuple, kwargs: Dict[str, Any]) -> Any:
+        """Invoke the native function through compiled-SDFG call hooks.
+
+        :param args: Positional arguments for the native function.
+        :param kwargs: Marshalled keyword arguments for the native function.
+        :returns: The selected native function's return value.
+        """
+        from dace import hooks
+
+        hook_args = self._ordered_call_arguments(args, kwargs)
+        with hooks.invoke_compiled_sdfg_call_hooks(self, hook_args) as compiled_sdfg:
+            if compiled_sdfg.do_not_execute:
+                return None
+            if compiled_sdfg is not self:
+                return compiled_sdfg._cfunc(compiled_sdfg._libhandle, *hook_args)
+            return self._func(*args, **kwargs)
 
     def _bind_positional(self, args: tuple, kwargs: Dict[str, Any]) -> Dict[str, Any]:
         """Convert positional arguments to keyword arguments.
@@ -221,17 +270,15 @@ class PythonCompiledSDFG:
             return dict(kwargs)
         argnames = self._get_argnames()
         if not argnames:
-            raise KeyError(
-                "Passed positional arguments to an SDFG that does "
-                "not accept them.")
+            raise KeyError("Passed positional arguments to an SDFG that does "
+                           "not accept them.")
         if len(args) > len(argnames):
             raise TypeError(f"Passed {len(args)} positional arguments to an SDFG that "
                             f"accepts at most {len(argnames)} ({argnames}).")
         positional = dict(zip(argnames, args))
         if not positional.keys().isdisjoint(kwargs.keys()):
-            raise ValueError(
-                "Arguments passed as both positional and keyword: "
-                f"{set(positional) & set(kwargs)}")
+            raise ValueError("Arguments passed as both positional and keyword: "
+                             f"{set(positional) & set(kwargs)}")
         merged = dict(kwargs)
         merged.update(positional)
         return merged
@@ -293,9 +340,7 @@ class PythonCompiledSDFG:
     def _get_return_names(self) -> List[str]:
         """Sorted names of ``__return*`` arrays in the SDFG."""
         if self._return_names is None:
-            self._return_names = sorted(
-                n for n in self._sdfg.arrays if _is_return_array_name(n)
-            )
+            self._return_names = sorted(n for n in self._sdfg.arrays if _is_return_array_name(n))
         return self._return_names
 
     def _allocate_return_array(self, name: str, syms: Dict[str, Any]) -> np.ndarray:
@@ -309,8 +354,7 @@ class PythonCompiledSDFG:
 
         desc = self._sdfg.arrays[name]
         if desc.transient:
-            raise ValueError(
-                f'Used the special array name "{name}" as transient.')
+            raise ValueError(f'Used the special array name "{name}" as transient.')
         shape = tuple(int(symbolic.evaluate(s, syms)) for s in desc.shape)
         dtype = desc.dtype.as_numpy_dtype()
         if desc.storage is dtypes.StorageType.GPU_Global:
@@ -318,8 +362,7 @@ class PythonCompiledSDFG:
                 import cupy
                 return cupy.empty(shape, dtype=dtype)
             except (ImportError, ModuleNotFoundError):
-                raise NotImplementedError(
-                    'GPU return values require cupy to be installed')
+                raise NotImplementedError('GPU return values require cupy to be installed')
         return np.empty(shape, dtype=dtype)
 
     def __call__(self, *args, **kwargs):
@@ -340,17 +383,14 @@ class PythonCompiledSDFG:
                     args = ()
             kwargs = self._marshal_arguments(kwargs)
             self.initialize(*args, **kwargs)
-            if self.do_not_execute:
-                return None
-            return self._func(*args, **kwargs)
+            return self._invoke_with_hooks(args, kwargs)
 
         # Convert positional args to keyword args
         kwargs = self._bind_positional(args, kwargs)
         kwargs = self._marshal_arguments(kwargs)
 
         # Resolve symbols for shape evaluation
-        syms = {k: v for k, v in kwargs.items()
-                if k not in self._sdfg.arrays}
+        syms = {k: v for k, v in kwargs.items() if k not in self._sdfg.arrays}
         syms.update(self._sdfg.constants)
 
         # Allocate (or reuse user-provided) return arrays
@@ -361,8 +401,7 @@ class PythonCompiledSDFG:
             return_arrays.append(kwargs[name])
 
         self.initialize(**kwargs)
-        if not self.do_not_execute:
-            self._func(**kwargs)
+        self._invoke_with_hooks((), kwargs)
 
         # Marshal return values
         if self._is_single_value_ret:
@@ -372,33 +411,12 @@ class PythonCompiledSDFG:
     def __del__(self):
         try:
             self.finalize()
-        except AttributeError: # can happen if __init__ raised an exception
+        except Exception:
+            # Destructors must not retry or report user cleanup failures.
             pass
 
 
-def compile_python_sdfg(sdfg, code_objects: 'list[CodeObject]') -> PythonCompiledSDFG:
-    """
-    Compile a Python-backend SDFG from the generated code objects.
-
-    The first code object is the frame (main SDFG function). Subsequent
-    linkable code objects are built as in-memory Python modules that are
-    resolvable by import statements in the frame code via a private
-    ``__import__`` hook. ``sys.modules`` is never modified. Non-linkable
-    objects (e.g. SampleMain) are skipped.
-
-    :param sdfg: The SDFG that was compiled.
-    :param code_objects: List of CodeObject instances from code generation.
-    :return: A callable PythonCompiledSDFG.
-    """
-    if not code_objects:
-        raise RuntimeError("No code objects generated for Python backend")
-
-    frame_co = code_objects[0]
-
-    aux_modules: Dict[str, types.ModuleType] = {}
-    for co in code_objects[1:]:
-        if not co.linkable:
-            continue
-        aux_modules[co.name] = _build_aux_module(co)
-
-    return PythonCompiledSDFG(sdfg, frame_co.code, aux_modules=aux_modules)
+def compile_python_sdfg(sdfg, code_objects: 'Sequence[CodeObject]', **kwargs) -> Optional[PythonCompiledSDFG]:
+    """Compatibility entry point for native Python-backend compilation."""
+    from dace.codegen.py.compiler import compile_python_sdfg as compile_native_python_sdfg
+    return compile_native_python_sdfg(sdfg, code_objects, **kwargs)

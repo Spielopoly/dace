@@ -46,7 +46,9 @@ def _lower_cutile(prog):
 
 
 def _main_code(sdfg):
-    return "".join(co.code for co in sdfg.generate_code() if co.name != "sympy_function_redefinitions")
+    build_objects = [co for co in sdfg.generate_code() if co.target_type == "cutile_build"]
+    assert len(build_objects) == 1
+    return build_objects[0].code
 
 
 # ---- inputs: negatives (fmod sign / atan2 quadrants) + non-divisible size ----

@@ -55,11 +55,13 @@ def _off_store_only(A: dace.float64[N], B: dace.float64[N]):
 
 
 def _lower(prog, widths=(8, )):
-    """Lower a program through ``VectorizeCuTile``; return ``(sdfg, code)``."""
+    """Return the lowered SDFG and aggregate cuTile build code."""
     sdfg = prog.to_sdfg(simplify=True)
     VectorizeCuTile(widths=widths).apply_pass(sdfg, {})
-    code = "".join(c.clean_code for c in sdfg.generate_code())
-    return sdfg, code
+    code_objects = sdfg.generate_code()
+    build_objects = [co for co in code_objects if co.target_type == "cutile_build"]
+    assert len(build_objects) == 1
+    return sdfg, build_objects[0].clean_code
 
 
 # ---------------------------------------------------------------------------

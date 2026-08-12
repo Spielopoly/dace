@@ -267,11 +267,12 @@ class BranchElimination(transformation.MultiStateTransformation):
 
         return False
 
-    def _symbol_required_as_symbol(self, sdfg: dace.SDFG, symbol_name: str) -> bool:
+    @staticmethod
+    def _symbol_required_as_symbol(sdfg: dace.SDFG, symbol_name: str) -> bool:
         """Whether ``symbol_name`` appears where code generation needs a
-        compile-time symbol -- a memlet subset, a map range, an array
-        shape/stride, or a loop bound -- so it must NOT be demoted to a runtime
-        scalar (a scalar cannot index an array, e.g. ``C[__sym_offset]``).
+        compile-time symbol -- a memlet property, map range, data-descriptor
+        property, or loop bound -- so it must NOT be demoted to a runtime scalar
+        (a scalar cannot index an array, e.g. ``C[__sym_offset]``).
 
         :param sdfg: The SDFG to scan.
         :param symbol_name: The candidate symbol.
@@ -283,13 +284,13 @@ class BranchElimination(transformation.MultiStateTransformation):
 
         for state in sdfg.all_states():
             for edge in state.edges():
-                if edge.data.data is not None and any(_in(b, e, s) for (b, e, s) in edge.data.subset):
+                if symbol_name in set(map(str, edge.data.free_symbols)):
                     return True
             for node in state.nodes():
                 if isinstance(node, dace.nodes.MapEntry) and any(_in(b, e, s) for (b, e, s) in node.map.range):
                     return True
         for arr in sdfg.arrays.values():
-            if any(_in(dim, stride) for dim, stride in zip(arr.shape, arr.strides)):
+            if symbol_name in set(map(str, arr.free_symbols)):
                 return True
         for lr in sdfg.all_control_flow_regions():
             if isinstance(lr, LoopRegion):

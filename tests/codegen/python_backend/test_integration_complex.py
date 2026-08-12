@@ -10,7 +10,6 @@ from dace.sdfg import InterstateEdge, SDFG
 from dace.sdfg.state import ConditionalBlock, ControlFlowRegion, LoopRegion
 from dace.transformation.interstate import InlineMultistateSDFG, InlineSDFG
 
-
 _SDFG_COUNTER = itertools.count()
 
 
@@ -141,7 +140,8 @@ def _make_runtime_inlining_assignment_target_sdfg(multistate: bool) -> tuple[SDF
     else:
         compute_state = inner.add_state('compute', is_start_block=True)
 
-    compute_state.add_edge(compute_state.add_read('X'), None, compute_state.add_write('Y'), None, dace.Memlet('X[0] -> [0]'))
+    compute_state.add_edge(compute_state.add_read('X'), None, compute_state.add_write('Y'), None,
+                           dace.Memlet('X[0] -> [0]'))
 
     outer_state = outer.add_state('state', is_start_block=True)
     nested_node = outer_state.add_nested_sdfg(inner, {'X'}, {'Y'}, symbol_mapping={'N': 'M'})
@@ -230,7 +230,12 @@ def test_multistate_symbols_constants_pipeline(dtype, np_dtype):
     copy_state = sdfg.states()[1]
     copy_state.add_edge(copy_state.add_read('A'), None, copy_state.add_write('B'), None, dace.Memlet('A[0:N] -> [0:N]'))
 
-    loop = LoopRegion('loop', condition_expr='i < N', loop_var='i', initialize_expr='i = 0', update_expr='i = i + 1', sdfg=sdfg)
+    loop = LoopRegion('loop',
+                      condition_expr='i < N',
+                      loop_var='i',
+                      initialize_expr='i = 0',
+                      update_expr='i = i + 1',
+                      sdfg=sdfg)
     sdfg.add_node(loop)
     sdfg.add_edge(copy_state, loop, InterstateEdge())
     body = loop.add_state('body', is_start_block=True)
@@ -262,7 +267,12 @@ def test_loop_then_conditional_kitchen_sink(flag, n):
     copy_state = sdfg.add_state('copy_state', is_start_block=True)
     copy_state.add_edge(copy_state.add_read('A'), None, copy_state.add_write('B'), None, dace.Memlet('A[0:N] -> [0:N]'))
 
-    loop = LoopRegion('loop', condition_expr='i < N', loop_var='i', initialize_expr='i = 0', update_expr='i = i + 1', sdfg=sdfg)
+    loop = LoopRegion('loop',
+                      condition_expr='i < N',
+                      loop_var='i',
+                      initialize_expr='i = 0',
+                      update_expr='i = i + 1',
+                      sdfg=sdfg)
     sdfg.add_node(loop)
     sdfg.add_edge(copy_state, loop, InterstateEdge(assignments={'bias': '1'}))
     body = loop.add_state('body', is_start_block=True)
@@ -301,7 +311,12 @@ def test_array_constant_lookup_pipeline():
     sdfg.add_array('A', [n_symbol], dace.int64)
     sdfg.add_array('B', [n_symbol], dace.int64)
 
-    loop = LoopRegion('loop', condition_expr='i < N', loop_var='i', initialize_expr='i = 0', update_expr='i = i + 1', sdfg=sdfg)
+    loop = LoopRegion('loop',
+                      condition_expr='i < N',
+                      loop_var='i',
+                      initialize_expr='i = 0',
+                      update_expr='i = i + 1',
+                      sdfg=sdfg)
     sdfg.add_node(loop, is_start_block=True)
     body = loop.add_state('body', is_start_block=True)
     tasklet = body.add_tasklet('lookup', {'inp'}, {'out'}, 'out = inp + LUT[i % 3]')
@@ -355,7 +370,8 @@ def test_zero_size_copy(dtype, np_dtype):
     _assert_same(b, a)
 
 
-@pytest.mark.parametrize(('shape', 'dtype', 'np_dtype'), [((1, 4), dace.float64, np.float64), ((3, 1), dace.int64, np.int64)])
+@pytest.mark.parametrize(('shape', 'dtype', 'np_dtype'), [((1, 4), dace.float64, np.float64),
+                                                          ((3, 1), dace.int64, np.int64)])
 def test_singleton_dimension_symbolic_2d_copy(shape, dtype, np_dtype):
     n_symbol = dace.symbol('N')
     m_symbol = dace.symbol('M')
@@ -396,7 +412,12 @@ def test_loop_region_multistate_pipeline_with_scalar_transient():
     second.add_edge(second.add_read('tmp'), None, t2, 'inp', dace.Memlet('tmp'))
     second.add_edge(t2, 'out', second.add_write('B'), None, dace.Memlet('B[0]'))
 
-    loop = LoopRegion('loop', condition_expr='i < N', loop_var='i', initialize_expr='i = 0', update_expr='i = i + 1', sdfg=sdfg)
+    loop = LoopRegion('loop',
+                      condition_expr='i < N',
+                      loop_var='i',
+                      initialize_expr='i = 0',
+                      update_expr='i = i + 1',
+                      sdfg=sdfg)
     sdfg.add_node(loop)
     sdfg.add_edge(second, loop, InterstateEdge())
     body = loop.add_state('body', is_start_block=True)
@@ -481,7 +502,12 @@ def test_loop_region_zero_iterations():
     sdfg.add_symbol('N', dace.int64)
     sdfg.add_array('A', [n_symbol], dace.int64)
 
-    loop = LoopRegion('loop', condition_expr='i < N', loop_var='i', initialize_expr='i = 0', update_expr='i = i + 1', sdfg=sdfg)
+    loop = LoopRegion('loop',
+                      condition_expr='i < N',
+                      loop_var='i',
+                      initialize_expr='i = 0',
+                      update_expr='i = i + 1',
+                      sdfg=sdfg)
     sdfg.add_node(loop, is_start_block=True)
     body = loop.add_state('body', is_start_block=True)
     tasklet = body.add_tasklet('fill', {}, {'out'}, 'out = 99')
@@ -529,7 +555,8 @@ def test_nested_sdfg_with_symbols():
     inner.add_array('X', [n_symbol], dace.float64)
     inner.add_array('Y', [n_symbol], dace.float64)
     inner_state = inner.add_state(is_start_block=True)
-    inner_state.add_edge(inner_state.add_read('X'), None, inner_state.add_write('Y'), None, dace.Memlet('X[0:N] -> [0:N]'))
+    inner_state.add_edge(inner_state.add_read('X'), None, inner_state.add_write('Y'), None,
+                         dace.Memlet('X[0:N] -> [0:N]'))
 
     state = outer.add_state(is_start_block=True)
     nested = state.add_nested_sdfg(inner, {'X'}, {'Y'}, symbol_mapping={'N': 'N'})
@@ -674,7 +701,7 @@ def test_nested_sdfg_local_constants_available_without_duplicate_headers():
 
     assert 'LOOKUP = numpy.array([7], dtype=numpy.int64)' in generated_code
     assert generated_code.count('# DaCe AUTO-GENERATED FILE. DO NOT MODIFY') == 1
-    assert generated_code.count('import numpy') == 1
+    assert generated_code.splitlines().count('import numpy') == 1
 
     a = np.array([2], dtype=np.int64)
     b = np.zeros(1, dtype=np.int64)
@@ -709,7 +736,7 @@ def test_nested_sdfg_runtime_code_stays_helper_local_and_keeps_local_context():
     assert 'SHIFT = LOOKUP[0]' in generated_code
     assert 'finally:' in generated_code
     assert generated_code.count('# DaCe AUTO-GENERATED FILE. DO NOT MODIFY') == 1
-    assert generated_code.count('import numpy') == 1
+    assert generated_code.splitlines().count('import numpy') == 1
 
     a = np.array([2], dtype=np.int64)
     b = np.zeros(1, dtype=np.int64)
@@ -749,7 +776,12 @@ def test_loop_region_with_map():
     sdfg.add_array('A', [4], dace.float64)
     sdfg.add_array('B', [4], dace.float64)
 
-    loop = LoopRegion('loop', condition_expr='j < 1', loop_var='j', initialize_expr='j = 0', update_expr='j = j + 1', sdfg=sdfg)
+    loop = LoopRegion('loop',
+                      condition_expr='j < 1',
+                      loop_var='j',
+                      initialize_expr='j = 0',
+                      update_expr='j = j + 1',
+                      sdfg=sdfg)
     sdfg.add_node(loop, is_start_block=True)
     body = loop.add_state('body', is_start_block=True)
     map_entry, map_exit = body.add_map('m', {'i': '0:4'}, schedule=ScheduleType.Sequential)
@@ -818,8 +850,7 @@ def test_runtime_code_public_api_and_lifecycle_reinitialize():
     sdfg = _new_sdfg('runtime_code_helpers')
     sdfg.add_array('A', [1], dace.int64)
     sdfg.set_global_code('GLOBAL_SENTINEL = 7\nEXIT_LOG = []', language=dace.dtypes.Language.Python)
-    sdfg.append_init_code('INIT_COUNTER = globals().get("INIT_COUNTER", 0) + 1',
-                          language=dace.dtypes.Language.Python)
+    sdfg.append_init_code('INIT_COUNTER = globals().get("INIT_COUNTER", 0) + 1', language=dace.dtypes.Language.Python)
     sdfg.append_exit_code('EXIT_LOG.append(INIT_COUNTER)', language=dace.dtypes.Language.Python)
 
     state = sdfg.add_state(is_start_block=True)
@@ -839,15 +870,16 @@ def test_runtime_code_public_api_and_lifecycle_reinitialize():
     assert compiled._namespace['EXIT_LOG'] == [1]
 
     compiled.finalize()
-    assert compiled._namespace['EXIT_LOG'] == [1] # Finalize should not run exit code again
+    assert compiled._namespace['EXIT_LOG'] == [1]  # Finalize should not run exit code again
 
     a.fill(0)
     compiled(A=a)
-    np.testing.assert_array_equal(a, np.array([9], dtype=np.int64)) # Init code should run again because it was finalized
-    
+    np.testing.assert_array_equal(a, np.array([9],
+                                              dtype=np.int64))  # Init code should run again because it was finalized
+
     a.fill(0)
     compiled(A=a)
-    np.testing.assert_array_equal(a, np.array([9], dtype=np.int64)) # Init code should not run again
+    np.testing.assert_array_equal(a, np.array([9], dtype=np.int64))  # Init code should not run again
 
     compiled.finalize()
     assert compiled._namespace['EXIT_LOG'] == [1, 2]

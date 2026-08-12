@@ -9,7 +9,7 @@ and uses :func:`tile_offset` to flatten the tile transient's index
 (register tiles are always row-major-contiguous).
 """
 import numbers
-from typing import List, Sequence
+from typing import Any, List, Sequence
 
 
 def ct_dtype_name(dtype) -> str:
@@ -23,6 +23,7 @@ def ct_dtype_name(dtype) -> str:
     """
     name = dtype.as_numpy_dtype().name
     return "bool_" if name == "bool" else name
+
 
 import sympy
 
@@ -637,6 +638,20 @@ def resolve_gather_deps(idx_shape, widths):
             return None  # non-marker extent disagrees with the tile width
         deps.append(d)
     return tuple(deps)
+
+
+def _no_ipow(expr: Any) -> Any:
+    """Rewrite opaque integer powers so symbolic layout checks can simplify.
+
+    :param expr: A stride or shape entry.
+    :returns: The expression with every ipow replaced by Pow.
+    """
+    import sympy
+
+    import dace
+    if not isinstance(expr, sympy.Basic):
+        return expr
+    return expr.replace(dace.symbolic.ipow, lambda base, exponent: base**exponent)
 
 
 def _strides_match_packed(shape, strides, order):

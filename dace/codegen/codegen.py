@@ -1,6 +1,5 @@
 # Copyright 2019-2026 ETH Zurich and the DaCe authors. All rights reserved.
 import functools
-import json
 from typing import List
 
 import dace
@@ -186,6 +185,14 @@ def generate_code(sdfg: SDFG, validate=True) -> List[CodeObject]:
     from dace.codegen.target import TargetCodeGenerator  # Avoid import loop
     from dace.codegen.py.target import PythonTargetCodeGenerator  # Avoid import loop
 
+    if sdfg.backend == dtypes.BackendLanguage.Python:
+        # Nested SDFGs execute as helpers in the same Python extension. Frontend-
+        # generated nested graphs retain the default C++ backend unless it is
+        # propagated here, which can select opaque C++ library expansions that the
+        # Python target cannot emit.
+        for nested_sdfg in sdfg.all_sdfgs_recursive(load_ext=True):
+            nested_sdfg.backend = dtypes.BackendLanguage.Python
+
     if validate:
         sdfg.validate()
 
@@ -256,7 +263,8 @@ def generate_code(sdfg: SDFG, validate=True) -> List[CodeObject]:
 
     # Experimental readable generator: flatten nested SDFGs, mark write-once data const/constexpr, and
     # inline tasklet connectors. Runs after library expansion so post-expansion tasklets are seen too.
-    if config.Config.get('compiler', 'cpu', 'implementation') == 'experimental_readable':
+    if (sdfg.backend == dtypes.BackendLanguage.CPP
+            and config.Config.get('compiler', 'cpu', 'implementation') == 'experimental_readable'):
         from dace.transformation.pass_pipeline import Pipeline
         from dace.transformation.passes.mark_const_init import MarkConstInit
         from dace.transformation.passes.inline_tasklet_connectors import InlineTaskletConnectors
@@ -339,10 +347,9 @@ def generate_code(sdfg: SDFG, validate=True) -> List[CodeObject]:
         raise exc.CodegenError("SDFG '%s' has undefined symbols in its arguments. "
                                "Please ensure all symbols are defined before generating code." % sdfg.name)
 
-
     if sdfg.backend == dtypes.BackendLanguage.Python:
         from dace.codegen.py import python_target
-        
+
         default_target = python_target.PythonCodeGen
         for k, v in target_code_generator_cls.extensions().items():
             # If another target has already been registered as Python, use it instead
@@ -399,28 +406,38 @@ def generate_code(sdfg: SDFG, validate=True) -> List[CodeObject]:
     if sdfg.backend == dtypes.BackendLanguage.CPP:
         target_objects = [
             CodeObject(sdfg.name,
-                    global_code + frame_code,
-                    'cpp',
-                    cpu.CPUCodeGen,
-                    'Frame',
-                    environments=used_environments,
-                    sdfg=sdfg)
+                       global_code + frame_code,
+                       'cpp',
+                       cpu.CPUCodeGen,
+                       'Frame',
+                       environments=used_environments,
+                       sdfg=sdfg)
         ]
     elif sdfg.backend == dtypes.BackendLanguage.Python:
+        symbolic_helpers = python_target.symbolic_helper_source()
         target_objects = [
             CodeObject(sdfg.name,
-                    global_code + frame_code,
-                    'py',
-                    python_target.PythonCodeGen,
-                    'Frame',
-                    environments=used_environments,
-                    sdfg=sdfg)
+                       symbolic_helpers + '\n\n' + global_code + frame_code,
+                       'pyx',
+                       python_target.PythonCodeGen,
+                       'Frame',
+                       environments=used_environments,
+                       sdfg=sdfg)
         ]
     else:
         raise NotImplementedError(f"Unsupported backend language '{sdfg.backend}' for SDFG '{sdfg.name}'")
 
-    for tgt in used_targets:
-        target_objects.extend(tgt.get_generated_codeobjects())
+    generated_target_objects = []
+    for tgt in sorted(used_targets,
+                      key=lambda target: (target.target_name, type(target).__module__, type(target).__qualname__)):
+        generated_target_objects.extend(tgt.get_generated_codeobjects())
+    generated_target_objects.sort(key=lambda obj: (obj.target_type, obj.name, obj.language, obj.title))
+    target_objects.extend(generated_target_objects)
+
+    if sdfg.backend == dtypes.BackendLanguage.Python:
+        source_names = [(obj.name, obj.language) for obj in target_objects]
+        if len(source_names) != len(set(source_names)):
+            raise exc.CodegenError('Python backend generated more than one CodeObject for the same source file')
 
     # Ensure that no new targets were dynamically added
     assert frame._dispatcher.used_targets == (frame.targets - {frame})
@@ -453,7 +470,7 @@ def generate_code(sdfg: SDFG, validate=True) -> List[CodeObject]:
     if sdfg.backend == dtypes.BackendLanguage.Python:
         from dace.codegen.py.prettycode import format_python_code
         for code_object in target_objects:
-            if code_object.language == 'py':
+            if code_object.language in ('py', 'pyx'):
                 code_object.code = format_python_code(code_object.code)
 
     return target_objects

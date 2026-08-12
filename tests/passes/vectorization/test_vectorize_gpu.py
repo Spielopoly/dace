@@ -120,12 +120,15 @@ def test_deferred_tile_nodes_are_cuda_stamped():
 
 def test_scalar_cast_constant_broadcasts():
     """The canonical constant-input shape ``tmp = float16(0.5); C = A * tmp`` -- a
-    scalar cast feeding a binop -- vectorizes to a single ``TileBinop`` (the scalar
-    is cast to the tile precision and broadcast into the tile), and compiles."""
+    scalar cast feeding a binop -- vectorizes to a ``TileBinop`` in both the
+    unmasked main branch and masked tail. The scalar is cast to the tile precision,
+    broadcast into the tile, and both branches compile."""
     sdfg = _prep(_scale_const16)
     VectorizeGPU(VectorizeConfig(widths=(2, ))).apply_pass(sdfg, {})
     binops = [n for n, _ in sdfg.all_nodes_recursive() if isinstance(n, TileBinop)]
-    assert len(binops) == 1, f"expected one TileBinop for A*const; got {len(binops)}"
+    assert len(binops) == 2, f"expected main and tail TileBinops for A*const; got {len(binops)}"
+    assert all(n.op == "*" and {n.kind_a, n.kind_b} == {"Tile", "Scalar"} for n in binops)
+    assert sorted(n.has_mask for n in binops) == [False, True]
     sdfg.expand_library_nodes()
     # the constant stays at the input (fp16) precision -- no fp64 container leaked
     assert all(d.dtype != dace.float64 for d in sdfg.arrays.values())

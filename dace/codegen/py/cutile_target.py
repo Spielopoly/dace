@@ -7,19 +7,28 @@ tiles).  MapExit is a no-op.
 """
 
 import ast
+import copy
+import re
 import warnings
 from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Tuple
 
+import numpy as np
 import sympy as sp
 
 from dace import data, dtypes, registry, subsets
 import dace.codegen.dispatcher as dispatcher_mod
 from dace.codegen.py import control_flow as py_cflow
+from dace.codegen.py.artifacts import (CuTileKernelSpec, CuTileModuleSpec, CuTileParameterKind, CuTileParameterSpec,
+                                       make_kernel_symbol, render_host_support)
 from dace.codegen.py.framecode import codeblock_to_python
 from dace.codegen.py.prettycode import PythonCodeIOStream
 from dace.codegen.py.target import PythonTargetCodeGenerator
+from dace.frontend.operations import detect_reduction_type
 from dace.sdfg import nodes
+from dace.sdfg.state import LoopRegion
+from dace.sdfg.type_inference import infer_expr_type
 from dace.symbolic import symstr
+from dace.transformation.passes.analysis import loop_analysis
 
 if TYPE_CHECKING:
     from dace.codegen.py.framecode import DaCePythonCodeGenerator
@@ -74,6 +83,17 @@ _CT_MATH_FUNCS: Dict[str, str] = {
 #: kept ``dace.float64(x)`` / ``np.int32(x)`` reaches the kernel module-qualified;
 #: cuda.tile can't resolve ``dace``/``np``, so it is rewritten to ``ct.astype``.
 _CT_CAST_DTYPES = {s.split('::')[-1] for s in dtypes.TYPECLASS_TO_STRING.values()}
+
+#: Reductions with direct cuda.tile atomic support. Other WCRs fail closed.
+_CT_ATOMIC_REDUCTIONS: Dict[dtypes.ReductionType, str] = {
+    dtypes.ReductionType.Sum: 'atomic_add',
+    dtypes.ReductionType.Min: 'atomic_min',
+    dtypes.ReductionType.Max: 'atomic_max',
+    dtypes.ReductionType.Bitwise_And: 'atomic_and',
+    dtypes.ReductionType.Bitwise_Or: 'atomic_or',
+    dtypes.ReductionType.Bitwise_Xor: 'atomic_xor',
+    dtypes.ReductionType.Exchange: 'atomic_xchg',
+}
 
 
 def _ct_attr(name: str) -> ast.Attribute:
@@ -194,7 +214,7 @@ class _CuTileTaskletRewriter(ast.NodeTransformer):
                 node.func = _ct_attr(ct_name)
             elif node.func.id in _NUMPY_EQUIVALENTS:
                 warnings.warn(f"cuTile codegen: math function {node.func.id!r} has no cuda.tile "
-                              f"equivalent; the kernel will fail to compile at runtime.")
+                              f"equivalent; aggregate cubin export will fail during the SDFG build.")
         return node
 
     def _cast_literal_arm(self, arm: ast.expr, other: ast.expr) -> ast.expr:
@@ -241,68 +261,17 @@ def _rewrite_cutile_tasklet_code(code: str, tile_conn_dtypes: Dict[str, str]) ->
     return ast.unparse(tree)
 
 
-def _is_device_scalar(desc: object) -> bool:
-    """Whether *desc* is a numeric ``data.Scalar`` that must reach a cuTile
-    kernel through device memory.
-
-    The ``cuda.tile`` launch boundary (1.5.0) cannot pass numeric scalars by
-    value faithfully: every by-value Python/numpy float is typed ``float32``
-    (silent float64 precision loss), a Python int >= 2**31 raises
-    ``OverflowError`` (int32 typing), and numpy int/float scalar types are
-    rejected outright. All float/int/uint Scalars are therefore passed as
-    1-element device arrays and bound as scalar tiles via
-    ``ct.load(name, (0,), shape=()).item()`` in-kernel (bit-exact for f64 and
-    int64/uint64). Bool scalars stay by value: the boundary types them
-    exactly (``ScalarConstraint(bool_)``).
-
-    :param desc: A data descriptor (or ``None``).
-    :returns: ``True`` for float/int/uint ``data.Scalar`` descriptors.
-    """
-    return isinstance(desc, data.Scalar) and desc.dtype.as_numpy_dtype().kind in "fiu"
-
-
-def _scalar_tile_load(name: str) -> str:
-    """The 0-d tile load binding a device-scalar kernel parameter.
-
-    The trailing ``.item()`` (``cuda.tile``'s ``Tile.item``, equivalent to
-    ``reshape(())``) is a device-side scalar extraction -- NOT the host
-    ``numpy``/``cupy`` ``.item()`` -- that normalizes the load to a canonical
-    scalar tile. It stays on device (no host copy) and yields the scalar form
-    contexts like load indices and ``range`` bounds expect.
-
-    :param name: The 1-element device-array parameter name.
-    :returns: The ``ct.load(...).item()`` expression producing a scalar tile.
-    """
-    return f"ct.load({name}, (0,), shape=()).item()"
-
-
 def _scalar_element_load(name: str, index_exprs: str) -> str:
     """The scalar load of a single addressed element of an in-kernel array.
 
-    Like :func:`_scalar_tile_load`, the trailing device-side ``.item()``
-    normalizes the load to a scalar tile (no host copy).
+    The trailing device-side ``.item()`` normalizes the load to a scalar tile
+    without a host copy.
 
     :param name: The in-kernel array name.
     :param index_exprs: Comma-joined per-dim index expressions.
     :returns: The ``ct.load(...).item()`` expression producing a scalar tile.
     """
     return f"ct.load({name}, ({index_exprs},), shape=()).item()"
-
-
-def _is_device_staged_scalar(desc: object) -> bool:
-    """Whether *desc* is a numeric ``data.Scalar`` materialized as a 1-element
-    DEVICE array at kernel entry — either a non-transient kernel parameter
-    (launch-site normalization, see :func:`_is_device_scalar`) or a transient
-    staged in ``GPU_Global`` storage by the data-copy insertion. Both need the
-    0-d ``ct.load`` binding; a transient in Register/Default storage is a plain
-    in-kernel Python variable and must be bound by rename instead.
-
-    :param desc: A data descriptor (or ``None``).
-    :returns: ``True`` when the in-kernel binding must be a 0-d tile load.
-    """
-    if not _is_device_scalar(desc):
-        return False
-    return (not desc.transient) or desc.storage == dtypes.StorageType.GPU_Global
 
 
 def _element_index_exprs(subset: object, allow_multi_element: bool = False) -> Optional[str]:
@@ -476,6 +445,212 @@ def _ordered_unique(items: Iterable[str]) -> List[str]:
     return sorted(set(items))
 
 
+_CUTILE_DTYPE_NAMES = {
+    "bool": "bool_",
+    "int8": "int8",
+    "int16": "int16",
+    "int32": "int32",
+    "int64": "int64",
+    "uint8": "uint8",
+    "uint16": "uint16",
+    "uint32": "uint32",
+    "uint64": "uint64",
+    "float16": "float16",
+    "float32": "float32",
+    "float64": "float64",
+}
+
+
+def _cutile_dtype_names(dtype: dtypes.typeclass) -> Tuple[str, str]:
+    """Return canonical NumPy and cuda.tile names for ``dtype``.
+
+    :raises NotImplementedError: If the exported scalar/array ABI does not
+        support the data type.
+    """
+    numpy_name = dtype.as_numpy_dtype().name
+    cutile_name = _CUTILE_DTYPE_NAMES.get(numpy_name)
+    if cutile_name is None:
+        raise NotImplementedError(f"cuTile exported kernels do not support dtype {numpy_name!r}")
+    return numpy_name, cutile_name
+
+
+def _constant_properties(sdfg: "SDFG") -> Dict[str, Tuple[data.Data, object]]:
+    """Return inherited constant descriptors and values, honoring shadowing."""
+    result: Dict[str, Tuple[data.Data, object]] = {}
+    if sdfg.parent_sdfg is not None:
+        result.update(_constant_properties(sdfg.parent_sdfg))
+    result.update(sdfg.constants_prop)
+    return result
+
+
+def _cutile_unsigned_bits(value: int, bits: int) -> str:
+    """Render an exact unsigned integer from 16-bit Python literals."""
+    dtype_name = f"uint{bits}"
+    highest_shift = 16 * ((bits + 15) // 16 - 1)
+    chunks = [(value >> shift) & 0xffff for shift in range(highest_shift, -1, -16)]
+    expression = f"ct.astype({chunks[0]}, ct.{dtype_name})"
+    for chunk in chunks[1:]:
+        expression = (f"({expression} * ct.astype(65536, ct.{dtype_name}) + "
+                      f"ct.astype({chunk}, ct.{dtype_name}))")
+    return expression
+
+
+def _cutile_scalar_constant(name: str, descriptor: data.Data, value: object) -> str:
+    """Render one exact, typed scalar constant for a cuTile kernel.
+
+    Python numeric literals enter cuda.tile as int32 or float32. Constructing
+    the target bit pattern from 16-bit integer chunks prevents that implicit
+    narrowing, including for non-float32-exact float64 values.
+
+    :param name: SDFG constant name, used in diagnostics.
+    :param descriptor: Declared constant descriptor.
+    :param value: Constant value.
+    :returns: cuda.tile expression with the declared scalar type.
+    :raises NotImplementedError: If the constant is not a supported scalar.
+    """
+    if not isinstance(descriptor, data.Scalar):
+        raise NotImplementedError(
+            f"cuTile constant {name!r} must be a scalar; {type(descriptor).__name__} constants are unsupported")
+    try:
+        numpy_name, cutile_name = _cutile_dtype_names(descriptor.dtype)
+    except NotImplementedError as error:
+        raise NotImplementedError(
+            f"cuTile constant {name!r} has unsupported scalar dtype {descriptor.dtype!r}") from error
+    numpy_dtype = np.dtype(numpy_name)
+    if numpy_dtype.kind == "b":
+        return repr(bool(np.asarray(value, dtype=numpy_dtype).item()))
+    if numpy_dtype.kind not in "iuf" or numpy_dtype.itemsize not in (1, 2, 4, 8):
+        raise NotImplementedError(f"cuTile constant {name!r} has unsupported scalar dtype {numpy_dtype.name!r}")
+
+    bits = numpy_dtype.itemsize * 8
+    unsigned_dtype = np.dtype(f"uint{bits}")
+    try:
+        scalar = np.asarray(value, dtype=numpy_dtype).reshape(())
+    except (OverflowError, TypeError, ValueError) as error:
+        raise NotImplementedError(
+            f"cuTile constant {name!r} value of type {type(value).__name__} is not a {numpy_dtype.name} scalar"
+        ) from error
+    bit_value = int(scalar.view(unsigned_dtype).item())
+    bit_expression = _cutile_unsigned_bits(bit_value, bits)
+    if numpy_dtype.kind == "u":
+        return bit_expression
+    return f"ct.bitcast({bit_expression}, ct.{cutile_name})"
+
+
+def _literalize_referenced_constants(sdfg: "SDFG", source: str) -> Tuple[List[str], List[Tuple[str, str]]]:
+    """Render scalar constants whose identifiers occur in generated source."""
+    definitions: List[str] = []
+    values: List[Tuple[str, str]] = []
+    for name, (descriptor, value) in sorted(_constant_properties(sdfg).items()):
+        if re.search(rf"\b{re.escape(name)}\b", source) is None:
+            continue
+        expression = _cutile_scalar_constant(name, descriptor, value)
+        definitions.append(f"{name} = {expression}")
+        values.append((name, expression))
+    return definitions, values
+
+
+def _constant_shape(shape: Iterable[object], sdfg: "SDFG") -> Tuple[Optional[int], ...]:
+    """Return proven constant nonnegative dimensions from an SDFG shape."""
+    substitutions = {
+        sp.Symbol(name): value
+        for name, (descriptor, value) in _constant_properties(sdfg).items() if isinstance(descriptor, data.Scalar)
+    }
+    result: List[Optional[int]] = []
+    for dimension in shape:
+        expression = sp.sympify(dimension).subs(substitutions)
+        if expression.is_integer is True and expression.is_number:
+            value = int(expression)
+            result.append(value if value >= 0 else None)
+        else:
+            result.append(None)
+    return tuple(result)
+
+
+def _normalize_runtime_integer_type(expression: object, inferred: dtypes.typeclass) -> dtypes.typeclass:
+    """Use signed host semantics for fixed Python integer literals."""
+    if inferred is None or inferred.as_numpy_dtype().kind not in "iu":
+        return inferred
+    try:
+        expression_ast = ast.parse(symstr(expression), mode="eval")
+    except (SyntaxError, TypeError, ValueError):
+        return inferred
+    allowed_nodes = (ast.Expression, ast.Constant, ast.UnaryOp, ast.BinOp, ast.operator, ast.unaryop)
+    if any(not isinstance(node, allowed_nodes) or (
+            isinstance(node, ast.Constant) and (isinstance(node.value, bool) or not isinstance(node.value, int)))
+           for node in ast.walk(expression_ast)):
+        return inferred
+    try:
+        value_expr = sp.sympify(expression)
+    except (AttributeError, TypeError, ValueError):
+        return inferred
+    if value_expr.is_integer is not True or value_expr.is_number is not True:
+        return inferred
+    value = int(value_expr)
+    if -(2**63) <= value < 2**63:
+        return dtypes.int64
+    if 0 <= value < 2**64:
+        return dtypes.uint64
+    raise OverflowError(f"Runtime integer value {value} does not fit an exported 64-bit scalar ABI")
+
+
+def _record_runtime_type(result: Dict[str, dtypes.typeclass], name: str, dtype: dtypes.typeclass) -> None:
+    previous = result.get(name)
+    if previous is not None and previous != dtype:
+        raise TypeError(f"Conflicting cuTile ABI types for runtime value {name!r}: {previous} and {dtype}")
+    result[name] = dtype
+
+
+def _runtime_symbol_types(sdfg: "SDFG") -> Dict[str, dtypes.typeclass]:
+    """Infer fixed types for loop and interstate-assigned host values."""
+    global_symbols = copy.deepcopy(sdfg.symbols)
+    global_symbols.update({name: desc.dtype for name, desc in sdfg.arrays.items()})
+    result: Dict[str, dtypes.typeclass] = {}
+    for region in sdfg.all_control_flow_regions():
+        if isinstance(region, LoopRegion) and region.loop_variable and region.init_statement is not None:
+            name = region.loop_variable
+            if name in global_symbols:
+                inferred = global_symbols[name]
+            else:
+                inferred = dtypes.result_type_of(
+                    infer_expr_type(loop_analysis.get_init_assignment(region), global_symbols),
+                    infer_expr_type(loop_analysis.get_loop_stride(region), global_symbols),
+                    infer_expr_type(loop_analysis.get_loop_end(region), global_symbols),
+                )
+                if inferred is not None and inferred.as_numpy_dtype().kind in "iu":
+                    inferred = dtypes.int64
+            if inferred is None:
+                raise TypeError(f"Cannot infer a fixed cuTile ABI type for loop variable {name!r}")
+            _record_runtime_type(result, name, inferred)
+            global_symbols[name] = inferred
+
+        if region.start_block is None:
+            continue
+        for edge in region.dfs_edges(region.start_block):
+            for name, expression in edge.data.assignments.items():
+                inferred = infer_expr_type(expression, global_symbols)
+                inferred = _normalize_runtime_integer_type(expression, inferred)
+                fixed_type = sdfg.symbols.get(name, inferred)
+                if fixed_type is None:
+                    raise TypeError(f"Cannot infer a fixed cuTile ABI type for interstate value {name!r}")
+                _record_runtime_type(result, name, fixed_type)
+                global_symbols[name] = fixed_type
+    return result
+
+
+def _source_location(entry: nodes.MapEntry) -> str:
+    """Return a stable source-location string for diagnostics."""
+    debuginfo = getattr(entry, "debuginfo", None)
+    if debuginfo is None:
+        return ""
+    filename = getattr(debuginfo, "filename", None) or ""
+    line = getattr(debuginfo, "start_line", None)
+    column = getattr(debuginfo, "start_column", None)
+    if line is None:
+        return str(filename)
+    return f"{filename}:{line}:{0 if column is None else column}"
+
+
 def _collect_free_symbols(entry: nodes.MapEntry, dfg_scope: object, sdfg: "SDFG") -> List[str]:
     """Collect free symbols used in a map scope.
 
@@ -592,6 +767,10 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
     def __init__(self, frame_codegen: "DaCePythonCodeGenerator", sdfg: "SDFG") -> None:
         self._frame = frame_codegen
         self._dispatcher = frame_codegen.dispatcher
+        self._module_spec = CuTileModuleSpec(sdfg.name)
+        self._host_support_emitted = False
+        self._runtime_symbol_type_cache: Dict[int, Dict[str, dtypes.typeclass]] = {}
+        self._active_compile_time_constants: Optional[Dict[str, str]] = None
         #: Tracks already-generated nested functions by position key to avoid duplicates.
         self._generated_nested_functions: Dict[str, str] = {}
         # Register as the handler for CuTile map scopes.
@@ -627,18 +806,23 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
         self._dispatcher.register_array_dispatcher(dtypes.StorageType.CuTile_Tile, self)
 
     def get_generated_codeobjects(self) -> list:
-        """Return generated code objects (none for this target).
-
-        :returns: Empty list.
-        """
-        return []
+        """Return the one aggregate build-only module when maps were found."""
+        code_object = self._module_spec.render_codeobject(type(self))
+        return [] if code_object is None else [code_object]
 
     def get_includes(self) -> Dict[str, List[str]]:
         """Return import statements needed for cuTile kernels.
 
         :returns: Mapping from code section to list of import lines.
         """
-        return {"frame": ["import cuda.tile as ct", "import cupy"]}
+        return {
+            "frame": [
+                "import cupy",
+                "import numpy",
+                "from cpython.bytes cimport PyBytes_FromStringAndSize",
+                "from libc.stddef cimport size_t",
+            ]
+        }
 
     def preprocess(self, sdfg: "SDFG") -> None:
         """Preprocessing hook (no-op for cuTile).
@@ -1103,6 +1287,24 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
         return outer_edge.data.data if outer_edge.data else outer_edge.src.data
 
     @staticmethod
+    def _trace_store_target_edge(state: "SDFGState", exit_node: nodes.MapExit, out_edge: object) -> Optional[object]:
+        """Trace a scope output to the outer edge receiving it.
+
+        :param state: The state containing the scope.
+        :param exit_node: The scope exit.
+        :param out_edge: The inner edge entering ``exit_node``.
+        :returns: The matching outer edge, or ``None``.
+        """
+        dst_conn = out_edge.dst_conn
+        if dst_conn is None or not dst_conn.startswith(_SCOPE_IN_PREFIX):
+            return None
+        outer_conn = _matching_inner_connector(dst_conn)
+        for outer_edge in state.out_edges_by_connector(exit_node, outer_conn):
+            if isinstance(outer_edge.dst, nodes.AccessNode):
+                return outer_edge
+        return None
+
+    @staticmethod
     def _trace_store_target(state: "SDFGState", exit_node: nodes.MapExit, tile_node: nodes.AccessNode,
                             out_edge: object) -> Optional[str]:
         """Trace through a MapExit to find the global array receiving a tile.
@@ -1117,14 +1319,10 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
         :param out_edge: The edge from tile_node to MapExit.
         :returns: The global array name, or ``None`` if not found.
         """
-        dst_conn = out_edge.dst_conn
-        if dst_conn is None or not dst_conn.startswith(_SCOPE_IN_PREFIX):
+        outer_edge = CuTilePythonCodeGen._trace_store_target_edge(state, exit_node, out_edge)
+        if outer_edge is None:
             return None
-        outer_conn = _matching_inner_connector(dst_conn)
-        for outer_edge in state.out_edges_by_connector(exit_node, outer_conn):
-            if isinstance(outer_edge.dst, nodes.AccessNode):
-                return outer_edge.data.data if outer_edge.data else outer_edge.dst.data
-        return None
+        return outer_edge.data.data if outer_edge.data else outer_edge.dst.data
 
     @staticmethod
     def _load_source_begins(state: "SDFGState", entry: nodes.MapEntry, in_edge: object) -> Optional[List[str]]:
@@ -1376,10 +1574,10 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
 
     @staticmethod
     def _kernel_input_names(state: "SDFGState", entry: nodes.MapEntry) -> set:
-        """Data names passed into the kernel (in-edges of the map entry) —
-        exactly the ``input_arrays`` the launch site normalizes (a numeric
-        Scalar param always becomes a 1-element device array; see
-        ``generate_scope``).
+        """Data names passed into the kernel from map-entry in-edges.
+
+        Scalar ABI handling is recorded separately in the aggregate kernel
+        specification and packed at the embedded-symbol launch site.
 
         :param state: The state containing the map scope.
         :param entry: The CuTile-scheduled MapEntry of the kernel scope.
@@ -1390,33 +1588,6 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
             for e in state.in_edges(entry)
             if e.data is not None and e.data.data is not None and isinstance(e.src, nodes.AccessNode)
         }
-
-    def _scalar_needs_tile_load(self, state: "SDFGState", entry: Optional[nodes.MapEntry], name: str,
-                                desc: object) -> bool:
-        """Whether a numeric-Scalar read must be bound as a 0-d tile load.
-
-        Mirrors the launch site exactly when the kernel entry is at hand: every
-        numeric (float/int/uint) Scalar in the kernel's INPUT list is a
-        1-element device array (regardless of transience/storage —
-        covariance's host-created transient prefactor is still a param), while
-        kernel-written scalars, bool scalars, and scalars defined inside the
-        kernel are plain values. Without an entry (a nested SDFG inside the
-        kernel), fall back to the descriptor heuristic
-        (:func:`_is_device_staged_scalar`).
-
-        :param state: The state owning the read.
-        :param entry: The enclosing CuTile MapEntry, or ``None`` inside a
-            nested SDFG.
-        :param name: The data name being bound.
-        :param desc: Its data descriptor.
-        :returns: ``True`` when the binding must be ``ct.load(name, (0,), shape=()).item()``.
-        """
-        if not _is_device_scalar(desc):
-            return False
-        if entry is not None:
-            return (name in self._kernel_input_names(state, entry)
-                    and name not in self._kernel_output_names(state, entry))
-        return _is_device_staged_scalar(desc)
 
     def _emit_scalar_bridge_binding(self, sdfg: "SDFG", state: "SDFGState", node: nodes.AccessNode, cfg: object,
                                     state_id: int, callsite_stream: PythonCodeIOStream) -> None:
@@ -1458,8 +1629,6 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
                 warnings.warn(f"cuTile codegen: scalar bridge {node.data!r} is fed by {srcs} instead of a "
                               f"MapEntry; no binding emitted (the kernel may reference an undefined name).")
             return
-        kernel_entry = _enclosing_cutile_entry(state, node)
-        kernel_outputs = (self._kernel_output_names(state, kernel_entry) if kernel_entry is not None else set())
         for in_edge in map_entry_edges:
             outer_edge = self._trace_load_source_edge(state, in_edge.src, in_edge)
             if outer_edge is None:
@@ -1468,25 +1637,8 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
                 continue
             src_name = outer_edge.data.data if outer_edge.data else outer_edge.src.data
             src_desc = sdfg.arrays.get(src_name)
-            # Mirror the launch-site convention (``_launch_arg_expr``): only
-            # *input-only* numeric Scalars in DEVICE memory (kernel params, or
-            # GPU_Global-staged transients like gramschmidt's ``R_index``) are
-            # 1-element device arrays bound as 0-d tiles; a kernel-written
-            # scalar is passed raw (and numeric input+output scalars are
-            # rejected in generate_scope). A Register/Default TRANSIENT
-            # scalar is bound in-kernel as a plain Python variable (e.g.
-            # syrk's ``alpha_times_A_slice``), so a ``ct.load`` on it would be
-            # invalid -- it takes the rename path.
-            if self._scalar_needs_tile_load(state, kernel_entry, src_name, src_desc):
-                # Numeric scalar: the kernel parameter is a 1-element device
-                # array (launch-site normalization, full f64/int64 precision);
-                # bind it as a 0-d tile.
-                source_expr = _scalar_tile_load(src_name)
-            elif src_desc is None or isinstance(src_desc, data.Scalar):
-                # Non-numeric scalar (bool -- complex is rejected at the
-                # launch boundary) or unknown descriptor: the kernel parameter
-                # carries the plain value (launch-site ``.item()``), so the
-                # bridge is a rename.
+            if src_desc is None or isinstance(src_desc, data.Scalar):
+                # Read-only scalars use the exact by-value exported ABI.
                 source_expr = src_name
             else:
                 # Array source: scalar tile load of the staged element. The
@@ -1510,6 +1662,55 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
                 source_expr = _scalar_element_load(src_name, index_exprs)
             if source_expr != node.data:
                 callsite_stream.write(f"{node.data} = {source_expr}", cfg, state_id)
+
+    def _emit_scalar_bridge_writeback(self, sdfg: "SDFG", state: "SDFGState", node: nodes.AccessNode, cfg: object,
+                                      state_id: int, callsite_stream: PythonCodeIOStream) -> None:
+        """Store a Register scalar bridge into its device-array scope output.
+
+        Ordinary writes use ``ct.store``. Supported WCRs use the matching
+        cuda.tile atomic operation so every tile can update the same promoted
+        one-element array safely.
+
+        :raises NotImplementedError: If the target is not device-array
+            storage, the memlet is not an element access, or the WCR has no
+            cuda.tile atomic equivalent.
+        """
+        for out_edge in state.out_edges(node):
+            if not isinstance(out_edge.dst, nodes.MapExit):
+                continue
+            outer_edge = self._trace_store_target_edge(state, out_edge.dst, out_edge)
+            if outer_edge is None:
+                continue
+            target = outer_edge.data.data if outer_edge.data is not None else outer_edge.dst.data
+            target_desc = sdfg.arrays.get(target)
+            if (not isinstance(target_desc, data.Array)
+                    or target_desc.storage not in (dtypes.StorageType.GPU_Global, dtypes.StorageType.GPU_Shared)):
+                raise NotImplementedError(
+                    f"cuTile codegen: mutable scalar output {target!r} must use one-element device-array storage")
+
+            subset = outer_edge.data.subset if outer_edge.data is not None else None
+            if subset is None and out_edge.data is not None:
+                subset = out_edge.data.subset
+            index_exprs = _element_index_exprs(subset) if subset is not None else None
+            if index_exprs is None:
+                raise NotImplementedError(
+                    f"cuTile codegen: mutable scalar output {target!r} must address exactly one array element")
+            index = f"({index_exprs},)"
+
+            inner_wcr = out_edge.data.wcr if out_edge.data is not None else None
+            outer_wcr = outer_edge.data.wcr if outer_edge.data is not None else None
+            wcr = inner_wcr or outer_wcr
+            if wcr is None:
+                callsite_stream.write(f"ct.store({target}, index={index}, tile={node.data})", cfg, state_id)
+                continue
+
+            reduction_type = detect_reduction_type(wcr)
+            atomic = _CT_ATOMIC_REDUCTIONS.get(reduction_type)
+            if atomic is None:
+                reduction_name = reduction_type.name if reduction_type is not None else "unknown"
+                raise NotImplementedError(
+                    f"cuTile codegen: mutable scalar WCR {reduction_name} has no supported atomic writeback")
+            callsite_stream.write(f"ct.{atomic}({target}, {index}, {node.data})", cfg, state_id)
 
     def _generate_AccessNode(self, sdfg: "SDFG", cfg: object, dfg: object, state_id: int, node: nodes.AccessNode,
                              function_stream: PythonCodeIOStream, callsite_stream: PythonCodeIOStream) -> None:
@@ -1553,6 +1754,7 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
             # ``Undefined variable <name>``.
             if desc.storage == dtypes.StorageType.Register and isinstance(desc, data.Scalar):
                 self._emit_scalar_bridge_binding(sdfg, state, node, cfg, state_id, callsite_stream)
+                self._emit_scalar_bridge_writeback(sdfg, state, node, cfg, state_id, callsite_stream)
             return
 
         entry = _enclosing_cutile_entry(state, node)
@@ -1730,12 +1932,8 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
                         # memlet subset (syrk's ``alpha * A[i, k]`` became
                         # ``alpha * A`` -- a mixed-rank TileTypeError at
                         # runtime). Bind the addressed element instead.
-                        if self._scalar_needs_tile_load(state, entry, rhs, src_desc):
-                            # Numeric-scalar kernel param: 1-element device
-                            # array (launch-site convention) -> 0-d tile.
-                            rhs = _scalar_tile_load(rhs)
-                        elif (isinstance(src_desc, data.Array) and not isinstance(src_desc, data.View)
-                              and edge.data is not None and edge.data.data == rhs):
+                        if (isinstance(src_desc, data.Array) and not isinstance(src_desc, data.View)
+                                and edge.data is not None and edge.data.data == rhs):
                             # Global array read: 0-d tile load of the addressed
                             # element. Multi-element subsets (e.g. gather
                             # sources) keep the raw array binding.
@@ -1754,21 +1952,10 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
                     root = state.memlet_path(edge)[0].src
                     if isinstance(root, nodes.AccessNode):
                         rhs = root.data
-                        # An *input-only* numeric scalar in device memory
-                        # (kernel param or GPU_Global-staged transient) is a
-                        # 1-element device array; bind as 0-d tile. Mirrors the
-                        # launch-site condition in ``_launch_arg_expr``
-                        # (kernel-written scalars are passed raw; numeric
-                        # input+output scalars are rejected in
-                        # ``generate_scope``; Register/Default transient
-                        # scalars are plain in-kernel variables -- rename
-                        # only).
                         root_desc = sdfg.arrays.get(rhs)
-                        if self._scalar_needs_tile_load(state, entry, rhs, root_desc):
-                            rhs = _scalar_tile_load(rhs)
-                        elif (isinstance(root_desc, data.Array) and not isinstance(root_desc, data.View)
-                              and root_desc.storage not in (dtypes.StorageType.CuTile_Tile, dtypes.StorageType.Register)
-                              and edge.data is not None and edge.data.data == rhs):
+                        if (isinstance(root_desc, data.Array) and not isinstance(root_desc, data.View) and
+                                root_desc.storage not in (dtypes.StorageType.CuTile_Tile, dtypes.StorageType.Register)
+                                and edge.data is not None and edge.data.data == rhs):
                             # Global-array element read through the scope
                             # entry (symm's ``alpha * B[i, j]``): binding the
                             # bare name hands the tasklet the whole ct array.
@@ -1981,14 +2168,19 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
 
         py_cflow.control_flow_region_to_code(inner_sdfg, dispatch_state, self._frame, inner_sdfg.symbols, body_stream)
 
+        body_code = body_stream.getvalue().rstrip("\n")
+        constant_defs, constant_values = _literalize_referenced_constants(inner_sdfg, body_code)
+        if self._active_compile_time_constants is not None:
+            for name, expression in constant_values:
+                self._active_compile_time_constants[f"{func_name}.{name}"] = expression
+
         if returned_outputs:
-            body_stream.write(f"return {', '.join(returned_outputs)}")
+            body_code += ("\n" if body_code else "") + f"return {', '.join(returned_outputs)}"
 
         function_stream.write("")
         function_stream.write(f"def {func_name}({', '.join(params)}):")
         with function_stream.indented():
-            body_code = body_stream.getvalue().rstrip("\n")
-            function_stream.write(body_code if body_code.strip() else "pass")
+            function_stream.write("\n".join(constant_defs + ([body_code] if body_code.strip() else ["pass"])))
         function_stream.write("")
 
     # ------------------------------------------------------------------
@@ -2063,56 +2255,110 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
         return conn_name  # fallback: use connector name itself
 
     # ------------------------------------------------------------------
-    # Scope generation (kernel wrapper + launch)
+    # Scope generation (build artifact + dedicated host launch helper)
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _launch_arg_expr(sdfg: "SDFG", name: str, is_output: bool) -> str:
-        """Return the ``ct.launch`` argument expression for a data name.
+    def _symbol_types(self, sdfg: "SDFG") -> Dict[str, dtypes.typeclass]:
+        """Return cached fixed types for runtime-defined host values."""
+        key = id(sdfg)
+        if key not in self._runtime_symbol_type_cache:
+            self._runtime_symbol_type_cache[key] = _runtime_symbol_types(sdfg)
+        return self._runtime_symbol_type_cache[key]
 
-        Input-only Scalar arguments are unwrapped to native Python scalars:
-        at runtime they may be 0-d numpy buffers (scalar SDFG arguments),
-        numpy scalars, or 0-d cupy arrays (values read from GPU memory), all
-        of which ``ct.launch`` rejects. Arrays and kernel-written scalars are
-        passed through unchanged.
+    def _parameter_specs(self, sdfg: "SDFG", input_names: List[str], output_names: List[str],
+                         free_symbols: List[str]) -> Tuple[CuTileParameterSpec, ...]:
+        """Build the explicit array and scalar ABI for one map scope."""
+        result: List[CuTileParameterSpec] = []
+        input_set = set(input_names)
+        output_set = set(output_names)
+        data_names = list(dict.fromkeys(input_names + output_names))
+        array_count = sum(isinstance(sdfg.arrays.get(name), data.Array) for name in data_names)
+        for name in data_names:
+            desc = sdfg.arrays.get(name)
+            if desc is None:
+                raise ValueError(f"cuTile kernel parameter {name!r} has no data descriptor")
+            numpy_name, cutile_name = _cutile_dtype_names(desc.dtype)
+            is_read = name in input_set
+            is_written = name in output_set
+            if isinstance(desc, data.Scalar):
+                if is_written:
+                    if is_read:
+                        raise NotImplementedError(
+                            f"cuTile codegen: Scalar {name!r} is both a kernel input and a kernel output; "
+                            "materialize mutable scalar storage as a one-element device array before lowering.")
+                    raise NotImplementedError(
+                        f"cuTile codegen: mutable Scalar {name!r} must be materialized as a one-element "
+                        "device array before lowering.")
+                result.append(
+                    CuTileParameterSpec(
+                        name=name,
+                        host_expression=_array_runtime_name(sdfg, name),
+                        kind=CuTileParameterKind.ReadOnlyScalar,
+                        dace_dtype=numpy_name,
+                        cutile_dtype=cutile_name,
+                        rank=0,
+                        index_dtype="int64",
+                        shape_constraints=(),
+                        stride_constraints=(),
+                        alias_groups=(),
+                        may_alias_internally=False,
+                        is_read=True,
+                        is_written=False,
+                        source=name,
+                    ))
+                continue
 
-        :param sdfg: The SDFG containing the data descriptor.
-        :param name: The data name.
-        :param is_output: Whether the kernel writes to this data.
-        :returns: The Python expression string for the launch argument.
-        :raises NotImplementedError: For complex Scalar inputs (no cuTile
-            launch convention exists for them).
-        """
-        expr = _array_runtime_name(sdfg, name)
-        desc = sdfg.arrays.get(name)
-        if isinstance(desc, data.Scalar) and not is_output:
-            if _is_device_scalar(desc):
-                # Numeric scalars (float/int/uint) go through device memory
-                # as 1-element arrays (``cupy.asarray(x).reshape(1)`` -- a
-                # no-copy view for device-resident values) and are bound as
-                # 0-d tiles in-kernel: by-value floats are typed float32 by
-                # cuda.tile (silent f64 precision loss), by-value Python ints
-                # >= 2**31 raise OverflowError, and numpy int scalars are
-                # rejected outright. The declared dtype is preserved (int64
-                # stays int64, uint64 stays uint64).
-                np_name = desc.dtype.as_numpy_dtype().name
-                return f"cupy.asarray({expr}, dtype=numpy.{np_name}).reshape(1)"
-            if desc.dtype.as_numpy_dtype().kind == 'c':
-                raise NotImplementedError(f"cuTile codegen: complex Scalar {name!r} is not supported as a "
-                                          f"kernel argument (no by-value or device-memory convention).")
-            # Bool scalars (the only remaining kind) are passed by value
-            # (typed exactly at the launch boundary); ``.item()`` covers cupy
-            # 0-d arrays, numpy scalars, and 0-d numpy buffers; plain Python
-            # bools pass through.
-            return f"({expr}.item() if hasattr({expr}, 'item') else {expr})"
-        return expr
+            if not isinstance(desc, data.Array):
+                raise NotImplementedError(
+                    f"cuTile kernel parameter {name!r} uses unsupported descriptor {type(desc).__name__}")
+            rank = len(desc.shape)
+            result.append(
+                CuTileParameterSpec(
+                    name=name,
+                    host_expression=_array_runtime_name(sdfg, name),
+                    kind=CuTileParameterKind.Array,
+                    dace_dtype=numpy_name,
+                    cutile_dtype=cutile_name,
+                    rank=rank,
+                    index_dtype="int64",
+                    shape_constraints=_constant_shape(desc.shape, sdfg),
+                    stride_constraints=(None, ) * rank,
+                    alias_groups=(("__dace_may_alias", ) if array_count > 1 else ()),
+                    may_alias_internally=True,
+                    is_read=is_read,
+                    is_written=is_written,
+                    source=name,
+                ))
+
+        runtime_types = self._symbol_types(sdfg)
+        for name in free_symbols:
+            dtype = sdfg.symbols.get(name, runtime_types.get(name))
+            if dtype is None:
+                raise TypeError(f"Cannot infer a fixed cuTile scalar ABI for runtime expression {name!r}; "
+                                "declare the symbol type explicitly.")
+            numpy_name, cutile_name = _cutile_dtype_names(dtype)
+            result.append(
+                CuTileParameterSpec(
+                    name=name,
+                    host_expression=name,
+                    kind=CuTileParameterKind.ReadOnlyScalar,
+                    dace_dtype=numpy_name,
+                    cutile_dtype=cutile_name,
+                    rank=0,
+                    index_dtype="int64",
+                    shape_constraints=(),
+                    stride_constraints=(),
+                    alias_groups=(),
+                    may_alias_internally=False,
+                    is_read=True,
+                    is_written=False,
+                    source=name,
+                ))
+        return tuple(result)
 
     def generate_scope(self, sdfg: "SDFG", cfg: object, dfg_scope: object, state_id: int,
                        function_stream: PythonCodeIOStream, callsite_stream: PythonCodeIOStream) -> None:
-        """Generate the cuTile kernel wrapper and launch call for a map scope.
-
-        Emits a ``@ct.kernel``-decorated function containing the scope body,
-        then emits a ``ct.launch(...)`` call at the call site.
+        """Collect a typed build kernel and emit its Cython launch helper.
 
         :param sdfg: The SDFG.
         :param cfg: The control flow graph.
@@ -2121,8 +2367,8 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
         :param function_stream: Stream for function-level code.
         :param callsite_stream: Stream for call-site code.
         :raises ValueError: If the scope source is not a MapEntry.
-        :raises NotImplementedError: If a Scalar is both a kernel input and a
-            kernel output, or a complex Scalar is a kernel argument.
+        :raises NotImplementedError: For unsupported mutable scalar storage or
+            exported data types.
         """
         entry = dfg_scope.source_nodes()[0]
         if not isinstance(entry, nodes.MapEntry):
@@ -2137,103 +2383,73 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
         output_arrays = _ordered_unique(e.data.data for e in state.out_edges(exit_node)
                                         if e.data and e.data.data and isinstance(e.dst, nodes.AccessNode))
         free_syms = _collect_free_symbols(entry, dfg_scope, sdfg)
-        kernel_params = list(dict.fromkeys(input_arrays + output_arrays + free_syms))
-
-        # A Scalar that is BOTH input and output cannot be launched: numeric
-        # scalars cannot satisfy the two conventions at once (the launch site
-        # passes kernel-written scalars raw, while in-kernel reads bind input
-        # numeric scalars as 0-d tiles from a 1-element device array), and a
-        # raw bool/complex in/out scalar is a 0-d host buffer that ct.launch
-        # rejects at runtime (probed: ``RuntimeError: NumPy only supports
-        # stream=None``) with no writeback path either. The current lowering
-        # pipeline never produces this shape; fail loudly if it ever does.
-        for name in set(input_arrays) & set(output_arrays):
-            if isinstance(sdfg.arrays.get(name), data.Scalar):
-                raise NotImplementedError(f"cuTile codegen: Scalar {name!r} is both a kernel input and a "
-                                          f"kernel output; the scalar launch conventions do not "
-                                          f"support in/out scalars. Stage the scalar through a 1-element array "
-                                          f"instead.")
-
-        # Numeric SYMBOLS would otherwise ride the by-value path, where the
-        # cuda.tile frontend types every Python/numpy float as float32 (silent
-        # f64 precision loss) and every int as int32 (OverflowError >= 2**31
-        # -- same issues as numeric Scalars). Stage them as 1-element device
-        # arrays at the launch site and rebind them as 0-d tiles at kernel
-        # entry (symbols are read-only, so the rebind is safe for every
-        # downstream use: binop broadcasting, tile indices, range() bounds,
-        # and branch conditions all accept 0-d tiles). Grid-dimension
-        # computations at the call site keep the raw host values.
-        # Maps sym name -> declared numpy dtype name, or None for a
-        # runtime-defined name (loop induction variable / interstate-
-        # assignment key, absent from ``sdfg.symbols``): those are staged with
-        # the runtime value's own dtype (``cupy.asarray`` types a Python float
-        # float64 and an int int64 -- exact; a bool becomes a 0-d bool tile,
-        # probe-verified as a branch condition). Declared bool symbols stay by
-        # value (typed exactly at the launch boundary).
-        device_syms: Dict[str, Optional[str]] = {}
-        for s in free_syms:
-            if s in sdfg.symbols:
-                np_dtype = sdfg.symbols[s].as_numpy_dtype()
-                if np_dtype.kind in 'fiu':
-                    device_syms[s] = np_dtype.name
-            else:
-                device_syms[s] = None
-
-        kernel_name = (f"__dace_cutile_{sdfg.name}_{cfg.cfg_id}_"
-                       f"{state.block_id}_{state.node_id(entry)}")
+        parameters = self._parameter_specs(sdfg, input_arrays, output_arrays, free_syms)
 
         kernel_stream = PythonCodeIOStream()
-        kernel_stream.write("@ct.kernel")
-        kernel_stream.write(f"def {kernel_name}({', '.join(kernel_params)}):")
-        with kernel_stream.indented():
-            for sym_name in device_syms:
-                kernel_stream.write(f"{sym_name} = {_scalar_tile_load(sym_name)}")
-            # Emit MapEntry (pid setup) ourselves; the dispatcher's
-            # topological walk treats MapEntry specially (dispatch_scope), so
-            # we cannot rely on dispatch_subgraph to invoke our handler for it.
-            self.generate_node(sdfg, cfg, dfg_scope, state_id, entry, function_stream, kernel_stream)
-            # Walk the rest of the scope. Tasklets, MapExit, AccessNodes, and
-            # NestedSDFGs are routed to our predicated handlers.
+        helper_stream = PythonCodeIOStream()
+        previous_constants = self._active_compile_time_constants
+        scope_constants: Dict[str, str] = {}
+        self._active_compile_time_constants = scope_constants
+        try:
+            self.generate_node(sdfg, cfg, dfg_scope, state_id, entry, helper_stream, kernel_stream)
             self._dispatcher.dispatch_subgraph(
                 sdfg,
                 cfg,
                 dfg_scope,
                 state_id,
-                function_stream,
+                helper_stream,
                 kernel_stream,
                 skip_entry_node=True,
             )
-
-        function_stream.write("")
-        function_stream.write(kernel_stream.getvalue())
-        function_stream.write("")
+        finally:
+            self._active_compile_time_constants = previous_constants
 
         # The cuTile launch grid is capped at 3 axes by the runtime. Grids with
         # more than 3 tiled dimensions are folded onto the 3 available axes (the
         # kernel recovers per-dim block IDs via div/mod in ``_generate_MapEntry``,
         # using the same ``_fold_grid_to_launch`` layout).
         launch_dims, _ = _fold_grid_to_launch(grid_exprs)
-        grid_tuple = f"({', '.join(launch_dims)})"
-        deduped_arrays = list(dict.fromkeys(input_arrays + output_arrays))
-        # Input-only Scalar parameters are normalized at the launch site: the
-        # host-side value may be a 0-d device array (e.g. a scalar computed by
-        # host tasklets from ``gpu_arr[i]``), which the cuda.tile kernel cannot
-        # use as an arithmetic operand. Note: passing a 0-d ARRAY as a kernel
-        # argument crashes the tile compiler; ``shape=()`` loads of 1-element
-        # arrays are fine and are exactly how numeric scalars are bound. See
-        # ``_launch_arg_expr`` for the per-dtype normalization.
-        launch_args = [self._launch_arg_expr(sdfg, n, is_output=n in output_arrays) for n in deduped_arrays]
-        for s in free_syms:
-            if s in device_syms:
-                # Numeric symbols travel through device memory (see above):
-                # declared symbols preserve the declared dtype, runtime-defined
-                # names use the runtime value's own dtype.
-                np_name = device_syms[s]
-                dtype_arg = f", dtype=numpy.{np_name}" if np_name is not None else ""
-                launch_args.append(f"cupy.asarray({s}{dtype_arg}).reshape(1)")
-            else:
-                launch_args.append(s)
-        args_tuple = (f"({', '.join(launch_args)},)" if len(launch_args) == 1 else f"({', '.join(launch_args)})")
+        cfg_id = int(cfg.cfg_id)
+        map_id = state.node_id(entry)
+        stable_identity = (cfg_id, int(state.block_id), map_id, sdfg.name)
+        map_identity = (f"{sdfg.name}:cfg={cfg_id}:state={state.block_id}:"
+                        f"map={map_id}:{entry.map.label}")
+        branch_body = kernel_stream.getvalue().rstrip()
+        constant_defs, constant_values = _literalize_referenced_constants(sdfg, branch_body)
+        for name, expression in constant_values:
+            scope_constants[f"{sdfg.name}.{name}"] = expression
+        constant_metadata = [
+            f"# __dace_compile_time_constant {name}={expression}"
+            for name, expression in sorted(scope_constants.items())
+        ]
+        branch_body = "\n".join(constant_metadata + constant_defs + ([branch_body] if branch_body else []))
+        exported_symbol, launch_helper = make_kernel_symbol(stable_identity, branch_body, parameters)
+        compile_time_values: List[Tuple[str, str]] = []
+        for parameter, map_range in zip(entry.map.params, entry.map.range):
+            compile_time_values.extend(
+                ((f"{parameter}_start", symstr(map_range[0])), (f"{parameter}_step", symstr(map_range[2]))))
+        compile_time_values.extend(sorted(scope_constants.items()))
+        spec = CuTileKernelSpec(
+            stable_identity=stable_identity,
+            map_identity=map_identity,
+            source_location=_source_location(entry),
+            branch_body=branch_body,
+            helper_source=helper_stream.getvalue(),
+            parameters=parameters,
+            exported_symbol=exported_symbol,
+            launch_helper=launch_helper,
+            grid=tuple(launch_dims),
+            tile_widths=tuple(symstr(map_range[2]) for map_range in entry.map.range),
+            compile_time_values=tuple(compile_time_values),
+        )
+        self._module_spec = self._module_spec.with_kernel(spec)
+
+        if not self._host_support_emitted:
+            function_stream.write("")
+            function_stream.write(render_host_support())
+            function_stream.write("")
+            self._host_support_emitted = True
+        function_stream.write(spec.render_launch_helper())
         instrumented = (entry.map.instrument != dtypes.InstrumentationType.No_Instrumentation)
 
         # Instrumentation: kernel-scope begin (before launch)
@@ -2242,21 +2458,10 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
                 if instr is not None:
                     instr.on_scope_entry(sdfg, cfg, state, entry, callsite_stream, callsite_stream, function_stream)
 
-        # Zero- or negative-trip maps (e.g. a loop-dependent range ``0:i`` at
-        # ``i == 0``, or ``1:N-1`` at ``N == 1``) yield a non-positive grid
-        # dimension, which the cuTile runtime rejects ("invalid argument");
-        # the launch is a no-op then, so skip it.
-        callsite_stream.write(
-            f"if min(({', '.join(launch_dims)},)) > 0: "
-            f"ct.launch(cupy.cuda.get_current_stream(), {grid_tuple}, "
-            f"{kernel_name}, {args_tuple})",
-            cfg,
-            state_id,
-        )
+        callsite_stream.write(spec.render_host_call(), cfg, state_id)
 
-        # Always synchronize so the kernel completes before the host
-        # continues (and before any timing measurement ends).
-        callsite_stream.write("cupy.cuda.get_current_stream().synchronize()", cfg, state_id)
+        if instrumented:
+            callsite_stream.write("cupy.cuda.get_current_stream().synchronize()", cfg, state_id)
 
         # Instrumentation: kernel-scope end (after synchronize). The exit node
         # is passed so the provider resolves the matching entry node (and thus

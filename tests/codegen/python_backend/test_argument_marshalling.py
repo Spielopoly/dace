@@ -5,7 +5,8 @@ Covers the NPBench ``dace_cutile`` failure classes:
 
 1. numpy scalar arguments (``np.int64`` etc.) for Scalar args and symbols
    (NPBench ``compute``): marshalled to 0-d numpy buffers of the declared
-   dtype / native Python symbol values; ``ct.launch`` receives native scalars.
+   dtype / native Python symbol values; the AOT launcher packs the declared
+   fixed-width scalar ABI exactly.
 2. plain Python floats for Scalar args (NPBench ``channel_flow``): generated
    host code must not index scalar values that were never wrapped.
 3. GPU element -> host scalar copies (NPBench ``syrk``/``syr2k``): emitted as
@@ -257,8 +258,8 @@ def _adi_like(u: dace.float64[N, N], p: dace.float64[N, N]):
 @pytest.mark.gpu
 class TestCuTileArgumentMarshalling:
 
-    def test_numpy_int_scalars_reach_ct_launch(self):
-        """np.int64 Scalar args through the cuTile pipeline (compute)."""
+    def test_numpy_int_scalars_use_exact_aot_abi(self):
+        """np.int64 Scalar args use the declared exported-kernel ABI."""
         csdfg = _cutile_compile(_compute_like)
         rng = np.random.default_rng(42)
         m, n = 64, 70  # non-divisible tail on the tiled dim
@@ -269,10 +270,8 @@ class TestCuTileArgumentMarshalling:
         ref = np.minimum(np.maximum(a1, 2), 10) * a + a2 * b + c
         np.testing.assert_array_equal(np.asarray(out), ref)
 
-    def test_int_scalar_above_int32_range_reaches_ct_launch(self):
-        """int64 Scalar args >= 2**31: the by-value path raised OverflowError
-        (cuda.tile types Python ints as int32); scalars now travel as
-        1-element device arrays."""
+    def test_int_scalar_above_int32_range_uses_exact_aot_abi(self):
+        """The exported-kernel ABI preserves int64 values above int32 range."""
         csdfg = _cutile_compile(_compute_like)
         rng = np.random.default_rng(43)
         m, n = 32, 40

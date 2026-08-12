@@ -17,7 +17,7 @@ import warnings
 from typing import Any, Dict, Optional, Set, Tuple, Type, Union
 
 from dace import SDFG, data, dtypes, properties, transformation
-from dace.sdfg import nodes
+from dace.sdfg import infer_types, nodes
 from dace.transformation import pass_pipeline as ppl
 from dace.transformation.passes.vectorization.config import VectorizeConfig
 from dace.transformation.passes.vectorization.cutile_lowering import (
@@ -292,6 +292,15 @@ class VectorizeCuTile(ppl.Pass):
 
         # Vectorize — emit tileops library nodes inside the GPU kernels.
         self._vectorizer.apply_pass(sdfg, {})
+
+        # VectorizeMultiDim deliberately scalarizes length-one arrays. Restore
+        # real device storage for GPU scalars only after that pipeline has
+        # finished, then refresh connector types before cuTile lowering.
+        from dace.transformation.passes.promote_gpu_scalars_to_arrays import (InferDefaultSchedulesAndStorages,
+                                                                              PromoteGPUScalarsToArrays)
+        ppl.Pipeline([InferDefaultSchedulesAndStorages(), PromoteGPUScalarsToArrays()]).apply_pass(sdfg, {})
+        infer_types.infer_connector_types(sdfg)
+        infer_types.set_default_schedule_and_storage_types(sdfg, None)
         debug_save_sdfg()
 
         # Anchor census: zero anchors is either the supported BLAS-only

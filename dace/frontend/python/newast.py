@@ -2635,7 +2635,8 @@ class ProgramVisitor(ExtNodeVisitor):
             self.cfg_target.add_node(test_region)
             self._on_block_added(test_region)
         else:
-            parsed_node = astutils.unparse(node)
+            parsed_node = copy.deepcopy(node)
+            parsed_node = astutils.ASTFindReplace({**self.scope_vars, **self.variables}).visit(parsed_node)
             test_region = None
 
         # Generate conditions

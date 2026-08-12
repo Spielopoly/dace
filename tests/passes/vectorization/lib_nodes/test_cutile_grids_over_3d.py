@@ -1,8 +1,8 @@
 # Copyright 2019-2026 ETH Zurich and the DaCe authors. All rights reserved.
 """Regression tests for cuTile launch grids with more than 3 dimensions.
 
-The ``cuda.tile`` runtime caps the launch grid at three axes (``ct.launch``
-takes a ``Dim3`` and ``ct.bid(axis)`` only accepts ``axis in {0, 1, 2}``). A
+The exported cuTile ABI caps the launch grid at three axes, and
+``ct.bid(axis)`` only accepts ``axis in {0, 1, 2}``. A
 tiled ``CuTile`` map with more than three dimensions (e.g. a 4-D or 5-D
 elementwise kernel, ``softmax``, ``conv2d``) therefore has its extra grid
 dimensions FOLDED, row-major, onto grid axis 0 and recovered inside the kernel
@@ -20,12 +20,14 @@ These tests cover:
   compared against NumPy (including non-divisible tile boundaries).
 """
 import ast
+from typing import Tuple
 
 import numpy as np
 import pytest
 
 import dace
 from dace import dtypes
+from dace.codegen.codeobject import CodeObject
 from dace.libraries.tileops._pure_codegen import cutile_bid_expr, cutile_launch_grid_dims
 from dace.transformation.passes.canonicalize import canonicalize
 from dace.transformation.passes.vectorization.vectorize_cutile import VectorizeCuTile
@@ -43,8 +45,8 @@ def _add4d(x: dace.float32[_N, _A, _B, _C], y: dace.float32[_N, _A, _B, _C], z: 
 
 
 @dace.program
-def _fma5d(x: dace.float32[_N, _A, _B, _C, _D], y: dace.float32[_N, _A, _B, _C, _D],
-           z: dace.float32[_N, _A, _B, _C, _D]):
+def _fma5d(x: dace.float32[_N, _A, _B, _C, _D], y: dace.float32[_N, _A, _B, _C, _D], z: dace.float32[_N, _A, _B, _C,
+                                                                                                     _D]):
     z[:] = x * y + x
 
 
@@ -60,9 +62,16 @@ def _lower(prog, widths):
     return sdfg
 
 
-def _main_code(sdfg):
-    """Return the generated Python code object body for the main SDFG."""
-    return next(co for co in sdfg.generate_code() if co.name == sdfg.name).code
+def _generated_artifacts(sdfg: dace.SDFG) -> Tuple[CodeObject, CodeObject]:
+    """Return the Cython host and aggregate cuTile build artifacts.
+
+    :param sdfg: Lowered Python-backend SDFG.
+    :returns: Host and build code objects.
+    """
+    code_objects = sdfg.generate_code()
+    host = next(co for co in code_objects if co.name == sdfg.name)
+    build = next(co for co in code_objects if co.target_type == "cutile_build")
+    return host, build
 
 
 def _max_bid_axis(code):
@@ -125,20 +134,27 @@ class TestCodegenStructure:
 
     def test_4d_no_bid_axis_above_2(self):
         sdfg = _lower(_add4d, (8, 8, 8))
-        code = _main_code(sdfg)
-        ast.parse(code)  # valid Python
-        assert _max_bid_axis(code) <= 2, "generated code uses a ct.bid axis > 2"
-        # launch grid folds the leading dims onto axis 0 (a product expression)
-        assert "ct.launch(" in code
-        assert "*" in code  # folded axis-0 product
+        host, build = _generated_artifacts(sdfg)
+        assert host.language == "pyx" and host.linkable
+        assert build.target_type == "cutile_build" and not build.linkable
+        ast.parse(build.code)
+        assert _max_bid_axis(build.code) <= 2, "generated code uses a ct.bid axis > 2"
+        # The host launch helper folds the leading dimensions onto axis 0.
+        assert "__dace_grid = (" in host.code
+        assert ") * (" in host.code
+        assert "(1, 1, 1)" in host.code
         # folded block-id recovery is present in the kernel
-        assert "ct.bid(0) %" in code and "ct.bid(0) //" in code
+        assert "ct.bid(0) %" in build.code and "ct.bid(0) //" in build.code
+        assert "ct.launch(" not in host.code and "ct.launch(" not in build.code
 
     def test_5d_no_bid_axis_above_2(self):
         sdfg = _lower(_fma5d, (8, 8, 8))
-        code = _main_code(sdfg)
-        ast.parse(code)
-        assert _max_bid_axis(code) <= 2, "generated code uses a ct.bid axis > 2"
+        host, build = _generated_artifacts(sdfg)
+        ast.parse(build.code)
+        assert _max_bid_axis(build.code) <= 2, "generated code uses a ct.bid axis > 2"
+        grid_line = next(line for line in host.code.splitlines() if "__dace_grid =" in line)
+        assert grid_line.count(" * ") == 2
+        assert "ct.bid(0) %" in build.code and "ct.bid(0) //" in build.code
 
 
 # ============================================================

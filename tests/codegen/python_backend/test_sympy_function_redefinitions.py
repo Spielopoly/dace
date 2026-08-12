@@ -3,7 +3,7 @@
 
 Host-side tasklet code is emitted verbatim with the C/sympy math names DaCe
 uses (``atan2``, ``fmin``, ``pow``, ``cpp_mod``, ...); the generated frame does
-``from sympy_function_redefinitions import *`` to resolve them. These tests
+inlines explicit NumPy-backed aliases so Cython can resolve them. These tests
 compile and run Python-backend SDFGs whose tasklets use the aliased names and
 compare against NumPy (regression: the arc_distance ``atan2`` failure).
 """

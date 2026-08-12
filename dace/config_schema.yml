@@ -1011,6 +1011,22 @@ required:
                                     every value of this key; only host-side transients become Scalars.
 
             #############################################
+            # cuTile compiler
+            cutile:
+                type: dict
+                title: cuTile
+                description: cuTile compiler preferences
+                required:
+                    arch:
+                        type: str
+                        default: 'auto'
+                        title: Target GPU architecture
+                        description: >
+                            GPU architecture for build-time cuTile export. ``auto``
+                            queries the active CuPy device; an explicit target uses
+                            ``sm_XX`` form, for example ``sm_90``.
+
+            #############################################
             # GPU (CUDA/HIP) compiler
             cuda:
                 type: dict

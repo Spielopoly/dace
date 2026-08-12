@@ -598,6 +598,69 @@ def test_converter_wires_mask_on_unop_when_mask_in_scope():
     assert mask_edges[0].src.data == "_tile_iter_mask"
 
 
+def _build_symbol_unop_with_mask(*, tile_output: bool) -> tuple[dace.SDFG, dace.SDFG]:
+    """Build a masked body whose unary operand is an invariant symbol.
+
+    :param tile_output: Whether the unary operation writes a tile or a scalar.
+    :returns: Outer SDFG and its nested tile body.
+    """
+    from dace.libraries.tileops import TileMaskGen
+    sdfg = dace.SDFG("masked_symbol_unop_fixture")
+    sdfg.add_symbol("N", dace.int64)
+    state = sdfg.add_state("s")
+    me, mx = state.add_map("k", {"ii": "0:8"})
+
+    inner = dace.SDFG("body")
+    inner.add_symbol("N", dace.int64)
+    if tile_output:
+        inner.add_array("tmp", (8, ), dace.float64, transient=True)
+        output_memlet = Memlet("tmp[0:8]")
+    else:
+        inner.add_scalar("tmp", dace.float64, transient=True)
+        output_memlet = Memlet("tmp")
+    inner.add_array("_tile_iter_mask", (8, ), dace.bool_, transient=True)
+    instate = inner.add_state("body")
+    mask_gen = TileMaskGen(name="_tile_iter_mask_gen", widths=(8, ), iter_vars=("ii", ), global_ubs=("8", ))
+    instate.add_node(mask_gen)
+    mask_an = instate.add_access("_tile_iter_mask")
+    instate.add_edge(mask_gen, "_o", mask_an, None, Memlet("_tile_iter_mask[0:8]"))
+    tasklet = instate.add_tasklet("symbol_unop", set(), {"_o"}, "_o = abs(N + 1)")
+    instate.add_edge(tasklet, "_o", instate.add_access("tmp"), None, output_memlet)
+
+    nsdfg = state.add_nested_sdfg(inner, set(), set(), symbol_mapping={"ii": "ii", "N": "N"})
+    state.add_nedge(me, nsdfg, Memlet())
+    state.add_nedge(nsdfg, mx, Memlet())
+    return sdfg, inner
+
+
+def test_converter_does_not_mask_scalar_symbol_unop() -> None:
+    """A scalar-only symbol expression executes once and does not consume a tile mask."""
+    from dace.libraries.tileops import TileUnop
+    sdfg, inner = _build_symbol_unop_with_mask(tile_output=False)
+    ConvertTaskletsToTileOps(widths=(8, )).apply_pass(sdfg, {})
+    body_state = next(s for s in inner.states())
+    unop = next(n for n in body_state.nodes() if isinstance(n, TileUnop))
+    assert isinstance(inner.arrays["tmp"], dace.data.Scalar)
+    assert unop.kind_a == "Symbol"
+    assert unop.has_mask is False
+    assert not [e for e in body_state.in_edges(unop) if e.dst_conn == "_mask"]
+
+
+def test_converter_masks_symbol_unop_with_prewidened_output() -> None:
+    """A prewidened result makes the invariant-symbol unary operation lane-wise."""
+    from dace.libraries.tileops import TileUnop
+    sdfg, inner = _build_symbol_unop_with_mask(tile_output=True)
+    ConvertTaskletsToTileOps(widths=(8, )).apply_pass(sdfg, {})
+    body_state = next(s for s in inner.states())
+    unop = next(n for n in body_state.nodes() if isinstance(n, TileUnop))
+    assert tuple(inner.arrays["tmp"].shape) == (8, )
+    assert unop.kind_a == "Symbol"
+    assert unop.has_mask is True
+    mask_edges = [e for e in body_state.in_edges(unop) if e.dst_conn == "_mask"]
+    assert len(mask_edges) == 1
+    assert mask_edges[0].src.data == "_tile_iter_mask"
+
+
 def test_converter_skips_mask_when_no_mask_in_scope():
     """A body without TileMaskGen produces has_mask=False (the divisible / unmasked case)."""
     sdfg, inner = _build_inner_body_with_binop(op="+")

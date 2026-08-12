@@ -85,7 +85,7 @@ def _vectorized(prog):
     sdfg.apply_transformations_repeated(LoopToMap)
     sdfg.simplify()
     offload_to_gpu(sdfg)
-    VectorizeGPU(VectorizeConfig(widths=(2, ))).apply_pass(sdfg, {})
+    VectorizeGPU(VectorizeConfig(widths=(2, ), assume_even=True)).apply_pass(sdfg, {})
     return sdfg
 
 
@@ -122,6 +122,7 @@ def test_half2_tile_reduce_fires(kind):
         f"expected one width-2 TileReduce; got {[r.widths for r in reds]}"
 
 
+@pytest.mark.old_gpu_codegen_only
 @pytest.mark.parametrize("kind", list(_PROGRAMS))
 def test_emits_block_reduce_and_single_atomic(kind):
     """The device TU folds the block with ``cub::BlockReduce`` and commits ONE atomic
@@ -149,6 +150,7 @@ def test_emits_block_reduce_and_single_atomic(kind):
         "a reduce_atomic outside the thread-0 block-fold guard = one atomic per thread"
 
 
+@pytest.mark.old_gpu_codegen_only
 @pytest.mark.skipif(not _HAS_NVCC, reason="nvcc not available; compile check skipped")
 @pytest.mark.parametrize("kind", list(_PROGRAMS))
 def test_compiles(kind):
@@ -166,6 +168,7 @@ def _run_inputs(kind, nval):
     return a, (np.max if kind == "max" else np.min)
 
 
+@pytest.mark.old_gpu_codegen_only
 @pytest.mark.gpu
 @pytest.mark.parametrize("kind", list(_PROGRAMS))
 def test_runs_exact_multiblock(kind):

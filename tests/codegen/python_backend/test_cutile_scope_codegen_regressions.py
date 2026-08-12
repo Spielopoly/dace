@@ -7,19 +7,15 @@ Covers the code-review findings on the scope generator:
    collides with a host loop variable or an interstate-assignment key must not
    pass the ``runtime_defined`` filter in ``_collect_free_symbols`` (it would
    become an undefined-at-callsite launch argument -> ``NameError``).
-2. **Scalar in kernel input AND output**: the launch site passes
-   kernel-written scalars raw while in-kernel reads bind numeric scalars as
-   0-d tiles (and a raw bool 0-d host buffer is rejected by ``ct.launch``)
-   -- no in/out convention works, so codegen must raise loudly.
-3. **Numeric SYMBOLS**: by-value float kernel arguments are typed float32 by
-   the cuda.tile frontend (and by-value ints int32); numeric symbols must
-   ride the same device-memory path as numeric Scalars (1-element device
-   array + 0-d tile load). Runtime-defined names (interstate-assigned, absent
-   from ``sdfg.symbols``) ride it too, staged with the runtime value's own
-   dtype (``cupy.asarray(s).reshape(1)``, no ``dtype=``).
-4. **Launch guard**: non-positive grid dims (zero- or negative-trip maps) skip
-   the launch (``min((...)) > 0``), not just zero dims.
+2. **Mutable scalar storage**: it must already be materialized as a one-element
+   device array; an unlowered ``Scalar`` fails clearly.
+3. **Numeric symbols**: declared and inferred host values receive exact
+   ``ScalarConstraint`` objects and matching fixed-width host packing.
+4. **Launch guard**: non-positive grid dimensions return before lookup and
+   launch from the dedicated Cython helper.
 """
+import json
+
 import numpy as np
 import pytest
 
@@ -103,25 +99,23 @@ def _inout_scalar_sdfg(dtype) -> dace.SDFG:
 
 
 def test_float_scalar_inout_raises_not_implemented():
+    """Mutable float storage must be materialized before cuTile codegen."""
     sdfg = _inout_scalar_sdfg(dace.float64)
-    with pytest.raises(NotImplementedError, match='both a kernel input and a kernel output'):
+    with pytest.raises(NotImplementedError, match='materialize mutable scalar storage'):
         sdfg.generate_code()
 
 
 def test_int_scalar_inout_raises_not_implemented():
-    """Integer scalars ride the device-memory convention too, so in/out
-    integer scalars are rejected the same way as floats."""
+    """Mutable integer storage must be materialized before cuTile codegen."""
     sdfg = _inout_scalar_sdfg(dace.int64)
-    with pytest.raises(NotImplementedError, match='both a kernel input and a kernel output'):
+    with pytest.raises(NotImplementedError, match='materialize mutable scalar storage'):
         sdfg.generate_code()
 
 
 def test_bool_scalar_inout_raises_not_implemented():
-    """Bool in/out scalars are rejected too: a raw bool in/out Scalar is a 0-d
-    host buffer that ``ct.launch`` rejects at runtime (probed: ``RuntimeError:
-    NumPy only supports stream=None``), with no writeback path either."""
+    """Mutable Boolean storage must be materialized before cuTile codegen."""
     sdfg = _inout_scalar_sdfg(dace.bool)
-    with pytest.raises(NotImplementedError, match='both a kernel input and a kernel output'):
+    with pytest.raises(NotImplementedError, match='materialize mutable scalar storage'):
         sdfg.generate_code()
 
 
@@ -155,24 +149,25 @@ def _float_symbol_sdfg(name: str, n: int = 64, tile_w: int = 32) -> dace.SDFG:
     return sdfg
 
 
-def test_float64_symbol_staged_through_device_memory():
-    """The launch site wraps the float symbol in a 1-element device array and
-    the kernel rebinds it as a 0-d tile (by-value floats are typed float32
-    by cuda.tile, silently losing f64 precision)."""
+def test_float64_symbol_uses_exact_exported_scalar():
+    """The build signature and host helper agree on exact float64 packing."""
     sdfg = _float_symbol_sdfg('float_sym_structural')
-    code = sdfg.generate_code()[0].code.replace(' ', '')
-    assert 'cupy.asarray(alpha_v,dtype=numpy.float64).reshape(1)' in code
-    assert 'alpha_v=ct.load(alpha_v,(0,),shape=()).item()' in code
+    code_objects = sdfg.generate_code()
+    host = next(code.code for code in code_objects if code.language == 'pyx').replace(' ', '')
+    build = next(code.code for code in code_objects if code.target_type == 'cutile_build').replace(' ', '')
+    assert 'compilation.ScalarConstraint(ct.float64)' in build
+    assert 'numpy.float64(__dace_raw_' in host
+    assert 'cupy.asarray(alpha_v' not in host
+    assert 'ct.load(alpha_v' not in build
 
 
 def test_launch_guard_skips_nonpositive_grid():
-    """The launch is guarded by ``min((...)) > 0`` (not merely ``0 not in``),
-    so negative-trip grids (e.g. ``1:N-1`` at ``N == 1``) are skipped too."""
+    """The helper returns before lookup and launch for nonpositive grids."""
     sdfg = _float_symbol_sdfg('launch_guard_structural')
     code = sdfg.generate_code()[0].code.replace(' ', '').replace('\n', '')
-    assert '>0:ct.launch' in code
-    assert 'ifmin((' in code
-    assert '0notin' not in code
+    assert 'ifmin(__dace_grid)<=0:return' in code
+    assert code.index('ifmin(__dace_grid)<=0:return') < code.rindex('__dace_cutile_get_function')
+    assert 'ct.launch' not in code
 
 
 def _int_symbol_sdfg(name: str, n: int = 64, tile_w: int = 32) -> dace.SDFG:
@@ -200,13 +195,16 @@ def _int_symbol_sdfg(name: str, n: int = 64, tile_w: int = 32) -> dace.SDFG:
     return sdfg
 
 
-def test_int64_symbol_staged_through_device_memory():
-    """Int symbols ride the same device-memory path as float symbols
-    (by-value ints are typed int32 by cuda.tile: OverflowError >= 2**31)."""
+def test_int64_symbol_uses_exact_exported_scalar():
+    """The build signature and host helper agree on exact int64 packing."""
     sdfg = _int_symbol_sdfg('int_sym_structural')
-    code = sdfg.generate_code()[0].code.replace(' ', '')
-    assert 'cupy.asarray(k_off,dtype=numpy.int64).reshape(1)' in code
-    assert 'k_off=ct.load(k_off,(0,),shape=()).item()' in code
+    code_objects = sdfg.generate_code()
+    host = next(code.code for code in code_objects if code.language == 'pyx').replace(' ', '')
+    build = next(code.code for code in code_objects if code.target_type == 'cutile_build').replace(' ', '')
+    assert 'compilation.ScalarConstraint(ct.int64)' in build
+    assert 'numpy.int64(__dace_raw_' in host
+    assert 'cupy.asarray(k_off' not in host
+    assert 'ct.load(k_off' not in build
 
 
 @pytest.mark.gpu
@@ -271,14 +269,46 @@ def _runtime_defined_symbol_sdfg(name: str,
     return sdfg
 
 
-def test_runtime_defined_symbol_staged_without_dtype():
-    """A runtime-defined name has no declared dtype: it is staged with the
-    runtime value's own dtype (bare ``cupy.asarray``) and rebound as a 0-d
-    tile at kernel entry, not passed by value."""
+def test_runtime_defined_symbol_type_is_inferred_for_exact_abi():
+    """An interstate value gets one inferred fixed scalar ABI."""
     sdfg = _runtime_defined_symbol_sdfg('rt_sym_structural', '1.0 + 2.0**(-40)', dace.float64, '*')
-    code = sdfg.generate_code()[0].code.replace(' ', '')
-    assert 'cupy.asarray(c_rt).reshape(1)' in code
-    assert 'c_rt=ct.load(c_rt,(0,),shape=()).item()' in code
+    code_objects = sdfg.generate_code()
+    host = next(code.code for code in code_objects if code.language == 'pyx').replace(' ', '')
+    build = next(code.code for code in code_objects if code.target_type == 'cutile_build').replace(' ', '')
+    assert 'compilation.ScalarConstraint(ct.float64)' in build
+    assert 'numpy.float64(__dace_raw_' in host
+    assert 'cupy.asarray(c_rt)' not in host
+    assert 'ct.load(c_rt' not in build
+
+
+def test_conflicting_runtime_defined_symbol_types_fail_during_compilation():
+    """Branch assignments with incompatible scalar ABIs fail closed."""
+    sdfg = _runtime_defined_symbol_sdfg('rt_conflicting_types', '1', dace.float64, '+')
+    sdfg.add_symbol('choose_float', dace.bool_)
+    init = sdfg.start_state
+    main = sdfg.states()[1]
+    for edge in list(sdfg.edges_between(init, main)):
+        sdfg.remove_edge(edge)
+    integer_path = sdfg.add_state('integer_path')
+    float_path = sdfg.add_state('float_path')
+    sdfg.add_edge(init, integer_path, dace.InterstateEdge(condition='not choose_float', assignments={'c_rt': '1'}))
+    sdfg.add_edge(init, float_path,
+                  dace.InterstateEdge(condition='choose_float', assignments={'c_rt': 'numpy.float64(1.5)'}))
+    sdfg.add_edge(integer_path, main, dace.InterstateEdge())
+    sdfg.add_edge(float_path, main, dace.InterstateEdge())
+
+    with pytest.raises(TypeError, match="Conflicting cuTile ABI types for runtime value 'c_rt'"):
+        sdfg.generate_code()
+
+
+def test_runtime_defined_numpy_integer_keeps_numpy_semantics():
+    """Explicit NumPy constructors retain their narrow scalar type."""
+    sdfg = _runtime_defined_symbol_sdfg('rt_numpy_int8', 'numpy.int8(5)', dace.int8, '+')
+    code_objects = sdfg.generate_code()
+    host = next(code.code for code in code_objects if code.language == 'pyx').replace(' ', '')
+    build = next(code.code for code in code_objects if code.target_type == 'cutile_build').replace(' ', '')
+    assert 'compilation.ScalarConstraint(ct.int8)' in build
+    assert 'numpy.int8(__dace_raw_' in host
 
 
 @pytest.mark.gpu
@@ -312,10 +342,63 @@ def test_runtime_defined_int_symbol_large_value_runtime():
 
 
 # ---------------------------------------------------------------------------
-# 5: py_mod / int_floor in rendered element-index expressions
+# 5: scalar SDFG constants
 # ---------------------------------------------------------------------------
 
+_NON_F32_CONSTANT = np.float64(1.0 + 2.0**-40)
 
+
+def _constant_sdfg(name: str, value: object = _NON_F32_CONSTANT) -> dace.SDFG:
+    """Build the float64 symbol fixture with a specialized SDFG constant."""
+    sdfg = _float_symbol_sdfg(name)
+    sdfg.add_constant('alpha_v', float(value), dace.data.Scalar(dace.float64))
+    return sdfg
+
+
+def test_scalar_constant_is_typed_literal_and_changes_symbol_hash():
+    """Specialized constants are absent from the ABI and enter both hashes."""
+    first = _constant_sdfg('constant_hash', _NON_F32_CONSTANT)
+    second = _constant_sdfg('constant_hash', np.float64(1.0 + 2.0**-39))
+    first_object = next(code for code in first.generate_code() if code.target_type == 'cutile_build')
+    second_object = next(code for code in second.generate_code() if code.target_type == 'cutile_build')
+    first_symbols = set(json.loads(first_object.extra_compiler_kwargs['cutile_symbols']))
+    second_symbols = set(json.loads(second_object.extra_compiler_kwargs['cutile_symbols']))
+
+    assert first_symbols != second_symbols
+    assert 'alpha_v = ct.bitcast(' in first_object.code
+    assert '__dace_compile_time_constant constant_hash.alpha_v=' in first_object.code
+    assert 'ScalarConstraint(ct.float64)' not in first_object.code
+
+    from dace.codegen.py.cutile_target import _cutile_scalar_constant
+    int8_literal = _cutile_scalar_constant('SMALL', dace.data.Scalar(dace.int8), -1)
+    assert 'ct.uint8' in int8_literal and 'ct.int8' in int8_literal
+
+
+def test_referenced_array_constant_fails_closed():
+    """An array constant cannot silently become a kernel-module capture."""
+    sdfg = _float_symbol_sdfg('unsupported_constant')
+    sdfg.symbols.pop('alpha_v')
+    sdfg.add_constant('alpha_v', np.asarray([1.0], dtype=np.float64))
+    with pytest.raises(NotImplementedError, match=r"constant 'alpha_v' must be a scalar"):
+        sdfg.generate_code()
+
+
+@pytest.mark.gpu
+def test_non_float32_exact_scalar_constant_runtime():
+    """A specialized float64 constant retains its exact bit pattern."""
+    cupy = pytest.importorskip('cupy')
+    n = 64
+    sdfg = _constant_sdfg('constant_runtime', _NON_F32_CONSTANT)
+    x_host = np.random.default_rng(17).random(n)
+    x = cupy.asarray(x_host)
+    y = cupy.zeros(n, dtype=cupy.float64)
+    sdfg.compile()(x=x, y=y)
+    np.testing.assert_array_equal(cupy.asnumpy(y), x_host * _NON_F32_CONSTANT)
+
+
+# ---------------------------------------------------------------------------
+# 6: py_mod / int_floor in rendered element-index expressions
+# ---------------------------------------------------------------------------
 
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])

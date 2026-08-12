@@ -8,7 +8,7 @@ Two layers:
   instead of ``CuTileInsertDataCopies``), the SDFG has the expected copy-in /
   copy-out states, GPU_Global transient clones, CPU_Heap originals, and correct
   AccessNode/Memlet references.  Codegen tests verify ``.set()`` /
-  ``.get(out=...)`` appear in the generated Python code.
+  ``.get(out=...)`` appear in the generated Cython host code.
 
 * **Runtime tests (``@pytest.mark.gpu``):** compile and run on GPU with
   **NumPy** (host) arrays directly -- the whole point of data copies -- and
@@ -16,13 +16,14 @@ Two layers:
 """
 
 import ast
-from typing import List, Set, Tuple
+from typing import Set, Tuple
 
 import numpy as np
 import pytest
 
 import dace
 from dace import data, dtypes
+from dace.codegen.codeobject import CodeObject
 from dace.sdfg import SDFG, nodes
 from dace.transformation.passes.vectorization import VectorizeCuTile
 from dace.transformation.passes.vectorization.cutile_lowering import (
@@ -32,10 +33,8 @@ from dace.transformation.passes.vectorization.cutile_lowering import (
     GPUDeviceToCuTile,
 )
 from dace.transformation.passes.vectorization.vectorize_cpu_multi_dim import (
-    VectorizeCPUMultiDim,
-)
+    VectorizeCPUMultiDim, )
 from dace.transformation.passes.vectorization.config import VectorizeConfig
-
 
 # ============================================================
 # Fixture builders
@@ -51,14 +50,17 @@ def _build_vadd_sdfg(name: str, dtype: dace.typeclass = dace.float64) -> SDFG:
     """
     N = dace.symbol("N")
     sdfg = dace.SDFG(name)
-    sdfg.add_array("A", (N,), dtype)
-    sdfg.add_array("B", (N,), dtype)
-    sdfg.add_array("C", (N,), dtype)
+    sdfg.add_array("A", (N, ), dtype)
+    sdfg.add_array("B", (N, ), dtype)
+    sdfg.add_array("C", (N, ), dtype)
     state = sdfg.add_state("main")
     state.add_mapped_tasklet(
         "add",
         {"i": "0:N"},
-        {"_a": dace.Memlet("A[i]"), "_b": dace.Memlet("B[i]")},
+        {
+            "_a": dace.Memlet("A[i]"),
+            "_b": dace.Memlet("B[i]")
+        },
         "_c = _a + _b",
         {"_c": dace.Memlet("C[i]")},
         external_edges=True,
@@ -82,8 +84,14 @@ def _build_vadd2d_sdfg(name: str, dtype: dace.typeclass = dace.float64) -> SDFG:
     state = sdfg.add_state("main")
     state.add_mapped_tasklet(
         "add2d",
-        {"i": "0:M", "j": "0:N"},
-        {"_a": dace.Memlet("A[i, j]"), "_b": dace.Memlet("B[i, j]")},
+        {
+            "i": "0:M",
+            "j": "0:N"
+        },
+        {
+            "_a": dace.Memlet("A[i, j]"),
+            "_b": dace.Memlet("B[i, j]")
+        },
         "_c = _a + _b",
         {"_c": dace.Memlet("C[i, j]")},
         external_edges=True,
@@ -99,9 +107,9 @@ def _build_vadd_with_scalar_sdfg(name: str) -> SDFG:
     """
     N = dace.symbol("N")
     sdfg = dace.SDFG(name)
-    sdfg.add_array("A", (N,), dace.float64)
-    sdfg.add_array("B", (N,), dace.float64)
-    sdfg.add_array("C", (N,), dace.float64)
+    sdfg.add_array("A", (N, ), dace.float64)
+    sdfg.add_array("B", (N, ), dace.float64)
+    sdfg.add_array("C", (N, ), dace.float64)
     sdfg.add_scalar("alpha", dace.float64)
     state = sdfg.add_state("main")
     state.add_mapped_tasklet(
@@ -124,18 +132,17 @@ def _build_vadd_with_scalar_sdfg(name: str) -> SDFG:
 # ============================================================
 
 
-def _lower_full_pipeline(sdfg: SDFG, widths: Tuple[int, ...] = (8,)) -> None:
+def _lower_full_pipeline(sdfg: SDFG, widths: Tuple[int, ...] = (8, )) -> None:
     """Run the full cuTile pipeline (vectorize + gpu transform + adapters).
 
     :param sdfg: The SDFG to lower.
     :param widths: Per-dim tile widths (innermost-last).
     """
-    vec = VectorizeCPUMultiDim(
-        VectorizeConfig(
-            widths=widths,
-            target_isa="CUTILE",
-            expand_tile_nodes=False,
-        ))
+    vec = VectorizeCPUMultiDim(VectorizeConfig(
+        widths=widths,
+        target_isa="CUTILE",
+        expand_tile_nodes=False,
+    ))
     vec.apply_pass(sdfg, {})
     CuTileValidateTiles().apply_pass(sdfg, {})
     sdfg.apply_gpu_transformations(
@@ -157,14 +164,18 @@ def _finish_pipeline(sdfg: SDFG) -> None:
     sdfg.backend = dtypes.BackendLanguage.Python
 
 
-def _generate_code(sdfg: SDFG) -> str:
-    """Generate Python-backend code for ``sdfg`` and return the main file text.
+def _generated_artifacts(sdfg: SDFG) -> Tuple[CodeObject, CodeObject]:
+    """Return the Cython host and aggregate cuTile build artifacts.
 
-    :param sdfg: The (already lowered) SDFG.
-    :returns: The generated code of the main code object.
+    :param sdfg: The already lowered SDFG.
+    :returns: The generated host and cuTile build code objects.
     """
     code_objects = sdfg.generate_code()
-    return next(co for co in code_objects if co.name == sdfg.name).code
+    host_objects = [co for co in code_objects if co.name == sdfg.name]
+    build_objects = [co for co in code_objects if co.target_type == "cutile_build"]
+    assert len(host_objects) == 1
+    assert len(build_objects) == 1
+    return host_objects[0], build_objects[0]
 
 
 # ============================================================
@@ -209,8 +220,8 @@ def _has_copyout_state(sdfg: SDFG) -> bool:
             if (isinstance(edge.src, nodes.AccessNode) and isinstance(edge.dst, nodes.AccessNode)):
                 src_desc = sdfg.arrays.get(edge.src.data)
                 dst_desc = sdfg.arrays.get(edge.dst.data)
-                if (src_desc is not None and dst_desc is not None
-                        and src_desc.storage == dtypes.StorageType.GPU_Global and src_desc.transient
+                if (src_desc is not None and dst_desc is not None and src_desc.storage == dtypes.StorageType.GPU_Global
+                        and src_desc.transient
                         and dst_desc.storage in (dtypes.StorageType.CPU_Heap, dtypes.StorageType.Default)):
                     return True
     return False
@@ -222,11 +233,7 @@ def _state_access_node_names(state: "dace.sdfg.state.SDFGState") -> Set[str]:
     :param state: The state to inspect.
     :returns: Set of data names referenced by AccessNodes in the state.
     """
-    return {
-        node.data
-        for node in state.nodes()
-        if isinstance(node, nodes.AccessNode)
-    }
+    return {node.data for node in state.nodes() if isinstance(node, nodes.AccessNode)}
 
 
 def _gpu_clone_names(sdfg: SDFG) -> Set[str]:
@@ -236,8 +243,8 @@ def _gpu_clone_names(sdfg: SDFG) -> Set[str]:
     :returns: Set of GPU_Global transient array names.
     """
     return {
-        name for name, desc in sdfg.arrays.items()
-        if desc.storage == dtypes.StorageType.GPU_Global and desc.transient
+        name
+        for name, desc in sdfg.arrays.items() if desc.storage == dtypes.StorageType.GPU_Global and desc.transient
     }
 
 
@@ -275,9 +282,7 @@ class TestCuTileDataCopiesStructure:
         host_storages = {dtypes.StorageType.Default, dtypes.StorageType.CPU_Heap}
         for name in ("A", "B", "C"):
             desc = sdfg.arrays[name]
-            assert desc.storage in host_storages, (
-                f"'{name}' storage is {desc.storage}, expected Default or CPU_Heap"
-            )
+            assert desc.storage in host_storages, (f"'{name}' storage is {desc.storage}, expected Default or CPU_Heap")
 
     def test_gpu_clones_are_gpu_global_transients(self) -> None:
         """GPU-side cloned arrays exist, are transient, and have
@@ -291,8 +296,7 @@ class TestCuTileDataCopiesStructure:
             desc = sdfg.arrays[gpu_name]
             assert desc.transient, f"'{gpu_name}' is not transient"
             assert desc.storage == dtypes.StorageType.GPU_Global, (
-                f"'{gpu_name}' storage is {desc.storage}, expected GPU_Global"
-            )
+                f"'{gpu_name}' storage is {desc.storage}, expected GPU_Global")
 
     def test_scalars_not_cloned(self) -> None:
         """Scalar parameters are NOT cloned by the pipeline."""
@@ -305,9 +309,8 @@ class TestCuTileDataCopiesStructure:
         # No GPU clone of a scalar should exist
         for name, desc in sdfg.arrays.items():
             if desc.transient and desc.storage == dtypes.StorageType.GPU_Global:
-                assert not isinstance(desc, data.Scalar), (
-                    f"Scalar '{name}' was cloned to GPU, but scalars should not be cloned"
-                )
+                assert not isinstance(
+                    desc, data.Scalar), (f"Scalar '{name}' was cloned to GPU, but scalars should not be cloned")
 
     def test_2d_vadd_structure(self) -> None:
         """2D vadd with widths=(8, 4) -- verify clones and copy states for
@@ -335,49 +338,49 @@ class TestCuTileDataCopiesStructure:
 
 
 class TestCuTileDataCopiesCodegen:
-    """Generated Python-backend code with data copies."""
+    """Generated Cython host and aggregate cuTile build artifacts."""
 
     def test_codegen_contains_set(self) -> None:
         """After full pipeline, generated code contains ``.set()``."""
         sdfg = _build_vadd_sdfg("dc_codegen_set")
-        VectorizeCuTile(widths=(8,)).apply_pass(sdfg, {})
-        code = _generate_code(sdfg)
-        assert ".set(" in code, (
-            "Generated code does not contain '.set('"
-        )
+        VectorizeCuTile(widths=(8, )).apply_pass(sdfg, {})
+        code = _generated_artifacts(sdfg)[0].code
+        assert ".set(" in code, ("Generated code does not contain '.set('")
 
     def test_codegen_contains_get_out(self) -> None:
         """After full pipeline, generated code contains ``.get(out=...)``."""
         sdfg = _build_vadd_sdfg("dc_codegen_get_out")
-        VectorizeCuTile(widths=(8,)).apply_pass(sdfg, {})
-        code = _generate_code(sdfg)
-        assert ".get(out=" in code, (
-            "Generated code does not contain '.get(out='"
-        )
+        VectorizeCuTile(widths=(8, )).apply_pass(sdfg, {})
+        code = _generated_artifacts(sdfg)[0].code
+        assert ".get(out=" in code, ("Generated code does not contain '.get(out='")
 
-    def test_codegen_valid_python(self) -> None:
-        """Generated code parses with ``ast.parse``."""
+    def test_codegen_valid_aot_artifacts(self) -> None:
+        """Generated host and build artifacts have their expected roles."""
         sdfg = _build_vadd_sdfg("dc_codegen_valid")
-        VectorizeCuTile(widths=(8,)).apply_pass(sdfg, {})
-        code = _generate_code(sdfg)
-        ast.parse(code)
+        VectorizeCuTile(widths=(8, )).apply_pass(sdfg, {})
+        host, build = _generated_artifacts(sdfg)
+        assert host.language == "pyx" and host.linkable
+        assert build.language == "py" and build.target_type == "cutile_build"
+        assert not build.linkable
+        ast.parse(build.code)
 
-    def test_codegen_2d_valid_python(self) -> None:
-        """2D vadd with data copies generates valid Python code."""
+    def test_codegen_2d_valid_aot_artifacts(self) -> None:
+        """2D data copies generate valid Cython and build artifacts."""
         sdfg = _build_vadd2d_sdfg("dc_codegen_2d_valid")
         VectorizeCuTile(widths=(8, 4)).apply_pass(sdfg, {})
-        code = _generate_code(sdfg)
-        ast.parse(code)
-        assert ".set(" in code
-        assert ".get(out=" in code
+        host, build = _generated_artifacts(sdfg)
+        assert host.language == "pyx" and host.linkable
+        ast.parse(build.code)
+        assert ".set(" in host.code
+        assert ".get(out=" in host.code
 
-    def test_codegen_with_scalar_valid_python(self) -> None:
-        """SDFG with a scalar parameter generates valid Python code with
-        data copies (scalar is not cloned)."""
+    def test_codegen_with_scalar_valid_aot_artifacts(self) -> None:
+        """Scalar data copies generate valid host and build artifacts."""
         sdfg = _build_vadd_with_scalar_sdfg("dc_codegen_scalar")
-        VectorizeCuTile(widths=(8,)).apply_pass(sdfg, {})
-        code = _generate_code(sdfg)
-        ast.parse(code)
+        VectorizeCuTile(widths=(8, )).apply_pass(sdfg, {})
+        host, build = _generated_artifacts(sdfg)
+        assert host.language == "pyx" and host.linkable
+        ast.parse(build.code)
 
 
 # ============================================================
@@ -396,7 +399,7 @@ class TestCuTileDataCopiesRuntime:
         This is the KEY test: after data copies, callers pass host arrays.
         """
         sdfg = _build_vadd_sdfg("dc_rt_vadd_numpy")
-        VectorizeCuTile(widths=(8,)).apply_pass(sdfg, {})
+        VectorizeCuTile(widths=(8, )).apply_pass(sdfg, {})
 
         n = 64
         rng = np.random.default_rng(42)
@@ -412,7 +415,7 @@ class TestCuTileDataCopiesRuntime:
     def test_vadd_non_divisible_numpy(self) -> None:
         """N=17 (non-divisible by 8) with NumPy arrays directly."""
         sdfg = _build_vadd_sdfg("dc_rt_vadd_nondiv")
-        VectorizeCuTile(widths=(8,)).apply_pass(sdfg, {})
+        VectorizeCuTile(widths=(8, )).apply_pass(sdfg, {})
 
         n = 17
         rng = np.random.default_rng(43)
@@ -441,16 +444,11 @@ class TestCuTileDataCopiesRuntime:
 
         np.testing.assert_allclose(C, A + B, rtol=1e-14)
 
-    @pytest.mark.skip(
-        reason="apply_gpu_transformations() stages scalars as constants "
-        "(alpha_const) which the cuTile runtime cannot resolve. Known "
-        "limitation of the GPU-transform-based pipeline with scalars."
-    )
     def test_vadd_with_scalar_param_numpy(self) -> None:
         """An SDFG with a scalar parameter. Verify scalar is passed through
         correctly with numpy arrays."""
         sdfg = _build_vadd_with_scalar_sdfg("dc_rt_vadd_scalar")
-        VectorizeCuTile(widths=(8,)).apply_pass(sdfg, {})
+        VectorizeCuTile(widths=(8, )).apply_pass(sdfg, {})
 
         n = 32
         rng = np.random.default_rng(45)
@@ -467,7 +465,7 @@ class TestCuTileDataCopiesRuntime:
     def test_vadd_large_numpy(self) -> None:
         """Larger problem size (N=1000) to exercise multiple tile iterations."""
         sdfg = _build_vadd_sdfg("dc_rt_vadd_large")
-        VectorizeCuTile(widths=(8,)).apply_pass(sdfg, {})
+        VectorizeCuTile(widths=(8, )).apply_pass(sdfg, {})
 
         n = 1000
         rng = np.random.default_rng(47)
@@ -483,7 +481,7 @@ class TestCuTileDataCopiesRuntime:
     def test_vadd_float32_numpy(self) -> None:
         """float32 dtype with numpy arrays directly."""
         sdfg = _build_vadd_sdfg("dc_rt_vadd_f32", dtype=dace.float32)
-        VectorizeCuTile(widths=(8,)).apply_pass(sdfg, {})
+        VectorizeCuTile(widths=(8, )).apply_pass(sdfg, {})
 
         n = 100
         rng = np.random.default_rng(48)
@@ -499,7 +497,7 @@ class TestCuTileDataCopiesRuntime:
     def test_symbolic_n_two_sizes_numpy(self) -> None:
         """One compiled SDFG, two runtime values of the symbol N, numpy arrays."""
         sdfg = _build_vadd_sdfg("dc_rt_vadd_symbolic")
-        VectorizeCuTile(widths=(8,)).apply_pass(sdfg, {})
+        VectorizeCuTile(widths=(8, )).apply_pass(sdfg, {})
         csdfg = sdfg.compile()
 
         rng = np.random.default_rng(49)

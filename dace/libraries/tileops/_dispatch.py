@@ -139,6 +139,8 @@ def select_tile_implementation(node: nodes.LibraryNode, parent_state: dace.SDFGS
         :data:`_ISA_TO_IMPL` (resolving ``"AUTO"`` to the host ISA via
         :func:`detect_host_isa`), falling back to ``'pure'`` when that per-ISA
         expansion is not yet defined on the node.
+    :raises ValueError: If an explicit CPU SIMD target is not executable on
+        the current host.
     """
     target_isa = getattr(node, "target_isa", "SCALAR")
     if len(node.widths) != 1:

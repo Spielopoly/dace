@@ -14,7 +14,7 @@ from dace.codegen import dispatcher as disp
 from dace.codegen.py.prettycode import PythonCodeIOStream
 from dace.codegen.target import TargetCodeGenerator
 from dace.frontend.python import astutils
-from dace.sdfg.type_inference import infer_expr_type
+from dace.sdfg.type_inference import infer_expr_type, infer_types
 from dace.sdfg import SDFG, SDFGState, nodes
 from dace.sdfg import scope as sdscope
 from dace.sdfg import utils
@@ -33,11 +33,73 @@ def codeblock_to_python(cb: CodeBlock):
     return ""
 
 
+def _sdfg_uses_cutile(sdfg: SDFG) -> bool:
+    """Return whether this SDFG tree contains a cuTile map."""
+    return any(
+        isinstance(node, nodes.MapEntry) and node.map.schedule == dtypes.ScheduleType.CuTile
+        for node, _ in sdfg.all_nodes_recursive())
+
+
+_CYTHON_SCALAR_TYPES = {
+    int: 'int',
+    float: 'float',
+    bool: 'cython.bint',
+    np.bool_: 'cython.bint',
+    np.int8: 'int8_t',
+    np.int16: 'int16_t',
+    np.int32: 'int32_t',
+    np.int64: 'int64_t',
+    np.uint8: 'uint8_t',
+    np.uint16: 'uint16_t',
+    np.uint32: 'uint32_t',
+    np.uint64: 'uint64_t',
+    np.float32: 'float',
+    np.float64: 'double',
+}
+
+_CYTHON_CONST_TYPES = {
+    type_name: f'__dace_const_{type_name}'
+    for type_name in set(_CYTHON_SCALAR_TYPES.values()) - {'cython.bint'}
+}
+
+
+def _cython_scalar_type(dtype: Any) -> Optional[str]:
+    """Return a Cython C type for a stable DaCe scalar type.
+
+    :param dtype: DaCe typeclass or data descriptor.
+    :returns: Cython type spelling, or ``None`` when narrowing is unsafe.
+    """
+    if isinstance(dtype, data.Data):
+        dtype = dtype.dtype
+    if not isinstance(dtype, dtypes.typeclass):
+        return None
+    return _CYTHON_SCALAR_TYPES.get(dtype.type)
+
+
+def _cython_memoryview_type(desc: data.Data, *, readonly: bool = False) -> Optional[str]:
+    """Return a strided memoryview type for a safe CPU array argument.
+
+    :param desc: Candidate argument descriptor.
+    :param readonly: Whether the view only needs read access.
+    :returns: Cython memoryview type, or ``None`` for Python-object arrays.
+    """
+    if not isinstance(desc, data.Array) or desc.transient:
+        return None
+    if desc.storage not in (dtypes.StorageType.Default, dtypes.StorageType.CPU_Heap):
+        return None
+    scalar_type = _cython_scalar_type(desc.dtype)
+    if scalar_type is None or scalar_type == 'cython.bint' or not desc.shape:
+        return None
+    if readonly:
+        scalar_type = _CYTHON_CONST_TYPES[scalar_type]
+    return f'{scalar_type}[{", ".join(":" for _ in desc.shape)}]'
+
+
 def _normalize_python_import(import_entry: str) -> Optional[str]:
     import_entry = import_entry.strip()
     if not import_entry:
         return None
-    if import_entry.startswith('import ') or import_entry.startswith('from '):
+    if import_entry.startswith(('import ', 'from ', 'cimport ')):
         return import_entry
     return f'import {import_entry}'
 
@@ -124,6 +186,25 @@ def _extract_python_defined_names(source: str) -> Set[str]:
     return _collect_defined_names(module.body)
 
 
+def _extract_python_local_names(source: str) -> Set[str]:
+    """Return every name assigned or defined by Python source.
+
+    :param source: Python source to inspect.
+    :returns: Function-scoped local names found in the source.
+    """
+    if not source.strip():
+        return set()
+    try:
+        module = ast.parse(source)
+    except SyntaxError:
+        return set()
+    stored_names = {
+        node.id
+        for node in ast.walk(module) if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
+    }
+    return _extract_python_defined_names(source) | stored_names
+
+
 def _extract_python_used_names(source: str) -> Set[str]:
     if not source.strip():
         return set()
@@ -206,7 +287,8 @@ class DaCePythonCodeGenerator(object):
         nested_runtime_defined_names = _collect_nested_runtime_defined_names(sdfg)
         nested_only_runtime_names = {name for name in nested_runtime_defined_names if name not in sdfg.symbols}
         runtime_symbol_names = {name for name in _collect_runtime_used_names(sdfg) if name in sdfg.symbols}
-        fsyms = (self.free_symbols(sdfg) | runtime_symbol_names) - self._runtime_defined_names - nested_only_runtime_names
+        fsyms = (self.free_symbols(sdfg)
+                 | runtime_symbol_names) - self._runtime_defined_names - nested_only_runtime_names
         self.arglist = sdfg.arglist(scalars_only=False, free_symbols=fsyms)
 
         # resolve all symbols and constants
@@ -276,7 +358,9 @@ class DaCePythonCodeGenerator(object):
                     const_str = f"{cstname} = numpy.array({cstval.tolist()!r}, dtype={dtypes.NUMPY_TYPES[csttype.dtype.type]})"
                     callsite_stream.write(const_str, sdfg)
                 except KeyError as e:
-                    raise NotImplementedError(f"Unsupported constant value for array constant {cstname}: {cstval} with type {csttype.dtype.type}") from e
+                    raise NotImplementedError(
+                        f"Unsupported constant value for array constant {cstname}: {cstval} with type {csttype.dtype.type}"
+                    ) from e
             elif isinstance(csttype, data.Scalar):
                 callsite_stream.write(f"{cstname} = {cstval!r}", sdfg)
             else:
@@ -325,9 +409,16 @@ class DaCePythonCodeGenerator(object):
             _write_imports(import_statements, code_sdfg)
             if remaining_code:
                 global_stream.write(remaining_code, code_sdfg)
-        
+
         #########################################################
         # Target-based includes
+        _write_imports([
+            'cimport cython',
+            'from libc.stdint cimport int8_t, int16_t, int32_t, int64_t, uint8_t, uint16_t, uint32_t, uint64_t',
+        ], sdfg)
+        global_stream.write(
+            '\n'.join(f'ctypedef const {type_name} {const_name}'
+                      for type_name, const_name in sorted(_CYTHON_CONST_TYPES.items())), sdfg)
         for target in self._dispatcher.used_targets:
             headers = target.get_includes()
             if backend in headers:
@@ -429,8 +520,7 @@ class DaCePythonCodeGenerator(object):
         # Collect external arrays to check if any exist
         for subsdfg, aname, arr in sdfg.arrays_recursive():
             if arr.lifetime == dtypes.AllocationLifetime.External:
-                raise NotImplementedError(
-                    'External memory management is not yet supported in the Python backend.')
+                raise NotImplementedError('External memory management is not yet supported in the Python backend.')
         # No external arrays — nothing to do.
         pass
 
@@ -493,7 +583,8 @@ class DaCePythonCodeGenerator(object):
                 if instr is not None:
                     instr.on_state_end(sdfg, cfg, state, callsite_stream, global_stream)
 
-    def generate_states(self, sdfg: SDFG, global_stream: PythonCodeIOStream, callsite_stream: PythonCodeIOStream) -> Set[SDFGState]:
+    def generate_states(self, sdfg: SDFG, global_stream: PythonCodeIOStream,
+                        callsite_stream: PythonCodeIOStream) -> Set[SDFGState]:
         states_generated = set()
 
         opbar = progress.OptionalProgressBar(len(sdfg.states()), title=f'Generating code (SDFG {sdfg.cfg_id})')
@@ -560,7 +651,7 @@ class DaCePythonCodeGenerator(object):
         """
         # TODO: I don't believe this is correct for the python backend
         # Python only has one way to scope things and that is with functions
-        
+
         # Gather shared transients, free symbols, and first/last appearance
         shared_transients = {}
         fsyms = {}
@@ -880,10 +971,10 @@ class DaCePythonCodeGenerator(object):
                      generation of this SDFG.
         """
         # TODO: This is not yet fully correct for a python implementation
-        # Also quite a bit of code was removed compared to C++ 
-        # version, so we should check that all necessary steps 
+        # Also quite a bit of code was removed compared to C++
+        # version, so we should check that all necessary steps
         # are still present and correct for python.
-        
+
         if len(cfg_id) == 0 and sdfg.cfg_id != 0:
             cfg_id = '_%d' % sdfg.cfg_id
 
@@ -917,7 +1008,9 @@ class DaCePythonCodeGenerator(object):
         # TODO: Check if this is correct for python
         for cname, (ctype, _) in sdfg.constants_prop.items():
             if isinstance(ctype, data.Array):
-                self.dispatcher.defined_vars.add(cname, disp.DefinedType.Pointer, ctype.dtype.ctype) # TODO: Pointer is almost definitely not correct for python
+                self.dispatcher.defined_vars.add(
+                    cname, disp.DefinedType.Pointer,
+                    ctype.dtype.ctype)  # TODO: Pointer is almost definitely not correct for python
             else:
                 self.dispatcher.defined_vars.add(cname, disp.DefinedType.Scalar, ctype.dtype.ctype)
 
@@ -976,6 +1069,9 @@ class DaCePythonCodeGenerator(object):
                 "\n  Generated: {}\n  Missing: {}".format(sdfg.label, [s.label for s in states_generated],
                                                           [s.label for s in (set(sdfg.states()) - states_generated)]))
 
+        if is_top_level and _sdfg_uses_cutile(sdfg):
+            callsite_stream.write("cupy.cuda.get_current_stream().synchronize()", sdfg)
+
         # Deallocate transients
         self.deallocate_arrays_in_scope(sdfg, sdfg, sdfg, global_stream, callsite_stream)
 
@@ -1007,13 +1103,15 @@ class DaCePythonCodeGenerator(object):
             generated_header = global_stream.getvalue()
 
         params = ', '.join(self.arglist.keys())
+        cython_annotations = self._collect_cython_annotations(sdfg, interstate_symbols)
         body = callsite_stream.getvalue().strip()
         body_preamble = function_body_preamble.strip()
         if body_preamble:
             body = '\n'.join(section for section in (body_preamble, body) if section)
 
         if emit_function_wrapper:
-            generated_code = self._build_function(emitted_function_name, params, body, sdfg, function_body_finally)
+            generated_code = self._build_function(emitted_function_name, params, body, sdfg, function_body_finally,
+                                                  cython_annotations)
             if is_top_level and include_lifecycle:
                 generated_code = self._build_lifecycle_functions(sdfg, params) + generated_code
         else:
@@ -1022,14 +1120,125 @@ class DaCePythonCodeGenerator(object):
         # Return the generated global and local code strings
         return (generated_header, generated_code, self._dispatcher.used_targets, self._dispatcher.used_environments)
 
+    def _collect_cython_annotations(self, sdfg: SDFG, interstate_symbols: Dict[str,
+                                                                               dtypes.typeclass]) -> Dict[str, str]:
+        """Collect conservative native types for one generated SDFG helper.
+
+        A name is kept native only when every use inferred in the helper agrees
+        on one type. GPU arrays and unsupported scalar types remain Python
+        objects.
+
+        :param sdfg: SDFG represented by the generated helper.
+        :param interstate_symbols: Types inferred for state-machine variables.
+        :returns: Mapping from generated local names to Cython type spellings.
+        """
+        annotations: Dict[str, str] = {}
+        ambiguous: Set[str] = set()
+        gpu_storages = {
+            dtypes.StorageType.GPU_Global,
+            dtypes.StorageType.GPU_Shared,
+            dtypes.StorageType.CuTile_Tile,
+        }
+        has_gpu_storage = _sdfg_uses_cutile(sdfg) or any(desc.storage in gpu_storages for desc in sdfg.arrays.values())
+        memoryview_destinations = {
+            edge.dst.data
+            for state in sdfg.states()
+            for edge in state.edges()
+            if isinstance(edge.src, nodes.AccessNode) and isinstance(edge.dst, nodes.AccessNode)
+        }
+        bulk_tasklets: Set[nodes.Tasklet] = set()
+        python_object_arrays: Set[str] = set()
+        for state in sdfg.states():
+            for edge in state.edges():
+                if edge.data.is_empty() or edge.data.data is None or edge.data.num_elements() == 1:
+                    continue
+                data_name = edge.data.data.split('.', maxsplit=1)[0]
+                if isinstance(edge.src, nodes.Tasklet):
+                    bulk_tasklets.add(edge.src)
+                    python_object_arrays.add(data_name)
+                if isinstance(edge.dst, nodes.Tasklet):
+                    bulk_tasklets.add(edge.dst)
+                    python_object_arrays.add(data_name)
+                if isinstance(edge.src, nodes.NestedSDFG) or isinstance(edge.dst, nodes.NestedSDFG):
+                    python_object_arrays.add(data_name)
+        bulk_python_names: Set[str] = set()
+        for tasklet in bulk_tasklets:
+            bulk_python_names.update(tasklet.in_connectors)
+            bulk_python_names.update(tasklet.out_connectors)
+            bulk_python_names.update(_extract_python_local_names(codeblock_to_python(tasklet.code)))
+        ambiguous.update(bulk_python_names)
+        written_data = {
+            node.data.split('.', maxsplit=1)[0]
+            for state in sdfg.states()
+            for node in state.data_nodes() if state.in_degree(node) > 0
+        }
+
+        def _merge(name: str, type_name: Optional[str]) -> None:
+            if type_name is None or not name.isidentifier() or name in ambiguous:
+                return
+            previous = annotations.get(name)
+            if previous is not None and previous != type_name:
+                annotations.pop(name, None)
+                ambiguous.add(name)
+            else:
+                annotations[name] = type_name
+
+        for name, arg_type in self.arglist.items():
+            if (name in sdfg.arrays and isinstance(arg_type, data.Array) and not has_gpu_storage
+                    and name not in memoryview_destinations and name not in python_object_arrays):
+                _merge(name, _cython_memoryview_type(arg_type, readonly=name not in written_data))
+            elif name in sdfg.symbols:
+                _merge(name, _cython_scalar_type(sdfg.symbols[name]))
+
+        for name, dtype in interstate_symbols.items():
+            _merge(name, _cython_scalar_type(dtype))
+
+        for state in sdfg.states():
+            for node in state.nodes():
+                if isinstance(node, nodes.MapEntry):
+                    defined_symbols = state.symbols_defined_at(node)
+                    for param, current_range in zip(node.map.params, node.map.range):
+                        begin, end, _ = current_range
+                        try:
+                            dtype = dtypes.result_type_of(infer_expr_type(begin, defined_symbols),
+                                                          infer_expr_type(end, defined_symbols))
+                        except (KeyError, TypeError, ValueError):
+                            dtype = dtypes.int64
+                        _merge(str(param), _cython_scalar_type(dtype))
+                elif (isinstance(node, nodes.Tasklet) and node.code.language == dtypes.Language.Python
+                      and node not in bulk_tasklets):
+                    defined_symbols = state.symbols_defined_at(node)
+                    connector_types = {
+                        name: dtype
+                        for name, dtype in (*node.in_connectors.items(), *node.out_connectors.items())
+                        if dtype is not None
+                    }
+                    defined_symbols.update(connector_types)
+                    for name, dtype in connector_types.items():
+                        _merge(name, _cython_scalar_type(dtype))
+                    try:
+                        inferred = infer_types(node.code.code, defined_symbols)
+                    except (KeyError, TypeError, ValueError):
+                        inferred = {}
+                    for name, dtype in inferred.items():
+                        _merge(name, _cython_scalar_type(dtype))
+
+        return dict(sorted(annotations.items()))
+
     def _build_function(self,
                         function_name: str,
                         params: str,
                         body: str,
                         sdfg: SDFG,
-                        finalizer: str = "") -> str:
+                        finalizer: str = "",
+                        cython_annotations: Optional[Dict[str, str]] = None) -> str:
         func_code = PythonCodeIOStream()
-        func_code.write(f'\ndef {function_name}({params}):\n', cfg=sdfg)
+        if cython_annotations:
+            annotation_args = '\n'.join(f'    {name}={type_name},' for name, type_name in cython_annotations.items())
+            func_code.write(f'\n@cython.locals(\n{annotation_args}\n)', cfg=sdfg)
+            func_code.write(f'def {function_name}({params}):\n', cfg=sdfg)
+        else:
+            func_code.write(f'\ndef {function_name}({params}):\n', cfg=sdfg)
         with func_code.indented():
             if finalizer.strip():
                 func_code.write('try:', cfg=sdfg)

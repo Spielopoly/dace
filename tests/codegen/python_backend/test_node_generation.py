@@ -7,12 +7,14 @@ import pytest
 import numpy as np
 
 import dace
-from dace import dtypes, data
+from dace import dtypes
 from dace.codegen.py.prettycode import PythonCodeIOStream
 from dace.codegen.py.python_target import PythonCodeGen
 from dace.dtypes import ScheduleType, Language
-from dace.sdfg import nodes, SDFG, NodeNotExpandedError
+from dace.sdfg import nodes, SDFG
 from dace.memlet import Memlet
+
+
 def _MAP_XFAIL(func):
     return func
 
@@ -25,6 +27,7 @@ def _make_python_sdfg(name: str) -> SDFG:
 
 
 class _DummyDispatcher:
+
     def __init__(self):
         self.copies = []
 
@@ -56,6 +59,7 @@ class _DummyDispatcher:
 
 
 class _DummyFrameCodegen:
+
     def __init__(self):
         self.dispatcher = _DummyDispatcher()
 
@@ -339,11 +343,12 @@ class TestTasklet:
         state = sdfg.add_state('s0')
         r = state.add_read('x')
         w = state.add_write('y')
-        t = state.add_tasklet('t', {'inp'}, set(), 'pass')
+        t = state.add_tasklet('t', {'inp'}, set(), '_ = inp')
         state.add_edge(r, None, t, 'inp', Memlet(data='x'))
         state.add_edge(t, None, w, None, Memlet(data='y'))
         code = sdfg.generate_code()[0].code
         assert 'inp = x' in code
+        assert 'y[...]' not in code
 
     def test_tasklet_multiple_inputs_outputs(self):
         """Multiple I/O connectors."""
@@ -437,6 +442,7 @@ class TestTasklet:
 
 
 class TestPythonTargetDirectBranches:
+
     def test_access_node_memlet_path_dst_mismatch_skips_copy(self, monkeypatch):
         sdfg = _make_python_sdfg('test_access_dst_mismatch')
         sdfg.add_array('A', [1], dace.float64)
@@ -449,6 +455,7 @@ class TestPythonTargetDirectBranches:
         codegen, dispatcher = _make_codegen(sdfg)
 
         class _PathElem:
+
             def __init__(self, src, dst):
                 self.src = src
                 self.dst = dst
@@ -488,6 +495,7 @@ class TestPythonTargetDirectBranches:
         codegen, dispatcher = _make_codegen(sdfg)
 
         class _PathElem:
+
             def __init__(self, src, dst):
                 self.src = src
                 self.dst = dst
@@ -585,7 +593,7 @@ class TestPythonTargetDirectBranches:
         generated_code = sdfg.generate_code()[0].code
 
         assert generated_code.count('# DaCe AUTO-GENERATED FILE. DO NOT MODIFY') == 1
-        assert generated_code.count('import numpy') == 1
+        assert generated_code.splitlines().count('import numpy') == 1
 
     def test_nested_sdfg_helper_propagates_nested_environment_headers(self):
         sdfg = _make_python_sdfg('nested_environment_headers')

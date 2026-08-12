@@ -1,4 +1,5 @@
 """Tests for Python backend compile() and execution."""
+import sysconfig
 import numpy as np
 import dace
 from dace.codegen.py.compiled_sdfg import PythonCompiledSDFG
@@ -6,6 +7,7 @@ from dace.codegen.py.compiled_sdfg import PythonCompiledSDFG
 
 def test_empty_program_compiles_and_runs():
     """An empty program should compile and run without errors."""
+
     @dace.program
     def empty_program():
         pass
@@ -18,6 +20,7 @@ def test_empty_program_compiles_and_runs():
 
 def test_compile_returns_python_compiled_sdfg():
     """compile() should return a PythonCompiledSDFG for the Python backend."""
+
     @dace.program
     def empty_program():
         pass
@@ -30,6 +33,7 @@ def test_compile_returns_python_compiled_sdfg():
 
 def test_compiled_sdfg_has_sdfg_property():
     """The compiled object should expose the SDFG via a .sdfg property."""
+
     @dace.program
     def empty_program():
         pass
@@ -42,6 +46,7 @@ def test_compiled_sdfg_has_sdfg_property():
 
 def test_compiled_sdfg_has_code_property():
     """The compiled object should expose the generated source via .code."""
+
     @dace.program
     def empty_program():
         pass
@@ -99,6 +104,7 @@ def test_program_with_positional_args():
 
 def test_return_program_handle_false():
     """compile(return_program_handle=False) should return None."""
+
     @dace.program
     def empty_program():
         pass
@@ -110,7 +116,8 @@ def test_return_program_handle_false():
 
 
 def test_output_file(tmp_path):
-    """compile(output_file=...) should write the generated Python source."""
+    """compile(output_file=...) should copy the compiled extension."""
+
     @dace.program
     def empty_program():
         pass
@@ -120,36 +127,31 @@ def test_output_file(tmp_path):
 
     # output_file as a directory
     compiled = sdfg.compile(output_file=str(tmp_path))
-    out_file = tmp_path / f'{compiled.sdfg.name}.py'
+    out_file = tmp_path / f'{compiled.sdfg.name}{sysconfig.get_config_var("EXT_SUFFIX")}'
     assert out_file.exists()
-    content = out_file.read_text()
-    assert 'def ' in content
+    assert out_file.read_bytes() == compiled.library_path.read_bytes()
 
     # output_file as exact filename
-    exact_path = tmp_path / 'my_output.py'
+    exact_path = tmp_path / 'my_output.so'
     sdfg2 = empty_program.to_sdfg(simplify=False)
     sdfg2.backend = dace.dtypes.BackendLanguage.Python
     sdfg2.compile(output_file=str(exact_path))
     assert exact_path.exists()
 
 
-def test_output_file_includes_numpy_for_constant_only_sdfg(tmp_path):
-    """compile(output_file=...) should emit numpy imports for array constants even without dispatch nodes."""
+def test_output_file_handles_constant_only_sdfg(tmp_path):
+    """A constant-only extension should retain its NumPy array constant."""
     sdfg = dace.SDFG('test_const_only_output_file')
     sdfg.add_state('empty')
     sdfg.add_constant('const_arr', np.array([1.0, 2.0], dtype=np.float64))
     sdfg.backend = dace.dtypes.BackendLanguage.Python
 
-    out_file = tmp_path / 'const_only.py'
+    out_file = tmp_path / 'const_only.so'
     compiled = sdfg.compile(output_file=str(out_file))
 
     assert out_file.exists()
-    content = out_file.read_text()
-    assert content.count('import numpy') == 1
-    assert 'const_arr = numpy.array(' in content
-    assert 'dtype=numpy.float64' in content
-    
-    np.testing.assert_equal(compiled._namespace['const_arr'], np.array([1.0, 2.0], dtype=np.float64))
+    assert out_file.read_bytes() == compiled.library_path.read_bytes()
+    np.testing.assert_equal(compiled.module.const_arr, np.array([1.0, 2.0], dtype=np.float64))
 
 
 def test_persistent_transient_resets_after_finalize():
@@ -163,7 +165,8 @@ def test_persistent_transient_resets_after_finalize():
     counter_read = state.add_read('counter')
     counter_write = state.add_write('counter')
     out_write = state.add_write('out')
-    tasklet = state.add_tasklet('inc', {'current'}, {'next_value', 'result'}, 'next_value = current + 1\nresult = next_value')
+    tasklet = state.add_tasklet('inc', {'current'}, {'next_value', 'result'},
+                                'next_value = current + 1\nresult = next_value')
     state.add_edge(counter_read, None, tasklet, 'current', dace.Memlet('counter'))
     state.add_edge(tasklet, 'next_value', counter_write, None, dace.Memlet('counter'))
     state.add_edge(tasklet, 'result', out_write, None, dace.Memlet('out[0]'))

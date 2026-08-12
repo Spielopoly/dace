@@ -96,6 +96,20 @@ def _cholesky_sdfg(strict: bool = False) -> SDFG:
     return sdfg
 
 
+def _atax_sdfg() -> SDFG:
+    """Lower a symbolic BLAS-only ATAX kernel through cuTile."""
+    M = dace.symbol("M", dtype=dace.int64)
+    N = dace.symbol("N", dtype=dace.int64)
+
+    @dace.program
+    def atax(A: dace.float32[M, N], x: dace.float32[N]):
+        return (A @ x) @ A
+
+    sdfg = atax.to_sdfg(simplify=False)
+    VectorizeCuTile(widths=(8, 4)).apply_pass(sdfg, {})
+    return sdfg
+
+
 def test_trisolv_lowers_and_validates():
     """trisolv lowers with no residual GPU_Device map and passes validation.
 
@@ -115,6 +129,20 @@ def test_cholesky_lowers_and_validates():
     sdfg = _cholesky_sdfg()
     assert not _gpu_device_maps(sdfg)
     sdfg.validate()
+
+
+def test_atax_blas_only_codegen_has_no_cpp_assumption_guard() -> None:
+    """BLAS-only cuTile lowering suppresses C++ symbol-assumption guards."""
+    with pytest.warns(UserWarning, match="BLAS-only configuration"):
+        sdfg = _atax_sdfg()
+    non_python = [
+        node for node, _ in sdfg.all_nodes_recursive()
+        if isinstance(node, nodes.Tasklet) and node.code.language != dtypes.Language.Python
+    ]
+    assert not non_python
+    host_objects = [co for co in sdfg.generate_code() if co.name == sdfg.name]
+    assert len(host_objects) == 1
+    assert host_objects[0].language == "pyx" and host_objects[0].linkable
 
 
 @pytest.mark.parametrize("build", [_trisolv_sdfg, _cholesky_sdfg], ids=["trisolv", "cholesky"])

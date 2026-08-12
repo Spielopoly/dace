@@ -10,9 +10,9 @@ Historically it was ``symstr(range.size())``, which rewrites a symbolic ceiling
 using C integer-division semantics -- e.g. ``ceiling((N-2)/8)`` becomes
 ``int_ceil(int_floor(N, 8) - 1/4, 1)``. Under Python true division the residual
 ``1/4`` is the float ``0.25``, so the grid dimension is a non-integer (rejected
-by ``ct.launch`` with ``TypeError: an integer is required``) *and* off-by-one for
-non-divisible extents (``N=204`` -> 25 tiles instead of 26). These tests pin the
-integer/ceil-div behaviour and, on a GPU, the end-to-end correctness.
+by the embedded-symbol launcher) *and* off-by-one for non-divisible extents
+(``N=204`` -> 25 tiles instead of 26). These tests pin the integer/ceil-div
+behaviour and, on a GPU, the end-to-end correctness.
 """
 import numpy as np
 import pytest
@@ -125,8 +125,8 @@ def test_lowered_grid_is_integer_ceil_div():
 @pytest.mark.gpu
 @pytest.mark.parametrize("n", [64, 66, 50, 204])
 def test_grid_end_to_end(n):
-    """End-to-end on GPU: non-divisible sizes match NumPy (grid launches all
-    tiles, integer grid accepted by ``ct.launch``)."""
+    """End-to-end on GPU: non-divisible sizes match NumPy and launch all
+    tiles through the embedded cubin entry point."""
     sdfg = _lower_head_sdfg()
     csdfg = sdfg.compile()
     rng = np.random.default_rng(0)

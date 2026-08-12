@@ -8,12 +8,14 @@ Modulo = dace.symbol('Modulo')
 
 FIVE = 5.0
 
-def foo(x: dace.float64[3,7]):
+
+def foo(x: dace.float64[3, 7]):
     s = np.sum(x)
     return FIVE + s
 
+
 @dace.program
-def simple_program(x: dace.float64[N,7], y: dace.float64[Modulo * N,7]):
+def simple_program(x: dace.float64[N, 7], y: dace.float64[Modulo * N, 7]):
     for i in range(N):
         for j in range(7):
             if i % Modulo == 0 and j % 2 == 0:
@@ -24,6 +26,7 @@ def simple_program(x: dace.float64[N,7], y: dace.float64[Modulo * N,7]):
         for j in range(0, 7, 3):
             z[i, j] = x[i, j] + y[i * Modulo, j]
     return z
+
 
 def _reference_simple_program(x: np.ndarray, y: np.ndarray, modulo: int) -> np.ndarray:
     """Mirror the source program exactly for backend regression checks."""
@@ -67,11 +70,13 @@ def test_simple_program(n_value, modulo_value, save_generated_code=False):
     assert 'x[0:3, 0:7]' not in generated_code
     assert ', s[0:1],' not in generated_code
     assert generated_code.count('# DaCe AUTO-GENERATED FILE. DO NOT MODIFY') == 1
-    assert generated_code.count('import numpy') == 1
+    assert generated_code.splitlines().count('import numpy as _np') == 1
+
 
 @dace.program
 def very_simple_program():
     return 42
+
 
 def test_very_simple_program():
     sdfg = very_simple_program.to_sdfg(simplify=False)

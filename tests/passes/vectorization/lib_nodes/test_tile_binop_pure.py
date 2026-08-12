@@ -143,6 +143,7 @@ def _build_binop_symbol_rhs_sdfg(widths, expr_b, tag, dtype=dace.float64, free_s
     a = state.add_access("A")
     c = state.add_access("C")
     node = TileBinop(name="tb_sym", widths=widths, op="+", kind_a="Tile", kind_b="Symbol", expr_b=expr_b)
+    assert node.free_symbols == set(free_symbols)
     state.add_node(node)
     full = ",".join(f"0:{w}" for w in widths)
     state.add_edge(a, None, node, "_a", dace.Memlet(f"A[{full}]"))

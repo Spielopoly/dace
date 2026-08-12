@@ -4,23 +4,25 @@
 Each test creates an SDFG (via API or @dace.program), applies the
 ``VectorizeCuTile`` orchestrator (vectorize with target_isa="CUTILE", lower
 schedules/storage/implementations, expand library nodes, select the Python
-backend), generates Python code, compiles, runs on GPU, and compares results
-against a NumPy reference. The structural tests double as regression tests of
-the cuTile lowering passes (``cutile_lowering.py``).
+backend), generates a Cython host plus an aggregate cuTile build module,
+compiles, runs on GPU, and compares results against a NumPy reference. The
+structural tests double as regression tests of the cuTile lowering passes
+(``cutile_lowering.py``).
 """
 import ast
+from typing import Tuple
 
 import numpy as np
 import pytest
 
 import dace
 from dace import dtypes
+from dace.codegen.codeobject import CodeObject
 from dace.sdfg import SDFG, nodes
 from dace.transformation.passes.vectorization.vectorize_cutile import VectorizeCuTile
 
 # All GPU execution tests require GPU
 pytestmark = pytest.mark.gpu
-
 
 # ============================================================
 # Pipeline helpers
@@ -34,6 +36,18 @@ def _apply_cutile_pipeline(sdfg: SDFG, widths=(8, )) -> None:
     :param widths: Tile widths for vectorization (must be powers of two).
     """
     VectorizeCuTile(widths=widths).apply_pass(sdfg, {})
+
+
+def _generated_artifacts(sdfg: SDFG) -> Tuple[CodeObject, CodeObject]:
+    """Return the Cython host and aggregate cuTile build artifacts.
+
+    :param sdfg: Lowered Python-backend SDFG.
+    :returns: Host and build code objects.
+    """
+    code_objects = sdfg.generate_code()
+    host = next(code for code in code_objects if code.name == sdfg.name)
+    build = next(code for code in code_objects if code.target_type == "cutile_build")
+    return host, build
 
 
 def _run_cutile(sdfg, **kwargs):
@@ -61,14 +75,17 @@ def _build_vadd_sdfg(name, dtype=dace.float64):
     """
     N = dace.symbol("N")
     sdfg = dace.SDFG(name)
-    sdfg.add_array("A", (N,), dtype)
-    sdfg.add_array("B", (N,), dtype)
-    sdfg.add_array("C", (N,), dtype)
+    sdfg.add_array("A", (N, ), dtype)
+    sdfg.add_array("B", (N, ), dtype)
+    sdfg.add_array("C", (N, ), dtype)
     state = sdfg.add_state("main")
     state.add_mapped_tasklet(
         "add",
         {"i": "0:N"},
-        {"_a": dace.Memlet("A[i]"), "_b": dace.Memlet("B[i]")},
+        {
+            "_a": dace.Memlet("A[i]"),
+            "_b": dace.Memlet("B[i]")
+        },
         "_c = _a + _b",
         {"_c": dace.Memlet("C[i]")},
         external_edges=True,
@@ -86,14 +103,17 @@ def _build_binop_sdfg(name, op, dtype=dace.float64):
     """
     N = dace.symbol("N")
     sdfg = dace.SDFG(name)
-    sdfg.add_array("A", (N,), dtype)
-    sdfg.add_array("B", (N,), dtype)
-    sdfg.add_array("C", (N,), dtype)
+    sdfg.add_array("A", (N, ), dtype)
+    sdfg.add_array("B", (N, ), dtype)
+    sdfg.add_array("C", (N, ), dtype)
     state = sdfg.add_state("main")
     state.add_mapped_tasklet(
         "binop",
         {"i": "0:N"},
-        {"_a": dace.Memlet("A[i]"), "_b": dace.Memlet("B[i]")},
+        {
+            "_a": dace.Memlet("A[i]"),
+            "_b": dace.Memlet("B[i]")
+        },
         f"_c = _a {op} _b",
         {"_c": dace.Memlet("C[i]")},
         external_edges=True,
@@ -112,7 +132,7 @@ class TestBasicOps:
     def test_vadd_aligned(self):
         """C[i] = A[i] + B[i] with N aligned to tile width."""
         sdfg = _build_vadd_sdfg("cutile_vadd_aligned")
-        _apply_cutile_pipeline(sdfg, widths=(8,))
+        _apply_cutile_pipeline(sdfg, widths=(8, ))
 
         n = 64
         rng = np.random.default_rng(42)
@@ -125,7 +145,7 @@ class TestBasicOps:
     def test_vadd_unaligned(self):
         """C[i] = A[i] + B[i] with N NOT aligned to tile width (tests masking)."""
         sdfg = _build_vadd_sdfg("cutile_vadd_unaligned")
-        _apply_cutile_pipeline(sdfg, widths=(8,))
+        _apply_cutile_pipeline(sdfg, widths=(8, ))
 
         n = 17  # Not aligned to 8
         rng = np.random.default_rng(43)
@@ -138,7 +158,7 @@ class TestBasicOps:
     def test_vsub(self):
         """C[i] = A[i] - B[i]."""
         sdfg = _build_binop_sdfg("cutile_vsub", "-")
-        _apply_cutile_pipeline(sdfg, widths=(8,))
+        _apply_cutile_pipeline(sdfg, widths=(8, ))
 
         n = 100
         rng = np.random.default_rng(44)
@@ -151,7 +171,7 @@ class TestBasicOps:
     def test_vmul(self):
         """C[i] = A[i] * B[i]."""
         sdfg = _build_binop_sdfg("cutile_vmul", "*")
-        _apply_cutile_pipeline(sdfg, widths=(8,))
+        _apply_cutile_pipeline(sdfg, widths=(8, ))
 
         n = 100
         rng = np.random.default_rng(45)
@@ -164,7 +184,7 @@ class TestBasicOps:
     def test_vdiv(self):
         """C[i] = A[i] / B[i]."""
         sdfg = _build_binop_sdfg("cutile_vdiv", "/")
-        _apply_cutile_pipeline(sdfg, widths=(8,))
+        _apply_cutile_pipeline(sdfg, widths=(8, ))
 
         n = 100
         rng = np.random.default_rng(46)
@@ -186,7 +206,7 @@ class TestDtypes:
     def test_float32(self):
         """float32 vadd."""
         sdfg = _build_vadd_sdfg("cutile_f32_add", dtype=dace.float32)
-        _apply_cutile_pipeline(sdfg, widths=(8,))
+        _apply_cutile_pipeline(sdfg, widths=(8, ))
 
         n = 100
         rng = np.random.default_rng(50)
@@ -199,7 +219,7 @@ class TestDtypes:
     def test_int32(self):
         """int32 vadd."""
         sdfg = _build_vadd_sdfg("cutile_i32_add", dtype=dace.int32)
-        _apply_cutile_pipeline(sdfg, widths=(8,))
+        _apply_cutile_pipeline(sdfg, widths=(8, ))
 
         n = 100
         rng = np.random.default_rng(51)
@@ -212,7 +232,7 @@ class TestDtypes:
     def test_float64(self):
         """float64 vadd (the default; explicit test for coverage)."""
         sdfg = _build_vadd_sdfg("cutile_f64_add_explicit", dtype=dace.float64)
-        _apply_cutile_pipeline(sdfg, widths=(8,))
+        _apply_cutile_pipeline(sdfg, widths=(8, ))
 
         n = 100
         rng = np.random.default_rng(52)
@@ -235,7 +255,7 @@ class TestAlignedSizes:
     def test_aligned_sizes(self, n):
         """Aligned sizes (multiples of 8)."""
         sdfg = _build_vadd_sdfg(f"cutile_aligned_{n}")
-        _apply_cutile_pipeline(sdfg, widths=(8,))
+        _apply_cutile_pipeline(sdfg, widths=(8, ))
 
         rng = np.random.default_rng(n)
         A = rng.random(n)
@@ -248,13 +268,11 @@ class TestAlignedSizes:
 class TestUnalignedSizes:
     """Unaligned sizes (not multiples of tile width) -- tests boundary masking."""
 
-    @pytest.mark.parametrize(
-        "n", [1, 3, 7, 9, 15, 17, 31, 33, 63, 65, 100, 127]
-    )
+    @pytest.mark.parametrize("n", [1, 3, 7, 9, 15, 17, 31, 33, 63, 65, 100, 127])
     def test_unaligned_sizes(self, n):
         """Unaligned sizes -- tests boundary masking."""
         sdfg = _build_vadd_sdfg(f"cutile_unaligned_{n}")
-        _apply_cutile_pipeline(sdfg, widths=(8,))
+        _apply_cutile_pipeline(sdfg, widths=(8, ))
 
         rng = np.random.default_rng(n + 100)
         A = rng.random(n)
@@ -276,7 +294,7 @@ class TestTileWidths:
     def test_tile_widths_aligned(self, w):
         """Different tile widths with aligned size."""
         sdfg = _build_vadd_sdfg(f"cutile_w{w}_aligned")
-        _apply_cutile_pipeline(sdfg, widths=(w,))
+        _apply_cutile_pipeline(sdfg, widths=(w, ))
 
         n = 128  # Aligned for all tile widths 4..32
         rng = np.random.default_rng(w)
@@ -290,7 +308,7 @@ class TestTileWidths:
     def test_tile_widths_unaligned(self, w):
         """Different tile widths with unaligned size."""
         sdfg = _build_vadd_sdfg(f"cutile_w{w}_unaligned")
-        _apply_cutile_pipeline(sdfg, widths=(w,))
+        _apply_cutile_pipeline(sdfg, widths=(w, ))
 
         n = 100  # Not aligned to any of 4, 8, 16, 32
         rng = np.random.default_rng(w + 100)
@@ -314,10 +332,8 @@ class TestOpSizeCombinations:
     def test_op_size_cross(self, op, n):
         """Various operators with various sizes."""
         op_names = {"+": "add", "-": "sub", "*": "mul"}
-        sdfg = _build_binop_sdfg(
-            f"cutile_{op_names[op]}_n{n}", op
-        )
-        _apply_cutile_pipeline(sdfg, widths=(8,))
+        sdfg = _build_binop_sdfg(f"cutile_{op_names[op]}_n{n}", op)
+        _apply_cutile_pipeline(sdfg, widths=(8, ))
 
         rng = np.random.default_rng(hash((op, n)) & 0xFFFF_FFFF)
         A = rng.random(n) + 0.1
@@ -343,54 +359,57 @@ class TestCodegenOnly:
     """Tests that verify codegen output structure.
 
     These tests exercise the full pipeline through code generation but do not
-    compile or execute the SDFG. They verify the generated Python code is
-    syntactically valid and contains the expected cuTile primitives.
+    compile or execute the SDFG. They verify the aggregate build module is
+    valid Python and that each artifact owns the expected responsibilities.
     """
 
-    def test_vadd_generates_valid_python(self):
-        """Generated code should be valid Python (parseable by ast.parse)."""
+    def test_vadd_generates_valid_aot_artifacts(self):
+        """The host is linkable Cython and the build module is valid Python."""
         sdfg = _build_vadd_sdfg("cutile_codegen_valid")
-        _apply_cutile_pipeline(sdfg, widths=(8,))
+        _apply_cutile_pipeline(sdfg, widths=(8, ))
 
-        code_objects = sdfg.generate_code()
-        main_code = next(co for co in code_objects if co.name == sdfg.name)
-        # Should be valid Python
-        ast.parse(main_code.code)
+        host, build = _generated_artifacts(sdfg)
+        assert host.language == "pyx" and host.linkable
+        assert build.language == "py"
+        assert build.target_type == "cutile_build" and not build.linkable
+        ast.parse(build.code)
 
     def test_vadd_contains_ct_primitives(self):
         """Generated code should contain ct.load, ct.scatter, ct.bid."""
         sdfg = _build_vadd_sdfg("cutile_codegen_prims")
-        _apply_cutile_pipeline(sdfg, widths=(8,))
+        _apply_cutile_pipeline(sdfg, widths=(8, ))
 
-        code_objects = sdfg.generate_code()
-        code = next(co for co in code_objects if co.name == sdfg.name).code
+        host, build = _generated_artifacts(sdfg)
+        code = build.code
 
         assert "ct.bid(0)" in code, "Missing ct.bid(0) in generated code"
         assert "ct.load(" in code, "Missing ct.load in generated code"
         assert "ct.scatter(" in code, "Missing ct.scatter in generated code"
         assert "ct.arange(" in code, "Missing ct.arange in generated code"
         assert "@ct.kernel" in code, "Missing @ct.kernel decorator"
-        assert "ct.launch(" in code, "Missing ct.launch call"
+        assert "compilation.export_kernel(" in code, "Missing AOT export call"
+        assert "__dace_cutile_launch_" in host.code, "Missing host launch helper"
+        assert "ct.launch(" not in code and "ct.launch(" not in host.code
 
     def test_vadd_has_import_cuda_tile(self):
         """Generated code should import cuda.tile."""
         sdfg = _build_vadd_sdfg("cutile_codegen_import")
-        _apply_cutile_pipeline(sdfg, widths=(8,))
+        _apply_cutile_pipeline(sdfg, widths=(8, ))
 
-        code_objects = sdfg.generate_code()
-        code = next(co for co in code_objects if co.name == sdfg.name).code
-        assert "import cuda.tile as ct" in code
+        host, build = _generated_artifacts(sdfg)
+        assert "import cuda.tile as ct" in build.code
+        assert "import cuda.tile" not in host.code
 
     def test_vadd_has_kernel_function(self):
         """Generated code should contain a @ct.kernel decorated function."""
         sdfg = _build_vadd_sdfg("cutile_codegen_kernel")
-        _apply_cutile_pipeline(sdfg, widths=(8,))
+        _apply_cutile_pipeline(sdfg, widths=(8, ))
 
-        code_objects = sdfg.generate_code()
-        code = next(co for co in code_objects if co.name == sdfg.name).code
+        _, build = _generated_artifacts(sdfg)
+        code = build.code
 
         # The kernel decorator must appear
-        assert "@ct.kernel" in code
+        assert code.count("@ct.kernel") == 1
         # The kernel function definition must follow the decorator
         kernel_idx = code.index("@ct.kernel")
         # There should be a 'def ' after the decorator
@@ -400,46 +419,41 @@ class TestCodegenOnly:
     def test_sub_generates_valid_python(self):
         """Subtraction variant should also produce valid Python."""
         sdfg = _build_binop_sdfg("cutile_codegen_sub", "-")
-        _apply_cutile_pipeline(sdfg, widths=(8,))
+        _apply_cutile_pipeline(sdfg, widths=(8, ))
 
-        code_objects = sdfg.generate_code()
-        main_code = next(co for co in code_objects if co.name == sdfg.name)
-        ast.parse(main_code.code)
+        _, build = _generated_artifacts(sdfg)
+        ast.parse(build.code)
 
     def test_mul_generates_valid_python(self):
         """Multiplication variant should produce valid Python."""
         sdfg = _build_binop_sdfg("cutile_codegen_mul", "*")
-        _apply_cutile_pipeline(sdfg, widths=(8,))
+        _apply_cutile_pipeline(sdfg, widths=(8, ))
 
-        code_objects = sdfg.generate_code()
-        main_code = next(co for co in code_objects if co.name == sdfg.name)
-        ast.parse(main_code.code)
+        _, build = _generated_artifacts(sdfg)
+        ast.parse(build.code)
 
     def test_float32_generates_valid_python(self):
         """float32 SDFG should produce valid Python."""
         sdfg = _build_vadd_sdfg("cutile_codegen_f32", dtype=dace.float32)
-        _apply_cutile_pipeline(sdfg, widths=(8,))
+        _apply_cutile_pipeline(sdfg, widths=(8, ))
 
-        code_objects = sdfg.generate_code()
-        main_code = next(co for co in code_objects if co.name == sdfg.name)
-        ast.parse(main_code.code)
+        _, build = _generated_artifacts(sdfg)
+        ast.parse(build.code)
 
     def test_tile_width_16_generates_valid_python(self):
         """Tile width 16 should produce valid Python."""
         sdfg = _build_vadd_sdfg("cutile_codegen_w16")
-        _apply_cutile_pipeline(sdfg, widths=(16,))
+        _apply_cutile_pipeline(sdfg, widths=(16, ))
 
-        code_objects = sdfg.generate_code()
-        main_code = next(co for co in code_objects if co.name == sdfg.name)
-        ast.parse(main_code.code)
+        _, build = _generated_artifacts(sdfg)
+        ast.parse(build.code)
 
     def test_mask_gen_present_in_code(self):
         """The iteration mask generation code should be in generated output."""
         sdfg = _build_vadd_sdfg("cutile_codegen_maskgen")
-        _apply_cutile_pipeline(sdfg, widths=(8,))
+        _apply_cutile_pipeline(sdfg, widths=(8, ))
 
-        code_objects = sdfg.generate_code()
-        code = next(co for co in code_objects if co.name == sdfg.name).code
+        code = _generated_artifacts(sdfg)[1].code
 
         # The mask generation uses arange + comparison against upper bound
         assert "ct.arange(8" in code, "Missing arange(8) for mask gen"
@@ -449,11 +463,10 @@ class TestCodegenOnly:
     def test_cupy_import_present(self):
         """Generated code should import cupy for stream management."""
         sdfg = _build_vadd_sdfg("cutile_codegen_cupy")
-        _apply_cutile_pipeline(sdfg, widths=(8,))
+        _apply_cutile_pipeline(sdfg, widths=(8, ))
 
-        code_objects = sdfg.generate_code()
-        code = next(co for co in code_objects if co.name == sdfg.name).code
-        assert "import cupy" in code
+        host, _ = _generated_artifacts(sdfg)
+        assert "import cupy" in host.code
 
 
 # ============================================================
@@ -467,7 +480,7 @@ class TestPipelineStructure:
     def test_map_schedule_is_cutile(self):
         """After pipeline, the tiled map should have CuTile schedule."""
         sdfg = _build_vadd_sdfg("cutile_struct_schedule")
-        _apply_cutile_pipeline(sdfg, widths=(8,))
+        _apply_cutile_pipeline(sdfg, widths=(8, ))
 
         found_cutile_map = False
         for state in sdfg.states():
@@ -481,25 +494,24 @@ class TestPipelineStructure:
         """After pipeline, original non-transient arrays have host storage
         (Default or CPU_Heap) with GPU_Global transient clones."""
         sdfg = _build_vadd_sdfg("cutile_struct_storage")
-        _apply_cutile_pipeline(sdfg, widths=(8,))
+        _apply_cutile_pipeline(sdfg, widths=(8, ))
 
         host_storages = {dtypes.StorageType.Default, dtypes.StorageType.CPU_Heap}
         for name in ("A", "B", "C"):
             assert sdfg.arrays[name].storage in host_storages, (
                 f"Array {name} has storage {sdfg.arrays[name].storage}, "
-                f"expected Default or CPU_Heap"
-            )
+                f"expected Default or CPU_Heap")
         # GPU_Global transient clones exist
         gpu_clones = {
-            name for name, desc in sdfg.arrays.items()
-            if desc.storage == dtypes.StorageType.GPU_Global and desc.transient
+            name
+            for name, desc in sdfg.arrays.items() if desc.storage == dtypes.StorageType.GPU_Global and desc.transient
         }
         assert len(gpu_clones) >= 3, f"Expected at least 3 GPU clones, found {gpu_clones}"
 
     def test_tile_transients_are_cutile_tile(self):
         """After pipeline, tile transients should have CuTile_Tile storage."""
         sdfg = _build_vadd_sdfg("cutile_struct_tile_storage")
-        _apply_cutile_pipeline(sdfg, widths=(8,))
+        _apply_cutile_pipeline(sdfg, widths=(8, ))
 
         found_cutile_tile = False
         for name, desc in sdfg.arrays.items():
@@ -510,26 +522,25 @@ class TestPipelineStructure:
     def test_backend_is_python(self):
         """After pipeline, backend should be Python."""
         sdfg = _build_vadd_sdfg("cutile_struct_backend")
-        _apply_cutile_pipeline(sdfg, widths=(8,))
+        _apply_cutile_pipeline(sdfg, widths=(8, ))
         assert sdfg.backend == dtypes.BackendLanguage.Python
 
     def test_expanded_tasklets_are_python(self):
         """All tasklets in the expanded SDFG should be Python language."""
         sdfg = _build_vadd_sdfg("cutile_struct_python_tasklets")
-        _apply_cutile_pipeline(sdfg, widths=(8,))
+        _apply_cutile_pipeline(sdfg, widths=(8, ))
 
         for state in sdfg.states():
             for node in state.nodes():
                 if isinstance(node, nodes.Tasklet):
                     assert node.language == dtypes.Language.Python, (
                         f"Tasklet {node.label} has language {node.language}, "
-                        f"expected Python"
-                    )
+                        f"expected Python")
 
     def test_tiled_map_has_stride(self):
         """The tiled map should have a step > 1 matching the tile width."""
         sdfg = _build_vadd_sdfg("cutile_struct_stride")
-        _apply_cutile_pipeline(sdfg, widths=(8,))
+        _apply_cutile_pipeline(sdfg, widths=(8, ))
 
         found_strided = False
         for state in sdfg.states():
@@ -570,18 +581,18 @@ class TestMultiDimGather:
         NPROMA = dace.symbol("NPROMA")
 
         @dace.program
-        def icon_zekinh_gather(e_bln: dace.float64[(NB * 8), 3, (NPROMA * 8)],
-                               edge_idx: dace.int32[(NB * 8), (NPROMA * 8), 3],
-                               edge_blk: dace.int32[(NB * 8), (NPROMA * 8), 3],
-                               z_kin_hor_e: dace.float64[(NB * 8), (NLEV * 8), (NPROMA * 8)],
+        def icon_zekinh_gather(e_bln: dace.float64[(NB * 8), 3, (NPROMA * 8)], edge_idx: dace.int32[(NB * 8),
+                                                                                                    (NPROMA * 8), 3],
+                               edge_blk: dace.int32[(NB * 8), (NPROMA * 8),
+                                                    3], z_kin_hor_e: dace.float64[(NB * 8), (NLEV * 8), (NPROMA * 8)],
                                z_ekinh: dace.float64[(NB * 8), (NLEV * 8), (NPROMA * 8)]):
             for jb in range((NB * 8)):
                 for jk in range((NLEV * 8)):
                     for jc in range((NPROMA * 8)):
-                        z_ekinh[jb, jk, jc] = (
-                            e_bln[jb, 0, jc] * z_kin_hor_e[edge_blk[jb, jc, 0], jk, edge_idx[jb, jc, 0]] +
-                            e_bln[jb, 1, jc] * z_kin_hor_e[edge_blk[jb, jc, 1], jk, edge_idx[jb, jc, 1]] +
-                            e_bln[jb, 2, jc] * z_kin_hor_e[edge_blk[jb, jc, 2], jk, edge_idx[jb, jc, 2]])
+                        z_ekinh[jb, jk,
+                                jc] = (e_bln[jb, 0, jc] * z_kin_hor_e[edge_blk[jb, jc, 0], jk, edge_idx[jb, jc, 0]] +
+                                       e_bln[jb, 1, jc] * z_kin_hor_e[edge_blk[jb, jc, 1], jk, edge_idx[jb, jc, 1]] +
+                                       e_bln[jb, 2, jc] * z_kin_hor_e[edge_blk[jb, jc, 2], jk, edge_idx[jb, jc, 2]])
 
         return icon_zekinh_gather.to_sdfg()
 
@@ -592,8 +603,8 @@ class TestMultiDimGather:
         for jb in range(NB8):
             for jk in range(NLEV8):
                 for jc in range(NPROMA8):
-                    out[jb, jk, jc] = sum(e_bln[jb, e, jc] * z[edge_blk[jb, jc, e], jk, edge_idx[jb, jc, e]]
-                                          for e in range(3))
+                    out[jb, jk,
+                        jc] = sum(e_bln[jb, e, jc] * z[edge_blk[jb, jc, e], jk, edge_idx[jb, jc, e]] for e in range(3))
         return out
 
     @pytest.mark.parametrize("NB_val", [1, 2])
@@ -610,9 +621,15 @@ class TestMultiDimGather:
         z = rng.standard_normal((NB8, NLEV8, NPROMA8))
         ref = self._reference(e_bln, edge_idx, edge_blk, z)
 
-        results = _run_cutile(sdfg, e_bln=e_bln, edge_idx=edge_idx, edge_blk=edge_blk,
-                              z_kin_hor_e=z, z_ekinh=np.zeros((NB8, NLEV8, NPROMA8)),
-                              NB=NB_val, NLEV=NLEV_val, NPROMA=NPROMA_val)
+        results = _run_cutile(sdfg,
+                              e_bln=e_bln,
+                              edge_idx=edge_idx,
+                              edge_blk=edge_blk,
+                              z_kin_hor_e=z,
+                              z_ekinh=np.zeros((NB8, NLEV8, NPROMA8)),
+                              NB=NB_val,
+                              NLEV=NLEV_val,
+                              NPROMA=NPROMA_val)
         np.testing.assert_allclose(results["z_ekinh"], ref, rtol=1e-12, atol=1e-12)
 
     def test_gather_code_is_pure_cutile(self):
@@ -620,7 +637,7 @@ class TestMultiDimGather:
         ``ct.gather`` + ``ct.load`` index tiles, no ``std::`` / for-loops."""
         sdfg = self._build()
         VectorizeCuTile(widths=(8, 8), branch_mode="merge").apply_pass(sdfg, {})
-        code = "".join(c.clean_code for c in sdfg.generate_code())
+        code = _generated_artifacts(sdfg)[1].clean_code
         assert "ct.gather" in code
         assert "std::" not in code and "for (" not in code
 
@@ -636,8 +653,8 @@ class TestMultiDimGather:
 
         @dace.program
         def gather_by_row(row_idx: dace.int32[(NB * 8), (NLEV * 8)],
-                          src: dace.float64[(NB * 8), (NLEV * 8), (NPROMA * 8)],
-                          out: dace.float64[(NB * 8), (NLEV * 8), (NPROMA * 8)]):
+                          src: dace.float64[(NB * 8), (NLEV * 8), (NPROMA * 8)], out: dace.float64[(NB * 8), (NLEV * 8),
+                                                                                                   (NPROMA * 8)]):
             for jb in range((NB * 8)):
                 for jk in range((NLEV * 8)):
                     for jc in range((NPROMA * 8)):
@@ -657,8 +674,13 @@ class TestMultiDimGather:
                 for jc in range(NPROMA8):
                     ref[jb, jk, jc] = src[jb, row_idx[jb, jk], jc]
 
-        results = _run_cutile(sdfg, row_idx=row_idx, src=src, out=np.zeros((NB8, NLEV8, NPROMA8)),
-                              NB=NB_val, NLEV=NLEV_val, NPROMA=NPROMA_val)
+        results = _run_cutile(sdfg,
+                              row_idx=row_idx,
+                              src=src,
+                              out=np.zeros((NB8, NLEV8, NPROMA8)),
+                              NB=NB_val,
+                              NLEV=NLEV_val,
+                              NPROMA=NPROMA_val)
         np.testing.assert_allclose(results["out"], ref, rtol=1e-12, atol=1e-12)
 
 
@@ -688,7 +710,7 @@ class TestScalarParams:
             Y[:] = alpha * X[:]
 
         sdfg = cutile_scale.to_sdfg()
-        _apply_cutile_pipeline(sdfg, widths=(8,))
+        _apply_cutile_pipeline(sdfg, widths=(8, ))
 
         rng = np.random.default_rng(101)
         X = rng.random(n)
@@ -706,7 +728,7 @@ class TestScalarParams:
             Z[:] = alpha * X[:] + beta * Y[:]
 
         sdfg = cutile_axpby.to_sdfg()
-        _apply_cutile_pipeline(sdfg, widths=(8,))
+        _apply_cutile_pipeline(sdfg, widths=(8, ))
 
         n = 100  # unaligned to 8
         alpha_val, beta_val = 2.5, -0.75
@@ -721,7 +743,6 @@ class TestScalarParams:
 # ============================================================
 # Entry point
 # ============================================================
-
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "--timeout=300"])

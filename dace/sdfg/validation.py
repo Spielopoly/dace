@@ -20,7 +20,7 @@ if TYPE_CHECKING:
     from dace.memlet import Memlet
     from dace.sdfg import SDFG
     from dace.sdfg import graph as gr
-    from dace.sdfg.state import ControlFlowRegion, SDFGState
+    from dace.sdfg.state import ControlFlowRegion
 
 ###########################################
 # Validation
@@ -1304,7 +1304,7 @@ class InvalidSDFGError(Exception):
 
     def unresolved(self, kind: str, element_id) -> str:
         """Placeholder text for an element whose id no longer resolves against the graph."""
-        return f'<unresolved {kind} id {element_id}>'
+        return f'<unresolved {kind} with id {element_id}>'
 
     def state_label(self, state) -> str:
         return state.label if state is not None else self.unresolved('state', self.state_id)

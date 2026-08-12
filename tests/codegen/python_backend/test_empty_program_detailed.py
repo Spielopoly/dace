@@ -4,6 +4,7 @@ import dace
 
 def _generate_empty_program():
     """Helper: generate code for an empty program via the Python backend."""
+
     @dace.program
     def empty_program():
         pass
@@ -19,10 +20,10 @@ def test_number_of_code_objects():
     assert len(code) == 1  # One for the frame
 
 
-def test_language_is_py():
-    """The CodeObject language must be 'py'."""
+def test_language_is_pyx():
+    """The host CodeObject language must be 'pyx'."""
     _, code = _generate_empty_program()
-    assert code[0].language == 'py'
+    assert code[0].language == 'pyx'
 
 
 def test_title_is_frame():
@@ -49,34 +50,29 @@ def test_generated_code_has_pass_body():
     assert 'pass' in code[0].code
 
 
-def test_generated_code_does_not_import_numpy():
-    """An empty Python SDFG should not emit a numpy import in the frame header."""
+def test_generated_code_inlines_symbolic_helpers():
+    """The one host source should contain helpers without wildcard imports."""
     _, code = _generate_empty_program()
-    assert 'import numpy' not in code[0].code
+    assert 'def int_ceil' in code[0].code
+    assert 'import *' not in code[0].code
+    assert 'sympy_function_redefinitions' not in code[0].code
 
 
-def test_generated_code_is_valid_python():
-    """Generated code must be compilable Python."""
-    _, code = _generate_empty_program()
-    compile(code[0].code, '<generated>', 'exec')
-
-
-def test_generated_code_is_executable():
-    """Generated code must be executable — calling the function should not raise."""
-    sdfg, code = _generate_empty_program()
-    ns = {}
-    exec(code[0].code, ns)
-    # Calling the generated function should succeed
-    ns[sdfg.name]()
+def test_generated_code_compiles_as_native_extension():
+    """The generated host should compile and execute through the public path."""
+    sdfg, _ = _generate_empty_program()
+    compiled = sdfg.compile()
+    compiled()
+    assert compiled.library_path.is_file()
 
 
 if __name__ == "__main__":
     test_number_of_code_objects()
-    test_language_is_py()
+    test_language_is_pyx()
     test_title_is_frame()
     test_name_matches_sdfg()
     test_generated_code_contains_function_def()
     test_generated_code_has_pass_body()
-    test_generated_code_is_valid_python()
-    test_generated_code_is_executable()
+    test_generated_code_inlines_symbolic_helpers()
+    test_generated_code_compiles_as_native_extension()
     print("All tests passed!")

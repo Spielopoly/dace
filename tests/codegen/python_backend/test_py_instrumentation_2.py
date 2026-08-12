@@ -11,9 +11,8 @@ refactor the provider:
 * supports SDFG-, state-, scope/map-, and node-level (Tasklet) timing for the
   plain Python backend;
 * for the cuTile backend, rejects node-level instrumentation inside kernels and
-  always emits ``cupy.cuda.get_current_stream().synchronize()`` after every
-  ``ct.launch(...)`` (wrapping launch+sync with the scope timer when the map is
-  instrumented).
+  synchronizes once on successful top-level exit; an instrumented map adds the
+  launch synchronization required for its scope timer.
 
 Coverage groups:
 
@@ -33,7 +32,6 @@ import numpy as np
 import pytest
 
 import dace
-from dace import dtypes
 from dace.codegen.instrumentation.provider import InstrumentationProvider
 from dace.codegen.instrumentation.py_timer import PythonTimerProvider
 from dace.dtypes import (
@@ -78,7 +76,10 @@ def _build_vadd_sdfg(name: str, size, dtype=dace.float64) -> SDFG:
     state.add_mapped_tasklet(
         'add',
         {'i': f'0:{size}'},
-        {'a_in': Memlet('A[i]'), 'b_in': Memlet('B[i]')},
+        {
+            'a_in': Memlet('A[i]'),
+            'b_in': Memlet('B[i]')
+        },
         'c_out = a_in + b_in',
         {'c_out': Memlet('C[i]')},
         external_edges=True,
@@ -241,9 +242,8 @@ class TestPlainPythonRuntime:
         np.testing.assert_allclose(c, a + b)
         report = sdfg.get_latest_report()
         tasklet_events = [n for n in _event_names(report) if n.startswith('Tasklet ')]
-        assert len(tasklet_events) == K, (
-            f"expected exactly {K} Tasklet events (one per map iteration), "
-            f"got {len(tasklet_events)}: {_event_names(report)}")
+        assert len(tasklet_events) == K, (f"expected exactly {K} Tasklet events (one per map iteration), "
+                                          f"got {len(tasklet_events)}: {_event_names(report)}")
         _assert_all_nonnegative_durations(report)
 
     def test_per_invocation_reset_event_count_constant(self):
@@ -386,8 +386,7 @@ class TestPlainPythonReportSchema:
         data = _load_latest_report_json(sdfg)
         assert isinstance(data['sdfgHash'], str)
         assert len(data['sdfgHash']) > 0
-        assert data['sdfgHash'] == frozen, (
-            f"report sdfgHash {data['sdfgHash']!r} != codegen-frozen hash {frozen!r}")
+        assert data['sdfgHash'] == frozen, (f"report sdfgHash {data['sdfgHash']!r} != codegen-frozen hash {frozen!r}")
 
     def test_no_instrumentation_no_events(self):
         """An SDFG with NO ``.instrument`` set anywhere produces either no report
@@ -559,7 +558,10 @@ def _build_cutile_vadd_sdfg(name: str, dtype=dace.float64) -> SDFG:
     state.add_mapped_tasklet(
         "add",
         {"i": "0:N"},
-        {"_a": Memlet("A[i]"), "_b": Memlet("B[i]")},
+        {
+            "_a": Memlet("A[i]"),
+            "_b": Memlet("B[i]")
+        },
         "_c = _a + _b",
         {"_c": Memlet("C[i]")},
         external_edges=True,
@@ -609,7 +611,6 @@ _requires_cutile = pytest.mark.skipif(
     not _cutile_available(),
     reason="cupy + cuda.tile + an NVIDIA GPU are required for cuTile runtime tests",
 )
-
 
 # ===========================================================================
 # B. cuTile target -- RUNTIME on the real GPU
@@ -678,6 +679,51 @@ class TestCuTileRuntime:
         assert any(name.startswith('Map ') for name in _event_names(report))
         _assert_all_nonnegative_durations(report)
 
+    def test_exception_skips_boundary_sync_and_sdfg_end_event(self):
+        """A host exception after launch skips successful-exit behavior."""
+        import cupy
+
+        sdfg = _build_cutile_vadd_sdfg(_unique('cutile_exception'))
+        _apply_cutile_pipeline(sdfg, widths=(8, ))
+        launch_state = sdfg.states()[0]
+        failing_state = sdfg.add_state('fail_after_launch')
+        failing_state.add_tasklet('fail', set(), set(), "raise RuntimeError('host failure')")
+        sdfg.add_edge(launch_state, failing_state, dace.InterstateEdge())
+        _instrument_sdfg(sdfg)
+        compiled = sdfg.compile()
+
+        current_stream_calls = 0
+        real_cupy = cupy
+
+        class _CudaProxy:
+
+            def __getattr__(self, name: str):
+                return getattr(real_cupy.cuda, name)
+
+            def get_current_stream(self):
+                nonlocal current_stream_calls
+                current_stream_calls += 1
+                return real_cupy.cuda.get_current_stream()
+
+        class _CupyProxy:
+
+            cuda = _CudaProxy()
+
+            def __getattr__(self, name: str):
+                return getattr(real_cupy, name)
+
+        compiled.module.cupy = _CupyProxy()
+        n = 64
+        a = np.arange(n, dtype=np.float64)
+        b = np.ones(n, dtype=np.float64)
+        c = np.zeros(n, dtype=np.float64)
+
+        with pytest.raises(RuntimeError, match='host failure'):
+            compiled(A=a, B=b, C=c, N=n)
+
+        assert current_stream_calls == 1, "only the launch may request the current stream"
+        assert compiled.module.__dict__['__dace_perf_events'] == []
+
 
 # ===========================================================================
 # C. cuTile target -- codegen / structural (no GPU needed)
@@ -691,21 +737,18 @@ def _build_cutile_tile_sdfg(name: str, instrument_map: bool) -> SDFG:
     with a CuTile-scheduled map. Optionally instruments the map entry.
 
     :param name: Unique SDFG name.
-    :param instrument_map: If True, set Timer instrumentation on the map.
+    :param instrument_map: If True, set PythonTimer instrumentation on the map.
     :returns: The constructed SDFG with ``backend == Python``.
     """
     sdfg = SDFG(name)
     sdfg.backend = BackendLanguage.Python
     sdfg.add_array("A", [32], dace.float64, storage=StorageType.GPU_Global)
     sdfg.add_array("B", [32], dace.float64, storage=StorageType.GPU_Global)
-    sdfg.add_array("_tile_A", [32], dace.float64,
-                   storage=StorageType.CuTile_Tile, transient=True)
-    sdfg.add_array("_tile_B", [32], dace.float64,
-                   storage=StorageType.CuTile_Tile, transient=True)
+    sdfg.add_array("_tile_A", [32], dace.float64, storage=StorageType.CuTile_Tile, transient=True)
+    sdfg.add_array("_tile_B", [32], dace.float64, storage=StorageType.CuTile_Tile, transient=True)
 
     state = sdfg.add_state("main")
-    me, mx = state.add_map("cutile_map", {"tile_i": "0:32:32"},
-                           schedule=ScheduleType.CuTile)
+    me, mx = state.add_map("cutile_map", {"tile_i": "0:32:32"}, schedule=ScheduleType.CuTile)
     if instrument_map:
         me.map.instrument = InstrumentationType.PythonTimer
 
@@ -713,17 +756,12 @@ def _build_cutile_tile_sdfg(name: str, instrument_map: bool) -> SDFG:
     b = state.add_write("B")
     tile_a = state.add_access("_tile_A")
     tile_b = state.add_access("_tile_B")
-    tasklet = state.add_tasklet("compute", {"inp"}, {"out"},
-                                "out = inp * 2.0", language=Language.Python)
+    tasklet = state.add_tasklet("compute", {"inp"}, {"out"}, "out = inp * 2.0", language=Language.Python)
 
-    state.add_memlet_path(a, me, tile_a, dst_conn=None,
-                          memlet=Memlet(data="A", subset="0:32"))
-    state.add_edge(tile_a, None, tasklet, "inp",
-                   Memlet(data="_tile_A", subset="0:32"))
-    state.add_edge(tasklet, "out", tile_b, None,
-                   Memlet(data="_tile_B", subset="0:32"))
-    state.add_memlet_path(tile_b, mx, b, src_conn=None,
-                          memlet=Memlet(data="B", subset="0:32"))
+    state.add_memlet_path(a, me, tile_a, dst_conn=None, memlet=Memlet(data="A", subset="0:32"))
+    state.add_edge(tile_a, None, tasklet, "inp", Memlet(data="_tile_A", subset="0:32"))
+    state.add_edge(tasklet, "out", tile_b, None, Memlet(data="_tile_B", subset="0:32"))
+    state.add_memlet_path(tile_b, mx, b, src_conn=None, memlet=Memlet(data="B", subset="0:32"))
     return sdfg
 
 
@@ -734,7 +772,7 @@ def _python_backend_code(sdfg: SDFG) -> str:
     for code_obj in codes:
         if code_obj.target.target_name == 'python':
             text = code_obj.clean_code
-            if 'ct.launch(' in text or 'cutile' in text:
+            if '__dace_cutile_launch_' in text or 'cutile' in text:
                 return text
     # Fall back to concatenating all python targets.
     return "\n".join(c.clean_code for c in codes if c.target.target_name == 'python')
@@ -745,35 +783,35 @@ class TestCuTileCodegen:
 
     def test_instrumented_order_tbegin_launch_sync_tend(self):
         """C1: an instrumented cuTile map emits, in order, ``__dace_tbegin_``,
-        ``ct.launch(``, ``synchronize()``, then ``__dace_tend_``."""
+        the concrete launch helper, ``synchronize()``, then ``__dace_tend_``."""
         sdfg = _build_cutile_tile_sdfg(_unique('cutile_cg_instr'), instrument_map=True)
         code = _python_backend_code(sdfg)
 
-        markers = ['__dace_tbegin_', 'ct.launch(', 'synchronize()', '__dace_tend_']
-        positions = []
-        for marker in markers:
-            idx = code.find(marker)
-            assert idx != -1, f"marker {marker!r} not found in generated code"
-            positions.append(idx)
-        assert positions == sorted(positions), (
-            f"markers out of order: {list(zip(markers, positions))}")
+        markers = ['__dace_tbegin_', '__dace_cutile_launch_', 'synchronize()', '__dace_tend_']
+        launch_match = re.search(r'(?m)^\s+__dace_cutile_launch_\w+\(', code)
+        assert launch_match is not None, "cuTile launch-helper call not found"
+        positions = [code.find(markers[0]), launch_match.start(), code.find(markers[2]), code.find(markers[3])]
+        for marker, position in zip(markers, positions):
+            assert position != -1, f"marker {marker!r} not found in generated code"
+        assert positions == sorted(positions), (f"markers out of order: {list(zip(markers, positions))}")
 
         m_begin = re.search(r'__dace_tbegin_(\w+)', code)
         m_end = re.search(r'__dace_tend_(\w+)', code)
         assert m_begin and m_end and m_begin.group(1) == m_end.group(1), \
             "tbegin/tend ids must match (regression guard: on_scope_exit must receive the exit node, not the entry)"
 
-    def test_uninstrumented_emits_sync_no_timer(self):
-        """C2: a non-instrumented cuTile map still emits ``synchronize()`` after
-        ``ct.launch(``, and emits no ``__dace_tbegin_``."""
+    def test_uninstrumented_has_one_top_level_sync_no_timer(self):
+        """C2: an uninstrumented program has one successful-exit sync and no timer."""
         sdfg = _build_cutile_tile_sdfg(_unique('cutile_cg_noinstr'), instrument_map=False)
         code = _python_backend_code(sdfg)
 
-        launch_idx = code.find('ct.launch(')
+        launch_match = re.search(r'(?m)^\s+__dace_cutile_launch_\w+\(', code)
+        launch_idx = -1 if launch_match is None else launch_match.start()
         sync_idx = code.find('synchronize()')
-        assert launch_idx != -1, "ct.launch( not found"
+        assert launch_idx != -1, "cuTile launch helper not found"
         assert sync_idx != -1, "synchronize() not found"
-        assert sync_idx > launch_idx, "synchronize() must come after ct.launch("
+        assert code.count('synchronize()') == 1, "only the top-level successful-exit sync is expected"
+        assert sync_idx > launch_idx, "the successful-exit sync must follow the launch helper"
         assert '__dace_tbegin_' not in code, "no timer code expected without instrumentation"
 
     def test_tasklet_instrumentation_in_cutile_raises(self):

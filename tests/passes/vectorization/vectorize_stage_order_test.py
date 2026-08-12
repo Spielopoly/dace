@@ -8,10 +8,13 @@ their subject no longer exists, which is a test that passes by skipping.
 """
 import pytest
 
+from dace.dtypes import DeviceType
 from dace.transformation.passes.vectorization.config import VectorizeConfig
 from dace.transformation.passes.vectorization.enums import BranchMode, ISA, RemainderStrategy
 from dace.transformation.passes.vectorization.vectorize_multi_dim import (ENTRY_CANONICALIZE_KWARGS,
-                                                                          VectorizeCPUMultiDim)
+                                                                          ENTRY_REDUCTION_TO_WCR_MAP,
+                                                                          VectorizeCPUMultiDim,
+                                                                          _entry_reduction_to_wcr_map)
 
 
 def _pass_names(**knobs) -> list:
@@ -54,6 +57,19 @@ def test_entry_canonicalization_skips_the_semantic_lifts():
     into arithmetic; running the lift from inside the vectorizer would put it on the wrong side of
     that rewrite, the exact ordering the canonicalize recipe documents."""
     assert ENTRY_CANONICALIZE_KWARGS['semantic_lifting'] is False
+
+
+def test_entry_canonicalization_uses_target_specific_wcr_map_lowering():
+    """Native CPU and GPU need WCR maps; cuTile preserves scalar copy chains.
+
+    Reapplying ``AccumulatorCopyChainToWCR`` to a GPU-first BLAS-only graph can mistake an
+    unrelated scalar copy, such as a Cholesky diagonal divisor, for an accumulator chain.
+    """
+    assert ENTRY_REDUCTION_TO_WCR_MAP[DeviceType.CPU] is True
+    assert ENTRY_REDUCTION_TO_WCR_MAP[DeviceType.GPU] is True
+    assert _entry_reduction_to_wcr_map(DeviceType.CPU, ISA.SCALAR) is True
+    assert _entry_reduction_to_wcr_map(DeviceType.GPU, ISA.CUDA) is True
+    assert _entry_reduction_to_wcr_map(DeviceType.CPU, ISA.CUTILE) is False
 
 
 def test_the_semantic_lifts_do_not_run_inside_the_vectorizer():

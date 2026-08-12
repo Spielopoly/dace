@@ -3,10 +3,9 @@
 NPBench sweep (durbin/go_fast, gemver/floyd_warshall, hdiff, arc_distance,
 nussinov). Each test is a minimal ``@dace.program`` repro of one class:
 
-1. **Float scalar staged into tile arithmetic** (durbin, go_fast): a scalar
-   computed on host from device data reaches the kernel; it must be passed
-   through device memory (1-element array + 0-d tile load) — by-value floats
-   are typed float32 by cuda.tile, so this also guards f64 precision.
+1. **Mutable float scalar in tile arithmetic** (durbin, go_fast): a scalar
+   computed from device data reaches the kernel through the exported ABI as a
+   rank-1, shape-1 array and a 0-d tile load, preserving f64 precision.
 2. **Array-element scalar bridge** (gemver, floyd_warshall): a staged element
    like ``u[i]`` must be bound with a constant-shape ``ct.load(u, (i,),
    shape=())`` — the propagated outer subset is a non-constant slice the
@@ -20,6 +19,8 @@ nussinov). Each test is a minimal ``@dace.program`` repro of one class:
    with the literal ``0.0``; the cutile expansion must emit a dtype-correct
    ``ct.full(..., ct.int32)`` instead of a float32 ``ct.broadcast_to``.
 """
+from typing import Tuple
+
 import numpy as np
 import pytest
 
@@ -39,6 +40,18 @@ def _lower(prog, widths=(32, )):
     sdfg = prog.to_sdfg(simplify=False)
     VectorizeCuTile(widths=widths).apply_pass(sdfg, {})
     return sdfg
+
+
+def _generated_sources(sdfg: dace.SDFG) -> Tuple[str, str]:
+    """Return the Cython host and aggregate cuTile build sources.
+
+    :param sdfg: Lowered Python-backend SDFG.
+    :returns: Host and build source text.
+    """
+    code_objects = sdfg.generate_code()
+    host = next(code.code for code in code_objects if code.name == sdfg.name)
+    build = next(code.code for code in code_objects if code.target_type == "cutile_build")
+    return host, build
 
 
 # ---------------------------------------------------------------------------
@@ -67,12 +80,17 @@ def test_float_scalar_device_path_runtime():
 
 
 def test_float_scalar_launch_normalization_codegen():
-    """The launch site passes float scalars as 1-element device arrays and
-    the kernel binds them as scalar tiles."""
+    """A mutable float scalar has an exact shape-1 exported array ABI."""
     sdfg = _lower(_gofast_like)
-    code = sdfg.generate_code()[0].code.replace(" ", "")
-    assert "cupy.asarray(trace,dtype=numpy.float64).reshape(1)" in code
-    assert "ct.load(trace,(0,),shape=()).item()" in code
+    host, build = _generated_sources(sdfg)
+    host_compact = "".join(host.split())
+    build_compact = "".join(build.split())
+    assert "trace=cupy.empty((1,),dtype=numpy.float64)" in host_compact
+    assert "cupy.asarray(trace" not in host_compact
+    assert "ct.load(trace,(0,),shape=()).item()" in build_compact
+    assert "compilation.ArrayConstraint(ct.float64,1," in build_compact
+    assert "shape_constant=(1,))" in build_compact
+    assert "compilation.ScalarConstraint(ct.float64)" not in build_compact
 
 
 # ---------------------------------------------------------------------------
@@ -102,7 +120,7 @@ def test_element_bridge_codegen_no_slice():
     """The bridge is a constant-shape element load, never an in-kernel slice
     with symbolic bounds (rejected by the cuda.tile compiler)."""
     sdfg = _lower(_outer_add)
-    code = sdfg.generate_code()[0].code
+    code = _generated_sources(sdfg)[1]
     assert ", shape=())" in code  # scalar tile load of the staged element
     assert "[0:(((N - 1))" not in code  # the old propagated-subset slice
 
@@ -154,7 +172,7 @@ def test_kernel_math_name_mapping_runtime():
 def test_kernel_math_name_mapping_codegen():
     """The kernel body spells the call ``ct.sinh``, not the host alias."""
     sdfg = _lower(_sinh_prog)
-    code = sdfg.generate_code()[0].code
+    code = _generated_sources(sdfg)[1]
     assert "ct.sinh(" in code
 
 
@@ -182,7 +200,7 @@ def test_const_fill_dtype_runtime():
 def test_const_fill_dtype_codegen():
     """The Symbol-kind fill is emitted as a dtype-typed ``ct.full``."""
     sdfg = _lower(_int_fill)
-    code = sdfg.generate_code()[0].code
+    code = _generated_sources(sdfg)[1]
     assert "ct.full" in code and "ct.int32" in code
 
 

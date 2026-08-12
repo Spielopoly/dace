@@ -94,9 +94,7 @@ from dace.transformation.passes.vectorization.split_map_for_tile_remainder impor
 # then rewrites the raw tasklets between staged tiles into TileBinop / TileITE / TileReduce.
 from dace.transformation.dataflow import MapCollapse, MapFission, WCRToAugAssign
 from dace.transformation.dataflow.lift_einsum import LiftEinsum
-from dace.transformation.interstate import (InlineMultistateSDFG, InlineSDFG, LoopToMap, RefineNestedAccess,
-                                            StateFusionExtended)
-from dace.transformation.interstate.expand_nested_sdfg_inputs import ExpandNestedSDFGInputs
+from dace.transformation.interstate import (InlineMultistateSDFG, InlineSDFG, StateFusionExtended)
 from dace.transformation.passes.pattern_matching import PatternMatchAndApplyRepeated
 from dace.transformation.passes.vectorization.split_multi_output_tasklets import SplitMultiOutputTasklets
 from dace.transformation.passes.vectorization.normalize_masked_write_tasklets import (NormalizeMaskedWriteTasklets,
@@ -115,8 +113,27 @@ _TILE_NODE_TYPES = (TileBinop, TileFMA, TileLoad, TileMaskGen, TileITE, TileRedu
 #: map -> library-node lifts (Einsum / Copy / Memset) would hand the tiler an opaque node with no
 #: per-lane body to widen, so the vectorizer needs the residual left as raw maps.
 #: ``unroll_limit=0``: ShortLoopUnroll would straight-line a short constant-trip loop and delete
-#: the very map the tiler was called to widen.
-ENTRY_CANONICALIZE_KWARGS = {'semantic_lifting': False, 'unroll_limit': 0}
+#: the very map the tiler was called to widen. Reduction canonicalization is target-specific:
+#: native CPU and GPU need WCR maps for their reduction lowering, while cuTile preserves
+#: accumulator copy chains when a GPU-first BLAS-only graph is canonicalized a second time.
+ENTRY_CANONICALIZE_KWARGS = {
+    'semantic_lifting': False,
+    'unroll_limit': 0,
+}
+ENTRY_REDUCTION_TO_WCR_MAP = {
+    DeviceType.CPU: True,
+    DeviceType.GPU: True,
+}
+
+
+def _entry_reduction_to_wcr_map(device: DeviceType, target_isa: ISA) -> bool:
+    """Return whether entry canonicalization should materialize WCR maps.
+
+    :param device: Effective execution device of the shared vectorizer.
+    :param target_isa: Requested tile-operation target ISA.
+    :returns: ``True`` for native CPU targets; ``False`` for GPU and cuTile.
+    """
+    return ENTRY_REDUCTION_TO_WCR_MAP[device] and target_isa != ISA.CUTILE
 
 
 def restore_sdfg_in_place(target: dace.SDFG, source: dace.SDFG) -> None:
@@ -1032,6 +1049,8 @@ class VectorizeMultiDim(ppl.Pipeline):
                          validate=self._validate,
                          validate_all=self._validate_all,
                          target='gpu' if self._device == DeviceType.GPU else 'cpu',
+                         assumption_guard=self._assumption_guard,
+                         reduction_to_wcr_map=_entry_reduction_to_wcr_map(self._device, self._target_isa),
                          **ENTRY_CANONICALIZE_KWARGS)
         # Always simplify first (user direction): callers may hand us an un-simplified SDFG
         # (``to_sdfg(simplify=False)``) with FunctionCallRegions / redundant states / un-inlined

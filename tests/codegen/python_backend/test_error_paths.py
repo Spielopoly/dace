@@ -10,7 +10,8 @@ import pytest
 
 import dace
 from dace import dtypes
-from dace.codegen.py.compiled_sdfg import PythonCompiledSDFG, compile_python_sdfg
+from dace.codegen.codeobject import CodeObject
+from dace.codegen.py.compiled_sdfg import compile_python_sdfg
 from dace.codegen.py.control_flow import (
     _unparse_codeblock,
     _write_conditional_block,
@@ -24,11 +25,6 @@ from dace.memlet import Memlet
 from dace.properties import CodeBlock
 from dace.sdfg import SDFG, NodeNotExpandedError, nodes
 from dace.sdfg.state import ConditionalBlock, ControlFlowRegion, LoopRegion
-
-
-class _FakeCodeObject:
-    def __init__(self, code: str):
-        self.code = code
 
 
 class _DummyCodegen:
@@ -58,6 +54,7 @@ def _make_streams():
 
 
 def _make_dispatch(result: str = '# state\n'):
+
     def _dispatch(_state):
         return result
 
@@ -72,9 +69,10 @@ def _make_conditional_branch_region(label: str, sdfg: SDFG) -> ControlFlowRegion
 
 def test_compiled_sdfg_missing_generated_function():
     sdfg = _make_sdfg('expected_name')
+    host = CodeObject('other_name', 'def other_name():\n    return 1\n', 'pyx', None, 'Frame')
 
     with pytest.raises(RuntimeError, match="does not define function 'expected_name'"):
-        PythonCompiledSDFG(sdfg, 'def other_name():\n    return 1\n')
+        compile_python_sdfg(sdfg, [host])
 
 
 def test_compile_python_sdfg_empty_code_object_list():
@@ -94,6 +92,7 @@ def test_generate_node_unknown_type_raises_not_implemented():
 
     with pytest.raises(NotImplementedError, match='MapExit'):
         target.generate_node(sdfg, sdfg, state, state.block_id, map_exit, function_stream, callsite_stream)
+
 
 @pytest.mark.xfail(reason="Currently the Python backend only supports sequential maps, \
                    but simply doesn't check the schedule type to maintain compatiblity with the \
@@ -299,25 +298,3 @@ def test_conditional_block_none_condition_for_non_final_branch_raises_runtime_er
 def test_dispatch_block_unknown_control_flow_type_raises_not_implemented():
     with pytest.raises(NotImplementedError, match='not implemented'):
         _write_dispatch_block(object(), _make_dispatch(), _DummyCodegen(), {}, PythonCodeIOStream())
-
-
-def test_compile_python_sdfg_auxiliary_object_non_linkable_is_skipped():
-    """Non-linkable code objects (e.g. SampleMain) are not built into aux modules."""
-    import sys
-
-    class _FakeNonLinkableCodeObject:
-        code = "SHOULD_NOT_BE_INJECTED = True\n"
-        name = "non_linkable_aux"
-        linkable = False
-
-    sdfg = _make_sdfg('frame_func')
-    frame = _FakeCodeObject('def frame_func():\n    return 7\n')
-    frame.name = 'frame_func'
-    frame.linkable = True
-    aux = _FakeNonLinkableCodeObject()
-
-    compiled = compile_python_sdfg(sdfg, [frame, aux])
-
-    assert compiled() == 7
-    assert 'non_linkable_aux' not in compiled._aux_modules
-    assert 'non_linkable_aux' not in sys.modules

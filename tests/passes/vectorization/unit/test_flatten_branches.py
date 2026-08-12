@@ -52,11 +52,20 @@ def test_three_way_becomes_three_single_arm_blocks():
     for b in blocks:
         assert len(b.branches) == 1
 
-    # Accumulated-negation conditions preserve if/elif first-match semantics.
-    conds = sorted(b.branches[0][0].as_string for b in blocks)
-    assert any(c == "(c0 > 0)" for c in conds)
-    assert any("not (c0 > 0)" in c and "(c1 > 0)" in c and "not (c1 > 0)" not in c for c in conds)
-    assert any("not (c0 > 0)" in c and "not (c1 > 0)" in c and "(c2 > 0)" in c for c in conds)
+    # Snapshot each source condition once, then preserve first-match semantics
+    # through accumulated negations of the snapshot symbols.
+    snap_state = next(b for b in sdfg.all_control_flow_blocks() if b.label == "cb_condsnap")
+    snap_edge = next(iter(sdfg.out_edges(snap_state)))
+    snapshots = {value: name for name, value in snap_edge.data.assignments.items()}
+    s0 = snapshots["((c0 > 0))"]
+    s1 = snapshots["((c1 > 0))"]
+    s2 = snapshots["((c2 > 0))"]
+    conds = {b.branches[0][0].as_string for b in blocks}
+    assert conds == {
+        s0,
+        f"((not {s0}) and {s1})",
+        f"((not {s0}) and (not {s1}) and {s2})",
+    }
     sdfg.validate()
 
 

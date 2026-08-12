@@ -1032,7 +1032,9 @@ class SDFG(ControlFlowRegion):
         existing = codeblocks[location].as_string or ''
 
         if existing and codeblocks[location].language != language:
-            raise ValueError(f'Cannot {action} code with language {language} to code with language {codeblocks[location].language} at location "{location}".')
+            raise ValueError(
+                f'Cannot {action} code with language {language} to code with language {codeblocks[location].language} at location "{location}".'
+            )
 
         new_code = code_string
         if action == 'append':
@@ -2721,20 +2723,21 @@ class SDFG(ControlFlowRegion):
         dll = cs.ReloadableDLL(binary_filename)
         return dll.is_loaded()
 
-    def compile(self, output_file=None, validate=True, return_program_handle=True) -> 'Union[CompiledSDFG, PythonCompiledSDFG, Any, None]':
+    def compile(self,
+                output_file=None,
+                validate=True,
+                return_program_handle=True) -> 'Union[CompiledSDFG, PythonCompiledSDFG, Any, None]':
         """ Compiles a runnable binary from this SDFG.
 
             For the C++ backend, compiles a shared library and returns a
             :class:`~dace.codegen.compiled_sdfg.CompiledSDFG`.
-            For the Python backend, no binary is produced; instead the
-            generated Python source is executed directly and a
+            For the Python backend, the generated host source is compiled as a
+            native Cython extension and a
             :class:`~dace.codegen.py.compiled_sdfg.PythonCompiledSDFG` is
             returned.
 
-            :param output_file: If not None, copies the output library file to
-                                the specified path (C++ backend) or writes the
-                                generated Python source to the path (Python
-                                backend).
+            :param output_file: If not None, copies the compiled library or
+                                Python extension to the specified path.
             :param validate: If True, validates the SDFG prior to generating
                              code.
             :param return_program_handle: If False, does not load the generated
@@ -2746,10 +2749,16 @@ class SDFG(ControlFlowRegion):
         # Importing these outside creates an import loop
         from dace.codegen import codegen, compiler
 
-        # Python backend: generate code and return a PythonCompiledSDFG directly
+        # Python backend: generate one host source and compile a native extension.
         if self.backend == dtypes.BackendLanguage.Python:
-            from dace.codegen.py.compiled_sdfg import compile_python_sdfg
+            from dace.codegen.py.compiler import compile_python_sdfg
+            build_folder = self.build_folder
+            compiler.register_disposable_folder(self)
             sdfg = copy.deepcopy(self)
+            sdfg.build_folder = build_folder
+
+            for _ in sdfg.all_sdfgs_recursive(load_ext=True):
+                pass
 
             try:
                 sdfg.fill_scope_connectors()
@@ -2760,20 +2769,7 @@ class SDFG(ControlFlowRegion):
                 print(f'Failing SDFG saved for inspection in {os.path.abspath(fpath)}')
                 raise
 
-            if output_file is not None:
-                import pathlib
-                p = pathlib.Path(output_file)
-                if p.is_dir():
-                    p = p / f'{sdfg.name}.py'
-                p.write_text(program_objects[0].code)
-                if len(program_objects) > 1:
-                    for obj in program_objects[1:]:
-                        p_obj = p.parent / f'{obj.name}.py'
-                        p_obj.write_text(obj.code)
-
-            if return_program_handle:
-                return compile_python_sdfg(sdfg, program_objects)
-            return None
+            return compile_python_sdfg(sdfg, program_objects, output_file=output_file, load=return_program_handle)
 
         # Compute build folder path before running codegen
         build_folder = self.build_folder

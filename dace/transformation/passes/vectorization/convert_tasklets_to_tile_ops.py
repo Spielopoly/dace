@@ -1795,7 +1795,8 @@ class ConvertTaskletsToTileOps(ppl.Pass):
         # cond-mask region), inactive lanes hold garbage that can trap (div-by-0,
         # log-of-neg) or propagate NaN — mask the op so they skip the compute. The
         # divisible main map (no mask AN) stays unmasked (fast path).
-        mask_an = self._find_mask_an(inner_state)
+        mask_an = (self._find_mask_an(inner_state) if self._operation_needs_tile_mask(
+            inner_state, out_edge, kind_a, kind_b) else None)
         binop = TileBinop(name=f"{tasklet.label}_binop",
                           widths=tuple(self.widths),
                           op=op,
@@ -1851,7 +1852,8 @@ class ConvertTaskletsToTileOps(ppl.Pass):
         kind_a = self._operand_kind(inner_state, a_edge)
         kind_b = self._operand_kind(inner_state, b_edge)
         kind_c = self._operand_kind(inner_state, c_edge)
-        mask_an = self._find_mask_an(inner_state)
+        mask_an = (self._find_mask_an(inner_state) if self._operation_needs_tile_mask(
+            inner_state, out_edge, kind_a, kind_b, kind_c) else None)
         fma = TileFMA(name=f"{tasklet.label}_fma",
                       widths=tuple(self.widths),
                       kind_a=kind_a,
@@ -1942,8 +1944,9 @@ class ConvertTaskletsToTileOps(ppl.Pass):
         op = self._classify_power_op(inner_state, op, symbol_side, symbol_expr, a_edge)
         kind_tile_side = self._operand_kind(inner_state, a_edge)
         sym_kind, sym_expr, sym_an_name = self._resolve_symbol_operand(inner_state, symbol_expr, iter_vars)
-        # Mask-when-partial.
-        mask_an = self._find_mask_an(inner_state)
+        # Mask lane-wise operations in a partial tile; scalar-only expressions execute once.
+        mask_an = (self._find_mask_an(inner_state) if self._operation_needs_tile_mask(
+            inner_state, out_edge, kind_tile_side, sym_kind) else None)
         if symbol_side == "b":
             binop = TileBinop(name=f"{tasklet.label}_binop_sym",
                               widths=tuple(self.widths),
@@ -1997,6 +2000,27 @@ class ConvertTaskletsToTileOps(ppl.Pass):
         subset = ", ".join(f"0:{w}" for w in self.widths)
         inner_state.add_edge(an, None, lib_node, dst_conn, dace.Memlet(f"{tile_name}[{subset}]"))
 
+    def _operation_needs_tile_mask(self, inner_state: SDFGState, out_edge, *operand_kinds: str) -> bool:
+        """Return whether an iteration mask must gate this operation.
+
+        Scalar-only operations execute once per tile and must not consume a full
+        tile mask as a scalar condition. A tile operand or pre-widened tile result
+        instead performs lane-wise work and needs the mask.
+
+        :param inner_state: State containing the operation.
+        :param out_edge: Original tasklet output edge.
+        :param operand_kinds: Lowered operand kinds.
+        :returns: ``True`` for a lane-wise tile operation.
+        """
+        if any(kind == "Tile" for kind in operand_kinds):
+            return True
+        from dace.libraries.tileops.nodes.tile_binop import _is_tile_shape
+        from dace.sdfg.nodes import AccessNode
+        if not isinstance(out_edge.dst, AccessNode):
+            return False
+        desc = inner_state.sdfg.arrays.get(out_edge.dst.data)
+        return desc is not None and _is_tile_shape(desc, tuple(self.widths))
+
     def _ensure_output_widened(self, inner_state: SDFGState, out_edge, lib_node=None) -> bool:
         """Widen the destination transient + memlets to ``(W_0, ..., W_{K-1})``.
 
@@ -2018,6 +2042,10 @@ class ConvertTaskletsToTileOps(ppl.Pass):
         if lib_node is not None:
             any_tile_in = False
             for e in inner_state.in_edges(lib_node):
+                # The predicate gates an operation; it does not determine whether
+                # the operation itself is scalar or tile-valued.
+                if e.dst_conn == "_mask":
+                    continue
                 if not isinstance(e.src, AccessNode):
                     continue
                 src_desc = sdfg.arrays.get(e.src.data)
@@ -2072,8 +2100,9 @@ class ConvertTaskletsToTileOps(ppl.Pass):
             return False
         out_edge = out_edges[0]
         sym_kind, sym_expr, sym_an_name = self._resolve_symbol_operand(inner_state, symbol_expr, iter_vars)
-        # Mask-when-partial.
-        mask_an = self._find_mask_an(inner_state)
+        # Mask lane-wise operations in a partial tile; scalar-only expressions execute once.
+        mask_an = (self._find_mask_an(inner_state)
+                   if self._operation_needs_tile_mask(inner_state, out_edge, sym_kind) else None)
         unop = TileUnop(name=f"{tasklet.label}_unop_sym",
                         widths=tuple(self.widths),
                         op=op,
@@ -2116,8 +2145,9 @@ class ConvertTaskletsToTileOps(ppl.Pass):
         out_edge = out_edges[0]
         kind_a, sym_expr_a, an_a = self._resolve_symbol_operand(inner_state, expr_a_str, iter_vars)
         kind_b, sym_expr_b, an_b = self._resolve_symbol_operand(inner_state, expr_b_str, iter_vars)
-        # Mask-when-partial.
-        mask_an = self._find_mask_an(inner_state)
+        # Mask lane-wise operations in a partial tile; scalar-only expressions execute once.
+        mask_an = (self._find_mask_an(inner_state) if self._operation_needs_tile_mask(
+            inner_state, out_edge, kind_a, kind_b) else None)
         binop = TileBinop(name=f"{tasklet.label}_binop_two_sym",
                           widths=tuple(self.widths),
                           op=op,
@@ -2161,8 +2191,9 @@ class ConvertTaskletsToTileOps(ppl.Pass):
         a_edge = in_edges[a_conn]
         kind_a = self._operand_kind(inner_state, a_edge)
         # Output transient shape is pre-determined by WidenAccesses.
-        # Mask-when-partial.
-        mask_an = self._find_mask_an(inner_state)
+        # Mask lane-wise operations in a partial tile; scalar-only expressions execute once.
+        mask_an = (self._find_mask_an(inner_state)
+                   if self._operation_needs_tile_mask(inner_state, out_edge, kind_a) else None)
         unop = TileUnop(name=f"{tasklet.label}_unop",
                         widths=tuple(self.widths),
                         op=op,

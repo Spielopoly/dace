@@ -12,6 +12,9 @@ The pure expansion returns a CPP tasklet whose body is a single
 """
 from typing import Optional, Set, Tuple
 
+import ast
+import math
+
 import numpy as np
 
 import dace
@@ -300,51 +303,110 @@ class ExpandTileBinopPure(ExpandTransformation):
 
 
 _CUTE_OP_EXPR = {
-    "+": "({lhs} + {rhs})",
-    "-": "({lhs} - {rhs})",
-    "*": "({lhs} * {rhs})",
+    "+":
+    "({lhs} + {rhs})",
+    "-":
+    "({lhs} - {rhs})",
+    "*":
+    "({lhs} * {rhs})",
     # TODO: handle integer division and other differences between Python and C++ semantics (e.g. negative numbers)
-    "/": "({lhs} / {rhs})",
+    "/":
+    "({lhs} / {rhs})",
     # TODO: address Python's different modulo semantics for negative numbers (math.fmod for floating point) (integers: r = a - (a / b) * b (with C++ division))
     # (maybe https://stackoverflow.com/questions/34291760/how-to-easily-implement-c-like-modulo-remainder-operation-in-python-2-7 but this is 2.7-specific) (https://en.wikipedia.org/wiki/Modulo#In_programming_languages) (https://www.youtube.com/watch?v=xVNYurap-lk)
     # actually we decided to just emit python modulo lol
     # cuTile is Python-semantics, so a bare ``%`` already matches ``py_mod``.
-    "%": "({lhs} % {rhs})",
-    "py_mod": "({lhs} % {rhs})",
-    "<": "({lhs} < {rhs})",
-    "<=": "({lhs} <= {rhs})",
-    ">": "({lhs} > {rhs})",
-    ">=": "({lhs} >= {rhs})",
-    "==": "({lhs} == {rhs})",
-    "!=": "({lhs} != {rhs})",
-    "&&": "(ct.astype({lhs}, ct.bool_) & ct.astype({rhs}, ct.bool_))",
-    "||": "(ct.astype({lhs}, ct.bool_) | ct.astype({rhs}, ct.bool_))",
-    "&": "({lhs} & {rhs})",
-    "|": "({lhs} | {rhs})",
-    "^": "({lhs} ^ {rhs})",
-    "min": "ct.minimum({lhs}, {rhs})",
-    "max": "ct.maximum({lhs}, {rhs})",
+    "%":
+    "({lhs} % {rhs})",
+    "py_mod":
+    "({lhs} % {rhs})",
+    "<":
+    "({lhs} < {rhs})",
+    "<=":
+    "({lhs} <= {rhs})",
+    ">":
+    "({lhs} > {rhs})",
+    ">=":
+    "({lhs} >= {rhs})",
+    "==":
+    "({lhs} == {rhs})",
+    "!=":
+    "({lhs} != {rhs})",
+    "&&":
+    "(ct.astype({lhs}, ct.bool_) & ct.astype({rhs}, ct.bool_))",
+    "||":
+    "(ct.astype({lhs}, ct.bool_) | ct.astype({rhs}, ct.bool_))",
+    "&":
+    "({lhs} & {rhs})",
+    "|":
+    "({lhs} | {rhs})",
+    "^":
+    "({lhs} ^ {rhs})",
+    "min":
+    "ct.minimum({lhs}, {rhs})",
+    "max":
+    "ct.maximum({lhs}, {rhs})",
     # ``**`` and the canonical ``pow(base, exp)`` spelling that
     # ``PowerOperatorExpansion`` rewrites it to, plus the integer-exponent
     # ``ipow`` from ``RelaxIntegerPowers`` -- all Python ``**`` (cuTile is
     # Python-semantics, so this matches the unvectorized reference).
-    "**": "({lhs} ** {rhs})",
-    "pow": "({lhs} ** {rhs})",
-    "ipow": "({lhs} ** {rhs})",
+    "**":
+    "({lhs} ** {rhs})",
+    "pow":
+    "({lhs} ** {rhs})",
+    "ipow":
+    "({lhs} ** {rhs})",
     # Binary elemental math functions (from ``np.arctan2`` / ``np.hypot`` /
     # ``np.fmod``). ``atan2`` is native to cuda.tile (13.x); ``hypot`` and
     # ``fmod`` are NOT (probed 2026-07: no ``ct.hypot``/``ct.fmod``/``ct.trunc``),
     # so they are decomposed with confirmed primitives (``sqrt``/``floor``/
     # ``ceil``/``where``). Operands are parenthesized because a Symbol-kind
     # operand is an inlined expression, not a bare name.
-    "atan2": "ct.atan2({lhs}, {rhs})",
-    "hypot": "ct.sqrt(({lhs}) * ({lhs}) + ({rhs}) * ({rhs}))",
+    "atan2":
+    "ct.atan2({lhs}, {rhs})",
+    "hypot":
+    "ct.sqrt(({lhs}) * ({lhs}) + ({rhs}) * ({rhs}))",
     # C ``fmod`` (sign of dividend): a - b*trunc(a/b). No ``ct.trunc``, so
     # trunc(q) = q>=0 ? floor(q) : ceil(q). Differs from ``%``/``ct.mod``, which
     # follow the divisor's sign (Python semantics).
     "fmod": ("(({lhs}) - ({rhs}) * ct.where(({lhs}) / ({rhs}) >= 0, "
              "ct.floor(({lhs}) / ({rhs})), ct.ceil(({lhs}) / ({rhs}))))"),
 }
+
+
+def _cutile_f64_const_tile(expr: str, widths: Tuple[int, ...]) -> Optional[str]:
+    """Render a non-float32-exact float64 literal as two exact terms.
+
+    cuda.tile first narrows plain Python float literals to float32. A high
+    float32 term plus a float32 residual reconstructs the original float64
+    value to within eight float64 ulps after promotion.
+
+    :param expr: Symbol-kind operand expression.
+    :param widths: Shape of the result tile.
+    :returns: A bounded-accuracy cuda.tile expression for a literal float, or ``None``.
+    """
+    try:
+        value = ast.literal_eval(str(expr))
+    except (SyntaxError, ValueError):
+        return None
+    if not isinstance(value, float) or not math.isfinite(value):
+        return None
+    value64 = np.float64(value)
+    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+        high = np.float64(np.float32(value64))
+        residual = np.float64(value64 - high)
+        low32 = np.float32(residual)
+        low = np.float64(low32)
+        reconstructed = np.float64(high + low)
+        reconstruction_error = abs(reconstructed - value64)
+        residual_tolerance = 0.5 * abs(np.float64(np.spacing(low32)))
+        float64_tolerance = 8.0 * abs(np.spacing(value64))
+    if value64 == high:
+        return None
+    if (not np.isfinite(high) or not np.isfinite(low) or not np.isfinite(reconstructed)
+            or reconstruction_error > residual_tolerance or reconstruction_error > float64_tolerance):
+        raise NotImplementedError(f"cuda.tile cannot accurately materialize float64 literal {value!r}")
+    return f"(ct.full({tuple(widths)!r}, {float(high)!r}, ct.float64) + {float(low)!r})"
 
 
 @library.expansion
@@ -354,7 +416,8 @@ class ExpandTileBinopCutile(ExpandTransformation):
     Emits the bare element-wise expression (e.g. ``a_tile + b_tile``)
     — matches the reference cuTile kernels, where the mask is applied
     at the ``ct.scatter`` store, not at the binop. Symbol-kind operands
-    are embedded inline. ``min`` / ``max`` route to ``ct.minimum`` /
+    are embedded inline; non-float32-exact float64 literals are materialized
+    from two exact terms. ``min`` / ``max`` route to ``ct.minimum`` /
     ``ct.maximum``.
     """
 
@@ -370,10 +433,28 @@ class ExpandTileBinopCutile(ExpandTransformation):
         :returns: A Python-language tasklet with the element-wise body.
         """
 
-        def _cutile_operand(kind, conn, expr):
-            """cuTile operand reference: inline expr for Symbol, the
-            connector for Tile or Scalar (broadcasts NumPy-style)."""
+        in_edges = {edge.dst_conn: edge for edge in parent_state.in_edges(node) if edge.dst_conn is not None}
+
+        def _operation_dtype() -> Optional[dace.dtypes.typeclass]:
+            """Infer the value dtype, preferring connected input operands."""
+            for kind, connector in ((node.kind_a, "_a"), (node.kind_b, "_b")):
+                if kind in (_TILE, _SCALAR) and connector in in_edges:
+                    return parent_sdfg.arrays[in_edges[connector].data.data].dtype
+            output = next((edge for edge in parent_state.out_edges(node) if edge.src_conn == "_c"), None)
+            if output is not None:
+                return parent_sdfg.arrays[output.data.data].dtype
+            return None
+
+        operation_dtype = _operation_dtype()
+
+        def _cutile_operand(kind: str, conn: str, expr: Optional[str]) -> str:
+            """Return an inline symbol expression or a data connector."""
             if kind == _SYMBOL:
+                assert expr is not None
+                if operation_dtype == dace.float64:
+                    exact_literal = _cutile_f64_const_tile(expr, tuple(node.widths))
+                    if exact_literal is not None:
+                        return exact_literal
                 from dace.symbolic import symstr
                 return symstr(expr)
             return conn
@@ -555,7 +636,7 @@ class TileBinop(nodes.LibraryNode):
         result: Set[str] = set()
         for expr in (self.expr_a, self.expr_b):
             if expr:
-                result |= {str(s) for s in dace.symbolic.pystr_to_symbolic(expr).free_symbols}
+                result.update(map(str, dace.symbolic.symbols_in_ast(ast.parse(expr, mode="eval"))))
         return result
 
     def validate(self, sdfg: dace.SDFG, state: dace.SDFGState) -> None:

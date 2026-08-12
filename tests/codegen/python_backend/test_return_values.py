@@ -10,7 +10,8 @@ import pytest
 
 import dace
 from dace import dtypes
-from dace.codegen.py.compiled_sdfg import PythonCompiledSDFG, _is_return_array_name
+from dace.codegen.codeobject import CodeObject
+from dace.codegen.py.compiled_sdfg import _is_return_array_name, compile_python_sdfg
 
 N = dace.symbol('N')
 
@@ -23,6 +24,12 @@ def _compile_python(sdfg):
     """Set the backend to Python and compile."""
     sdfg.backend = dtypes.BackendLanguage.Python
     return sdfg.compile()
+
+
+def _compile_fixture(sdfg, code):
+    """Compile a focused native host used by adapter-only tests."""
+    host = CodeObject(sdfg.name, code, 'pyx', None, 'Frame')
+    return compile_python_sdfg(sdfg, [host])
 
 
 # ---------------------------------------------------------------------------
@@ -461,7 +468,7 @@ class TestEdgeCases:
         sdfg.backend = dtypes.BackendLanguage.Python
         sdfg.add_state('s')
         code = "def empty_test(): pass\n"
-        csdfg = PythonCompiledSDFG(sdfg, code)
+        csdfg = _compile_fixture(sdfg, code)
         result = csdfg()
         assert result is None
 
@@ -741,7 +748,7 @@ class TestGpuReturn:
         sdfg.add_array('__return', [8], dace.float64, storage=dtypes.StorageType.GPU_Global)
         sdfg.add_state('s')
         code = "def gpu_ret_test(**kwargs): pass\n"
-        csdfg = PythonCompiledSDFG(sdfg, code)
+        csdfg = _compile_fixture(sdfg, code)
 
         arr = csdfg._allocate_return_array('__return', {})
         assert isinstance(arr, cupy.ndarray)
@@ -792,7 +799,7 @@ class TestReturnTilePrefixTransients:
         code = "def ret_tile_test(**kwargs): pass\n"
 
         # Must not raise AssertionError.
-        csdfg = PythonCompiledSDFG(sdfg, code)
+        csdfg = _compile_fixture(sdfg, code)
 
         # The tile transient is not a return value: single-return semantics
         # hold and only __return is marshaled.
@@ -807,7 +814,7 @@ class TestReturnTilePrefixTransients:
         sdfg.add_transient('__return_tile_out', [8], dace.float64)
         sdfg.add_state('s')
         code = "def tile_only_test(**kwargs): pass\n"
-        csdfg = PythonCompiledSDFG(sdfg, code)
+        csdfg = _compile_fixture(sdfg, code)
         assert csdfg._has_returns is False
         assert csdfg._get_return_names() == []
 

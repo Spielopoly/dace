@@ -307,6 +307,29 @@ def test_scalar_assignment_branch_dispatch():
     assert np.allclose(out, [10.0, 20.0, 30.0, 10.0, 20.0, 30.0])
 
 
+@pytest.mark.parametrize("simplify", [False, True])
+def test_rebound_scalar_names_in_simple_condition(simplify: bool) -> None:
+    """Simple conditions must use the current scalar descriptor names."""
+
+    @dace.program
+    def maximum_absolute(a: dace.float64[8], out: dace.float64[1]):
+        maxv = dace.float64(0)
+        maxv = abs(a[0])
+        for i in range(8):
+            av = abs(a[i])
+            if av > maxv:
+                maxv = av
+        out[0] = maxv
+
+    sdfg = maximum_absolute.to_sdfg(simplify=simplify)
+    a = np.array([0.2, -0.9, 0.4, 0.1, -0.3, 0.7, -0.5, 0.6], dtype=np.float64)
+    out = np.zeros((1, ), dtype=np.float64)
+
+    sdfg(a=a, out=out)
+
+    assert out[0] == np.max(np.abs(a))
+
+
 def test_array_assignment_aliases():
 
     @dace.program

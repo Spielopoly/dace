@@ -1,5 +1,6 @@
 # Copyright 2019-2026 ETH Zurich and the DaCe authors. All rights reserved.
 import ast
+from pathlib import Path
 import re
 from typing import TYPE_CHECKING, Optional
 import warnings
@@ -21,6 +22,28 @@ from dace.sdfg.state import ControlFlowRegion
 if TYPE_CHECKING:
     from dace.codegen.dispatcher import TargetDispatcher
     from dace.codegen.py.framecode import DaCePythonCodeGenerator
+
+_SYMBOLIC_HELPERS_PATH = Path(__file__).with_name('sympy_function_redefinitions.py')
+
+
+def symbolic_helper_source() -> str:
+    """Return the symbolic helper definitions embedded in generated hosts.
+
+    :returns: Python source containing the symbolic helper definitions.
+    """
+    source = _SYMBOLIC_HELPERS_PATH.read_text(encoding='utf-8').rstrip()
+    tree = ast.parse(source)
+    mapping_node = next(statement.value for statement in tree.body if isinstance(statement, ast.Assign) and any(
+        isinstance(target, ast.Name) and target.id == '_NUMPY_EQUIVALENTS' for target in statement.targets))
+    aliases = ast.literal_eval(mapping_node)
+    if not isinstance(aliases, dict) or any(not isinstance(alias, str) or not alias.isidentifier()
+                                            or not isinstance(np_name, str) or not np_name.isidentifier()
+                                            for alias, np_name in aliases.items()):
+        raise ValueError('Symbolic NumPy aliases must map identifiers to identifiers')
+
+    # Cython cannot discover names installed indirectly through ``globals()``.
+    declarations = '\n'.join(f'{alias} = _np.{np_name}' for alias, np_name in aliases.items())
+    return f'{source}\n\n{declarations}'
 
 
 def _python_expr(expr) -> str:
@@ -192,29 +215,12 @@ class PythonCodeGen(PythonTargetCodeGenerator):
                     dispatcher.register_copy_dispatcher(src_storage, dst_storage, schedule, self)
 
     def get_generated_codeobjects(self):
-        # Unfortunately we need to redefine some sympy functions so we just load that file as a code object
-        from pathlib import Path
-
-        HERE = Path(__file__).parent
-        file_path = HERE / "sympy_function_redefinitions.py"
-        content = file_path.read_text()
-
-        from dace.codegen.codeobject import CodeObject
-
-        code = CodeObject(
-            name="sympy_function_redefinitions",
-            code=content,
-            language="py",
-            target=type(self),
-            title="Sympy Function Redefinitions",
-        )
-        return [code]
+        return []
 
     def get_includes(self) -> dict[str, list[str]]:
         includes = [
             'import numpy',
             'from dataclasses import dataclass',
-            "from sympy_function_redefinitions import *",
         ]
         if _sdfg_needs_cupy(self._sdfg):
             # GPU_Global allocations emit cupy.empty; do not rely on the cuTile
@@ -1018,16 +1024,17 @@ class PythonCodeGen(PythonTargetCodeGenerator):
                 if instr is not None:
                     instr.on_node_begin(sdfg, cfg, state_dfg, node, callsite_stream, callsite_stream, function_stream)
 
+        tasklet_body = _rewrite_dace_dtype_casts(codeblock_to_python(node.code).strip())
+        referenced_connectors = {name.id for name in ast.walk(ast.parse(tasklet_body)) if isinstance(name, ast.Name)}
+
         for edge in state_dfg.in_edges(node):
-            if not edge.dst_conn:
+            if not edge.dst_conn or edge.dst_conn not in referenced_connectors:
                 continue
             src_node = state_dfg.memlet_path(edge)[0].src
             if isinstance(src_node, nodes.CodeNode):
                 raise NotImplementedError('Code-to-code memlets not supported in the Python backend.')
             callsite_stream.write(f'{edge.dst_conn} = {self._read_expr(sdfg, edge.data)}', cfg, state_id)
             self._dispatcher.defined_vars.add(edge.dst_conn, dispatcher_mod.DefinedType.Scalar, 'object')
-
-        tasklet_body = _rewrite_dace_dtype_casts(codeblock_to_python(node.code).strip())
 
         callsite_stream.write(f'\n####### Tasklet: {node.label}\n\n', cfg, state_id)
 
@@ -1036,7 +1043,7 @@ class PythonCodeGen(PythonTargetCodeGenerator):
         callsite_stream.write(f'\n####### End of tasklet: {node.label}\n\n', cfg, state_id)
 
         for edge in state_dfg.out_edges(node):
-            if edge.src_conn is None:
+            if edge.src_conn is None or edge.src_conn not in referenced_connectors:
                 continue
             dst_node = state_dfg.memlet_path(edge)[-1].dst
             if isinstance(dst_node, nodes.CodeNode):
