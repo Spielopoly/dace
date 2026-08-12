@@ -1,7 +1,8 @@
 # Copyright 2019-2026 ETH Zurich and the DaCe authors. All rights reserved.
 """Detect scalar-accumulator loops -> ``Reduce`` nodes.
 
-Emitted ``Reduce`` uses ``identity=None`` so the pre-loop accumulator seeds the fold.
+The emitted ``Reduce`` folds from the operation identity, then an explicit
+combine tasklet folds in the pre-loop accumulator seed.
 
 Three shapes:
 
@@ -20,6 +21,7 @@ from typing import Dict, NamedTuple, Optional
 import sympy
 
 from dace import SDFG, SDFGState, data, dtypes, memlet as mm, nodes, properties, subsets, symbolic
+from dace.frontend import operations
 from dace.sdfg.state import ConditionalBlock, ControlFlowRegion, LoopRegion
 from dace.symbolic import AND, OR, bitwise_and, bitwise_or, Subscript
 from dace.transformation import pass_pipeline as ppl
@@ -46,6 +48,40 @@ _CALL_TO_WCR: Dict[str, str] = {
 # Guard `lhs <cmp> rhs` with body `sym = arr[i]`: reduction = max iff guard fires when arr > sym.
 _CMP_GT = (ast.Gt, ast.GtE)
 _CMP_LT = (ast.Lt, ast.LtE)
+
+
+class _RenameWCRConnectors(ast.NodeTransformer):
+    """Rename WCR lambda arguments to combine-tasklet connectors."""
+
+    def __init__(self, mapping: Dict[str, str]):
+        self.mapping = mapping
+
+    def visit_Name(self, node: ast.Name) -> ast.AST:
+        return ast.copy_location(ast.Name(id=self.mapping.get(node.id, node.id), ctx=node.ctx), node)
+
+
+def _wcr_combine_code(wcr: str) -> Optional[str]:
+    """Return tasklet code that combines a seed and reduction result."""
+    try:
+        tree = ast.parse(wcr, mode='eval').body
+    except (SyntaxError, ValueError):
+        return None
+    if not isinstance(tree, ast.Lambda) or len(tree.args.args) != 2:
+        return None
+    first, second = (arg.arg for arg in tree.args.args)
+    body = _RenameWCRConnectors({first: '__seed', second: '__red'}).visit(tree.body)
+    return f"__out = {ast.unparse(body)}"
+
+
+def _reduction_identity_for(wcr: str, dtype: object) -> Optional[object]:
+    """Return the associative identity for a recognized WCR operation."""
+    reduction_type = operations.detect_reduction_type(wcr)
+    if reduction_type == dtypes.ReductionType.Custom:
+        return None
+    try:
+        return dtypes.reduction_identity(dtype, reduction_type)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _nested_in_sequential_loop(loop: LoopRegion) -> bool:
@@ -1028,9 +1064,26 @@ def _lift(parent: ControlFlowRegion, loop: LoopRegion, info: _Reduction):
 
     arr = red_state.add_read(info.array)
     dst = red_state.add_write(dest_name)
-    red = red_state.add_reduce(info.wcr, axes=list(range(len(info.array_subset))), identity=None)
-    red_state.add_edge(arr, None, red, None, mm.Memlet(data=info.array, subset=info.array_subset))
-    red_state.add_edge(red, None, dst, None, mm.Memlet(data=dest_name, subset=dest_subset))
+    src_memlet = mm.Memlet(data=info.array, subset=info.array_subset)
+    op_identity = _reduction_identity_for(info.wcr, root.arrays[dest_name].dtype)
+    combine_code = _wcr_combine_code(info.wcr)
+    if op_identity is not None and combine_code is not None:
+        seed = red_state.add_read(dest_name)
+        reduced_name, _ = root.add_transient(f'_reduced_{dest_name}', [1],
+                                             root.arrays[dest_name].dtype,
+                                             find_new_name=True)
+        reduced = red_state.add_access(reduced_name)
+        red = red_state.add_reduce(info.wcr, axes=list(range(len(info.array_subset))), identity=op_identity)
+        red_state.add_edge(arr, None, red, None, src_memlet)
+        red_state.add_edge(red, None, reduced, None, mm.Memlet(data=reduced_name, subset='0'))
+        combine = red_state.add_tasklet(f'combine_{dest_name}', {'__seed', '__red'}, {'__out'}, combine_code)
+        red_state.add_edge(seed, None, combine, '__seed', mm.Memlet(data=dest_name, subset=copy.deepcopy(dest_subset)))
+        red_state.add_edge(reduced, None, combine, '__red', mm.Memlet(data=reduced_name, subset='0'))
+        red_state.add_edge(combine, '__out', dst, None, mm.Memlet(data=dest_name, subset=copy.deepcopy(dest_subset)))
+    else:
+        red = red_state.add_reduce(info.wcr, axes=list(range(len(info.array_subset))), identity=None)
+        red_state.add_edge(arr, None, red, None, src_memlet)
+        red_state.add_edge(red, None, dst, None, mm.Memlet(data=dest_name, subset=dest_subset))
 
 
 def _lift_wcr_scalar(parent: ControlFlowRegion, loop: LoopRegion, info: _Reduction):

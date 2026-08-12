@@ -1139,6 +1139,13 @@ class RefineNestedAccess(transformation.SingleStateTransformation):
                 if aname in refined:
                     continue
                 # Refine internal memlets
+                desc = nsdfg.arrays[aname]
+                if isinstance(desc, data.Array):
+                    new_shape = list(desc.shape)
+                    refine_size = refine.subset.size()
+                    for index in indices:
+                        new_shape[index] = refine_size[index]
+                    desc.set_shape(new_shape, strides=desc.strides, offset=desc.offset)
                 for nstate in nsdfg.states():
                     for e in nstate.edges():
                         if e.data.data == aname:

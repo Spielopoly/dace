@@ -462,6 +462,19 @@ class TestSetTileStorage:
             assert sdfg.arrays[name].transient, f"{name} is not transient"
             assert isinstance(sdfg.arrays[name], data.Array)
 
+    def test_host_stamped_tile_output_recovers_tile_storage(self):
+        """A tile-shaped anchored transient recovers CuTile_Tile storage."""
+        sdfg = _build_vadd_k1_sdfg()
+        _apply_gpu_and_adapt(sdfg)
+        tile_binop, state = next((node, graph) for node, graph in _tileops_nodes(sdfg) if isinstance(node, TileBinop))
+        output = next(edge.dst for edge in state.out_edges(tile_binop) if isinstance(edge.dst, nodes.AccessNode))
+        desc = state.sdfg.arrays[output.data]
+        assert desc.transient and tuple(desc.shape) == tuple(tile_binop.widths)
+        desc.storage = dtypes.StorageType.CPU_Heap
+
+        CuTileSetTileStorage().apply_pass(sdfg, {})
+        assert desc.storage == dtypes.StorageType.CuTile_Tile
+
     def test_scalar_descriptors_untouched(self):
         """No Scalar descriptor changes storage (and none becomes a tile)."""
         sdfg = _build_vadd_k1_sdfg()

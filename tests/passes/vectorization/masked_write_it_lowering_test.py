@@ -31,6 +31,7 @@ from dace.transformation.passes.vectorization.config import VectorizeConfig
 from dace.transformation.passes.vectorization.enums import BranchMode
 from dace.transformation.passes.vectorization.normalize_masked_write_tasklets import NormalizeMaskedWriteTasklets
 from dace.transformation.passes.vectorization.vectorize_cpu_multi_dim import VectorizeCPUMultiDim
+from dace.transformation.passes.vectorization.vectorize_cutile import VectorizeCuTile
 
 N = dace.symbol('N')
 #: The host's best runnable SIMD ISA; vectorization enforces arch-native, so a hardcoded AVX-512
@@ -148,6 +149,49 @@ def test_masked_value_write_matches_numpy(isa, remainder):
     work = A.copy()
     sdfg(A=work, x=x.copy(), m=m.copy(), N=Nval)
     assert np.array_equal(work, ref), f"{work[:6]} != {ref[:6]}"
+
+
+@dace.program
+def masked_transient_use(A: dace.float64[N], out: dace.float64[N]):
+    values = np.sqrt(A)
+    values[values <= 0.25] = 1.0
+    out[:] = values * 2.0
+
+
+def test_masked_transient_update_matches_numpy():
+    """A fused transient update selects the old tile for inactive lanes."""
+    sdfg = _base(masked_transient_use)
+    VectorizeCPUMultiDim(
+        VectorizeConfig(widths=(8, ),
+                        target_isa="SCALAR",
+                        remainder_strategy="masked_tail",
+                        branch_mode=BranchMode.MERGE,
+                        validate_all=True)).apply_pass(sdfg, {})
+    rng = np.random.default_rng(2)
+    n = 37
+    a = rng.random(n)
+    values = np.sqrt(a)
+    values[values <= 0.25] = 1.0
+    expected = values * 2.0
+    out = np.empty_like(a)
+    sdfg(A=a.copy(), out=out, N=n)
+    np.testing.assert_allclose(out, expected, rtol=1e-12, atol=1e-12)
+
+
+@pytest.mark.gpu
+def test_masked_transient_update_cutile_e2e():
+    """The fused transient read-modify-write also runs through cuTile."""
+    rng = np.random.default_rng(3)
+    n = 37
+    a = rng.random(n)
+    values = np.sqrt(a)
+    values[values <= 0.25] = 1.0
+    expected = values * 2.0
+    out = np.empty_like(a)
+    sdfg = masked_transient_use.to_sdfg(simplify=False)
+    VectorizeCuTile(widths=(8, )).apply_pass(sdfg, {})
+    sdfg.compile()(A=a.copy(), out=out, N=n)
+    np.testing.assert_allclose(out, expected, rtol=1e-12, atol=1e-12)
 
 
 if __name__ == '__main__':

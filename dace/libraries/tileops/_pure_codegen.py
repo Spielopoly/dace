@@ -24,6 +24,7 @@ def ct_dtype_name(dtype) -> str:
     name = dtype.as_numpy_dtype().name
     return "bool_" if name == "bool" else name
 
+
 import sympy
 
 import dace
@@ -310,7 +311,7 @@ def cutile_tile_dim_bids(node, parent_state, parent_sdfg, used_dimensions: Seque
         sd = used_dimensions[d] if d < len(used_dimensions) else None
         pos = None
         has_symbols = False
-        if sd is not None and sd < len(src_begins):
+        if sd is not None and 0 <= sd < len(src_begins):
             try:
                 syms = {str(s) for s in _sym.pystr_to_symbolic(str(src_begins[sd])).free_symbols}
             except Exception:  # noqa: BLE001 - non-symbolic begin -> use the raw string
@@ -403,7 +404,7 @@ def cutile_tile_dim_offsets(node, parent_state, parent_sdfg, used_dimensions: Se
     offsets = []
     for d in range(K):
         sd = used_dimensions[d] if d < len(used_dimensions) else None
-        if sd is None or sd >= len(begins):
+        if sd is None or sd < 0 or sd >= len(begins):
             offsets.append(0)
             continue
         try:
@@ -672,7 +673,7 @@ def _strides_match_packed(shape, strides, order):
                 return False
         except Exception:  # noqa: BLE001 -- conservative refusal on un-comparable expressions.
             return False
-        expected = expected * _no_ipow(shape[d])
+        expected = expected * dace.symbolic.relax_ipow(shape[d])
     return True
 
 
@@ -701,7 +702,7 @@ def validate_packed_layout(node_label, conn_name, desc):
         return
     if len(shape) == 1:
         try:
-            if dace.symbolic.simplify(_no_ipow(strides[0]) - 1) != 0:
+            if dace.symbolic.simplify(dace.symbolic.relax_ipow(strides[0]) - 1) != 0:
                 raise NotImplementedError(f"{node_label}: {conn_name!r} has non-unit stride "
                                           f"{strides[0]} on its single dim; only packed layouts are "
                                           f"supported (section 2.3).")

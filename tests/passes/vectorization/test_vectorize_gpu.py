@@ -120,12 +120,21 @@ def test_deferred_tile_nodes_are_cuda_stamped():
 
 def test_scalar_cast_constant_broadcasts():
     """The canonical constant-input shape ``tmp = float16(0.5); C = A * tmp`` -- a
-    scalar cast feeding a binop -- vectorizes to a single ``TileBinop`` (the scalar
-    is cast to the tile precision and broadcast into the tile), and compiles."""
+    scalar cast feeding a binop -- vectorizes both default remainder arms to
+    ``TileBinop`` nodes (the scalar is cast to tile precision and broadcast), and compiles."""
     sdfg = _prep(_scale_const16)
     VectorizeGPU(VectorizeConfig(widths=(2, ))).apply_pass(sdfg, {})
     binops = [n for n, _ in sdfg.all_nodes_recursive() if isinstance(n, TileBinop)]
-    assert len(binops) == 1, f"expected one TileBinop for A*const; got {len(binops)}"
+    assert len(binops) == 2, f"expected one TileBinop per remainder arm; got {len(binops)}"
+    for graph in sdfg.all_sdfgs_recursive():
+        for state in graph.states():
+            for edge in state.edges():
+                if not isinstance(edge.src, dace.nodes.AccessNode) or not isinstance(edge.dst, dace.nodes.AccessNode):
+                    continue
+                src_shape = tuple(graph.arrays[edge.src.data].shape)
+                dst_shape = tuple(graph.arrays[edge.dst.data].shape)
+                assert not (src_shape == (2, ) and dst_shape == (1, )), \
+                    "a widened cast result must also widen its transient scalar alias"
     sdfg.expand_library_nodes()
     # the constant stays at the input (fp16) precision -- no fp64 container leaked
     assert all(d.dtype != dace.float64 for d in sdfg.arrays.values())

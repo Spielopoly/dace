@@ -428,6 +428,84 @@ def test_scope_crossing_read_view_runs():
     np.testing.assert_allclose(b, 2.0 * a)
 
 
+def _build_symbolic_nested_flatten_views() -> SDFG:
+    """Build symbolic read/write flatten views around a NestedSDFG."""
+    n = dace.symbol('N', dtype=dace.int64)
+
+    inner = SDFG('symbolic_flatten_inner')
+    inner.add_symbol('N', dace.int64)
+    inner.add_array('X', (n, 4), dace.float64)
+    inner.add_array('Y', (n, 4), dace.float64)
+    inner_state = inner.add_state(is_start_block=True)
+    inner_state.add_mapped_tasklet('double', {
+        'i': '0:N',
+        'j': '0:4'
+    }, {'x': Memlet('X[i, j]')},
+                                   'y = 2.0 * x', {'y': Memlet('Y[i, j]')},
+                                   external_edges=True)
+
+    sdfg = _new_sdfg('symbolic_nested_flatten_views')
+    sdfg.add_symbol('N', dace.int64)
+    sdfg.add_array('A', (n, 2, 2), dace.float64)
+    sdfg.add_array('B', (n, 2, 2), dace.float64)
+    sdfg.add_view('Vin', (n, 4), dace.float64)
+    sdfg.add_view('Vout', (n, 4), dace.float64)
+
+    state = sdfg.add_state(is_start_block=True)
+    a = state.add_read('A')
+    b = state.add_write('B')
+    vin = state.add_access('Vin')
+    vout = state.add_access('Vout')
+    nested = state.add_nested_sdfg(inner, ['X'], ['Y'], symbol_mapping={'N': n})
+    state.add_edge(a, None, vin, 'views', Memlet('A[0:N, 0:2, 0:2]', other_subset='0:N, 0:4'))
+    state.add_edge(vin, None, nested, 'X', Memlet('Vin[0:N, 0:4]'))
+    state.add_edge(nested, 'Y', vout, None, Memlet('Vout[0:N, 0:4]'))
+    state.add_edge(vout, 'views', b, None, Memlet('B[0:N, 0:2, 0:2]', other_subset='0:N, 0:4'))
+    return sdfg
+
+
+def test_symbolic_nested_flatten_views_python_backend():
+    """Surviving symbolic flatten views alias their backing NumPy arrays."""
+    from dace.transformation.passes.remove_views import RemoveViews
+
+    sdfg = _build_symbolic_nested_flatten_views()
+    RemoveViews().apply_pass(sdfg, {})
+    assert _count_views(sdfg) == 2
+
+    compiled = sdfg.compile()
+    a = np.arange(12, dtype=np.float64).reshape(3, 2, 2)
+    b = np.zeros_like(a)
+    compiled(A=a, B=b, N=3)
+    np.testing.assert_allclose(b, 2.0 * a)
+
+
+@pytest.mark.gpu
+def test_cutile_symbolic_flatten_matmul_view():
+    """A Lenet-shaped flatten -> matmul -> tile kernel runs on the GPU."""
+    import cupy as cp
+    from dace.transformation.passes.vectorization import VectorizeCuTile
+
+    n = dace.symbol('N', dtype=dace.int64)
+    o = dace.symbol('O', dtype=dace.int64)
+
+    @dace.program
+    def flatten_matmul_bias(A: dace.float32[n, 2, 2, 4], B: dace.float32[16, o], bias: dace.float32[o]):
+        flat = np.reshape(A, (n, 16))
+        return flat @ B + bias
+
+    sdfg = flatten_matmul_bias.to_sdfg(simplify=False)
+    VectorizeCuTile(widths=(8, 8), use_gpu_storage=True).apply_pass(sdfg, {})
+    assert any(isinstance(desc, data.View) for nsdfg in sdfg.all_sdfgs_recursive() for desc in nsdfg.arrays.values())
+
+    compiled = sdfg.compile()
+    rng = np.random.default_rng(42)
+    a = rng.random((3, 2, 2, 4), dtype=np.float32)
+    b = rng.random((16, 19), dtype=np.float32)
+    bias = rng.random(19, dtype=np.float32)
+    result = compiled(A=cp.asarray(a), B=cp.asarray(b), bias=cp.asarray(bias), N=3, O=19)
+    np.testing.assert_allclose(cp.asnumpy(result), a.reshape(3, 16) @ b + bias, rtol=2e-5, atol=2e-5)
+
+
 # ---------------------------------------------------------------------------
 
 if __name__ == '__main__':

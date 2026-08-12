@@ -261,6 +261,13 @@ class Node(object):
         """ Returns a set of symbols used in this node's properties. """
         return set()
 
+    def replace_dict(self, repl: Dict[str, str]) -> None:
+        """Replace symbols in node-specific non-standard properties.
+
+        :param repl: Mapping from symbol names to replacement expressions.
+        """
+        return
+
     def new_symbols(self, sdfg, state, symbols) -> Dict[str, dtypes.typeclass]:
         """ Returns a mapping between symbols defined by this node (e.g., for
             scope entries) to their type. """

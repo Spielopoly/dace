@@ -10,18 +10,50 @@ Symbol pair belongs outside the tile path.
 The pure expansion returns a CPP tasklet whose body is a single
 ``for``-loop over the flattened tile (correctness-only).
 """
-from typing import Optional, Set, Tuple
+import ast
+from typing import Dict, Optional, Set, Tuple
 
 import numpy as np
 
 import dace
 from dace import library, properties
 from dace.codegen.cppunparse import pyexpr2cpp
+from dace.frontend.python import astutils
 from dace.sdfg import nodes
 from dace.transformation.transformation import ExpandTransformation
 
 from .._pure_codegen import nested_loops, tile_offset
 from .. import _isa_codegen
+
+
+class _ReplaceComplexLiterals(ast.NodeTransformer):
+    """Replace Python complex literals before symbolic dependency analysis."""
+
+    def visit_Constant(self, node: ast.Constant) -> ast.Constant:
+        if isinstance(node.value, complex):
+            return ast.copy_location(ast.Constant(value=0), node)
+        return node
+
+
+def _symbol_operand_free_symbols(expr: str) -> Set[str]:
+    """Return runtime symbols in an inline Python operand expression."""
+    try:
+        tree = ast.parse(expr, mode="eval")
+        normalized = ast.unparse(_ReplaceComplexLiterals().visit(tree))
+        return {str(s) for s in dace.symbolic.pystr_to_symbolic(normalized).free_symbols}
+    except (SyntaxError, TypeError, ValueError):
+        return {str(s) for s in dace.symbolic.pystr_to_symbolic(expr).free_symbols}
+
+
+def _replace_symbol_operand(expr: Optional[str], repl: Dict[str, str]) -> Optional[str]:
+    """Replace names in an inline Python operand while preserving literals."""
+    if expr is None:
+        return None
+    try:
+        tree = astutils.ASTFindReplace(repl).visit(ast.parse(expr, mode="eval"))
+        return astutils.unparse(tree)
+    except (SyntaxError, TypeError, ValueError):
+        return expr
 
 
 def _is_tile_shape(desc, widths) -> bool:
@@ -300,45 +332,69 @@ class ExpandTileBinopPure(ExpandTransformation):
 
 
 _CUTE_OP_EXPR = {
-    "+": "({lhs} + {rhs})",
-    "-": "({lhs} - {rhs})",
-    "*": "({lhs} * {rhs})",
+    "+":
+    "({lhs} + {rhs})",
+    "-":
+    "({lhs} - {rhs})",
+    "*":
+    "({lhs} * {rhs})",
     # TODO: handle integer division and other differences between Python and C++ semantics (e.g. negative numbers)
-    "/": "({lhs} / {rhs})",
+    "/":
+    "({lhs} / {rhs})",
     # TODO: address Python's different modulo semantics for negative numbers (math.fmod for floating point) (integers: r = a - (a / b) * b (with C++ division))
     # (maybe https://stackoverflow.com/questions/34291760/how-to-easily-implement-c-like-modulo-remainder-operation-in-python-2-7 but this is 2.7-specific) (https://en.wikipedia.org/wiki/Modulo#In_programming_languages) (https://www.youtube.com/watch?v=xVNYurap-lk)
     # actually we decided to just emit python modulo lol
     # cuTile is Python-semantics, so a bare ``%`` already matches ``py_mod``.
-    "%": "({lhs} % {rhs})",
-    "py_mod": "({lhs} % {rhs})",
-    "<": "({lhs} < {rhs})",
-    "<=": "({lhs} <= {rhs})",
-    ">": "({lhs} > {rhs})",
-    ">=": "({lhs} >= {rhs})",
-    "==": "({lhs} == {rhs})",
-    "!=": "({lhs} != {rhs})",
-    "&&": "(ct.astype({lhs}, ct.bool_) & ct.astype({rhs}, ct.bool_))",
-    "||": "(ct.astype({lhs}, ct.bool_) | ct.astype({rhs}, ct.bool_))",
-    "&": "({lhs} & {rhs})",
-    "|": "({lhs} | {rhs})",
-    "^": "({lhs} ^ {rhs})",
-    "min": "ct.minimum({lhs}, {rhs})",
-    "max": "ct.maximum({lhs}, {rhs})",
+    "%":
+    "({lhs} % {rhs})",
+    "py_mod":
+    "({lhs} % {rhs})",
+    "<":
+    "({lhs} < {rhs})",
+    "<=":
+    "({lhs} <= {rhs})",
+    ">":
+    "({lhs} > {rhs})",
+    ">=":
+    "({lhs} >= {rhs})",
+    "==":
+    "({lhs} == {rhs})",
+    "!=":
+    "({lhs} != {rhs})",
+    "&&":
+    "(ct.astype({lhs}, ct.bool_) & ct.astype({rhs}, ct.bool_))",
+    "||":
+    "(ct.astype({lhs}, ct.bool_) | ct.astype({rhs}, ct.bool_))",
+    "&":
+    "({lhs} & {rhs})",
+    "|":
+    "({lhs} | {rhs})",
+    "^":
+    "({lhs} ^ {rhs})",
+    "min":
+    "ct.minimum({lhs}, {rhs})",
+    "max":
+    "ct.maximum({lhs}, {rhs})",
     # ``**`` and the canonical ``pow(base, exp)`` spelling that
     # ``PowerOperatorExpansion`` rewrites it to, plus the integer-exponent
     # ``ipow`` from ``RelaxIntegerPowers`` -- all Python ``**`` (cuTile is
     # Python-semantics, so this matches the unvectorized reference).
-    "**": "({lhs} ** {rhs})",
-    "pow": "({lhs} ** {rhs})",
-    "ipow": "({lhs} ** {rhs})",
+    "**":
+    "({lhs} ** {rhs})",
+    "pow":
+    "({lhs} ** {rhs})",
+    "ipow":
+    "({lhs} ** {rhs})",
     # Binary elemental math functions (from ``np.arctan2`` / ``np.hypot`` /
     # ``np.fmod``). ``atan2`` is native to cuda.tile (13.x); ``hypot`` and
     # ``fmod`` are NOT (probed 2026-07: no ``ct.hypot``/``ct.fmod``/``ct.trunc``),
     # so they are decomposed with confirmed primitives (``sqrt``/``floor``/
     # ``ceil``/``where``). Operands are parenthesized because a Symbol-kind
     # operand is an inlined expression, not a bare name.
-    "atan2": "ct.atan2({lhs}, {rhs})",
-    "hypot": "ct.sqrt(({lhs}) * ({lhs}) + ({rhs}) * ({rhs}))",
+    "atan2":
+    "ct.atan2({lhs}, {rhs})",
+    "hypot":
+    "ct.sqrt(({lhs}) * ({lhs}) + ({rhs}) * ({rhs}))",
     # C ``fmod`` (sign of dividend): a - b*trunc(a/b). No ``ct.trunc``, so
     # trunc(q) = q>=0 ? floor(q) : ceil(q). Differs from ``%``/``ct.mod``, which
     # follow the divisor's sign (Python semantics).
@@ -555,8 +611,12 @@ class TileBinop(nodes.LibraryNode):
         result: Set[str] = set()
         for expr in (self.expr_a, self.expr_b):
             if expr:
-                result |= {str(s) for s in dace.symbolic.pystr_to_symbolic(expr).free_symbols}
+                result |= _symbol_operand_free_symbols(expr)
         return result
+
+    def replace_dict(self, repl: Dict[str, str]) -> None:
+        self.expr_a = _replace_symbol_operand(self.expr_a, repl)
+        self.expr_b = _replace_symbol_operand(self.expr_b, repl)
 
     def validate(self, sdfg: dace.SDFG, state: dace.SDFGState) -> None:
         """Validate connector counts + output-kind rule at expansion time.

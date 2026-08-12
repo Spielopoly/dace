@@ -268,6 +268,21 @@ def test_lift_array_predicate_cond_stages_array_read_as_connector():
     assert str(a_edges[0].data.subset) == "i", "the bare array read is staged at the write's per-lane subset"
 
 
+def test_lift_array_predicate_cond_preserves_multidimensional_singleton_rank():
+    """A shape-(1, 1) predicate source is read with a rank-two subset."""
+    sdfg = dace.SDFG("lift_multidim_singleton_pred")
+    sdfg.add_array("A", (1, 1), dace.float64)
+    sdfg.add_symbol("K", dace.float64)
+    state = sdfg.add_state("s", is_start_block=True)
+    result = SameWriteSetIfElseToITECFG()._lift_array_predicate_cond(sdfg, state, "A > K", "0, 0")
+    assert result is not None
+    tasklet = next(node for node in state.nodes() if isinstance(node, dace.nodes.Tasklet))
+    edge = next(edge for edge in state.in_edges(tasklet) if edge.data.data == "A")
+    assert edge.data.subset.dims() == 2
+    assert str(edge.data.subset) == "0, 0"
+    sdfg.validate()
+
+
 def test_lift_array_predicate_cond_skips_pure_symbol_condition():
     """Pure-symbol guard (``K > 0``, no array read) -> nothing to stage; helper
     returns ``None``, caller keeps free-symbol text."""
@@ -456,3 +471,68 @@ def test_promote_gather_indices_refuses_out_of_scope_index_symbol():
 
     assert out == rhs and p._has_nested_subscript(sdfg, out)
     assert "_gidx_0" not in (edge.data.assignments or {}), "must not plant an out-of-scope assignment"
+
+
+def _constant_write_arm(sdfg: dace.SDFG, name: str, output: str, value: float) -> ControlFlowRegion:
+    """Build one branch arm that writes a constant to ``output[0]``."""
+    region = ControlFlowRegion(name, sdfg=sdfg)
+    state = region.add_state(f"{name}_state", is_start_block=True)
+    tasklet = state.add_tasklet(f"{name}_write", set(), {"_o"}, f"_o = {value}")
+    state.add_edge(tasklet, "_o", state.add_write(output), None, dace.Memlet(f"{output}[0]"))
+    return region
+
+
+def test_lift_interstate_condition_uses_reaching_redefinition():
+    """Sequential conditionals that reuse one symbol lift their own source."""
+    sdfg = dace.SDFG("reaching_condition_redefinition")
+    sdfg.add_array("pred0", (1, ), dace.bool_)
+    sdfg.add_array("pred1", (1, ), dace.bool_)
+    sdfg.add_array("out0", (1, ), dace.float64)
+    sdfg.add_array("out1", (1, ), dace.float64)
+    sdfg.add_symbol("flag", dace.bool_)
+
+    start = sdfg.add_state("start", is_start_block=True)
+    first = ConditionalBlock("first")
+    second = ConditionalBlock("second")
+    finish = sdfg.add_state("finish")
+    sdfg.add_node(first)
+    sdfg.add_node(second)
+    sdfg.add_edge(start, first, dace.InterstateEdge(assignments={"flag": "pred0[0]"}))
+    sdfg.add_edge(first, second, dace.InterstateEdge(assignments={"flag": "pred1[0]"}))
+    sdfg.add_edge(second, finish, dace.InterstateEdge())
+
+    first.add_branch(CodeBlock("flag"), _constant_write_arm(sdfg, "first_then", "out0", 1.0))
+    first.add_branch(None, _constant_write_arm(sdfg, "first_else", "out0", 0.0))
+    second.add_branch(CodeBlock("flag"), _constant_write_arm(sdfg, "second_then", "out1", 1.0))
+    second.add_branch(None, _constant_write_arm(sdfg, "second_else", "out1", 0.0))
+
+    assert SameWriteSetIfElseToITECFG().apply_pass(sdfg, {}) == 2
+    staged_sources = {}
+    for state in sdfg.states():
+        for node in state.nodes():
+            if isinstance(node, dace.nodes.Tasklet) and node.label.startswith("lift_cond_flag"):
+                staged_sources[state.label] = {edge.data.data for edge in state.in_edges(node)}
+    assert staged_sources == {"apply_ITE_first": {"pred0"}, "apply_ITE_second": {"pred1"}}
+    assert not any(isinstance(block, ConditionalBlock) for block in sdfg.all_control_flow_blocks())
+    sdfg.validate()
+
+
+def test_lift_interstate_condition_refuses_partially_defined_join():
+    """A local definition cannot replace an external value reaching another path."""
+    sdfg = dace.SDFG("partially_defined_condition")
+    sdfg.add_array("pred", (1, ), dace.bool_)
+    sdfg.add_symbol("flag", dace.bool_)
+    start = sdfg.add_state("start", is_start_block=True)
+    defined_path = sdfg.add_state("defined_path")
+    external_path = sdfg.add_state("external_path")
+    merge = sdfg.add_state("merge")
+    sdfg.add_edge(start, defined_path, dace.InterstateEdge(condition=CodeBlock("flag")))
+    sdfg.add_edge(start, external_path, dace.InterstateEdge(condition=CodeBlock("not flag")))
+    sdfg.add_edge(defined_path, merge, dace.InterstateEdge(assignments={"flag": "pred[0]"}))
+    sdfg.add_edge(external_path, merge, dace.InterstateEdge())
+
+    result = SameWriteSetIfElseToITECFG()._lift_interstate_cond_to_tasklet(sdfg, merge, "flag", "0")
+    assert result is None
+    assert merge.number_of_nodes() == 0
+    assert "flag" in sdfg.symbols
+    sdfg.validate()

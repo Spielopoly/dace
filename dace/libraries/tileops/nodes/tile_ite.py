@@ -22,7 +22,7 @@ should be further masked so it should be fine``); the surrounding
 The pure expansion returns a CPP tasklet whose body is a single
 ``for``-loop over the flattened tile (correctness-only).
 """
-from typing import Optional, Tuple
+from typing import Dict, Optional, Set, Tuple
 
 import dace
 from dace import library, properties
@@ -32,7 +32,8 @@ from dace.transformation.transformation import ExpandTransformation
 
 from .._pure_codegen import nested_loops, tile_offset
 from .. import _isa_codegen
-from .tile_binop import _TILE, _SYMBOL, _SCALAR, _VALID_KINDS, _is_tile_shape, scalar_operand_ref
+from .tile_binop import (_TILE, _SYMBOL, _SCALAR, _VALID_KINDS, _is_tile_shape, _replace_symbol_operand,
+                         _symbol_operand_free_symbols, scalar_operand_ref)
 
 # Capability probe for ``ct.where`` (cuTile's select). The cuTile runtime is
 # never installed on CI, so this resolves to ``None`` there (meaning "assume
@@ -177,7 +178,8 @@ class ExpandTileITECutile(ExpandTransformation):
 
         return nodes.Tasklet(
             label=f"{node.label}_cutile",
-            inputs={c: None for c in inputs},
+            inputs={c: None
+                    for c in inputs},
             outputs={"_o": None},
             code=body,
             language=dace.dtypes.Language.Python,
@@ -328,6 +330,19 @@ class TileITE(nodes.LibraryNode):
         self.expr_e = expr_e
         self.kind_mask = kind_mask
         self.expr_mask = expr_mask
+
+    @property
+    def free_symbols(self) -> Set[str]:
+        result: Set[str] = set()
+        for expr in (self.expr_t, self.expr_e, self.expr_mask):
+            if expr:
+                result |= _symbol_operand_free_symbols(expr)
+        return result
+
+    def replace_dict(self, repl: Dict[str, str]) -> None:
+        self.expr_t = _replace_symbol_operand(self.expr_t, repl)
+        self.expr_e = _replace_symbol_operand(self.expr_e, repl)
+        self.expr_mask = _replace_symbol_operand(self.expr_mask, repl)
 
     def validate(self, sdfg: dace.SDFG, state: dace.SDFGState) -> None:
         """Validate connector counts and the then/else/out dtype agreement.

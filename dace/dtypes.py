@@ -158,6 +158,7 @@ class Language(ExtensibleAttributeEnum):
     SystemVerilog = auto()
     MLIR = auto()
 
+
 class BackendLanguage(ExtensibleAttributeEnum):
     """ Available programming languages for code generation. """
     CPP = auto()
@@ -209,7 +210,7 @@ SCOPEDEFAULT_STORAGE = {
     ScheduleType.GPU_ThreadBlock_Dynamic: StorageType.Register,
     ScheduleType.SVE_Map: StorageType.CPU_Heap,
     ScheduleType.Snitch: StorageType.Snitch_TCDM,
-    ScheduleType.GPU_Warp: StorageType.Register,,
+    ScheduleType.GPU_Warp: StorageType.Register,
     ScheduleType.CuTile: StorageType.CuTile_Tile,
 }
 
@@ -228,7 +229,7 @@ SCOPEDEFAULT_SCHEDULE = {
     ScheduleType.SVE_Map: ScheduleType.Sequential,
     ScheduleType.Snitch: ScheduleType.Snitch,
     ScheduleType.Snitch_Multicore: ScheduleType.Snitch_Multicore,
-    ScheduleType.GPU_Warp: ScheduleType.Sequential,,
+    ScheduleType.GPU_Warp: ScheduleType.Sequential,
     ScheduleType.CuTile: ScheduleType.Sequential,
 }
 
@@ -904,7 +905,11 @@ class struct(typeclass):
             typ='\n'.join(["    %s %s;" % (t.ctype, tname) for tname, t in self._data.items()]),
         )
 
-    def emit_python_definition(self, code_stream: 'PythonCodeIOStream', cfg: 'ControlFlowRegion | None'=None, state_id: int | None=None, node_id: int | None=None):
+    def emit_python_definition(self,
+                               code_stream: 'PythonCodeIOStream',
+                               cfg: 'ControlFlowRegion | None' = None,
+                               state_id: int | None = None,
+                               node_id: int | None = None):
         class_definition = f"@dataclass\nclass {self.name}:"
         code_stream.write(class_definition, cfg, state_id, node_id)
         with code_stream.indented():
@@ -1701,7 +1706,6 @@ def can_allocate(storage: StorageType, schedule: ScheduleType):
             ScheduleType.GPU_Device, ScheduleType.GPU_ThreadBlock, ScheduleType.GPU_ThreadBlock_Dynamic,
             ScheduleType.GPU_Persistent
         ]
-
 
     # cuTile tile-level memory
     if storage == StorageType.CuTile_Tile:

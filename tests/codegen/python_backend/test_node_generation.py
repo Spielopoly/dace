@@ -3,16 +3,20 @@
 
 Covers generate_node dispatch, _generate_AccessNode, and _generate_Tasklet.
 """
+from pathlib import Path
+
 import pytest
 import numpy as np
 
 import dace
-from dace import dtypes, data
+from dace import dtypes
 from dace.codegen.py.prettycode import PythonCodeIOStream
 from dace.codegen.py.python_target import PythonCodeGen
 from dace.dtypes import ScheduleType, Language
-from dace.sdfg import nodes, SDFG, NodeNotExpandedError
+from dace.sdfg import nodes, SDFG
 from dace.memlet import Memlet
+
+
 def _MAP_XFAIL(func):
     return func
 
@@ -25,6 +29,7 @@ def _make_python_sdfg(name: str) -> SDFG:
 
 
 class _DummyDispatcher:
+
     def __init__(self):
         self.copies = []
 
@@ -56,6 +61,7 @@ class _DummyDispatcher:
 
 
 class _DummyFrameCodegen:
+
     def __init__(self):
         self.dispatcher = _DummyDispatcher()
 
@@ -398,37 +404,66 @@ class TestTasklet:
         with pytest.raises(NotImplementedError, match="Python backend only supports Python tasklets"):
             sdfg.generate_code()
 
-    def test_tasklet_code_to_code_input_memlet(self):
-        """Input memlet with data=None (code-to-code) raises NotImplementedError."""
+    def test_tasklet_code_to_code_unnamed_memlet(self):
+        """An unnamed direct tasklet edge is passed through a shared local."""
         sdfg = _make_python_sdfg('test_c2c_in')
-        sdfg.add_scalar('y', dace.float64)
+        sdfg.add_array('y', [1], dace.float64)
         state = sdfg.add_state('s0')
 
         t1 = state.add_tasklet('src', set(), {'out'}, 'out = 42.0')
-        t2 = state.add_tasklet('dst', {'inp'}, {'res'}, 'res = inp')
+        t2 = state.add_tasklet('dst', {'inp'}, {'res'}, 'res = inp + 1.0')
         w = state.add_write('y')
 
         state.add_edge(t1, 'out', t2, 'inp', Memlet())
-        state.add_edge(t2, 'res', w, None, Memlet(data='y'))
+        state.add_edge(t2, 'res', w, None, Memlet(data='y', subset='0'))
 
-        with pytest.raises(NotImplementedError, match="Code-to-code memlets"):
-            sdfg.generate_code()
+        y = np.zeros(1, dtype=np.float64)
+        sdfg.compile()(y=y)
+        assert y[0] == 43.0
 
-    def test_tasklet_code_to_code_output_memlet(self):
-        """Output memlet with data=None (code-to-code) raises NotImplementedError."""
+    def test_tasklet_code_to_code_named_memlet(self):
+        """A direct tasklet edge may retain its eliminated transient name."""
         sdfg = _make_python_sdfg('test_c2c_out')
-        sdfg.add_scalar('x', dace.float64)
+        sdfg.add_array('x', [1], dace.float64)
+        sdfg.add_array('y', [1], dace.float64)
+        sdfg.add_scalar('tmp', dace.float64, transient=True)
         state = sdfg.add_state('s0')
 
         r = state.add_read('x')
-        t1 = state.add_tasklet('src', {'a'}, {'out'}, 'out = a')
-        t2 = state.add_tasklet('dst', {'inp'}, set(), 'pass')
+        w = state.add_write('y')
+        t1 = state.add_tasklet('src', {'a'}, {'out'}, 'out = a * 3.0')
+        t2 = state.add_tasklet('dst', {'inp'}, {'res'}, 'res = inp + 1.0')
 
-        state.add_edge(r, None, t1, 'a', Memlet(data='x'))
-        state.add_edge(t1, 'out', t2, 'inp', Memlet())
+        state.add_edge(r, None, t1, 'a', Memlet(data='x', subset='0'))
+        state.add_edge(t1, 'out', t2, 'inp', Memlet(data='tmp'))
+        state.add_edge(t2, 'res', w, None, Memlet(data='y', subset='0'))
 
-        with pytest.raises(NotImplementedError, match="Code-to-code memlets"):
-            sdfg.generate_code()
+        x = np.array([4.0], dtype=np.float64)
+        y = np.zeros(1, dtype=np.float64)
+        sdfg.compile()(x=x, y=y)
+        assert y[0] == 13.0
+
+    def test_tasklet_code_to_code_across_map_entry(self):
+        """A direct tasklet edge keeps one shared local across a map entry."""
+        sdfg = _make_python_sdfg('test_c2c_across_map_entry')
+        sdfg.add_array('tmp', [1], dace.float64, transient=True)
+        sdfg.add_array('y', [4], dace.float64)
+        state = sdfg.add_state('s0')
+
+        producer = state.add_tasklet('producer', set(), {'produced'}, 'produced = 10.0')
+        map_entry, map_exit = state.add_map('map', {'i': '0:4'}, schedule=ScheduleType.Sequential)
+        consumer = state.add_tasklet('consumer', {'value'}, {'result'}, 'result = value + i')
+        state.add_memlet_path(producer,
+                              map_entry,
+                              consumer,
+                              src_conn='produced',
+                              dst_conn='value',
+                              memlet=Memlet('tmp[0]'))
+        state.add_memlet_path(consumer, map_exit, state.add_write('y'), src_conn='result', memlet=Memlet('y[i]'))
+
+        y = np.zeros(4, dtype=np.float64)
+        sdfg.compile()(y=y)
+        np.testing.assert_array_equal(y, [10.0, 11.0, 12.0, 13.0])
 
 
 # =============================================================================
@@ -437,6 +472,7 @@ class TestTasklet:
 
 
 class TestPythonTargetDirectBranches:
+
     def test_access_node_memlet_path_dst_mismatch_skips_copy(self, monkeypatch):
         sdfg = _make_python_sdfg('test_access_dst_mismatch')
         sdfg.add_array('A', [1], dace.float64)
@@ -449,6 +485,7 @@ class TestPythonTargetDirectBranches:
         codegen, dispatcher = _make_codegen(sdfg)
 
         class _PathElem:
+
             def __init__(self, src, dst):
                 self.src = src
                 self.dst = dst
@@ -488,6 +525,7 @@ class TestPythonTargetDirectBranches:
         codegen, dispatcher = _make_codegen(sdfg)
 
         class _PathElem:
+
             def __init__(self, src, dst):
                 self.src = src
                 self.dst = dst
@@ -655,6 +693,67 @@ class TestNodeCorrectnessE2E:
         y = np.array([0.0], dtype=np.float64)
         csdfg(x=x, y=y)
         assert y[0] == 6.0
+
+    def test_serialized_bare_dtype_cast(self, tmp_path: Path):
+        """A dtype cast remains executable after an SDFG save/load round trip."""
+        sdfg = _make_python_sdfg("test_serialized_bare_dtype_cast")
+        sdfg.add_array("x", [1], dace.float64)
+        sdfg.add_array("y", [1], dace.int64)
+        state = sdfg.add_state("s")
+        map_entry, map_exit = state.add_map("m", {"i": "0:1"}, schedule=ScheduleType.Sequential)
+        tasklet = state.add_tasklet("cast", {"value"}, {"result"}, "result = int64(value)")
+        state.add_memlet_path(state.add_read("x"), map_entry, tasklet, dst_conn="value", memlet=Memlet("x[i]"))
+        state.add_memlet_path(tasklet, map_exit, state.add_write("y"), src_conn="result", memlet=Memlet("y[i]"))
+
+        path = tmp_path / "bare_dtype_cast.sdfg"
+        sdfg.save(path)
+        reloaded = SDFG.from_file(path)
+        result = np.zeros(1, dtype=np.int64)
+        reloaded.compile()(x=np.array([3.75]), y=result)
+        assert result[0] == 3
+
+    def test_serialized_nested_symbol_dtype_cast(self, tmp_path: Path):
+        """A dtype cast in a nested symbol mapping survives serialization."""
+        outer = _make_python_sdfg("test_nested_mapping_cast")
+        outer.add_symbol("value", dace.float64)
+        outer.add_array("result", [1], dace.int64)
+        outer_state = outer.add_state("outer")
+
+        inner = _make_python_sdfg("inner")
+        inner.add_symbol("index", dace.int64)
+        inner.add_array("result", [1], dace.int64)
+        inner_state = inner.add_state("inner")
+        tasklet = inner_state.add_tasklet("write", set(), {"out"}, "out = index")
+        inner_state.add_edge(tasklet, "out", inner_state.add_write("result"), None, Memlet("result[0]"))
+        nested = outer_state.add_nested_sdfg(inner, set(), {"result"}, {"index": "int64(value)"})
+        outer_state.add_edge(nested, "result", outer_state.add_write("result"), None, Memlet("result[0]"))
+
+        path = tmp_path / "nested_mapping_cast.sdfg"
+        outer.save(path)
+        reloaded = SDFG.from_file(path)
+        result = np.zeros(1, dtype=np.int64)
+        reloaded.compile()(result=result, value=4.75)
+        assert result[0] == 4
+
+    @pytest.mark.gpu
+    def test_serialized_interstate_cast_from_gpu_scalar(self, tmp_path: Path):
+        """An interstate dtype cast unwraps a CuPy array scalar safely."""
+        cupy = pytest.importorskip("cupy")
+        sdfg = _make_python_sdfg("test_interstate_gpu_cast")
+        sdfg.add_array("x", [1], dace.float64, storage=dtypes.StorageType.GPU_Global)
+        sdfg.add_array("result", [1], dace.int64)
+        init = sdfg.add_state("init")
+        body = sdfg.add_state("body")
+        sdfg.add_edge(init, body, dace.InterstateEdge(assignments={"index": "int64(x[0])"}))
+        tasklet = body.add_tasklet("write", set(), {"out"}, "out = index")
+        body.add_edge(tasklet, "out", body.add_write("result"), None, Memlet("result[0]"))
+
+        path = tmp_path / "interstate_gpu_cast.sdfg"
+        sdfg.save(path)
+        reloaded = SDFG.from_file(path)
+        result = np.zeros(1, dtype=np.int64)
+        reloaded.compile()(x=cupy.asarray([6.75]), result=result)
+        assert result[0] == 6
 
     def test_array_copy_correctness(self):
         """Array copy via access nodes, compile and verify."""

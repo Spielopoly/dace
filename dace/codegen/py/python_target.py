@@ -1,7 +1,6 @@
 # Copyright 2019-2026 ETH Zurich and the DaCe authors. All rights reserved.
 import ast
-import re
-from typing import TYPE_CHECKING, Optional
+from typing import Any, Mapping, Optional, Sequence, TYPE_CHECKING
 import warnings
 
 from dace import Config, data, dtypes, memlet as mmlt, registry, subsets, symbolic
@@ -14,7 +13,7 @@ from dace.codegen.py.framecode import (_collect_nested_runtime_defined_names, _c
 from dace.codegen.py.prettycode import PythonCodeIOStream
 from dace.codegen.py.target import PythonTargetCodeGenerator
 from dace.frontend.python import astutils
-from dace.sdfg import NodeNotExpandedError, SDFG, ScopeSubgraphView, dynamic_map_inputs, nodes
+from dace.sdfg import NodeNotExpandedError, SDFG, SDFGState, ScopeSubgraphView, dynamic_map_inputs, nodes, utils as sdutils
 from dace.sdfg.scope import scope_contains_scope
 from dace.sdfg.state import ControlFlowRegion
 
@@ -29,19 +28,11 @@ def _python_expr(expr) -> str:
     return symbolic.symstr(expr, cpp_mode=False)
 
 
-#: Dtype names a kept cast can carry, built from the dtype registry.
-_PY_CAST_DTYPES = {s.split('::')[-1] for s in dtypes.TYPECLASS_TO_STRING.values()}
-_DACE_DTYPE_CAST_RE = re.compile(r'\bdace\.(' + '|'.join(sorted(_PY_CAST_DTYPES, key=len, reverse=True)) + r')\b')
-
-
-def _rewrite_dace_dtype_casts(body: str) -> str:
-    """Repoint a kept ``dace.<dtype>(x)`` cast at ``numpy``.
-
-    VTI keeps dtype casts rather than stripping them, so a host Python tasklet can
-    carry ``dace.float64(x)``; the generated module imports ``numpy`` but not ``dace``.
-    Only the ``dace.<dtype>`` token is rewritten -- the rest of the body is untouched.
-    """
-    return _DACE_DTYPE_CAST_RE.sub(r'numpy.\1', body)
+def _tasklet_edge_name(cfg: ControlFlowRegion, state_id: int, src_node: nodes.Tasklet, dst_node: nodes.Tasklet,
+                       src_conn: str) -> str:
+    """Return the shared Python local used by a direct tasklet edge."""
+    state = cfg.state(state_id)
+    return f'__dace_{cfg.cfg_id}_{state_id}_{state.node_id(src_node)}_{state.node_id(dst_node)}_{src_conn}'
 
 
 def _python_view_component(start, end, step) -> str:
@@ -223,11 +214,10 @@ class PythonCodeGen(PythonTargetCodeGenerator):
         return {'frame': includes}
 
     def preprocess(self, sdfg: SDFG) -> None:
-        """Strip remaining View access nodes before Python backend codegen.
+        """Remove views that can be eliminated before Python backend codegen.
 
-        The Python backend does not support View access nodes and raises
-        ``NotImplementedError`` when one is encountered during code generation.
-        Therefore we hopefully remove them here
+        Surviving native ``ArrayView`` descriptors are emitted as NumPy/CuPy
+        aliases by the backend.
         """
         from dace.transformation.passes.remove_views import RemoveViews
         remove_views = RemoveViews()
@@ -330,6 +320,52 @@ class PythonCodeGen(PythonTargetCodeGenerator):
         func = 'zeros' if setzero else 'empty'
         return f'{module}.{func}({self._shape_expression(desc.shape)}, dtype={_numpy_dtype(desc.dtype)})'
 
+    def _array_is_on_gpu(self, sdfg: SDFG, desc: data.Data) -> bool:
+        """Whether a Python-backend array descriptor is backed by CuPy.
+
+        :param sdfg: SDFG containing the descriptor.
+        :param desc: Data descriptor.
+        :returns: True when the runtime array uses CuPy.
+        """
+        return (isinstance(desc, data.Array) and desc.storage != dtypes.StorageType.Register
+                and (desc.storage == dtypes.StorageType.GPU_Global or (desc.transient and _sdfg_uses_cutile(sdfg))))
+
+    def _view_expression(self, sdfg: SDFG, state: SDFGState, node: nodes.AccessNode, desc: data.View) -> str:
+        """Build a NumPy/CuPy alias for a surviving SDFG view.
+
+        :param sdfg: SDFG containing the view.
+        :param state: State containing the view access node.
+        :param node: View access node.
+        :param desc: View descriptor.
+        :returns: Alias expression.
+        """
+        edge = sdutils.get_view_edge(state, node)
+        if edge is None:
+            raise ValueError(f'Cannot allocate view {node.data!r}: no unambiguous view edge was found.')
+        if not isinstance(desc, data.Array):
+            raise NotImplementedError(f'Python backend only supports array views, not {type(desc).__name__}.')
+
+        is_write = edge.src is node
+        path = state.memlet_path(edge)
+        viewed_node = path[-1].dst if is_write else path[0].src
+        if not isinstance(viewed_node, nodes.AccessNode):
+            raise ValueError(f'Cannot allocate view {node.data!r}: its viewed endpoint is not an AccessNode.')
+        viewed_desc = viewed_node.desc(sdfg)
+
+        viewed_subset = edge.data.get_dst_subset(edge, state) if is_write else edge.data.get_src_subset(edge, state)
+        if viewed_subset is None:
+            viewed_subset = subsets.Range.from_array(viewed_desc)
+        if hasattr(viewed_desc, 'offset') and any(str(offset) != '0' for offset in viewed_desc.offset):
+            viewed_subset = viewed_subset.offset_new(viewed_desc.offset, False)
+
+        origin = self._nested_view_expr(sdfg, viewed_node.data, viewed_subset)
+        module = 'cupy' if self._array_is_on_gpu(sdfg, viewed_desc) else 'numpy'
+        itemsize = f'{self._runtime_data_name(sdfg, viewed_node.data)}.dtype.itemsize'
+        strides = [f'({_python_expr(stride)}) * {itemsize}' for stride in desc.strides]
+        stride_expr = f'({strides[0]},)' if len(strides) == 1 else f'({", ".join(strides)})'
+        return (f'{module}.lib.stride_tricks.as_strided({origin}, '
+                f'shape={self._shape_expression(desc.shape)}, strides={stride_expr})')
+
     def _persistent_key(self, sdfg: SDFG, name: str) -> str:
         return f'{sdfg.cfg_id}:{name}'
 
@@ -412,16 +448,40 @@ class PythonCodeGen(PythonTargetCodeGenerator):
             expected = expected * dim
         return True
 
-    def _nested_shapes_match(self, memlet: mmlt.Memlet, desc: data.Array) -> bool:
+    @staticmethod
+    def _mapped_nested_values(values: Sequence[Any], symbol_mapping: Optional[Mapping[str, Any]]) -> list:
+        """Express nested descriptor properties in the parent symbol scope.
+
+        :param values: Descriptor values in the nested SDFG's symbol scope.
+        :param symbol_mapping: The nested node's inner-to-outer symbol mapping.
+        :returns: Values rewritten into the parent scope.
+        """
+        result = list(values)
+        if not symbol_mapping:
+            return result
+
+        def _replace(mapping: dict) -> None:
+            for index, value in enumerate(result):
+                if symbolic.issymbolic(value):
+                    result[index] = value.subs(mapping)
+
+        symbolic.safe_replace(symbol_mapping, _replace)
+        return result
+
+    def _nested_shapes_match(self,
+                             memlet: mmlt.Memlet,
+                             desc: data.Array,
+                             symbol_mapping: Optional[Mapping[str, Any]] = None) -> bool:
         """Whether the outer memlet subset and the nested connector have
         provably identical ordered shapes (including singleton positions).
 
         :param memlet: The connector's memlet.
         :param desc: The nested connector's array descriptor.
+        :param symbol_mapping: Optional inner-to-outer symbol mapping.
         :returns: True when no reconciliation is needed.
         """
         subset_size = list(memlet.subset.size())
-        conn_shape = list(desc.shape)
+        conn_shape = self._mapped_nested_values(desc.shape, symbol_mapping)
         return len(subset_size) == len(conn_shape) and all(
             self._provably_equal(a, b) for a, b in zip(subset_size, conn_shape))
 
@@ -444,7 +504,11 @@ class PythonCodeGen(PythonTargetCodeGenerator):
                     for (start, end, step), size, stride in zip(subset.ranges, subset.size(), outer_desc.strides)]
         return None
 
-    def _nested_strided_view_expr(self, sdfg: SDFG, memlet: mmlt.Memlet, desc: data.Array) -> Optional[str]:
+    def _nested_strided_view_expr(self,
+                                  sdfg: SDFG,
+                                  memlet: mmlt.Memlet,
+                                  desc: data.Array,
+                                  symbol_mapping: Optional[Mapping[str, Any]] = None) -> Optional[str]:
         """Expression for a genuine strided view of the outer array matching
         the nested connector's declared shape/strides, or None when no such
         view provably exists.
@@ -460,6 +524,7 @@ class PythonCodeGen(PythonTargetCodeGenerator):
         :param sdfg: The parent SDFG.
         :param memlet: The connector's memlet.
         :param desc: The nested connector's array descriptor.
+        :param symbol_mapping: Optional inner-to-outer symbol mapping.
         :returns: A Python view expression, or None.
         """
         outer_desc = sdfg.arrays[memlet.data]
@@ -479,7 +544,9 @@ class PythonCodeGen(PythonTargetCodeGenerator):
                 components.append(_python_view_component(start, end, step))
                 kept.append((size, stride))
 
-        conn_nonsingleton = [(size, stride) for size, stride in zip(desc.shape, desc.strides)
+        conn_shape = self._mapped_nested_values(desc.shape, symbol_mapping)
+        conn_strides = self._mapped_nested_values(desc.strides, symbol_mapping)
+        conn_nonsingleton = [(size, stride) for size, stride in zip(conn_shape, conn_strides)
                              if not symbolic.equal_valued(1, size)]
         if len(kept) == 0 or len(conn_nonsingleton) != len(kept):
             return None
@@ -506,13 +573,17 @@ class PythonCodeGen(PythonTargetCodeGenerator):
         expr = f'{self._runtime_data_name(sdfg, memlet.data)}[{", ".join(components)}]'
         if perm != list(range(len(kept))):
             expr = f'{expr}.transpose({tuple(perm)})'
-        if len(conn_nonsingleton) != len(desc.shape):
+        if len(conn_nonsingleton) != len(conn_shape):
             # Insert singleton connector dims via None-indexing (a pure view).
-            inserts = ', '.join('None' if symbolic.equal_valued(1, size) else ':' for size in desc.shape)
+            inserts = ', '.join('None' if symbolic.equal_valued(1, size) else ':' for size in conn_shape)
             expr = f'{expr}[{inserts}]'
         return expr
 
-    def _nested_desc_spans_full_outer(self, memlet: mmlt.Memlet, desc: data.Array, outer_desc: data.Data) -> bool:
+    def _nested_desc_spans_full_outer(self,
+                                      memlet: mmlt.Memlet,
+                                      desc: data.Array,
+                                      outer_desc: data.Data,
+                                      symbol_mapping: Optional[Mapping[str, Any]] = None) -> bool:
         """Whether the nested connector is declared over the WHOLE outer array
         while the memlet subset is only the (zero-based, step-1) accessed window.
 
@@ -525,6 +596,7 @@ class PythonCodeGen(PythonTargetCodeGenerator):
         :param memlet: The connector's memlet (subset = accessed window).
         :param desc: The nested connector's array descriptor.
         :param outer_desc: The outer array descriptor.
+        :param symbol_mapping: Optional inner-to-outer symbol mapping.
         :returns: True when the whole outer array can be passed directly.
         """
         if not isinstance(outer_desc, data.Array) or isinstance(outer_desc, data.View):
@@ -537,7 +609,7 @@ class PythonCodeGen(PythonTargetCodeGenerator):
             # An explicit inner-side subset means inner subscripts are NOT
             # outer-origin coordinates; the whole-array shortcut is unsound.
             return False
-        conn_shape = list(desc.shape)
+        conn_shape = self._mapped_nested_values(desc.shape, symbol_mapping)
         outer_shape = list(outer_desc.shape)
         if len(conn_shape) != len(outer_shape):
             return False
@@ -551,7 +623,11 @@ class PythonCodeGen(PythonTargetCodeGenerator):
         return all(
             self._provably_equal(start, 0) and symbolic.equal_valued(1, step) for start, _end, step in subset.ranges)
 
-    def _nested_arg_needs_flat_reshape(self, connector_name: str, memlet: mmlt.Memlet, desc: data.Array) -> bool:
+    def _nested_arg_needs_flat_reshape(self,
+                                       connector_name: str,
+                                       memlet: mmlt.Memlet,
+                                       desc: data.Array,
+                                       symbol_mapping: Optional[Mapping[str, Any]] = None) -> bool:
         """Whether a nested-SDFG array connector needs (and safely admits) a
         flat C-order ``.reshape`` from the outer memlet subset to its shape.
 
@@ -571,15 +647,17 @@ class PythonCodeGen(PythonTargetCodeGenerator):
         :param connector_name: The nested SDFG connector name (for diagnostics).
         :param memlet: The connector's memlet (its subset gives the outer shape).
         :param desc: The nested connector's array descriptor.
+        :param symbol_mapping: Optional inner-to-outer symbol mapping.
         :returns: True when a flat reshape is needed and provably safe, False
             when the shapes already match.
         :raises NotImplementedError: When the shapes mismatch but a flat
             reshape is not provably order-preserving.
         """
         subset_size = list(memlet.subset.size())
-        conn_shape = list(desc.shape)
+        conn_shape = self._mapped_nested_values(desc.shape, symbol_mapping)
+        conn_strides = self._mapped_nested_values(desc.strides, symbol_mapping)
         # Identical ordered shapes (including singleton positions) need nothing.
-        if self._nested_shapes_match(memlet, desc):
+        if self._nested_shapes_match(memlet, desc, symbol_mapping):
             return False
         # A pure squeeze/unsqueeze mismatch -- only size-1 dims differ (e.g. a
         # strided column slice ``A[0:N, i]`` of subset size ``(N, 1)`` feeding
@@ -594,10 +672,10 @@ class PythonCodeGen(PythonTargetCodeGenerator):
                 self._provably_equal(a, b) for a, b in zip(sub_nontrivial, conn_nontrivial)):
             return True
         if (not self._provably_equal(prod(subset_size), prod(conn_shape))
-                or not self._is_c_contiguous_layout(desc.shape, desc.strides)):
+                or not self._is_c_contiguous_layout(conn_shape, conn_strides)):
             raise NotImplementedError(
                 f'Cannot reconcile nested SDFG connector {connector_name!r} (shape {conn_shape}, '
-                f'strides {list(desc.strides)}) with the outer subset of array {memlet.data!r} '
+                f'strides {conn_strides}) with the outer subset of array {memlet.data!r} '
                 f'(shape {subset_size}): the mismatch is neither a representable strided view of the '
                 f'outer subset nor a provably flat-order-preserving reshape.')
         return True
@@ -727,8 +805,6 @@ class PythonCodeGen(PythonTargetCodeGenerator):
         desc = target_desc or sdfg.arrays[name]
         if isinstance(desc, data.Stream):
             raise NotImplementedError('Streams are not supported for the Python backend.')
-        if isinstance(desc, data.View):
-            raise NotImplementedError('Views are not supported for the Python backend.')
         if isinstance(desc, data.Reference):
             raise NotImplementedError('References are not supported for the Python backend.')
         if subset is None and target_name is not None:
@@ -743,7 +819,10 @@ class PythonCodeGen(PythonTargetCodeGenerator):
             return
         # TODO: Inconsistent handling of copies. What happens if we have something that is not scalar or array?
         # On the other hand is that even possible? I can only think of structures but not sure if those can be memlet targets
-        # And we don't support views or references or streams
+        # References and streams remain unsupported.
+        if isinstance(desc, data.View) and actual_subset is None:
+            stream.write(f'{self._runtime_data_name(sdfg, name)}[...] = {value_expr}', cfg, state_id)
+            return
         if isinstance(desc, data.Array) and actual_subset is None:
             stream.write(f'numpy.copyto({self._runtime_data_name(sdfg, name)}, {value_expr})', cfg, state_id)
             return
@@ -814,13 +893,23 @@ class PythonCodeGen(PythonTargetCodeGenerator):
                        allocate_nested_data: bool = True) -> None:
         if not isinstance(node, nodes.AccessNode):
             return
-        if isinstance(nodedesc, data.View):
-            raise NotImplementedError('Views are not supported for the Python backend.')
         if isinstance(nodedesc, data.Reference):
             raise NotImplementedError('References are not supported for the Python backend.')
         if isinstance(nodedesc, data.Stream):
             raise NotImplementedError('Stream descriptors are not supported for the Python backend.')
         if _is_inside_cutile_scope(cfg, state_id, node):
+            return
+
+        if isinstance(nodedesc, data.View):
+            if self._dispatcher.defined_vars.has(node.data):
+                return
+            expression = self._view_expression(sdfg, dfg, node, nodedesc)
+            is_global = nodedesc.lifetime in (dtypes.AllocationLifetime.Global, dtypes.AllocationLifetime.Persistent,
+                                              dtypes.AllocationLifetime.External)
+            if is_global:
+                allocation_stream.write(f'global {node.data}', cfg, state_id)
+            allocation_stream.write(f'{node.data} = {expression}', cfg, state_id)
+            self._register_defined_name(node.data, nodedesc, is_global=is_global)
             return
 
         root_name = node.data.split('.')[0]
@@ -849,8 +938,7 @@ class PythonCodeGen(PythonTargetCodeGenerator):
         # kernels and the transient is passed between kernel launches.
         # Register-storage transients stay numpy: they are never passed to a
         # kernel directly.
-        on_gpu = (isinstance(desc, data.Array) and desc.storage != dtypes.StorageType.Register
-                  and (desc.storage == dtypes.StorageType.GPU_Global or _sdfg_uses_cutile(sdfg)))
+        on_gpu = self._array_is_on_gpu(sdfg, desc)
         init_expr = self._default_expression(desc, on_gpu=on_gpu, setzero=node.setzero)
 
         if is_global:
@@ -896,10 +984,14 @@ class PythonCodeGen(PythonTargetCodeGenerator):
 
         src_desc = src_node.desc(sdfg) if isinstance(src_node, nodes.AccessNode) else None
         dst_desc = dst_node.desc(sdfg) if isinstance(dst_node, nodes.AccessNode) else None
+        state = cfg.state(state_id)
+        if ((isinstance(src_desc, data.View) and sdutils.get_view_edge(state, src_node) is edge)
+                or (isinstance(dst_desc, data.View) and sdutils.get_view_edge(state, dst_node) is edge)):
+            # The allocation already emits this edge as an alias. It is not a
+            # data copy, even when the view relationship crosses a scope.
+            return
         if isinstance(src_desc, data.Stream) or isinstance(dst_desc, data.Stream):
             raise NotImplementedError('Streams are not supported for the Python backend.')
-        if isinstance(src_desc, data.View) or isinstance(dst_desc, data.View):
-            raise NotImplementedError('Views are not supported for the Python backend.')
         if isinstance(src_desc, data.Reference) or isinstance(dst_desc, data.Reference):
             raise NotImplementedError('References are not supported for the Python backend.')
 
@@ -1009,6 +1101,9 @@ class PythonCodeGen(PythonTargetCodeGenerator):
         state_dfg = cfg.state(state_id)
         self._dispatcher.defined_vars.enter_scope(node)
 
+        tasklet_body = pyutils.rewrite_dtype_casts(codeblock_to_python(node.code).strip())
+        tasklet_names = {item.id for item in ast.walk(ast.parse(tasklet_body)) if isinstance(item, ast.Name)}
+
         # Instrumentation: node begin (before reading inputs). The node hooks are
         # intentionally emitted INSIDE the enclosing map-loop body, so an N-trip
         # map produces N node timing events -- matching the C++ TimerProvider,
@@ -1021,13 +1116,20 @@ class PythonCodeGen(PythonTargetCodeGenerator):
         for edge in state_dfg.in_edges(node):
             if not edge.dst_conn:
                 continue
-            src_node = state_dfg.memlet_path(edge)[0].src
-            if isinstance(src_node, nodes.CodeNode):
+            if edge.dst_conn not in tasklet_names and edge.data.data in node.ignored_symbols:
+                # InlineTaskletConnectors replaced this local with a direct
+                # array access in the tasklet body.
+                continue
+            path_start = state_dfg.memlet_path(edge)[0]
+            src_node = path_start.src
+            if isinstance(src_node, nodes.Tasklet):
+                shared_name = _tasklet_edge_name(cfg, state_id, src_node, node, path_start.src_conn)
+                callsite_stream.write(f'{edge.dst_conn} = {shared_name}', cfg, state_id)
+            elif isinstance(src_node, nodes.CodeNode):
                 raise NotImplementedError('Code-to-code memlets not supported in the Python backend.')
-            callsite_stream.write(f'{edge.dst_conn} = {self._read_expr(sdfg, edge.data)}', cfg, state_id)
+            else:
+                callsite_stream.write(f'{edge.dst_conn} = {self._read_expr(sdfg, edge.data)}', cfg, state_id)
             self._dispatcher.defined_vars.add(edge.dst_conn, dispatcher_mod.DefinedType.Scalar, 'object')
-
-        tasklet_body = _rewrite_dace_dtype_casts(codeblock_to_python(node.code).strip())
 
         callsite_stream.write(f'\n####### Tasklet: {node.label}\n\n', cfg, state_id)
 
@@ -1038,11 +1140,17 @@ class PythonCodeGen(PythonTargetCodeGenerator):
         for edge in state_dfg.out_edges(node):
             if edge.src_conn is None:
                 continue
+            if edge.src_conn not in tasklet_names and edge.data.data in node.ignored_symbols:
+                # InlineTaskletConnectors made the write directly in the body.
+                continue
             dst_node = state_dfg.memlet_path(edge)[-1].dst
-            if isinstance(dst_node, nodes.CodeNode):
+            if isinstance(dst_node, nodes.Tasklet):
+                shared_name = _tasklet_edge_name(cfg, state_id, node, dst_node, edge.src_conn)
+                callsite_stream.write(f'{shared_name} = {edge.src_conn}', cfg, state_id)
+            elif isinstance(dst_node, nodes.CodeNode):
                 raise NotImplementedError('Code-to-code memlets not supported in the Python backend.')
-            # TODO: Involve self._dispatcher.dispatch_copy instead?
-            self._emit_memlet_write(sdfg, edge.data, edge.src_conn, callsite_stream, cfg, state_id)
+            else:
+                self._emit_memlet_write(sdfg, edge.data, edge.src_conn, callsite_stream, cfg, state_id)
 
         # Instrumentation: node end (after writing outputs)
         if node.instrument != dtypes.InstrumentationType.No_Instrumentation:
@@ -1056,7 +1164,7 @@ class PythonCodeGen(PythonTargetCodeGenerator):
                         toplevel_schedule):
         if node.code.language != dtypes.Language.Python:
             raise NotImplementedError('Python backend only supports Python tasklets.')
-        inner_stream.write(codeblock_to_python(node.code).strip() or 'pass')
+        inner_stream.write(pyutils.rewrite_dtype_casts(codeblock_to_python(node.code).strip()) or 'pass')
 
     def define_out_memlet(self, sdfg: SDFG, cfg: ControlFlowRegion, state_dfg, state_id: int, src_node: nodes.Node,
                           dst_node: nodes.Node, edge, function_stream: PythonCodeIOStream,
@@ -1072,7 +1180,9 @@ class PythonCodeGen(PythonTargetCodeGenerator):
     def generate_nsdfg_call(self, sdfg, cfg, state, node, memlet_references, sdfg_label, state_struct=True):
         # TODO: state struct?
         args = [argval for _, _, argval in memlet_references]
-        args.extend(_python_expr(node.symbol_mapping[symname]) for symname in self._nsdfg_runtime_symbol_names(node))
+        args.extend(
+            pyutils.rewrite_dtype_casts(_python_expr(node.symbol_mapping[symname]))
+            for symname in self._nsdfg_runtime_symbol_names(node))
         return f'{sdfg_label}({", ".join(args)})'
 
     def _prepare_nsdfg_arguments(self, sdfg: SDFG, cfg: ControlFlowRegion, state, node: nodes.NestedSDFG):
@@ -1105,8 +1215,8 @@ class PythonCodeGen(PythonTargetCodeGenerator):
                 })
             return bridge_name
 
-        def _bind_reshape_bridge(connector_name: str, memlet: mmlt.Memlet, desc: data.Array, view_expr: str,
-                                 is_input: bool) -> str:
+        def _bind_reshape_bridge(connector_name: str, memlet: mmlt.Memlet, desc: data.Array, connector_shape: list,
+                                 view_expr: str, is_input: bool) -> str:
             """Bind a flat-reshape-mismatched OUTPUT (or in/out) connector via a
             contiguous temporary, copied back after the call.
 
@@ -1119,7 +1229,7 @@ class PythonCodeGen(PythonTargetCodeGenerator):
             bridge_name = self._nested_reshape_bridge_name(cfg, state, node, connector_name)
             if bridge_name not in initialized_reshape_bridges:
                 pre_call_statements.append(
-                    f'{bridge_name} = ({view_expr}).copy().reshape({self._shape_expression(desc.shape)})')
+                    f'{bridge_name} = ({view_expr}).copy().reshape({self._shape_expression(connector_shape)})')
                 initialized_reshape_bridges.add(bridge_name)
             if not is_input and bridge_name not in registered_reshape_writebacks:
                 target_desc = sdfg.arrays[memlet.data]
@@ -1147,6 +1257,7 @@ class PythonCodeGen(PythonTargetCodeGenerator):
             elif self._is_singleton_buffer_desc(desc) and isinstance(outer_desc, data.Scalar):
                 arg_expr = _bind_bridge(connector_name, memlet, desc, is_input)
             elif isinstance(desc, data.Array):
+                connector_shape = self._mapped_nested_values(desc.shape, node.symbol_mapping)
                 # A connector declared over the whole outer array takes the array
                 # itself (inner subscripts are outer-origin coordinates), whether
                 # the subset is the explicit full array or a zero-based accessed
@@ -1154,24 +1265,26 @@ class PythonCodeGen(PythonTargetCodeGenerator):
                 # connector with an explicit-full IN subset and a window OUT
                 # subset canonicalizes to the same (bare-name) binding instead of
                 # raising the inconsistent-binding error.
-                if self._nested_desc_spans_full_outer(memlet, desc, outer_desc):
+                if self._nested_desc_spans_full_outer(memlet, desc, outer_desc, node.symbol_mapping):
                     arg_expr = self._runtime_data_name(sdfg, memlet.data)
                 else:
                     arg_expr = self._nested_view_expr(sdfg, memlet.data, memlet.subset)
-                    if not self._nested_shapes_match(memlet, desc):
+                    if not self._nested_shapes_match(memlet, desc, node.symbol_mapping):
                         # Otherwise prefer a genuine strided view (exact layout,
                         # valid for reads and writes); otherwise fall back to a flat
                         # reshape, which raises when not provably order-preserving.
-                        if (strided_expr := self._nested_strided_view_expr(sdfg, memlet, desc)) is not None:
+                        if (strided_expr := self._nested_strided_view_expr(sdfg, memlet, desc,
+                                                                           node.symbol_mapping)) is not None:
                             arg_expr = strided_expr
-                        elif self._nested_arg_needs_flat_reshape(connector_name, memlet, desc):
+                        elif self._nested_arg_needs_flat_reshape(connector_name, memlet, desc, node.symbol_mapping):
                             if connector_name in output_connector_names:
                                 # Writes must land in the outer array: go through a
                                 # contiguous bridge with an explicit copy-back.
-                                arg_expr = _bind_reshape_bridge(connector_name, memlet, desc, arg_expr, is_input)
+                                arg_expr = _bind_reshape_bridge(connector_name, memlet, desc, connector_shape, arg_expr,
+                                                                is_input)
                             else:
                                 # Read-only: a flat reshape view (or copy) suffices.
-                                arg_expr = f'({arg_expr}).reshape({self._shape_expression(desc.shape)})'
+                                arg_expr = f'({arg_expr}).reshape({self._shape_expression(connector_shape)})'
             else:
                 arg_expr = self._runtime_data_name(sdfg, memlet.data)
 

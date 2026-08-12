@@ -1,6 +1,120 @@
+import ast
 from typing import TYPE_CHECKING
 
-from dace import data, subsets, symbolic
+from dace import data, dtypes, subsets, symbolic
+
+_PY_CAST_TARGETS = {
+    name: dtypes.PYTHON_TYPES.get(typeclass.type, f"dace.{name}")
+    for typeclass, type_string in dtypes.TYPECLASS_TO_STRING.items() if (name := type_string.split("::")[-1])
+}
+_PY_CAST_TARGETS["bool"] = "numpy.bool_"
+
+
+class _BoundNameCollector(ast.NodeVisitor):
+    """Collect names that can shadow serialized bare dtype calls."""
+
+    def __init__(self) -> None:
+        self.names: set[str] = set()
+
+    def visit_Name(self, node: ast.Name) -> None:
+        if isinstance(node.ctx, (ast.Store, ast.Del)):
+            self.names.add(node.id)
+
+    def visit_arg(self, node: ast.arg) -> None:
+        self.names.add(node.arg)
+
+    def visit_alias(self, node: ast.alias) -> None:
+        self.names.add(node.asname or node.name.split(".", maxsplit=1)[0])
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self.names.add(node.name)
+        self.generic_visit(node)
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        self.names.add(node.name)
+        self.generic_visit(node)
+
+    def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:
+        if node.name is not None:
+            self.names.add(node.name)
+        self.generic_visit(node)
+
+    def visit_MatchAs(self, node: ast.MatchAs) -> None:
+        if node.name is not None:
+            self.names.add(node.name)
+        self.generic_visit(node)
+
+    def visit_MatchStar(self, node: ast.MatchStar) -> None:
+        if node.name is not None:
+            self.names.add(node.name)
+
+    def visit_MatchMapping(self, node: ast.MatchMapping) -> None:
+        if node.rest is not None:
+            self.names.add(node.rest)
+        self.generic_visit(node)
+
+
+class _PythonDtypeCastRewriter(ast.NodeTransformer):
+    """Make dtype calls safe for Python, NumPy, and CuPy scalar values."""
+
+    def __init__(self, bound_names: set[str]) -> None:
+        self.changed = False
+        self._bound_names = bound_names
+
+    def visit_Call(self, node: ast.Call) -> ast.expr:
+        node = self.generic_visit(node)
+        dtype_name = None
+        if (isinstance(node.func, ast.Name) and node.func.id in _PY_CAST_TARGETS
+                and node.func.id not in self._bound_names):
+            dtype_name = node.func.id
+        elif (isinstance(node.func, ast.Attribute) and node.func.attr in _PY_CAST_TARGETS
+              and isinstance(node.func.value, ast.Name) and node.func.value.id in {"dace", "numpy", "np"}):
+            dtype_name = node.func.attr
+        if dtype_name is None or len(node.args) != 1 or node.keywords:
+            return node
+        self.changed = True
+
+        def _value() -> ast.Name:
+            return ast.Name(id="__dace_value", ctx=ast.Load())
+
+        normalized = ast.IfExp(
+            test=ast.Call(func=ast.Name(id="hasattr", ctx=ast.Load()),
+                          args=[_value(), ast.Constant(value="item")],
+                          keywords=[]),
+            body=ast.Call(func=ast.Attribute(value=_value(), attr="item", ctx=ast.Load()), args=[], keywords=[]),
+            orelse=_value(),
+        )
+        cast_target = ast.parse(_PY_CAST_TARGETS[dtype_name], mode="eval").body
+        cast = ast.Call(func=cast_target, args=[normalized], keywords=[])
+        cast_lambda = ast.Lambda(
+            args=ast.arguments(posonlyargs=[],
+                               args=[ast.arg(arg="__dace_value")],
+                               vararg=None,
+                               kwonlyargs=[],
+                               kw_defaults=[],
+                               kwarg=None,
+                               defaults=[]),
+            body=cast,
+        )
+        return ast.copy_location(ast.Call(func=cast_lambda, args=node.args, keywords=[]), node)
+
+
+def rewrite_dtype_casts(body: str) -> str:
+    """Qualify DaCe dtype calls and safely unwrap array scalar values."""
+    try:
+        tree = ast.parse(body)
+    except SyntaxError:
+        return body
+    bound_names = _BoundNameCollector()
+    bound_names.visit(tree)
+    rewriter = _PythonDtypeCastRewriter(bound_names.names)
+    tree = rewriter.visit(tree)
+    if not rewriter.changed:
+        return body
+    return ast.unparse(ast.fix_missing_locations(tree))
+
 
 if TYPE_CHECKING:
     from dace.codegen.py.framecode import DaCePythonCodeGenerator

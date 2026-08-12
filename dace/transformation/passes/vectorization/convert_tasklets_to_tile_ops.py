@@ -1184,6 +1184,13 @@ class ConvertTaskletsToTileOps(ppl.Pass):
         # copy (user 2026-06-14).
         if self._maybe_emit_scalar_broadcast(inner_state, tasklet, a_edge, out_edge):
             return True
+        # A tile producer followed by the frontend's explicit scalar-rebinding
+        # assignment carries the same per-lane value through the alias. Promote
+        # that transient destination before replacing the tasklet; otherwise the
+        # direct copy below becomes an invalid tile-to-scalar CopyND.
+        src_desc = inner_state.sdfg.arrays.get(a_edge.data.data) if a_edge.data is not None else None
+        if isinstance(src_desc, dace.data.Array) and tuple(src_desc.shape) == tuple(self.widths):
+            self._ensure_output_widened(inner_state, out_edge)
         # Use the input-side memlet so the new edge's memlet.data matches its source.
         inner_state.add_edge(a_edge.src, a_edge.src_conn, out_edge.dst, out_edge.dst_conn,
                              dace.Memlet.from_memlet(a_edge.data))
@@ -1565,10 +1572,21 @@ class ConvertTaskletsToTileOps(ppl.Pass):
         out_edge = out_edges[0]
         store = self._find_downstream_store(inner_state, out_edge)
         if store is None:
-            raise NotImplementedError(f"{tasklet.label}: masked write ``_o = IT(cond, val)`` whose output "
-                                      f"{out_edge.dst!r} does not feed a single downstream ``TileStore._src``. The "
-                                      f"masked-store lowering needs exactly one store to gate on ``cond``; this shape "
-                                      f"(no store / fan-out to several stores) is not yet handled.")
+            old_value = self._find_upstream_old_value(inner_state, tasklet, out_edge.dst)
+            if old_value is None:
+                raise NotImplementedError(f"{tasklet.label}: masked write ``_o = IT(cond, val)`` whose output "
+                                          f"{out_edge.dst!r} neither feeds one ``TileStore._src`` nor has one "
+                                          f"unambiguous upstream old-value tile.")
+            old_conn = "__it_old"
+            while old_conn in tasklet.in_connectors:
+                old_conn += "_"
+            tasklet.add_in_connector(old_conn)
+            subset = ", ".join(f"0:{w}" for w in self.widths)
+            inner_state.add_edge(old_value, None, tasklet, old_conn, dace.Memlet(f"{out_edge.dst.data}[{subset}]"))
+            out_edge.data.dynamic = False
+            tasklet.code = CodeBlock(f"{out_conn} = ITE({cond_conn}, {val_arg}, {old_conn})",
+                                     language=dace.dtypes.Language.Python)
+            return self._convert_one(inner_state, tasklet, iter_vars)
         cond_edge = in_edges[cond_conn]
         cond_an = self._resolve_cond_tile(inner_state, cond_edge)
         self._apply_cond_mask_to_store(inner_state, store, cond_an)
@@ -1579,6 +1597,27 @@ class ConvertTaskletsToTileOps(ppl.Pass):
             tasklet.remove_in_connector(cond_conn)
         tasklet.code = CodeBlock(f"{out_conn} = {val_arg}", language=dace.dtypes.Language.Python)
         return self._convert_one(inner_state, tasklet, iter_vars)
+
+    @staticmethod
+    def _find_upstream_old_value(inner_state: SDFGState, tasklet: Tasklet, destination: Any) -> Optional[Any]:
+        """Find the unique prior producer of a transient conditional update."""
+        from dace.sdfg.nodes import AccessNode
+        if not isinstance(destination, AccessNode):
+            return None
+        candidates = []
+        seen = {tasklet}
+        pending = list(inner_state.predecessors(tasklet))
+        while pending:
+            node = pending.pop()
+            if node in seen:
+                continue
+            seen.add(node)
+            if (isinstance(node, AccessNode) and node is not destination and node.data == destination.data
+                    and inner_state.in_degree(node) > 0):
+                candidates.append(node)
+                continue
+            pending.extend(inner_state.predecessors(node))
+        return candidates[0] if len(candidates) == 1 else None
 
     def _find_downstream_store(self, inner_state: SDFGState, out_edge):
         """Return the single downstream ``TileStore`` fed (via its ``_src``) by this

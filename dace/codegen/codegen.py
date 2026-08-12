@@ -1,6 +1,5 @@
 # Copyright 2019-2026 ETH Zurich and the DaCe authors. All rights reserved.
 import functools
-import json
 from typing import List
 
 import dace
@@ -238,6 +237,15 @@ def generate_code(sdfg: SDFG, validate=True) -> List[CodeObject]:
 
     infer_types.set_default_schedule_and_storage_types(sdfg, None)
 
+    if sdfg.backend == dtypes.BackendLanguage.Python:
+        # Python code generation cannot execute native-tasklet expansions.
+        # Prefer portable SDFG expansions unless a lowering pass explicitly
+        # selected an implementation (for example, tileops ``cutile``).
+        from dace.sdfg import nodes as nd
+        for node, _ in sdfg.all_nodes_recursive():
+            if isinstance(node, nd.LibraryNode) and node.implementation is None and 'pure' in node.implementations:
+                node.implementation = 'pure'
+
     sdfg.expand_library_nodes()
 
     infer_types.infer_connector_types(sdfg)
@@ -256,7 +264,8 @@ def generate_code(sdfg: SDFG, validate=True) -> List[CodeObject]:
 
     # Experimental readable generator: flatten nested SDFGs, mark write-once data const/constexpr, and
     # inline tasklet connectors. Runs after library expansion so post-expansion tasklets are seen too.
-    if config.Config.get('compiler', 'cpu', 'implementation') == 'experimental_readable':
+    if (sdfg.backend == dtypes.BackendLanguage.CPP
+            and config.Config.get('compiler', 'cpu', 'implementation') == 'experimental_readable'):
         from dace.transformation.pass_pipeline import Pipeline
         from dace.transformation.passes.mark_const_init import MarkConstInit
         from dace.transformation.passes.inline_tasklet_connectors import InlineTaskletConnectors
@@ -339,10 +348,9 @@ def generate_code(sdfg: SDFG, validate=True) -> List[CodeObject]:
         raise exc.CodegenError("SDFG '%s' has undefined symbols in its arguments. "
                                "Please ensure all symbols are defined before generating code." % sdfg.name)
 
-
     if sdfg.backend == dtypes.BackendLanguage.Python:
         from dace.codegen.py import python_target
-        
+
         default_target = python_target.PythonCodeGen
         for k, v in target_code_generator_cls.extensions().items():
             # If another target has already been registered as Python, use it instead
@@ -399,22 +407,22 @@ def generate_code(sdfg: SDFG, validate=True) -> List[CodeObject]:
     if sdfg.backend == dtypes.BackendLanguage.CPP:
         target_objects = [
             CodeObject(sdfg.name,
-                    global_code + frame_code,
-                    'cpp',
-                    cpu.CPUCodeGen,
-                    'Frame',
-                    environments=used_environments,
-                    sdfg=sdfg)
+                       global_code + frame_code,
+                       'cpp',
+                       cpu.CPUCodeGen,
+                       'Frame',
+                       environments=used_environments,
+                       sdfg=sdfg)
         ]
     elif sdfg.backend == dtypes.BackendLanguage.Python:
         target_objects = [
             CodeObject(sdfg.name,
-                    global_code + frame_code,
-                    'py',
-                    python_target.PythonCodeGen,
-                    'Frame',
-                    environments=used_environments,
-                    sdfg=sdfg)
+                       global_code + frame_code,
+                       'py',
+                       python_target.PythonCodeGen,
+                       'Frame',
+                       environments=used_environments,
+                       sdfg=sdfg)
         ]
     else:
         raise NotImplementedError(f"Unsupported backend language '{sdfg.backend}' for SDFG '{sdfg.name}'")

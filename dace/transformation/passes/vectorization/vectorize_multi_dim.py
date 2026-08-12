@@ -94,29 +94,28 @@ from dace.transformation.passes.vectorization.split_map_for_tile_remainder impor
 # then rewrites the raw tasklets between staged tiles into TileBinop / TileITE / TileReduce.
 from dace.transformation.dataflow import MapCollapse, MapFission, WCRToAugAssign
 from dace.transformation.dataflow.lift_einsum import LiftEinsum
-from dace.transformation.interstate import (InlineMultistateSDFG, InlineSDFG, LoopToMap, RefineNestedAccess,
-                                            StateFusionExtended)
-from dace.transformation.interstate.expand_nested_sdfg_inputs import ExpandNestedSDFGInputs
+from dace.transformation.interstate import (InlineMultistateSDFG, InlineSDFG, StateFusionExtended)
 from dace.transformation.passes.pattern_matching import PatternMatchAndApplyRepeated
 from dace.transformation.passes.vectorization.split_multi_output_tasklets import SplitMultiOutputTasklets
 from dace.transformation.passes.vectorization.normalize_masked_write_tasklets import (NormalizeMaskedWriteTasklets,
                                                                                       NormalizeTernaryTasklets)
-from dace.libraries.tileops.nodes import (TileBinop, TileFMA, TileLoad, TileMaskGen, TileITE, TileReduce, TileStore,
-                                          TileUnop)
+from dace.libraries.tileops.nodes import (TILEOPS_NODE_TYPES)
 from dace.libraries.tileops._dispatch import select_tile_implementation
 from dace.transformation.passes.vectorization.fuse_multiply_add import FuseMultiplyAdd
 from dace.transformation.passes.vectorization.utils.errors import VectorizeUnsupported
 
 #: Tile lib-node types -- all of them, used by the implementation selector.
-_TILE_NODE_TYPES = (TileBinop, TileFMA, TileLoad, TileMaskGen, TileITE, TileReduce, TileStore, TileUnop)
+_TILE_NODE_TYPES = TILEOPS_NODE_TYPES
 
 #: ``canonicalize()`` knobs for the vectorizer's own entry normalization (see
 #: :meth:`VectorizeMultiDim.apply_pass`). ``semantic_lifting=False`` is the whole point: canon's
 #: map -> library-node lifts (Einsum / Copy / Memset) would hand the tiler an opaque node with no
-#: per-lane body to widen, so the vectorizer needs the residual left as raw maps.
+#: per-lane body to widen. Generic CPU/GPU vectorization keeps the reduction-to-WCR-map stage:
+#: its OpenMP and CUDA block-reduction lowering consumes that canonical form. The cuTile front
+#: door disables the stage separately because its lowering requires sequential accumulator loops.
 #: ``unroll_limit=0``: ShortLoopUnroll would straight-line a short constant-trip loop and delete
 #: the very map the tiler was called to widen.
-ENTRY_CANONICALIZE_KWARGS = {'semantic_lifting': False, 'unroll_limit': 0}
+ENTRY_CANONICALIZE_KWARGS = {'semantic_lifting': False, 'reduction_to_wcr_map': True, 'unroll_limit': 0}
 
 
 def restore_sdfg_in_place(target: dace.SDFG, source: dace.SDFG) -> None:
@@ -1032,6 +1031,7 @@ class VectorizeMultiDim(ppl.Pipeline):
                          validate=self._validate,
                          validate_all=self._validate_all,
                          target='gpu' if self._device == DeviceType.GPU else 'cpu',
+                         assumption_guard=self._assumption_guard,
                          **ENTRY_CANONICALIZE_KWARGS)
         # Always simplify first (user direction): callers may hand us an un-simplified SDFG
         # (``to_sdfg(simplify=False)``) with FunctionCallRegions / redundant states / un-inlined

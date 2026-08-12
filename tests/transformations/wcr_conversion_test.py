@@ -224,6 +224,45 @@ def test_aug_assign_state_fission_map():
     assert applied == 2
 
 
+def test_aug_assign_state_fission_preserves_alias_producer():
+    """State fission must keep an alias load used by a later update."""
+    import numpy as np
+
+    sdfg = dace.SDFG('aug_assign_alias_fission')
+    sdfg.add_array('A', [2], dace.float64)
+    sdfg.add_array('B', [1], dace.float64)
+    sdfg.add_scalar('A_index', dace.float64, transient=True)
+    state = sdfg.add_state()
+
+    a_in = state.add_read('A')
+    b_in = state.add_read('B')
+    first = state.add_tasklet('first_update', {'acc', 'value'}, {'out'}, 'out = acc - value')
+    a_between = state.add_access('A')
+    alias = state.add_access('A_index')
+    second = state.add_tasklet('second_update', {'acc', 'value'}, {'out'}, 'out = acc - value')
+    a_out = state.add_write('A')
+
+    state.add_edge(a_in, None, first, 'acc', dace.Memlet('A[0]'))
+    state.add_edge(b_in, None, first, 'value', dace.Memlet('B[0]'))
+    state.add_edge(first, 'out', a_between, None, dace.Memlet('A[0]'))
+    state.add_edge(a_between, None, second, 'acc', dace.Memlet('A[0]'))
+    state.add_edge(a_between, None, alias, None, dace.Memlet(data='A', subset='1', other_subset='0'))
+    state.add_edge(alias, None, second, 'value', dace.Memlet('A_index[0]'))
+    state.add_edge(second, 'out', a_out, None, dace.Memlet('A[0]'))
+
+    assert sdfg.apply_transformations_repeated(AugAssignToWCR) == 2
+    sdfg.validate()
+    alias_nodes = [(inner_state, node) for inner_state in sdfg.states() for node in inner_state.data_nodes()
+                   if node.data == 'A_index']
+    assert len(alias_nodes) == 1
+    assert alias_nodes[0][0].in_degree(alias_nodes[0][1]) == 1
+
+    a = np.array([10.0, 3.0])
+    b = np.array([2.0])
+    sdfg(A=a, B=b)
+    assert np.allclose(a, [5.0, 3.0])
+
+
 def test_free_map_permissive():
 
     @dace.program

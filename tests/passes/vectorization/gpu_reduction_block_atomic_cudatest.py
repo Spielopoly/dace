@@ -115,11 +115,11 @@ def test_partial_is_thread_local_register(kind):
 
 @pytest.mark.parametrize("kind", list(_PROGRAMS))
 def test_half2_tile_reduce_fires(kind):
-    """The within-thread half2->half fold is a ``TileReduce`` of width 2."""
+    """Both default remainder arms fold half2 to half with width-2 ``TileReduce`` nodes."""
     sdfg = _vectorized(_PROGRAMS[kind][0])
     reds = [n for n, _ in sdfg.all_nodes_recursive() if isinstance(n, TileReduce)]
-    assert len(reds) == 1 and list(reds[0].widths) == [2], \
-        f"expected one width-2 TileReduce; got {[r.widths for r in reds]}"
+    assert len(reds) == 2 and all(list(red.widths) == [2] for red in reds), \
+        f"expected two width-2 TileReduce nodes; got {[r.widths for r in reds]}"
 
 
 @pytest.mark.parametrize("kind", list(_PROGRAMS))

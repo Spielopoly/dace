@@ -30,6 +30,9 @@ def test_refine_dataflow():
     num = sdfg.apply_transformations_repeated(RefineNestedAccess)
     assert num == 1
 
+    assert nsdfg.sdfg.arrays['A'].shape == (1, 1)
+    assert nsdfg.sdfg.arrays['B'].shape == (1, 1)
+
     for edge in state.out_edges(me):
         assert edge.data.subset == dace.subsets.Range([(j, j, 1), (i, i, 1)])
     for edge in state.in_edges(mx):

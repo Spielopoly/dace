@@ -19,7 +19,9 @@ import copy
 import dace
 import pytest
 from dace.sdfg.state import ConditionalBlock, ControlFlowRegion, LoopRegion
-from dace.transformation.passes.vectorization.utils.map_predicates import (is_vectorizable_map, map_body_has_inner_loop,
+from dace.transformation.passes.vectorization.utils.map_predicates import (is_vectorizable_map,
+                                                                           map_body_depends_on_tiled_params,
+                                                                           map_body_has_inner_loop,
                                                                            map_body_has_tiled_param_dependent_branch)
 
 N = 16
@@ -118,6 +120,21 @@ def test_loop_body_is_refused(arrays):
     """ANY sequential inner loop is refused -- one carried sweep as much as three (adi)."""
     _sdfg, state, map_entry = _map_over_body(_loop_body(arrays), arrays)
     assert map_body_has_inner_loop(state, map_entry) is True
+    assert is_vectorizable_map(state, map_entry, 1) is False
+
+
+def test_loop_invariant_helper_map_is_refused():
+    """A fixed-size helper map around scalar arithmetic has no lane semantics."""
+    sdfg = dace.SDFG("invariant_helper")
+    sdfg.add_array("a", (1, ), dace.float64)
+    sdfg.add_array("out", (1, ), dace.float64)
+    state = sdfg.add_state("main")
+    map_entry, map_exit = state.add_map("helper", {"lane": "0:32"})
+    tasklet = state.add_tasklet("scalar_add", {"a"}, {"out"}, "out = a + 1")
+    state.add_memlet_path(state.add_access("a"), map_entry, tasklet, dst_conn="a", memlet=dace.Memlet("a[0]"))
+    state.add_memlet_path(tasklet, map_exit, state.add_access("out"), src_conn="out", memlet=dace.Memlet("out[0]"))
+
+    assert map_body_depends_on_tiled_params(state, map_entry, ("lane", )) is False
     assert is_vectorizable_map(state, map_entry, 1) is False
 
 

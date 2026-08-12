@@ -81,6 +81,43 @@ def test_map_param_colliding_with_loop_variable_not_a_kernel_symbol():
     assert 'jj' not in syms
 
 
+def test_nested_runtime_symbols_exclude_locally_assigned_mapping():
+    """An identity mapping must not turn an interstate-defined name into a call argument."""
+    from dace.codegen.py.cutile_target import CuTilePythonCodeGen
+
+    outer = dace.SDFG('outer')
+    outer.add_symbol('outer_n', dace.int64)
+    outer.add_symbol('local_start', dace.int64)
+    outer_state = outer.add_state('main')
+
+    inner = dace.SDFG('inner')
+    inner.add_symbol('outer_n', dace.int64)
+    inner.add_symbol('local_start', dace.int64)
+    init = inner.add_state('init', is_start_block=True)
+    body = inner.add_state('body')
+    inner.add_edge(init, body, dace.InterstateEdge(assignments={'local_start': '1'}))
+    body.add_map('uses_symbols', {'i': '0:outer_n + local_start'})
+
+    nested = outer_state.add_nested_sdfg(
+        inner,
+        {},
+        {},
+        symbol_mapping={
+            'outer_n': 'outer_n',
+            'local_start': 'local_start'
+        },
+    )
+    assert CuTilePythonCodeGen._nsdfg_runtime_symbols(nested) == ['outer_n']
+
+
+def test_nested_control_flow_array_read_uses_scalar_load():
+    """An interstate scalar read inside a cuTile helper uses ``ct.load``."""
+    from dace.codegen.py.cutile_target import _rewrite_cutile_control_flow_expr
+
+    expr = _rewrite_cutile_control_flow_expr('A_row[i + 1]', {'A_row': dace.data.Array(dace.uint32, [4])})
+    assert expr.replace(' ', '') == 'ct.astype(ct.load(A_row,(i+1,),shape=()),ct.int64).item()'
+
+
 # ---------------------------------------------------------------------------
 # 2: numeric Scalar in input AND output -> NotImplementedError
 # ---------------------------------------------------------------------------
@@ -314,8 +351,6 @@ def test_runtime_defined_int_symbol_large_value_runtime():
 # ---------------------------------------------------------------------------
 # 5: py_mod / int_floor in rendered element-index expressions
 # ---------------------------------------------------------------------------
-
-
 
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])

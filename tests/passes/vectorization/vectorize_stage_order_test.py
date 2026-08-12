@@ -6,10 +6,14 @@ constraints against them lived in ``tests/canonicalize/canonicalize_stage_order_
 passes now live HERE, so the constraints do too -- otherwise they are asserted in a file where
 their subject no longer exists, which is a test that passes by skipping.
 """
+from unittest.mock import Mock
+
+import dace
 import pytest
 
 from dace.transformation.passes.vectorization.config import VectorizeConfig
 from dace.transformation.passes.vectorization.enums import BranchMode, ISA, RemainderStrategy
+from dace.transformation.passes.vectorization import vectorize_multi_dim
 from dace.transformation.passes.vectorization.vectorize_multi_dim import (ENTRY_CANONICALIZE_KWARGS,
                                                                           VectorizeCPUMultiDim)
 
@@ -44,16 +48,27 @@ def test_merge_mode_has_no_fp_factor_lowering():
     assert 'LowerITEToFpFactor' not in _pass_names(branch_mode=BranchMode.MERGE)
 
 
-def test_entry_canonicalization_skips_the_semantic_lifts():
-    """The vectorizer canonicalizes at its own entry, and must do so with
-    ``semantic_lifting=False``.
+def test_entry_canonicalization_uses_backend_reduction_form():
+    """The generic vectorizer keeps backend reductions but skips semantic lifts.
 
-    Two reasons, both hard requirements. A lifted ``Einsum`` / ``Copy`` / ``Memset`` library node
-    has no per-lane body for the tiler to widen. And ``LiftInv`` -- one of the lifts -- matches the
-    ``1 if i == j else 0`` identity tasklet that this pipeline's ``LowerITEToFpFactor`` rewrites
-    into arithmetic; running the lift from inside the vectorizer would put it on the wrong side of
-    that rewrite, the exact ordering the canonicalize recipe documents."""
+    A lifted ``Einsum`` / ``Copy`` / ``Memset`` library node has no per-lane body for the tiler to
+    widen. CPU OpenMP and CUDA block reductions, however, consume canonical privatized WCR maps.
+    The cuTile front door disables that stage in its own canonicalization policy."""
     assert ENTRY_CANONICALIZE_KWARGS['semantic_lifting'] is False
+    assert ENTRY_CANONICALIZE_KWARGS['reduction_to_wcr_map'] is True
+
+
+def test_entry_canonicalization_forwards_assumption_guard(monkeypatch: pytest.MonkeyPatch):
+    """cuTile's disabled C++ assumption guard reaches entry canonicalization."""
+    canonicalize = Mock(side_effect=RuntimeError("stop after canonicalize call"))
+    monkeypatch.setattr(vectorize_multi_dim, 'canonicalize', canonicalize)
+    sdfg = dace.SDFG('entry_canonicalization_options')
+    config = VectorizeConfig(widths=(8, ), target_isa=ISA.SCALAR, assumption_guard=False)
+
+    with pytest.raises(RuntimeError, match='stop after canonicalize call'):
+        VectorizeCPUMultiDim(config).apply_pass(sdfg, {})
+
+    assert canonicalize.call_args.kwargs['assumption_guard'] is False
 
 
 def test_the_semantic_lifts_do_not_run_inside_the_vectorizer():

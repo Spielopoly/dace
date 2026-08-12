@@ -189,40 +189,40 @@ class TestInvalidSDFGErrorStr:
     def test_invalid_sdfg_error_stale_state_id(self):
         err = InvalidSDFGError('boom', _tiny_sdfg(), state_id=6)
         assert 'boom' in str(err)
-        assert 'state with id 6' in str(err)
+        assert '<unresolved state id 6>' in str(err)
 
     def test_invalid_sdfg_node_error_stale_state_id(self):
         err = InvalidSDFGNodeError('boom', _tiny_sdfg(), state_id=6, node_id=3)
         s = str(err)
         assert 'boom' in s
-        assert 'state with id 6' in s
-        assert 'node with id 3' in s
+        assert '<unresolved state id 6>' in s
+        assert '<unresolved node id 3>' in s
 
     def test_invalid_sdfg_node_error_stale_node_id(self):
         err = InvalidSDFGNodeError('boom', _tiny_sdfg(), state_id=0, node_id=99)
         s = str(err)
         assert 'boom' in s
         assert 'only_state' in s
-        assert 'node with id 99' in s
+        assert '<unresolved node id 99>' in s
 
     def test_invalid_sdfg_edge_error_stale_state_id(self):
         err = InvalidSDFGEdgeError('boom', _tiny_sdfg(), state_id=6, edge_id=0)
         s = str(err)
         assert 'boom' in s
-        assert 'state with id 6' in s
-        assert 'edge with id 0' in s
+        assert '<unresolved state id 6>' in s
+        assert '<unresolved edge id 0>' in s
 
     def test_invalid_sdfg_edge_error_stale_edge_id(self):
         err = InvalidSDFGEdgeError('boom', _tiny_sdfg(), state_id=0, edge_id=42)
         s = str(err)
         assert 'boom' in s
-        assert 'edge with id 42' in s
+        assert '<unresolved edge id 42>' in s
 
     def test_invalid_interstate_edge_error_stale_edge_id(self):
         err = InvalidSDFGInterstateEdgeError('boom', _tiny_sdfg(), edge_id=7)
         s = str(err)
         assert 'boom' in s
-        assert 'edge with id 7' in s
+        assert '<unresolved interstate edge id 7>' in s
 
     def test_valid_ids_still_render_labels(self):
         err = InvalidSDFGError('boom', _tiny_sdfg(), state_id=0)

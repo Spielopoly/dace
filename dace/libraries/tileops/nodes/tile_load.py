@@ -5,7 +5,7 @@ The pure expansion emits a CPP tasklet whose body walks the K-fold
 nested index space using the source array's strides (which DaCe
 codegen passes via ``__<arr>_strides`` from the surrounding scope).
 """
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import sympy
 
@@ -15,11 +15,12 @@ from dace.codegen.cppunparse import pyexpr2cpp
 from dace.sdfg import nodes
 from dace.transformation.transformation import ExpandTransformation
 
-from .._pure_codegen import (GATHER_INDEX_DTYPES, ct_dtype_name, cutile_bid_lines, cutile_grid_dim_offset, cutile_offset_block_shift,
-                             cutile_offset_is_nonzero, cutile_tile_dim_bids, cutile_tile_dim_offsets,
-                             gather_lane_offset, nested_loops, offset_via_strides,
+from .._pure_codegen import (GATHER_INDEX_DTYPES, ct_dtype_name, cutile_bid_lines, cutile_grid_dim_offset,
+                             cutile_offset_block_shift, cutile_offset_is_nonzero, cutile_tile_dim_bids,
+                             cutile_tile_dim_offsets, gather_lane_offset, nested_loops, offset_via_strides,
                              resolve_gather_deps, tile_offset)
 from .. import _isa_codegen
+from .tile_binop import _replace_symbol_operand, _symbol_operand_free_symbols
 
 
 def _enclosing_map_params(parent_state: dace.SDFGState, node: nodes.Node) -> List[str]:
@@ -798,6 +799,18 @@ class TileLoad(nodes.LibraryNode):
         self.gather_dims = list(g)
         self.replicate_factor_per_dim = (list(replicate_factor_per_dim) if replicate_factor_per_dim else [1] *
                                          len(widths))
+
+    @property
+    def free_symbols(self) -> Set[str]:
+        """Runtime symbols used by :attr:`src_expr`."""
+        result = super().free_symbols
+        if self.src_expr is not None:
+            result |= _symbol_operand_free_symbols(self.src_expr)
+        return result
+
+    def replace_dict(self, repl: Dict[str, str]) -> None:
+        """Replace runtime symbols in :attr:`src_expr`."""
+        self.src_expr = _replace_symbol_operand(self.src_expr, repl)
 
     def validate(self, sdfg: dace.SDFG, state: dace.SDFGState) -> None:
         """Check connectors + index-tile shape contract (design section 9.4).

@@ -26,6 +26,8 @@ import numpy as np
 import pytest
 
 import dace
+from dace.libraries.tileops import TileReduce
+from dace.sdfg.nodes import AccessNode
 from dace.transformation.interstate import LoopToMap
 from dace.transformation.dataflow.wcr_conversion import AugAssignToWCR
 from dace.transformation.passes.vectorization.config import VectorizeConfig
@@ -118,14 +120,16 @@ def test_emits_omp_reduction_clause(kind):
 
 @pytest.mark.parametrize("kind", list(_PROGRAMS))
 def test_partial_folds_to_single_element(kind):
-    """The interposed reduction partial (``NormalizeWCRSource``'s ``_wcr_priv_*_acc`` on the
-    ``NSDFG -> AccessNode -[wcr]-> MapExit`` boundary) folds onto a single element -- a scalar,
-    not a widened tile buffer -- and the accumulator ``acc`` stays a true Scalar (required by
-    the OMP ``reduction`` clause)."""
+    """Every tile fold produces one scalar partial and ``acc`` stays a Scalar."""
     sdfg = _vectorized(_PROGRAMS[kind][0])
-    parts = [(k, d) for s in sdfg.all_sdfgs_recursive() for k, d in s.arrays.items()
-             if k.startswith("_wcr_priv") and k.endswith("_acc")]
-    assert parts, "expected an interposed _wcr_priv reduction partial"
+    parts = []
+    for node, state in sdfg.all_nodes_recursive():
+        if not isinstance(node, TileReduce):
+            continue
+        for edge in state.out_edges(node):
+            if isinstance(edge.dst, AccessNode):
+                parts.append((edge.dst.data, state.sdfg.arrays[edge.dst.data]))
+    assert parts, "expected a scalar partial produced by TileReduce"
     for k, d in parts:
         assert d.total_size == 1, f"{k} reduction partial must fold onto a single element, got {d.total_size}"
     accs = [d for s in sdfg.all_sdfgs_recursive() for k, d in s.arrays.items() if k == "acc"]

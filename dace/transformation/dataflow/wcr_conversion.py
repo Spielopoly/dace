@@ -993,6 +993,12 @@ class AugAssignToWCR(transformation.SingleStateTransformation):
                         nodes_to_move.add(e.src)
                         orig_edges.add(e)
 
+        # Preserve the complete induced subgraph. An access node can feed the
+        # tasklet both directly and through a transient alias; both endpoints
+        # of that alias edge are then moved even though the edge itself is not
+        # part of either tasklet memlet path.
+        orig_edges.update(e for e in state.edges() if e.src in nodes_to_move and e.dst in nodes_to_move)
+
         # Define boundary nodes
         for node in nodes_to_move:
             if isinstance(node, nodes.AccessNode):

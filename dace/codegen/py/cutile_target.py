@@ -17,6 +17,7 @@ import dace.codegen.dispatcher as dispatcher_mod
 from dace.codegen.py import control_flow as py_cflow
 from dace.codegen.py.framecode import codeblock_to_python
 from dace.codegen.py.prettycode import PythonCodeIOStream
+from dace.codegen.py.utils import rewrite_dtype_casts
 from dace.codegen.py.target import PythonTargetCodeGenerator
 from dace.sdfg import nodes
 from dace.symbolic import symstr
@@ -73,7 +74,7 @@ _CT_MATH_FUNCS: Dict[str, str] = {
 #: built from the dtype registry. VTI keeps casts rather than stripping them, so a
 #: kept ``dace.float64(x)`` / ``np.int32(x)`` reaches the kernel module-qualified;
 #: cuda.tile can't resolve ``dace``/``np``, so it is rewritten to ``ct.astype``.
-_CT_CAST_DTYPES = {s.split('::')[-1] for s in dtypes.TYPECLASS_TO_STRING.values()}
+_CT_CAST_DTYPES = {s.split('::')[-1] for s in dtypes.TYPECLASS_TO_STRING.values()} | {'bool'}
 
 
 def _ct_attr(name: str) -> ast.Attribute:
@@ -83,6 +84,37 @@ def _ct_attr(name: str) -> ast.Attribute:
     :returns: The ``ast.Attribute`` node (load context).
     """
     return ast.Attribute(value=ast.Name(id='ct', ctx=ast.Load()), attr=name, ctx=ast.Load())
+
+
+class _CuTileControlFlowArrayLoads(ast.NodeTransformer):
+    """Rewrite scalar array subscripts in kernel control-flow expressions."""
+
+    def __init__(self, arrays: Dict[str, data.Data]):
+        self._arrays = arrays
+
+    def visit_Subscript(self, node: ast.Subscript) -> ast.expr:
+        node = self.generic_visit(node)
+        if not isinstance(node.value, ast.Name) or node.value.id not in self._arrays:
+            return node
+        indices = list(node.slice.elts) if isinstance(node.slice, ast.Tuple) else [node.slice]
+        load = ast.Call(
+            func=_ct_attr('load'),
+            args=[node.value, ast.Tuple(elts=indices, ctx=ast.Load())],
+            keywords=[ast.keyword(arg='shape', value=ast.Tuple(elts=[], ctx=ast.Load()))],
+        )
+        desc = self._arrays[node.value.id]
+        if desc.dtype.as_numpy_dtype().kind == 'u':
+            load = ast.Call(func=_ct_attr('astype'), args=[load, _ct_attr('int64')], keywords=[])
+        return ast.copy_location(
+            ast.Call(func=ast.Attribute(value=load, attr='item', ctx=ast.Load()), args=[], keywords=[]), node)
+
+
+def _rewrite_cutile_control_flow_expr(expr: str, arrays: Dict[str, data.Data]) -> str:
+    """Render kernel control-flow reads and casts in the ``cuda.tile`` dialect."""
+    tree = ast.parse(expr, mode='exec')
+    tree = _CuTileControlFlowArrayLoads(arrays).visit(tree)
+    tree = _CuTileTaskletRewriter({}).visit(tree)
+    return ast.unparse(ast.fix_missing_locations(tree))
 
 
 def _literal_value(arm: ast.expr) -> Optional[object]:
@@ -179,12 +211,13 @@ class _CuTileTaskletRewriter(ast.NodeTransformer):
         """
         from dace.codegen.py.sympy_function_redefinitions import _NUMPY_EQUIVALENTS
         self.generic_visit(node)
-        if (isinstance(node.func, ast.Attribute) and node.func.attr in _CT_CAST_DTYPES
-                and isinstance(node.func.value, ast.Name) and node.func.value.id in ('dace', 'numpy', 'np')
-                and len(node.args) == 1):
-            # A kept dtype cast reaches the kernel module-qualified (``dace.float64(x)``);
-            # cuda.tile can't resolve ``dace``/``np``, so rewrite to ``ct.astype(x, ct.<dtype>)``.
-            dt = node.func.attr
+        qualified_cast = (isinstance(node.func, ast.Attribute) and node.func.attr in _CT_CAST_DTYPES
+                          and isinstance(node.func.value, ast.Name) and node.func.value.id in ('dace', 'numpy', 'np'))
+        bare_cast = isinstance(node.func, ast.Name) and node.func.id in _CT_CAST_DTYPES
+        if (qualified_cast or bare_cast) and len(node.args) == 1:
+            # Serialized tasklets can contain either ``dace.float64(x)`` or
+            # bare ``float64(x)``. Neither name is available inside a kernel.
+            dt = node.func.attr if qualified_cast else node.func.id
             return ast.Call(func=_ct_attr('astype'),
                             args=[node.args[0], _ct_attr('bool_' if dt == 'bool' else dt)],
                             keywords=node.keywords)
@@ -1447,26 +1480,29 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
         :param state_id: The state ID.
         :param callsite_stream: Stream for call-site (kernel body) code.
         """
-        in_edges = list(state.in_edges(node))
-        map_entry_edges = [e for e in in_edges if isinstance(e.src, nodes.MapEntry)]
-        if in_edges and not map_entry_edges:
-            # A code-node producer (tasklet / nested SDFG) binds the name in its
-            # own emission; anything else leaves the bridge undefined in the
-            # kernel body -- surface it instead of silently emitting nothing.
-            if not any(isinstance(e.src, nodes.CodeNode) for e in in_edges):
-                srcs = sorted({type(e.src).__name__ for e in in_edges})
-                warnings.warn(f"cuTile codegen: scalar bridge {node.data!r} is fed by {srcs} instead of a "
-                              f"MapEntry; no binding emitted (the kernel may reference an undefined name).")
-            return
         kernel_entry = _enclosing_cutile_entry(state, node)
-        kernel_outputs = (self._kernel_output_names(state, kernel_entry) if kernel_entry is not None else set())
-        for in_edge in map_entry_edges:
-            outer_edge = self._trace_load_source_edge(state, in_edge.src, in_edge)
-            if outer_edge is None:
-                warnings.warn(f"cuTile codegen: could not trace the source of scalar bridge {node.data!r} "
-                              f"through MapEntry {in_edge.src.map.label!r}; no binding emitted.")
+        for in_edge in state.in_edges(node):
+            if isinstance(in_edge.src, nodes.MapEntry):
+                source_edge = self._trace_load_source_edge(state, in_edge.src, in_edge)
+                if source_edge is None:
+                    warnings.warn(f"cuTile codegen: could not trace the source of scalar bridge {node.data!r} "
+                                  f"through MapEntry {in_edge.src.map.label!r}; no binding emitted.")
+                    continue
+                src_name = source_edge.data.data if source_edge.data else source_edge.src.data
+                subset = in_edge.data.subset if in_edge.data is not None and in_edge.data.data == src_name else None
+                if subset is None and source_edge.data is not None:
+                    subset = source_edge.data.subset
+            elif isinstance(in_edge.src, nodes.AccessNode):
+                src_name = in_edge.src.data
+                subset = in_edge.data.get_src_subset(in_edge, state) if in_edge.data is not None else None
+            elif isinstance(in_edge.src, nodes.CodeNode):
+                # Code-node producers bind the connector name in their own emission.
                 continue
-            src_name = outer_edge.data.data if outer_edge.data else outer_edge.src.data
+            else:
+                warnings.warn(f"cuTile codegen: scalar bridge {node.data!r} is fed by "
+                              f"{type(in_edge.src).__name__}; no binding emitted.")
+                continue
+
             src_desc = sdfg.arrays.get(src_name)
             # Mirror the launch-site convention (``_launch_arg_expr``): only
             # *input-only* numeric Scalars in DEVICE memory (kernel params, or
@@ -1489,15 +1525,6 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
                 # bridge is a rename.
                 source_expr = src_name
             else:
-                # Array source: scalar tile load of the staged element. The
-                # inner memlet subset carries the per-element index in map
-                # parameters bound inside the kernel; the outer subset is
-                # propagated over the map range and unusable in-kernel.
-                subset = None
-                if in_edge.data is not None and in_edge.data.data == src_name:
-                    subset = in_edge.data.subset
-                elif outer_edge.data is not None:
-                    subset = outer_edge.data.subset
                 if subset is None:
                     warnings.warn(f"cuTile codegen: scalar bridge {node.data!r} stages array "
                                   f"{src_name!r} without a usable subset; no binding emitted.")
@@ -1941,7 +1968,7 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
         ]
         for sym_name in symbol_names:
             mapping_expr = node.symbol_mapping.get(sym_name)
-            call_args.append(symstr(mapping_expr) if mapping_expr is not None else sym_name)
+            call_args.append(rewrite_dtype_casts(symstr(mapping_expr)) if mapping_expr is not None else sym_name)
         args_str = ", ".join(call_args)
 
         if returned_outputs:
@@ -1979,7 +2006,18 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
                                                skip_entry_node=False)
             return tmp.getvalue()
 
-        py_cflow.control_flow_region_to_code(inner_sdfg, dispatch_state, self._frame, inner_sdfg.symbols, body_stream)
+        rewriter_attr = '_python_control_flow_expr_rewriter'
+        had_rewriter = hasattr(inner_sdfg, rewriter_attr)
+        previous_rewriter = getattr(inner_sdfg, rewriter_attr, None)
+        setattr(inner_sdfg, rewriter_attr, lambda expr: _rewrite_cutile_control_flow_expr(expr, inner_sdfg.arrays))
+        try:
+            py_cflow.control_flow_region_to_code(inner_sdfg, dispatch_state, self._frame, inner_sdfg.symbols,
+                                                 body_stream)
+        finally:
+            if had_rewriter:
+                setattr(inner_sdfg, rewriter_attr, previous_rewriter)
+            else:
+                delattr(inner_sdfg, rewriter_attr)
 
         if returned_outputs:
             body_stream.write(f"return {', '.join(returned_outputs)}")
@@ -1999,14 +2037,15 @@ class CuTilePythonCodeGen(PythonTargetCodeGenerator):
     def _nsdfg_runtime_symbols(node: nodes.NestedSDFG) -> List[str]:
         """Return sorted list of symbol names that must be passed at runtime.
 
-        Symbols that are free in the inner SDFG and not constants are
-        included.
+        Symbols that are genuinely free in the inner SDFG and not constants
+        are included. The symbol mapping must not itself make a locally
+        assigned interstate symbol look external.
 
         :param node: The NestedSDFG node.
         :returns: Sorted list of symbol names.
         """
         inner_sdfg = node.sdfg
-        free_symbols = set(str(s) for s in inner_sdfg.used_symbols(all_symbols=False, keep_defined_in_mapping=True))
+        free_symbols = set(str(s) for s in inner_sdfg.used_symbols(all_symbols=False))
         return [
             sym_name for sym_name in sorted(node.symbol_mapping.keys())
             if sym_name in free_symbols and sym_name not in inner_sdfg.constants

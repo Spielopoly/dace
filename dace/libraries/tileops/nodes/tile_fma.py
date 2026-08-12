@@ -18,7 +18,7 @@ opts into FMA's single-rounded result over a separate ``*`` then ``+``.
 The pure expansion returns a CPP tasklet whose body is a single ``for``-loop over
 the flattened tile (correctness-only).
 """
-from typing import Optional, Tuple
+from typing import Dict, Optional, Set, Tuple
 
 import dace
 from dace import library, properties
@@ -29,7 +29,7 @@ from dace.transformation.transformation import ExpandTransformation
 from .._pure_codegen import nested_loops, tile_offset
 from .. import _isa_codegen
 from .tile_binop import (_TILE, _SYMBOL, _SCALAR, _VALID_KINDS, _is_tile_shape, _is_scalar_shape, scalar_operand_ref,
-                         _promotion_ok)
+                         _promotion_ok, _replace_symbol_operand, _symbol_operand_free_symbols)
 
 
 @library.expansion
@@ -319,6 +319,19 @@ class TileFMA(nodes.LibraryNode):
         self.expr_a = expr_a
         self.expr_b = expr_b
         self.expr_c = expr_c
+
+    @property
+    def free_symbols(self) -> Set[str]:
+        result: Set[str] = set()
+        for expr in (self.expr_a, self.expr_b, self.expr_c):
+            if expr:
+                result |= _symbol_operand_free_symbols(expr)
+        return result
+
+    def replace_dict(self, repl: Dict[str, str]) -> None:
+        self.expr_a = _replace_symbol_operand(self.expr_a, repl)
+        self.expr_b = _replace_symbol_operand(self.expr_b, repl)
+        self.expr_c = _replace_symbol_operand(self.expr_c, repl)
 
     def validate(self, sdfg: dace.SDFG, state: dace.SDFGState) -> None:
         """Validate connector counts + output-kind rule at expansion time.

@@ -18,7 +18,7 @@ Each pass calls checkers directly from ``apply_pass``:
                          "WidenAccesses", "memlet dim consistent")
         return result
 """
-from typing import Optional, Tuple
+from typing import Iterable, Optional, Tuple
 
 import dace
 from dace.dtypes import ReductionType
@@ -457,6 +457,19 @@ def no_wcr_inside_nested_sdfgs(scope) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 
+def lane_dep_transients_widened(inner_sdfg: SDFG, names: Iterable[str], widths: Tuple[int, ...]) -> Optional[str]:
+    """Check only transients classified as lane-dependent by ``WidenAccesses``."""
+    for name in sorted(names):
+        desc = inner_sdfg.arrays.get(name)
+        if desc is None:
+            return f"{inner_sdfg.name}: lane-dependent transient ``{name}`` has no descriptor"
+        shape = tuple(desc.shape)
+        if shape != tuple(widths):
+            return (f"{inner_sdfg.name}: lane-dependent transient ``{name}`` has shape {shape} "
+                    f"!= widths {tuple(widths)} (expected widened tile)")
+    return None
+
+
 def no_widened_scalar_tasklets(sdfg: SDFG, K: int, widths: Tuple[int, ...]) -> Optional[str]:
     """No plain Python :class:`~dace.sdfg.nodes.Tasklet` inside a tile-tagged body may still read or
     write a TILE.
@@ -527,38 +540,6 @@ def no_lane_collapsing_nested_sdfgs(sdfg: SDFG, K: int, widths: Tuple[int, ...])
                         return (f"{inner_sdfg.name}.{state.label}: nested SDFG ``{node.label}`` reads/writes "
                                 f"tile ``{edge.data.data}`` {tuple(widths)} through single-element connector "
                                 f"``{conn}`` -- it would run once at the tile base (lane 0 for all lanes)")
-    return None
-
-
-def lane_dep_transients_widened(sdfg: SDFG, K: int, widths: Tuple[int, ...]) -> Optional[str]:
-    """Every lane-dependent transient in a tile-tagged body NSDFG is at tile shape ``widths`` OR an
-    exempt bridge name (gather idx tile / ITE materialised tile / cond broadcast tile / Scalar
-    bridge). Per user example 2026-06-12: all non-scalar non-gather dims widened.
-    """
-    import dace.data as _dd
-    for _state, nsdfg_node, _map_entry in _tile_tagged_bodies(sdfg, K):
-        inner_sdfg = nsdfg_node.sdfg
-        for name, desc in inner_sdfg.arrays.items():
-            if not desc.transient:
-                continue
-            if name.startswith("_idx_") or name.startswith("_ite_sym_tile") or name.startswith("_cond_bcast"):
-                continue
-            if isinstance(desc, _dd.Scalar):
-                continue
-            if isinstance(desc, _dd.View):
-                continue  # alias of the viewed array: widened in place, never descriptor-swapped
-            if not isinstance(desc, _dd.Array):
-                continue
-            shape = tuple(desc.shape)
-            if shape == tuple(widths):
-                continue
-            try:
-                if all(bool(dace.symbolic.simplify(s - 1) == 0) for s in shape):
-                    continue
-            except Exception:  # noqa: BLE001
-                pass
-            return (f"{inner_sdfg.name}: lane-dep transient ``{name}`` has shape {shape} "
-                    f"!= widths {tuple(widths)} (expected widened or Scalar bridge)")
     return None
 
 
