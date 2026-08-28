@@ -7,8 +7,9 @@ import dace.sdfg.nodes
 from dace.transformation.transformation import ExpandTransformation
 from dace.libraries.blas import blas_helpers
 from .. import environments
-from dace import dtypes, memlet as mm, SDFG, SDFGState
+from dace import dtypes, memlet as mm, symbolic, SDFG, SDFGState
 from dace.frontend.common import op_repository as oprepo
+from ordered_set import OrderedSet
 
 
 @dace.library.expansion
@@ -140,11 +141,11 @@ class ExpandDotCuBLAS(ExpandTransformation):
 
         code = environments.cublas.cuBLAS.handle_setup_code(node)
         if node.accumulator_type is None:
-            code += f"""cublas{func}(__dace_cublas_handle, {n}, _x, {stride_x}, _y,
-                             {stride_y}, _result);"""
+            code += f"""dace::blas::CheckCublasError(cublas{func}(__dace_cublas_handle, {n}, _x, {stride_x}, _y,
+                             {stride_y}, _result));"""
         else:
             code += f"""
-            cublasDotEx(
+            dace::blas::CheckCublasError(cublasDotEx(
                 __dace_cublas_handle,
                 {n},
                 _x,
@@ -155,7 +156,7 @@ class ExpandDotCuBLAS(ExpandTransformation):
                 {stride_y},
                 _result,
                 {blas_helpers.dtype_to_cudadatatype(desc_res.dtype)},
-                {blas_helpers.dtype_to_cudadatatype(node.accumulator_type)});
+                {blas_helpers.dtype_to_cudadatatype(node.accumulator_type)}));
             """
 
         tasklet = dace.sdfg.nodes.Tasklet(node.name,
@@ -265,7 +266,7 @@ class Dot(dace.sdfg.nodes.LibraryNode):
                                          "DOT_PRODUCT); no-op for real operands")
 
     def __init__(self, name, n=None, accumulator_type=None, conjugate=False, **kwargs):
-        super().__init__(name, inputs={"_x", "_y"}, outputs={"_result"}, **kwargs)
+        super().__init__(name, inputs=OrderedSet(('_x', '_y')), outputs={"_result"}, **kwargs)
         self.n = n
         self.accumulator_type = accumulator_type
         self.conjugate = conjugate
@@ -316,7 +317,7 @@ class Dot(dace.sdfg.nodes.LibraryNode):
         stride_x = desc_x.strides[sqdims1[0]]
         stride_y = desc_y.strides[sqdims2[0]]
         n = squeezed1.num_elements()
-        if squeezed1.num_elements() != squeezed2.num_elements():
+        if symbolic.inequal_symbols(squeezed1.num_elements(), squeezed2.num_elements()):
             raise ValueError('Size mismatch in inputs')
 
         return (desc_x, stride_x), (desc_y, stride_y), desc_res, n

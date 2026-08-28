@@ -9,7 +9,7 @@ import functools
 import itertools
 import warnings
 from collections import deque
-from typing import TYPE_CHECKING, List, Set
+from typing import TYPE_CHECKING, List, Optional, Set
 
 import sympy
 from sympy import Symbol, ceiling
@@ -257,8 +257,12 @@ class AffineSMemlet(SeparableMemletPattern):
         if (self.multiplier < 0) == True:
             result_begin, result_end = result_end, result_begin
 
-        # Special case: i:i+stride for a begin:end:stride range
-        if (node_rb == result_begin and (re - rb + 1) == node_rs and rs == 1 and rt == 1):
+        # Special case: i:i+stride for a begin:end:stride range. The multiplier must be one:
+        # for a single-element access ``(re - rb + 1)`` is 1, so with a unit map stride the length
+        # test below is trivially true, and ``a*i`` starting at a zero map begin also passes the
+        # ``result_begin`` test. Returning the map range verbatim then drops the multiplier, which
+        # UNDER-approximates the write set (``C[2*i]`` over ``i=0:N`` became ``C[0:N]``).
+        if (self.multiplier == 1 and node_rb == result_begin and (re - rb + 1) == node_rs and rs == 1 and rt == 1):
             return (node_rb, node_re, 1, 1)
 
         # Experimental
@@ -486,19 +490,9 @@ class GenericSMemlet(SeparableMemletPattern):
             # Support for affine expressions with a negative multiplier
             firstindex = pos_firstindex
             lastindex = pos_lastindex
-            a = sympy.Wild('a', exclude=self.params)
-            b = sympy.Wild('b', exclude=self.params)
-            if result_begin is None:
-                matches = rb.match(a * self.params[idx] + b)
-            else:
-                matches = result_begin.match(a * self.params[idx] + b)
-            if matches and (matches[a] < 0) == True:
+            if self._negative_affine_transform(rb if result_begin is None else result_begin, idx):
                 firstindex = neg_firstindex
-            if result_end is None:
-                matches = re.match(a * self.params[idx] + b)
-            else:
-                matches = result_end.match(a * self.params[idx] + b)
-            if matches and (matches[a] < 0) == True:
+            if self._negative_affine_transform(re if result_end is None else result_end, idx):
                 lastindex = neg_lastindex
 
             if result_begin is None:
@@ -514,6 +508,26 @@ class GenericSMemlet(SeparableMemletPattern):
         result_tile = 1
 
         return (result_begin, result_end, result_skip, result_tile)
+
+    def _negative_affine_transform(self, expr: sympy.Basic, idx: int) -> bool:
+        """Returns true iff the expression matches an affine transformation with a negative multiplier."""
+        if not _maybe_affine_transform(expr):
+            return False
+
+        a = sympy.Wild('a', exclude=self.params)
+        b = sympy.Wild('b', exclude=self.params)
+        match = expr.match(a * self.params[idx] + b)
+
+        return match is not None and match[a] < 0 == True
+
+
+def _maybe_affine_transform(expr: sympy.Basic) -> bool:
+    """Quickly judge whether the given expression might be an affine tranformation.
+
+    Used as a guard before actually trying to sympy.match() affine transformation
+    coefficients. Matching is kind of slow compared to checking a couple
+    properties."""
+    return expr.is_Add and expr.args[0].is_Mul
 
 
 def _subexpr(dexpr, repldict):
@@ -1008,7 +1022,12 @@ def _collect_state_border_memlet_candidates(state: 'SDFGState', border_memlets) 
                 continue
 
             edges = state.out_edges(node) if direction == 'in' else state.in_edges(node)
-            border_memlets[direction][node.label].extend(edge.data for edge in edges)
+            # An EMPTY memlet is an ordering edge: it sequences a WAR/WAW hazard and moves no
+            # data, so it contributes nothing to what the connector transfers. Collecting it
+            # anyway folds a subset-less memlet into the union, which falls back to the whole
+            # array -- a per-iteration border write ``a[i]`` came out as ``a[0:Max(i, N-1)+1]``
+            # with volume 2, and the vectorizer then read the ordering edge as dataflow.
+            border_memlets[direction][node.label].extend(edge.data for edge in edges if not edge.data.is_empty())
 
 
 def _append_border_memlet_candidates(border_memlets, propagated_memlets) -> None:
@@ -1503,26 +1522,45 @@ def propagate_memlets_map_scope(sdfg: 'SDFG', state: 'SDFGState', map_entry: nod
 
 def _propagate_node(dfg_state, node):
     if isinstance(node, nodes.EntryNode):
+        entry_node = node
         internal_edges = [e for e in dfg_state.out_edges(node) if e.src_conn and e.src_conn.startswith('OUT_')]
         external_edges = [e for e in dfg_state.in_edges(node) if e.dst_conn and e.dst_conn.startswith('IN_')]
         geticonn = lambda e: e.src_conn[4:]
         geteconn = lambda e: e.dst_conn[3:]
         use_dst = False
     else:
+        entry_node = dfg_state.entry_node(node)
         internal_edges = [e for e in dfg_state.in_edges(node) if e.dst_conn and e.dst_conn.startswith('IN_')]
         external_edges = [e for e in dfg_state.out_edges(node) if e.src_conn and e.src_conn.startswith('OUT_')]
         geticonn = lambda e: e.dst_conn[3:]
         geteconn = lambda e: e.src_conn[4:]
         use_dst = True
 
+    # One table for every edge through this node -- it is one scope, and empty memlets need none.
+    defined_variables = None
+
     for edge in external_edges:
         if edge.data.is_empty():
-            new_memlet = Memlet()
-        else:
-            internal_edge = next(e for e in internal_edges if geticonn(e) == geteconn(edge))
-            aligned_memlet = align_memlet(dfg_state, internal_edge, dst=use_dst)
-            new_memlet = propagate_memlet(dfg_state, aligned_memlet, node, True, connector=geteconn(edge))
-        edge.data = new_memlet
+            edge.data = Memlet()
+            continue
+        if defined_variables is None:
+            defined_variables = dfg_state.symbols_defined_at(entry_node).keys() | dfg_state.parent.constants.keys()
+        connector = geteconn(edge)
+        # An empty internal edge is an ORDERING edge, and ``propagate_memlet`` answers Memlet()
+        # for one. Taking it as the seed collapses the external DATA edge to a connector with no
+        # array behind it, which later reads as a Code->Code connector of unknowable type. Seed
+        # from a real data edge instead; when every internal edge on this connector only orders,
+        # there is nothing to derive and the external memlet stands as it is.
+        internal_edge = next((e for e in internal_edges if geticonn(e) == connector and not e.data.is_empty()), None)
+        if internal_edge is None:
+            continue
+        aligned_memlet = align_memlet(dfg_state, internal_edge, dst=use_dst)
+        edge.data = propagate_memlet(dfg_state,
+                                     aligned_memlet,
+                                     node,
+                                     True,
+                                     connector=connector,
+                                     defined_variables=defined_variables)
 
 
 def align_memlet(state, e: gr.MultiConnectorEdge[Memlet], dst: bool) -> Memlet:
@@ -1559,7 +1597,8 @@ def propagate_memlet(dfg_state,
                      scope_node: nodes.EntryNode,
                      union_inner_edges: bool,
                      arr=None,
-                     connector=None):
+                     connector=None,
+                     defined_variables: Optional[Set[str]] = None):
     """ Tries to propagate a memlet through a scope (computes the image of
         the memlet function applied on an integer set of, e.g., a map range)
         and returns a new memlet object.
@@ -1570,6 +1609,9 @@ def propagate_memlet(dfg_state,
         :param union_inner_edges: True if the propagation should take other
                                   neighboring internal memlets within the same
                                   scope into account.
+        :param defined_variables: The symbols defined at ``scope_node`` plus the SDFG's constants,
+                                  when the caller already has them. Deriving them here walks every
+                                  descriptor in the SDFG, once per memlet.
     """
     if memlet.is_empty():
         return Memlet()
@@ -1592,7 +1634,9 @@ def propagate_memlet(dfg_state,
 
     sdfg = dfg_state.parent
     scope_node_symbols = set(conn for conn in entry_node.in_connectors if not conn.startswith('IN_'))
-    defined_vars = (dfg_state.symbols_defined_at(entry_node).keys() | sdfg.constants.keys()) - scope_node_symbols
+    if defined_variables is None:
+        defined_variables = dfg_state.symbols_defined_at(entry_node).keys() | sdfg.constants.keys()
+    defined_vars = set(defined_variables) - scope_node_symbols
 
     # Find other adjacent edges within the connected to the scope node
     # and union their subsets

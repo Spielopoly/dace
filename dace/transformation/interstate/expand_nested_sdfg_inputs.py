@@ -63,6 +63,12 @@ def _rewrite_scalar_reads_in_tasklets(inner_sdfg: SDFG, inner_name: str, outer_n
     distinct ``inner_name``; the memlet already names the widened ``outer_name`` descriptor."""
     for state in inner_sdfg.states():
         for tnode in [n for n in state.nodes() if isinstance(n, nodes.Tasklet)]:
+            if tnode.language != dtypes.Language.Python:
+                # The code below is parsed as PYTHON. A C++ tasklet is not, and the scatter guard's
+                # trap (``if (sym > 0) { std::abort(); }``) raises SyntaxError here rather than
+                # being skipped. Nothing to rewrite either way: a non-Python tasklet reads its
+                # symbols directly, not through this connector-folding path.
+                continue
             if inner_name in tnode.in_connectors:
                 continue  # already a dataflow read, not a symbolic one
             loads = {
@@ -258,6 +264,13 @@ def _replace_desc_and_uncollapse_dims(nsdfg_node: nodes.NestedSDFG,
     inner_sdfg: SDFG = nsdfg_node.sdfg
     inner_sdfg.remove_data(inner_name, validate=False)
     copy_desc = copy.deepcopy(desc)
+    # A View is a view only next to the data it views: the ``views`` edge stays in the outer state,
+    # which resolves it before the memlet reaches this connector. Carrying the View class inward
+    # leaves an access node with nothing to view, which validation rejects as an ambiguous edge.
+    if isinstance(copy_desc, data.StructureView):
+        copy_desc = copy_desc.as_structure()
+    elif isinstance(copy_desc, data.View):
+        copy_desc = copy_desc.as_array()
     copy_desc.transient = False
     if outer_name not in inner_sdfg.arrays:
         inner_sdfg.add_datadesc(outer_name, copy_desc)
@@ -400,6 +413,11 @@ def _replace_desc_and_uncollapse_dims(nsdfg_node: nodes.NestedSDFG,
             return symbolic.Subscript(*args)
 
         def _rw_index_expr(expr):
+            # A strip-mined bound is a SymExpr, whose ``str`` prints "main (approx)" -- text that
+            # sympy then reads as a call and rejects with "'One' object is not callable". Rewrite
+            # the two halves and keep the pair.
+            if isinstance(expr, symbolic.SymExpr):
+                return symbolic.SymExpr(_rw_index_expr(expr.expr), _rw_index_expr(expr.approx))
             symexpr = symbolic.pystr_to_symbolic(str(expr))
             if inner_name not in symbolic.arrays(symexpr) and \
                     inner_name not in {str(s) for s in symexpr.free_symbols}:
@@ -644,7 +662,9 @@ class ExpandNestedSDFGInputs(transformation.SingleStateTransformation):
                 return set()
             names: Set[str] = set()
             for ex in exprs:
-                names |= symbolic.arrays(symbolic.pystr_to_symbolic(str(ex)))
+                # Same SymExpr trap as ``_rw_index_expr``: read the two halves, not the printed pair.
+                for part in ((ex.expr, ex.approx) if isinstance(ex, symbolic.SymExpr) else (ex, )):
+                    names |= symbolic.arrays(symbolic.pystr_to_symbolic(str(part)))
             return names
 
         referenced: Set[str] = set()
@@ -700,10 +720,18 @@ class ExpandNestedSDFGInputs(transformation.SingleStateTransformation):
         # Per user direction 2026-06-10: all symbols in any array's shape/strides/offsets must be
         # added to the inner NSDFG (if absent) AND bound in symbol_mapping (identity default). Use
         # ``Data.free_symbols`` (aggregates shape+strides+offset) not per-field walking.
+        #
+        # A symbol the inner SDFG DEFINES itself is excluded: a scope-lifetime transient may be
+        # sized by an inner loop iterator (a triangular reduction buffer ``_red_buf[M - it - 1]``
+        # inside the ``it`` loop). Such a name has no binding in the caller's scope, so putting it
+        # in ``symbol_mapping`` makes codegen pass an undeclared variable at the call site.
+        inner_defined = set(inner_sdfg.symbols.keys()) - {str(s) for s in inner_sdfg.free_symbols}
         for inner_arr_name, inner_desc in inner_sdfg.arrays.items():
             for sym in inner_desc.free_symbols:
                 sym_name = str(sym)
                 if sym_name in nsdfg_node.in_connectors or sym_name in nsdfg_node.out_connectors:
+                    continue
+                if sym_name in inner_sdfg.constants_prop or sym_name in inner_defined:
                     continue
                 if sym_name not in nsdfg_node.symbol_mapping:
                     introduced_symbols.add(sym_name)

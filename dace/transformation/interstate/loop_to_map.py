@@ -4,7 +4,7 @@
 from collections import defaultdict
 import copy
 import sympy as sp
-from typing import Dict, List, Set
+from typing import Dict, List, Optional, Set
 import warnings
 
 from dace import data as dt, dtypes, memlet, nodes, sdfg as sd, symbolic, subsets, properties
@@ -16,7 +16,8 @@ from dace.sdfg.analysis import cfg as cfg_analysis
 from dace.sdfg.state import BreakBlock, ContinueBlock, ControlFlowRegion, LoopRegion, ReturnBlock, ConditionalBlock
 import dace.transformation.helpers as helpers
 from dace.transformation import transformation as xf
-from dace.transformation.passes.analysis import loop_analysis
+from dace.transformation.passes.analysis import loop_analysis, smt_dependence
+from ordered_set import OrderedSet
 
 
 def _align_itersym(expr, itersym):
@@ -28,22 +29,20 @@ def _align_itersym(expr, itersym):
 
 def _check_range(subset, a, itersym, b, step):
     found = False
-    for rb, re, _ in subset.ndrange():
+    for rb, _, _ in subset.ndrange():
         # ``ndrange()`` yields plain ints as well as sympy expressions, and an int has no ``match``
         # -- a fixed-slot write such as a scalar's ``[0]`` would raise instead of failing the test.
-        rb, re = _align_itersym(sp.sympify(rb), itersym), _align_itersym(sp.sympify(re), itersym)
-        if rb != 0:
-            m = rb.match(a * itersym + b)
-            if m is None:
-                continue
-            if (abs(m[a]) >= 1) != True:
-                continue
-        else:
-            m = re.match(a * itersym + b)
-            if m is None:
-                continue
-            if (abs(m[a]) >= 1) != True:
-                continue
+        rb = _align_itersym(sp.sympify(rb), itersym)
+        # The LOWER bound is what identifies the element this iteration starts at. Matching the
+        # upper bound instead whenever the lower one happened to fold to ``0`` accepted a range
+        # that GROWS with the iteration -- ``a[0:i+1]`` reads as "uniquely indexed by ``i``" while
+        # every iteration rewrites element 0. tsvc_2_5 ``wf_diff_skew`` is the wavefront it
+        # parallelized; the branch only ever fired on a 0-based range, which is never injective.
+        m = rb.match(a * itersym + b)
+        if m is None:
+            continue
+        if (abs(m[a]) >= 1) != True:
+            continue
         found = True
         break
     return found
@@ -76,6 +75,11 @@ def _nested_writes_iter_indexed(nsdfg_node, conn, itersym, a, b, step) -> bool:
             if dn.data != conn or state.in_degree(dn) == 0:
                 continue
             for e in state.in_edges(dn):
+                # An EMPTY memlet is a happens-before edge, not a write: it moves no data and has
+                # no subset, so reading it as a write would refuse a perfectly parallel body (the
+                # same skip the outer per-array write walk applies).
+                if e.data is not None and e.data.is_empty():
+                    continue
                 if e.data is None or e.data.wcr is not None:
                     return False
                 if isinstance(e.src, nodes.NestedSDFG):
@@ -112,7 +116,8 @@ def _nested_reads_match_writes(nsdfg_node, conn, itersym, a, b, step) -> bool:
             if dn.data != conn or state.out_degree(dn) == 0:
                 continue
             for e in state.out_edges(dn):
-                if e.data is None:
+                # Empty memlets are ordering edges, not reads; see _nested_writes_iter_indexed.
+                if e.data is None or e.data.is_empty():
                     continue
                 if isinstance(e.dst, nodes.NestedSDFG):
                     # The read enters another nested SDFG; descend.
@@ -170,8 +175,17 @@ def _affine_coeffs(expr, itersym):
         when it is higher, which is the degree test), and evaluating at zero IS ``b``. Both are
         structural, and neither expands the expression. Non-polynomial in ``itersym`` (an
         ``int_floor`` of it, say) is not affine and is refused, as before.
+
+        SOUNDNESS: the expression is re-pointed at ``itersym`` first. A DaCe symbol folds its
+        dtype into its identity, so a subset built by the frontend can carry ``j:int64`` while
+        ``itersym`` is the reparsed ``j:int32``. ``diff`` then sees no occurrence of ``itersym``
+        and reports ``a == 0`` -- the index reads as a loop-INVARIANT constant. Two such
+        "constants" ``j+1`` and ``j`` differ by a nonzero number, so
+        :func:`_dim_provably_disjoint` declares a genuine loop-carried recurrence provably
+        disjoint and LoopToMap parallelizes it (adi/deriche's ``u[1:N-1, j] = ... u[1:N-1, j+1]``
+        silently miscompiled). Aligning first makes the derivative see the real coefficient.
     """
-    e = symbolic.pystr_to_symbolic(expr)
+    e = _align_itersym(symbolic.pystr_to_symbolic(expr), itersym)
     if not e.is_polynomial(itersym):
         return None
     a = sp.diff(e, itersym)
@@ -264,6 +278,120 @@ def _dim_provably_disjoint(idx1, idx2, itersym, step=1, start=0) -> bool:
     if not diff.is_Integer:
         return True
     return sp.Integer(diff) % g != 0
+
+
+def _smt_proves_injective_write(dst_subset, itersym, start, end, step) -> bool:
+    """Ask the SMT oracle whether a non-affine write touches a distinct location on
+    every iteration.
+
+    A point subset must be injective in the iteration variable; a range subset must have
+    intervals that never intersect across iterations. Conservative: returns ``False`` whenever z3
+    is unavailable, the subset is multi-dimensional, or the solver returns ``unknown``.
+    """
+    if not smt_dependence.has_z3():
+        return False
+    nd = list(dst_subset.ndrange())
+    if len(nd) != 1:
+        return False  # nothing to write, or a multi-dimensional non-affine write: out of scope
+    itervar = str(itersym)
+    rb, re_, _ = nd[0]
+    try:
+        args = (itervar, symbolic.pystr_to_symbolic(str(start)), symbolic.pystr_to_symbolic(str(end)))
+        kwargs = dict(step=symbolic.pystr_to_symbolic(str(step)))
+        if rb == re_:
+            r = smt_dependence.prove_injective_write(symbolic.pystr_to_symbolic(str(rb)), *args, **kwargs)
+        else:
+            # A RANGE write: the iteration owns the whole interval, so the property that makes the
+            # loop parallel is that two iterations' intervals never intersect. Chunked rewrites land
+            # here -- anti-dependence chunking writes ``[i, Min(N - 2, i + 4095)]`` at ``step = 4096``,
+            # disjoint by construction but not of the ``a*i+b`` form the affine matcher accepts. An
+            # inner stride only thins the interval, so proving the intervals disjoint proves the
+            # written sets disjoint whatever that stride is.
+            r = smt_dependence.prove_disjoint_write_ranges(symbolic.pystr_to_symbolic(str(rb)),
+                                                           symbolic.pystr_to_symbolic(str(re_)), *args, **kwargs)
+    except Exception:
+        return False
+    return r is True
+
+
+def _smt_proves_disjoint_boxes(sub1: subsets.Subset, sub2: subsets.Subset, itersym, start, end, step,
+                               varying: Set[str]) -> bool:
+    """Ask the SMT oracle whether two multi-dimensional RANGE accesses can collide across iterations.
+
+    The range counterpart of :func:`_collision_forces_same_iteration`, which only accepts point
+    subsets: a mirrored triangular access such as covariance's ``cov[i, i:M]`` against
+    ``cov[i:M, i]`` has no point dimension at all, so the affine certificate never gets to run.
+
+    ``varying`` carries the same soundness screen the affine certificate applies: the oracle shares
+    one constant per non-iteration symbol between the two boxes, which only describes the loop while
+    that symbol is fixed for the loop's whole execution. Conservative: returns ``False`` whenever z3
+    is unavailable, a body-varying symbol appears, the ranks differ, or the solver returns
+    ``unknown``.
+    """
+    if not smt_dependence.has_z3():
+        return False
+    nd1 = list(sub1.ndrange())
+    nd2 = list(sub2.ndrange())
+    if len(nd1) != len(nd2) or not nd1:
+        return False
+    try:
+        box1 = [(symbolic.pystr_to_symbolic(str(rb)), symbolic.pystr_to_symbolic(str(re_))) for rb, re_, _ in nd1]
+        box2 = [(symbolic.pystr_to_symbolic(str(rb)), symbolic.pystr_to_symbolic(str(re_))) for rb, re_, _ in nd2]
+        for lo, hi in box1 + box2:
+            if any(str(s) in varying for s in set(lo.free_symbols) | set(hi.free_symbols)):
+                return False
+        r = smt_dependence.prove_disjoint_access_boxes(box1,
+                                                       box2,
+                                                       str(itersym),
+                                                       symbolic.pystr_to_symbolic(str(start)),
+                                                       symbolic.pystr_to_symbolic(str(end)),
+                                                       step=symbolic.pystr_to_symbolic(str(step)))
+    except Exception:
+        return False
+    return r is True
+
+
+def _smt_classify_read_write_pair(read_subset: subsets.Subset,
+                                  write_subset: subsets.Subset,
+                                  itervar: str,
+                                  start,
+                                  end,
+                                  step,
+                                  read_state: Optional[SDFGState] = None) -> Optional[str]:
+    """SMT fallback classification for a single read/write pair.
+
+    Returns ``'none'``, ``'RAW'``, ``'WAR'``, or ``None`` (inconclusive).  Only
+    handles one-dimensional point subsets; multi-dimensional or non-point
+    subsets are left inconclusive so the existing conservative fallback applies.
+    """
+    if not smt_dependence.has_z3():
+        return None
+    read_nd = list(read_subset.ndrange())
+    write_nd = list(write_subset.ndrange())
+    if len(read_nd) != 1 or len(write_nd) != 1:
+        return None
+    if any(rb != re_ for rb, re_, _ in read_nd) or any(rb != re_ for rb, re_, _ in write_nd):
+        return None
+    try:
+        read_expr = symbolic.pystr_to_symbolic(str(read_nd[0][0]))
+        write_expr = symbolic.pystr_to_symbolic(str(write_nd[0][0]))
+    except Exception:
+        return None
+    read_guard = None
+    if read_state is not None:
+        conds = smt_dependence.collect_enclosing_conditions(read_state)
+        if conds is not sp.true:
+            read_guard = conds
+    try:
+        return smt_dependence.classify_read_write_pair(read_expr,
+                                                       write_expr,
+                                                       itervar,
+                                                       symbolic.pystr_to_symbolic(str(start)),
+                                                       symbolic.pystr_to_symbolic(str(end)),
+                                                       step=symbolic.pystr_to_symbolic(str(step)),
+                                                       read_guard=read_guard)
+    except Exception:
+        return None
 
 
 def carried_local_transients(loop: LoopRegion, candidates: Set[str]) -> Set[str]:
@@ -518,7 +646,7 @@ def _collision_forces_same_iteration(sub1: subsets.Subset, sub2: subsets.Subset,
     return len(sp.linsolve(lin_eqs, lambdas)) > 0
 
 
-def _writes_may_overlap(m1: memlet.Memlet, m2: memlet.Memlet, itersym, step, start, varying: Set[str]) -> bool:
+def _writes_may_overlap(m1: memlet.Memlet, m2: memlet.Memlet, itersym, step, start, end, varying: Set[str]) -> bool:
     """ Conservatively decide whether two write memlets to the same container
         can address the same element on different loop iterations. Returns
         ``False`` only if some subset dimension is provably disjoint (the
@@ -552,6 +680,11 @@ def _writes_may_overlap(m1: memlet.Memlet, m2: memlet.Memlet, itersym, step, sta
     # force the two iterations to coincide.
     if _collision_forces_same_iteration(m1.subset, m2.subset, itersym, varying):
         return False
+    # Still undecided, and the certificate above needs POINT subsets. A mirrored triangular write
+    # (``cov[i, i:M]`` against ``cov[i:M, i]``) has none, yet the two boxes provably meet only on
+    # the diagonal of a single iteration -- which the SMT oracle can show directly.
+    if _smt_proves_disjoint_boxes(m1.subset, m2.subset, itersym, start, end, step, varying):
+        return False
     return True
 
 
@@ -571,8 +704,14 @@ class LoopToMap(xf.MultiStateTransformation):
 
     def can_be_applied(self, graph, expr_index, sdfg, permissive=False):
 
+        # Exposed so companion passes can distinguish a genuine loop-carried
+        # dependence from structural/typing inapplicability without re-running
+        # the dependence analysis.
+        self.last_refusal_reason = None
+
         def refuse(reason: str) -> bool:
-            """Refuse the match. Reason dropped; diagnostics live in the pipeline driver."""
+            """Refuse the match and record why."""
+            self.last_refusal_reason = reason
             return False
 
         # A loop pinned sequential is a deliberate fallback (the else branch of an
@@ -764,6 +903,16 @@ class LoopToMap(xf.MultiStateTransformation):
                         # ``_read_and_write_sets`` already skips empty memlets for the same reason.
                         if e.data is None or e.data.is_empty():
                             continue
+                        # The edge that DEFINES a view rebinds it; it moves no data. Every
+                        # iteration re-establishes the same binding, so it carries no dependence --
+                        # but its subset spans whatever the view looks at (``np.reshape(Xi, ...)``
+                        # binds all of ``Xi``), which the ``a*i+b`` test below reads as an
+                        # unindexed whole-array store and refuses on (npbench ``mandelbrot2``).
+                        # Real traffic THROUGH the view keeps its own edges and is still analysed:
+                        # a write-through view's defining edge is its OUT edge, which never appears
+                        # here, and a store into the view node is a separate in-edge.
+                        if isinstance(sdfg.arrays[dn.data], dt.View) and e is sdutil.get_view_edge(state, dn):
+                            continue
                         if e.data.dynamic and e.data.wcr is None:
                             # Dynamic write (no WCR) is safe across iterations if its dst subset
                             # pins an axis to the iter var (same ``a*i+b`` as non-dynamic below):
@@ -790,8 +939,10 @@ class LoopToMap(xf.MultiStateTransformation):
                                 if ok and not _nested_reads_match_writes(e.src, e.src_conn, itersym, a, b, step):
                                     ok = False
                             if not ok and not permissive:
-                                return refuse(f"write to {dn.data} is not uniquely indexed by the iteration variable "
-                                              f"(needs an a*i+b subset) - dst_subset={dst_subset}")
+                                if not _smt_proves_injective_write(dst_subset, itersym, start, end, step):
+                                    return refuse(
+                                        f"write to {dn.data} is not uniquely indexed by the iteration variable "
+                                        f"(needs an a*i+b subset) - dst_subset={dst_subset}")
 
                         write_memlets[dn.data].append(e.data)
 
@@ -840,7 +991,7 @@ class LoopToMap(xf.MultiStateTransformation):
             reps = list(distinct.values())
             for x in range(len(reps)):
                 for y in range(x + 1, len(reps)):
-                    if _writes_may_overlap(reps[x], reps[y], itersym, step, start, varying) and not permissive:
+                    if _writes_may_overlap(reps[x], reps[y], itersym, step, start, end, varying) and not permissive:
                         return refuse(f"writes {reps[x].subset} and {reps[y].subset} to {data} "
                                       "may overlap across iterations")
 
@@ -995,6 +1146,23 @@ class LoopToMap(xf.MultiStateTransformation):
             # guard inside the certificate is what keeps its OUTER ``i`` loop sequential.
             if _collision_forces_same_iteration(read, write, itersym, varying):
                 continue
+            # The range form of the same certificate: neither subset need be a point, so a
+            # triangular read against its mirrored write (covariance reads ``cov[i, i:M]`` back to
+            # store ``cov[i:M, i]``) is decided here rather than falling through to the
+            # propagate+intersect fallback, which widens both to the whole array and always aliases.
+            if _smt_proves_disjoint_boxes(read, write, itersym, start, end, step, varying):
+                continue
+            # SMT fallback for non-affine read/write pairs. Only a proven 'none' (the accesses
+            # never alias across iterations) admits the pair. A 'WAR' verdict is NOT enough:
+            # BreakAntiDependence runs before this transformation and has no SMT path, so an
+            # anti-dependence still standing here was never snapshot-renamed and lifting it
+            # would race. 'WAR' and inconclusive both fall through to the affine checks below.
+            if smt_dependence.has_z3():
+                classification = _smt_classify_read_write_pair(read, write, itervar, start, end, step, state)
+                if classification == 'none':
+                    continue
+                if classification == 'RAW':
+                    return False
             ridx = _dependent_indices(itervar, read)
             widx = _dependent_indices(itervar, write)
             indices = set(ridx) | set(widx)
@@ -1148,6 +1316,14 @@ class LoopToMap(xf.MultiStateTransformation):
         read_set -= view_set
         write_set -= view_set
 
+        # Ordered from here on: these name the nested SDFG's connectors and fix the order its
+        # access nodes are wired in, which is what numbers the enclosing map's IN_n / OUT_n. Left
+        # as sets they get numbered differently per interpreter run, because set iteration order
+        # for strings is hash order. Sorted, since a set of container names carries no order of
+        # its own to preserve.
+        read_set = OrderedSet(sorted(read_set))
+        write_set = OrderedSet(sorted(write_set))
+
         # Create NestedSDFG and add the loop contents to it. Gather symbols defined in it.
         fsymbols = set(sdfg.free_symbols)
         body = graph.add_state_before(self.loop, 'single_state_body')
@@ -1163,7 +1339,7 @@ class LoopToMap(xf.MultiStateTransformation):
             nsdfg.add_edge(e.src, e.dst, e.data)
 
         # Add NestedSDFG arrays
-        for name in read_set | write_set:
+        for name in read_set.union(write_set):
             if '.' in name:
                 root_data_name = name.split('.')[0]
                 name = root_data_name
@@ -1211,6 +1387,8 @@ class LoopToMap(xf.MultiStateTransformation):
                 sym_name = str(sym)
                 if sym_name in internally_defined:
                     continue
+                if sym_name in nsdfg.constants_prop:
+                    continue
                 if sym_name in sdfg.symbols:
                     if sym_name not in nsdfg.symbols:
                         nsdfg.symbols[sym_name] = sdfg.symbols[sym_name]
@@ -1241,6 +1419,16 @@ class LoopToMap(xf.MultiStateTransformation):
                 # Only add explicit type, if it cannot be inferred
                 if vtype is None:
                     nsdfg.symbols[k] = ktype
+
+        # The registrations above can free a symbol after ``add_nested_sdfg`` fixed the mapping;
+        # a free symbol missing from the node's mapping fails validation, so self-map leftovers.
+        nconnectors = cnode.in_connectors.keys() | cnode.out_connectors.keys()
+        for sym in sorted(nsdfg.free_symbols):
+            if sym in nconnectors or sym in cnode.symbol_mapping:
+                continue
+            cnode.symbol_mapping[sym] = symbolic.pystr_to_symbolic(sym)
+            if sym not in nsdfg.symbols and sym in sdfg.symbols:
+                nsdfg.symbols[sym] = sdfg.symbols[sym]
 
         if (step < 0) == True:
             # If step is negative, we have to flip start and end to produce a correct map with a positive increment.
@@ -1359,11 +1547,10 @@ class LoopToMap(xf.MultiStateTransformation):
                 src_conn, dst_conn = '__out', '__inp'
             else:
                 desc = sdfg.arrays[src]
-                tname, _ = sdfg.add_transient('tmp',
-                                              e.data.src_subset.size(),
-                                              desc.dtype,
-                                              desc.storage,
-                                              find_new_name=True)
+                # Generic name into a graph with connectors this pass did not choose -- see
+                # SDFG.find_new_name_avoiding_connectors.
+                tname, _ = sdfg.add_transient(sdfg.find_new_name_avoiding_connectors('tmp'), e.data.src_subset.size(),
+                                              desc.dtype, desc.storage)
                 t = body.add_access(tname)
                 src_conn, dst_conn = None, None
             # Endpoints must come from ``e``; ``n1``/``n2`` here are the leftover values of the
@@ -1401,6 +1588,13 @@ class LoopToMap(xf.MultiStateTransformation):
                     sdfg.remove_symbol(var)
             else:
                 sdfg.remove_symbol(var)
+
+        # Deregistering does not un-free a symbol whose uses remain; the parent node must map it.
+        if sdfg.parent_nsdfg_node is not None:
+            pnode = sdfg.parent_nsdfg_node
+            pconnectors = pnode.in_connectors.keys() | pnode.out_connectors.keys()
+            for var in sorted((sdfg.free_symbols - fsymbols) - pnode.symbol_mapping.keys() - pconnectors):
+                pnode.symbol_mapping[var] = symbolic.pystr_to_symbolic(var)
 
         # Also remove arrays that are unique to the loop body
         for name in unique_set:

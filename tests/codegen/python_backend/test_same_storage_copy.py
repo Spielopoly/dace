@@ -37,12 +37,12 @@ from dace.codegen.py.cutile_target import CuTilePythonCodeGen
 from dace.codegen.py.framecode import DaCePythonCodeGenerator
 from dace.codegen.py.prettycode import PythonCodeIOStream
 from dace.codegen.py.python_target import PythonCodeGen
+from dace.libraries.tileops import TileStore
 from dace.memlet import Memlet
 from dace.sdfg import SDFG, nodes
 from dace.transformation.passes.vectorization.vectorize_cutile import VectorizeCuTile
 
 ST = dtypes.StorageType
-
 
 # ============================================================
 # Helpers
@@ -424,9 +424,8 @@ def _build_vadd_with_tile_copy(name: str, width: int = 8) -> Tuple[SDFG, str]:
     ``CuTile_Tile -> CuTile_Tile`` tile-rename path -- and the result must be
     unchanged (``C == A + B``).
 
-    The result tile's name is ``C_tile_out`` under the legacy order and
-    ``gpu_C_tile_out`` under the GPU-first order (arrays are renamed with a
-    ``gpu_`` prefix by the GPU transform); it is resolved by suffix match.
+    The result tile is located through the ``TileStore._src`` edge rather than
+    by name because GPU lowering may prefix or suffix renamed arrays.
 
     :param name: Unique SDFG name.
     :param width: Tile width (power of two).
@@ -441,29 +440,24 @@ def _build_vadd_with_tile_copy(name: str, width: int = 8) -> Tuple[SDFG, str]:
     state.add_mapped_tasklet(
         "add",
         {"i": "0:N"},
-        {"_a": dace.Memlet("A[i]"), "_b": dace.Memlet("B[i]")},
+        {
+            "_a": dace.Memlet("A[i]"),
+            "_b": dace.Memlet("B[i]")
+        },
         "_c = _a + _b",
         {"_c": dace.Memlet("C[i]")},
         external_edges=True,
     )
     VectorizeCuTile(widths=(width, )).apply_pass(sdfg, {})
 
-    # Locate the kernel state, the result-tile AccessNode, and the store edge.
-    # The tile transient is named ``C_tile_out`` (legacy) or ``gpu_C_tile_out``
-    # (GPU-first) -- match by suffix.
-    def _is_out_tile(n) -> bool:
-        data = getattr(n, "data", None)
-        return isinstance(data, str) and data.endswith("C_tile_out")
-
-    kstate = next(s for s in sdfg.all_states() if any(_is_out_tile(n) for n in s.nodes()))
-    c_out = next(n for n in kstate.nodes() if _is_out_tile(n))
+    kstate, store = next((s, n) for s in sdfg.all_states() for n in s.nodes() if isinstance(n, TileStore))
+    store_edge = next(e for e in kstate.in_edges(store) if e.dst_conn == "_src")
+    c_out = store_edge.src
+    assert isinstance(c_out, nodes.AccessNode)
     out_name = c_out.data
-    store_edge = next(e for e in kstate.out_edges(c_out) if isinstance(e.dst, nodes.LibraryNode))
-    store = store_edge.dst
 
     # Splice a CuTile_Tile copy: <out tile> -> C_tile_copy -> TileStore.
-    sdfg.add_array("C_tile_copy", sdfg.arrays[out_name].shape, dace.float64,
-                   storage=ST.CuTile_Tile, transient=True)
+    sdfg.add_array("C_tile_copy", sdfg.arrays[out_name].shape, dace.float64, storage=ST.CuTile_Tile, transient=True)
     c_copy = kstate.add_access("C_tile_copy")
     kstate.remove_edge(store_edge)
     kstate.add_edge(c_out, None, c_copy, None, dace.Memlet(data=out_name))

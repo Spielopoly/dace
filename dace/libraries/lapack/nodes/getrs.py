@@ -8,6 +8,7 @@ from .. import environments
 from dace import dtypes
 from dace.libraries.blas import environments as blas_environments
 from dace.libraries.blas import blas_helpers
+from ordered_set import OrderedSet
 
 
 @dace.library.expansion
@@ -134,7 +135,11 @@ class Getrs(dace.sdfg.nodes.LibraryNode):
     n = dace.properties.SymbolicProperty(allow_none=True, default=None)
 
     def __init__(self, name, n=None, *args, **kwargs):
-        super().__init__(name, *args, inputs={"_a", "_rhs_in", "_ipiv"}, outputs={"_rhs_out", "_res"}, **kwargs)
+        super().__init__(name,
+                         *args,
+                         inputs=OrderedSet(('_a', '_rhs_in', '_ipiv')),
+                         outputs=OrderedSet(('_rhs_out', '_res')),
+                         **kwargs)
 
     def validate(self, sdfg, state):
         """

@@ -17,7 +17,9 @@ os.environ.setdefault("UCX_VFS_ENABLE", "n")
 os.environ.setdefault("MPI4PY_RC_INITIALIZE", "0")
 
 # Pin 1 OpenMP thread: reduction order must be deterministic for the bit-exact legacy-vs-experimental compare.
-os.environ.setdefault("OMP_NUM_THREADS", "1")
+# Forced, not setdefault: CI runners export OMP_NUM_THREADS=8, and a live libgomp team breaks the
+# fork-based isolation this directory uses. A single thread means no worker team exists to strand.
+os.environ["OMP_NUM_THREADS"] = "1"
 
 import numpy as np
 import pytest
@@ -58,21 +60,19 @@ def generated_code(sdfg):
 
 @functools.lru_cache(maxsize=1)
 def experimental_available():
-    """True iff the experimental readable CPU generator is wired up and its output differs from legacy."""
-    try:
-        Config.get(*IMPLEMENTATION_KEY)
-    except Exception:  # noqa: BLE001 - key absent -> feature not present
-        return False
-    try:
-        # Same SDFG object under both configs -- avoids spurious divergence from DaCe deduplicating
-        # two separately-built SDFGs' names.
-        sdfg = trivial_elementwise_sdfg("readable_probe")
-        with use_implementation(LEGACY):
-            legacy_code = generated_code(sdfg)
-        with use_implementation(EXPERIMENTAL):
-            experimental_code = generated_code(sdfg)
-    except Exception:  # noqa: BLE001 - generator under development raised -> not ready
-        return False
+    """True iff the readable CPU generator is wired up and its output differs from legacy.
+
+    Nothing is swallowed here: a raising probe means the generator regressed, and that must surface
+    as an error rather than as silent skips.
+    """
+    Config.get(*IMPLEMENTATION_KEY)
+    # Same SDFG object under both configs -- avoids spurious divergence from DaCe deduplicating
+    # two separately-built SDFGs' names.
+    sdfg = trivial_elementwise_sdfg("readable_probe")
+    with use_implementation(LEGACY):
+        legacy_code = generated_code(sdfg)
+    with use_implementation(EXPERIMENTAL):
+        experimental_code = generated_code(sdfg)
     return experimental_code != legacy_code
 
 
@@ -125,7 +125,15 @@ def waitpid_with_timeout(pid, timeout):
 
 def run_isolated(build_and_run, timeout=300):
     """Run ``build_and_run() -> Dict[str, ndarray]`` in a forked child process (CPU only -- CUDA and
-    ``os.fork`` don't mix). A crash or timeout surfaces as a ``RuntimeError`` in the parent."""
+    ``os.fork`` don't mix). A crash or timeout surfaces as a ``RuntimeError`` in the parent.
+
+    A CPU kernel that already ran in THIS process leaves a live OpenMP thread team behind, and a
+    fork from that state deadlocks the child on libgomp's team barrier (the top-level conftest
+    guards ``os.fork`` against exactly this). Pausing the pools first is semantically transparent
+    -- the next parallel region rebuilds the team -- and makes the fork safe.
+    """
+    from dace.transformation.layout.isolation import pause_openmp_pools
+    pause_openmp_pools()
     handle, path = tempfile.mkstemp(suffix=".npz")
     os.close(handle)
     pid = os.fork()
@@ -184,9 +192,9 @@ def assert_outputs_equivalent(legacy, experimental, target, label=""):
 # --------------------------------------------------------------------------- #
 @pytest.fixture
 def require_experimental():
-    """Skip the test unless the readable generator is wired up (see the gate)."""
-    if not experimental_available():
-        pytest.skip("experimental readable codegen not ready")
+    """Assert the readable generator is wired up; it is required, not optional."""
+    assert experimental_available(), (
+        "the readable CPU generator produced byte-identical output to legacy -- it is not wired up")
 
 
 @pytest.fixture

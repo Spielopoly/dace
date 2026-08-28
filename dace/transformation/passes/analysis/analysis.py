@@ -1061,6 +1061,12 @@ def writes_whole_array(state: SDFGState, edge: Edge[Memlet], desc: dt.Data) -> b
     * a dynamic edge -- the write may not happen at all;
     * a write handed out of a ``NestedSDFG`` connector -- the outer subset is a propagated
       over-approximation of what the body actually writes, so it proves nothing;
+    * a write from a ``LibraryNode`` with a non-zero ``beta`` property (BLAS-style accumulate
+      nodes: Gemm/Gemv/Symm/Syrk/Einsum...) -- it folds onto the output's PRIOR value in place,
+      with no explicit read edge to show it, so the write is a read-modify-write like a WCR one;
+    * a write from a reduction ``LibraryNode`` with no ``identity`` -- it has no value to start
+      the fold from, so it starts from the output. The expansion emits no init and gives the
+      output memlet the node's ``wcr``, which is the same in-place read-modify-write;
     * a subset that does not provably span the whole extent (:func:`covers_full_extent`).
 
     The whole memlet tree is checked, not just the outer edge: a map that writes ``A[0:N]`` in
@@ -1076,6 +1082,15 @@ def writes_whole_array(state: SDFGState, edge: Edge[Memlet], desc: dt.Data) -> b
             return False
         if isinstance(tree_edge.src, nd.NestedSDFG):
             return False
+        src = tree_edge.src
+        if isinstance(src, nd.LibraryNode):
+            beta = getattr(src, 'beta', None)
+            if beta is not None and not symbolic.equal_valued(0, beta):
+                return False
+            # The default distinguishes "no identity" from "no such property": only a node that
+            # reduces (carries a ``wcr``) and left the identity unset folds onto the output.
+            if getattr(src, 'wcr', None) is not None and getattr(src, 'identity', 0) is None:
+                return False
     return covers_full_extent(edge.data.get_dst_subset(edge, state), desc)
 
 

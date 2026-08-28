@@ -10,21 +10,24 @@ import re
 
 import numpy as np
 import dace
-from dace.config import Config
+from dace.config import set_temporary
 
-#: The constexpr binding a write-once single-value transient gets. Which of the two spellings is
-#: emitted is ``scalar_emission_type``'s call, not this group's: the default (``scalar``, since
-#: ``c027cdf12``) normalizes the length-1 transient to a by-value Scalar and binds it as
-#: ``constexpr double s = 3.0;``, while ``len1_array`` keeps the array and binds
-#: ``constexpr double s[1] = {3.0};``. Matching both keeps these tests pinned on what they are about
-#: -- the value is bound at compile time rather than written at runtime.
-SCALAR_CONSTEXPR = re.compile(r'constexpr\s+double\s+s(\[1\])?\s*=\s*\{?\s*3')
+#: The constexpr binding a write-once single-value transient gets. The readable pipeline
+#: normalizes the length-1 transient to a by-value Scalar and binds it as
+#: ``constexpr double s = 3.0;``. Matching keeps these tests pinned on what they are about --
+#: the value is bound at compile time rather than written at runtime.
+SCALAR_CONSTEXPR = re.compile(r'constexpr\s+double\s+s\s*=\s*\{?\s*3')
 
 
 def _gen(sdfg_factory, impl, name):
-    Config.set('compiler', 'cpu', 'implementation', value=impl)
-    sdfg = sdfg_factory(name)
-    return sdfg, sdfg.generate_code()[0].clean_code
+    """Build and emit under `impl`, leaving the process Config as it was found.
+
+    The generator is a process-wide setting, so a test that switches it and walks away hands its
+    choice to every test after it in the same worker.
+    """
+    with set_temporary('compiler', 'cpu', 'implementation', value=impl):
+        sdfg = sdfg_factory(name)
+        return sdfg, sdfg.generate_code()[0].clean_code
 
 
 def _array_const_sdfg(name, shape, values, read=True):
@@ -74,9 +77,9 @@ def _scalar_const_sdfg(name):
 def _no_redundant_init(code, name):
     """ Assert the promoted const data has no runtime init/allocation.
 
-    ``name`` is matched as a whole identifier rather than as a substring: under the default
-    ``scalar_emission_type`` a single-value transient is bound as ``s``, not ``s[0]``, so a
-    subscripted needle would silently scan zero lines and pass vacuously.
+    ``name`` is matched as a whole identifier rather than as a substring: a single-value
+    transient is bound as ``s``, not ``s[0]``, so a subscripted needle would silently scan zero
+    lines and pass vacuously.
     """
     token = re.compile(r'\b%s\b' % re.escape(name))
     for line in code.splitlines():
@@ -93,11 +96,8 @@ def test_const_init_flag_off_keeps_the_runtime_write():
     scalar stays a mutable buffer written at runtime instead of a ``constexpr`` initializer, and the
     result must be unchanged either way.
     """
-    Config.set('compiler', 'cpu', 'codegen_params', 'const_init', value='off')
-    try:
+    with set_temporary('compiler', 'cpu', 'codegen_params', 'const_init', value='off'):
         sdfg_off, code_off = _gen(_scalar_const_sdfg, 'experimental_readable', 'sc_flag_off')
-    finally:
-        Config.set('compiler', 'cpu', 'codegen_params', 'const_init', value='on')
     sdfg_on, code_on = _gen(_scalar_const_sdfg, 'experimental_readable', 'sc_flag_on')
 
     assert not SCALAR_CONSTEXPR.search(code_off), 'const_init=off still promoted the scalar to a constexpr'
@@ -118,12 +118,12 @@ def test_scalar_constexpr_no_memset():
     _no_redundant_init(code, 's')
     # correctness
     sdfg_l = _scalar_const_sdfg('sc_leg')
-    Config.set('compiler', 'cpu', 'implementation', value='legacy')
     A = np.random.rand(8)
     bl, be = np.zeros(8), np.zeros(8)
-    sdfg_l.compile()(A=A.copy(), B=bl, N=8)
-    Config.set('compiler', 'cpu', 'implementation', value='experimental_readable')
-    sdfg.compile()(A=A.copy(), B=be, N=8)
+    with set_temporary('compiler', 'cpu', 'implementation', value='legacy'):
+        sdfg_l.compile()(A=A.copy(), B=bl, N=8)
+    with set_temporary('compiler', 'cpu', 'implementation', value='experimental_readable'):
+        sdfg.compile()(A=A.copy(), B=be, N=8)
     assert np.array_equal(bl, be) and np.allclose(be, A * 3.0)
 
 
@@ -135,12 +135,12 @@ def test_array_constexpr_full_no_memset():
         'array not emitted constexpr initializer'
     _no_redundant_init(code, 'arr')
     # correctness
-    Config.set('compiler', 'cpu', 'implementation', value='legacy')
     A = np.random.rand(4)
     bl, be = np.zeros(4), np.zeros(4)
-    fac('ac_leg').compile()(A=A.copy(), B=bl)
-    Config.set('compiler', 'cpu', 'implementation', value='experimental_readable')
-    sdfg.compile()(A=A.copy(), B=be)
+    with set_temporary('compiler', 'cpu', 'implementation', value='legacy'):
+        fac('ac_leg').compile()(A=A.copy(), B=bl)
+    with set_temporary('compiler', 'cpu', 'implementation', value='experimental_readable'):
+        sdfg.compile()(A=A.copy(), B=be)
     assert np.array_equal(bl, be) and np.allclose(be, A + np.array([0., 1., 2., 3.]))
 
 
@@ -158,12 +158,12 @@ def test_array_constexpr_partial_zerofill():
     # and only compare the WRITTEN region against legacy.
     A = np.zeros(4)
     be = np.zeros(4)
-    Config.set('compiler', 'cpu', 'implementation', value='experimental_readable')
-    sdfg.compile()(A=A.copy(), B=be)
+    with set_temporary('compiler', 'cpu', 'implementation', value='experimental_readable'):
+        sdfg.compile()(A=A.copy(), B=be)
     assert np.allclose(be, np.array([0., 5., 6., 0.])), f'zero-fill wrong: {be}'
     bl = np.zeros(4)
-    Config.set('compiler', 'cpu', 'implementation', value='legacy')
-    fac('ap_leg').compile()(A=A.copy(), B=bl)
+    with set_temporary('compiler', 'cpu', 'implementation', value='legacy'):
+        fac('ap_leg').compile()(A=A.copy(), B=bl)
     assert np.allclose(bl[[1, 2]], be[[1, 2]]), 'written region differs from legacy'
 
 
@@ -278,10 +278,10 @@ def test_const_binding_stays_in_scope_of_its_readers():
     # Same numbers as legacy (this also proves the emitted C++ compiles).
     X = np.arange(12.0).reshape(4, 3).copy()
     res_exp, res_legacy = np.zeros(3), np.zeros(3)
-    sdfg.compile()(X=X.copy(), res=res_exp)
-    Config.set('compiler', 'cpu', 'implementation', value='legacy')
-    const_chain_sdfg('const_chain_leg').compile()(X=X.copy(), res=res_legacy)
-    Config.set('compiler', 'cpu', 'implementation', value='experimental_readable')
+    with set_temporary('compiler', 'cpu', 'implementation', value='experimental_readable'):
+        sdfg.compile()(X=X.copy(), res=res_exp)
+    with set_temporary('compiler', 'cpu', 'implementation', value='legacy'):
+        const_chain_sdfg('const_chain_leg').compile()(X=X.copy(), res=res_legacy)
     assert np.array_equal(res_exp, res_legacy) and np.array_equal(res_exp, X.sum(axis=0))
 
 

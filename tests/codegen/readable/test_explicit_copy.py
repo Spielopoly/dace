@@ -1,5 +1,5 @@
 # Copyright 2019-2026 ETH Zurich and the DaCe authors. All rights reserved.
-""" Tests for ``compiler.cpu.codegen_params.explicit_copy`` (lifts implicit copies to explicit
+""" Tests for ``compiler.cpu.explicit_copy`` (lifts implicit copies to explicit
     ``CopyLibraryNode`` instances before emission). """
 import numpy
 import pytest
@@ -16,45 +16,43 @@ def mixed_copies(A: dace.float64[N], B: dace.float64[N], sc_in: dace.float64[1],
     sc_out[:] = sc_in  # single-element copy -> '=' tasklet when lifted
 
 
-def generate(implementation: str, explicit_copy: str) -> str:
+def generate(implementation: str, explicit_copy: bool) -> str:
     # simplify=False: keeps the copy alive so it reaches codegen instead of being simplified away.
     sdfg = mixed_copies.to_sdfg(simplify=False)
     with set_temporary('compiler', 'cpu', 'implementation', value=implementation), \
-         set_temporary('compiler', 'cpu', 'codegen_params', 'explicit_copy', value=explicit_copy):
+         set_temporary('compiler', 'cpu', 'explicit_copy', value=explicit_copy):
         return '\n'.join(obj.code for obj in sdfg.generate_code() if obj.language == 'cpp')
 
 
-def test_on_replaces_copynd_in_readable():
-    """ ``on`` (the default) removes ``dace::CopyND`` and lowers the contiguous copy to ``memcpy``. """
-    on = generate('experimental_readable', 'on')
-    assert 'dace::CopyND' not in on, 'explicit_copy on should leave no dace::CopyND behind'
-    assert 'memcpy' in on, 'the contiguous copy should lower to memcpy'
+def test_readable_always_lowers():
+    """ The readable generator requires the lowering, so the knob has no effect on it: either value
+    removes ``dace::CopyND`` and lowers the contiguous copy to ``memcpy``. """
+    for value in (True, False):
+        code = generate('experimental_readable', value)
+        assert 'dace::CopyND' not in code, f'readable must lower copies regardless of the knob (got {value})'
+        assert 'memcpy' in code, 'the contiguous copy should lower to memcpy'
 
 
-def test_off_keeps_copynd_in_readable():
-    """ ``off`` takes the pass out: the copies stay on the implicit ``dace::CopyND`` path. """
-    off = generate('experimental_readable', 'off')
-    assert 'dace::CopyND' in off, 'explicit_copy off should keep the implicit CopyND lowering'
-
-
-def test_on_is_the_default():
-    """ The schema default is ``on``: generating without touching the key matches an explicit ``on``. """
-    with set_temporary('compiler', 'cpu', 'implementation', value='experimental_readable'):
+def test_legacy_honours_the_flag_and_defaults_off():
+    """ The knob governs only the classic generator: ``on`` opts into the lowering, ``off`` -- the
+    schema default -- keeps the implicit ``dace::CopyND`` emission byte-identical to upstream. """
+    on = generate('legacy', True)
+    assert 'dace::CopyND' not in on, 'explicit_copy on should leave no dace::CopyND behind on legacy'
+    assert 'memcpy' in on, 'the contiguous copy should lower to memcpy on legacy too'
+    off = generate('legacy', False)
+    assert 'dace::CopyND' in off, 'off should keep the implicit CopyND lowering'
+    with set_temporary('compiler', 'cpu', 'implementation', value='legacy'):
         sdfg = mixed_copies.to_sdfg(simplify=False)
         default = '\n'.join(o.code for o in sdfg.generate_code() if o.language == 'cpp')
-    assert default == generate('experimental_readable', 'on')
+    assert default == off, 'the schema default must be off'
 
 
-def test_legacy_ignores_the_flag():
-    """ Legacy never enters the readable pipeline, so its output is byte-identical across the flag. """
-    assert generate('legacy', 'on') == generate('legacy', 'off')
-
-
-@pytest.mark.parametrize('explicit_copy', ['on', 'off'])
-def test_both_settings_compile_and_run(explicit_copy):
-    """ Either setting must produce the same, correct numbers. """
-    with set_temporary('compiler', 'cpu', 'implementation', value='experimental_readable'), \
-         set_temporary('compiler', 'cpu', 'codegen_params', 'explicit_copy', value=explicit_copy):
+@pytest.mark.parametrize('implementation', ['experimental_readable', 'legacy'])
+@pytest.mark.parametrize('explicit_copy', [True, False])
+def test_both_settings_compile_and_run(implementation, explicit_copy):
+    """ Either setting must produce the same, correct numbers, on either generator. """
+    with set_temporary('compiler', 'cpu', 'implementation', value=implementation), \
+         set_temporary('compiler', 'cpu', 'explicit_copy', value=explicit_copy):
         A = numpy.random.rand(N)
         B = numpy.zeros(N)
         sc_in = numpy.array([3.5])
@@ -112,10 +110,9 @@ def test_self_copy_direction_matches_legacy():
 
 
 if __name__ == '__main__':
-    test_on_replaces_copynd_in_readable()
-    test_off_keeps_copynd_in_readable()
-    test_on_is_the_default()
-    test_legacy_ignores_the_flag()
-    test_both_settings_compile_and_run('on')
-    test_both_settings_compile_and_run('off')
+    test_readable_always_lowers()
+    test_legacy_honours_the_flag_and_defaults_off()
+    for implementation in ('experimental_readable', 'legacy'):
+        test_both_settings_compile_and_run(implementation, True)
+        test_both_settings_compile_and_run(implementation, False)
     test_self_copy_direction_matches_legacy()

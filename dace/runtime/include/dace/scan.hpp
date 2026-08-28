@@ -47,8 +47,8 @@
 //
 // 1. Its floating-point association is block-wise, so it does NOT reproduce the
 //    sequential left-to-right order and the result MOVES WITH ``OMP_NUM_THREADS``.
-//    Below ``PARALLEL_MIN_ELEMENTS_CONTIGUOUS`` it runs on one thread and does come
-//    out stable, so small-n tests will not catch this. A caller that needs a
+//    With a one-thread team it runs on one thread and does come out stable, so
+//    small-n tests will not catch this. A caller that needs a
 //    reproducible scan must use the sequential shape, not this header. (Blocking
 //    shortens the dependent chains, so it is more accurate, not less: against a
 //    long-double reference at n=4e6 it lands 1.1e-13 closer, scale-relative.)
@@ -84,6 +84,12 @@
 
 #ifdef _OPENMP
 #include <omp.h>
+#endif
+
+#if defined(__has_include)
+#if __has_include(<unistd.h>)
+#include <unistd.h>
+#endif
 #endif
 
 // NON-NESTED CONTEXT IS ASSUMED, and there is no runtime check for it: the
@@ -123,25 +129,58 @@ struct alignas(64) TeamSlot {
     T v[K];
 };
 
-/// Below this element count a scan runs faster on one thread than on a team: the
-/// fork plus two barriers costs more than the extra lanes save. Measured (fp64
-/// sum, 8 threads, against a sequential single pass) one thread runs 2.5x and a
-/// team 2.1x at n=8192; one thread 2.6x and a team 3.8x at n=16384.
-constexpr long PARALLEL_MIN_ELEMENTS_CONTIGUOUS = 1L << 14;
-
-/// Bytes per thread per tile. The reduce pass and the scan pass walk the same
-/// block back to back, so a tile that fits in L2 keeps the second walk off the
-/// memory bus. Measured at n=4e6 and n=1.6e7 the 64 KB - 256 KB range is flat and
-/// 1 MB (>= L2) loses 20-30%; 128 KB sits inside the L2 of every target this
-/// backend compiles for.
+/// Fallback tile, used when the cache hierarchy cannot be queried. Was the fixed value before
+/// :func:`tile_bytes` derived one, and equals ``L2 / 8`` on the machine it was measured on.
 constexpr long TILE_BYTES = 1L << 17;
+
+/// One level's size in bytes, or 0 when it cannot be determined. Queried ONCE -- ``sysconf`` walks
+/// sysfs, which is far more expensive than the scan it would be sizing.
+inline long cache_bytes(int level) {
+#if defined(_SC_LEVEL2_CACHE_SIZE) && defined(_SC_LEVEL1_DCACHE_SIZE) && defined(_SC_LEVEL3_CACHE_SIZE)
+    static const long sizes[3] = {sysconf(_SC_LEVEL1_DCACHE_SIZE), sysconf(_SC_LEVEL2_CACHE_SIZE),
+                                  sysconf(_SC_LEVEL3_CACHE_SIZE)};
+    const long v = (level >= 1 && level <= 3) ? sizes[level - 1] : 0;
+    return v > 0 ? v : 0;
+#else
+    (void)level;
+    return 0;
+#endif
+}
+
+/// Bytes per thread per tile, derived from the L2 this build is RUNNING on rather than assumed.
+///
+/// The reduce pass and the scan pass walk the same block back to back, so the tile has to be small
+/// enough that the second walk finds the block still in cache. L2 is the level that decides it: the
+/// block is private to one thread, and L1 is far too small to hold a re-read block (a 32 KB tile
+/// measured no better than 128 KB anywhere). The block is not the only thing in L2 either -- the
+/// scan pass streams ``out`` through it as well -- which is why the measured optimum sits well
+/// below the full L2: sweeping 32 KB - 4 MB per thread at 4 and 8 threads over 1 MB - 256 MB
+/// arrays, the flat optimum is 64 KB - 256 KB with ``L2 / 8`` inside it at every size, while a tile
+/// at full L2 loses up to 1.54x.
+///
+/// The clamp keeps a machine with an unusually large or small L2 inside the measured range instead
+/// of extrapolating a ratio that was only ever observed on one hierarchy.
+inline long tile_bytes() {
+    const long l2 = cache_bytes(2);
+    if (l2 <= 0) return TILE_BYTES;
+    const long derived = l2 / 8;
+    if (derived < (1L << 15)) return 1L << 15;
+    if (derived > (1L << 19)) return 1L << 19;
+    return derived;
+}
 
 /// Elements one thread takes per tile. A one-thread team takes the whole range in
 /// a single tile: with no block totals to exchange it needs no tiling either, and
 /// the scan collapses to one seeded ``simd inscan`` pass.
+///
+/// Always tiled otherwise. A scan whose whole working set fits the shared last level does better
+/// untiled -- the second read hits L3 regardless, so each tile only adds two barriers, measured
+/// 1.47x at 8 MB / 8 threads -- but that case is deliberately NOT special-cased: the working set is
+/// assumed big, and one rule that is right where the time actually goes beats two rules.
 inline long block_span(long n, long team, long elem_bytes) {
     if (team <= 1) return n;
-    const long cap = (elem_bytes > 0 && TILE_BYTES / elem_bytes > 0) ? TILE_BYTES / elem_bytes : 1;
+    const long budget = tile_bytes();
+    const long cap = (elem_bytes > 0 && budget / elem_bytes > 0) ? budget / elem_bytes : 1;
     const long even = (n + team - 1) / team;
     return (cap < even) ? cap : even;
 }
@@ -209,37 +248,39 @@ constexpr T max_identity() {
 // identifier is not a template parameter -- the op has to be spelled into the
 // clause. Each is a single vectorised pass over one thread's block.
 
-template <typename It>
-inline typename std::iterator_traits<It>::value_type fold_sum(It f, long lo, long hi) {
-    typename std::iterator_traits<It>::value_type s = 0;
+// ``A`` is the ACCUMULATOR type and is named explicitly rather than deduced from the input
+// iterator: the scan's accumulator is the OUTPUT element type, and a widening scan (an int8
+// predicate mask prefix-summed into int64 ranks) folds a block into a value the input type
+// cannot hold. Deducing from ``It`` overflowed silently at 127.
+template <typename A, typename It>
+inline A fold_sum(It f, long lo, long hi) {
+    A s = 0;
     #pragma omp simd reduction(+:s)
     for (long i = lo; i < hi; ++i) s = s + f[i];
     return s;
 }
 
-template <typename It>
-inline typename std::iterator_traits<It>::value_type fold_product(It f, long lo, long hi) {
-    typename std::iterator_traits<It>::value_type s = 1;
+template <typename A, typename It>
+inline A fold_product(It f, long lo, long hi) {
+    A s = 1;
     #pragma omp simd reduction(*:s)
     for (long i = lo; i < hi; ++i) s = s * f[i];
     return s;
 }
 
-template <typename It>
-inline typename std::iterator_traits<It>::value_type fold_min(It f, long lo, long hi) {
-    using T = typename std::iterator_traits<It>::value_type;
-    T s = min_identity<T>();
+template <typename A, typename It>
+inline A fold_min(It f, long lo, long hi) {
+    A s = min_identity<A>();
     #pragma omp simd reduction(min:s)
-    for (long i = lo; i < hi; ++i) s = std::min<T>(s, f[i]);
+    for (long i = lo; i < hi; ++i) s = std::min<A>(s, static_cast<A>(f[i]));
     return s;
 }
 
-template <typename It>
-inline typename std::iterator_traits<It>::value_type fold_max(It f, long lo, long hi) {
-    using T = typename std::iterator_traits<It>::value_type;
-    T s = max_identity<T>();
+template <typename A, typename It>
+inline A fold_max(It f, long lo, long hi) {
+    A s = max_identity<A>();
     #pragma omp simd reduction(max:s)
-    for (long i = lo; i < hi; ++i) s = std::max<T>(s, f[i]);
+    for (long i = lo; i < hi; ++i) s = std::max<A>(s, static_cast<A>(f[i]));
     return s;
 }
 
@@ -341,11 +382,16 @@ inline void blocked_scan(long n, long elem_bytes, T seed, Reduce reduce, Scan sc
     if (n <= 0) return;
 #ifdef _OPENMP
     const int want = team_size();
-    // The size test has to sit OUTSIDE the pragma rather than in an ``if`` clause:
-    // a serialized region is not free -- an empty ``omp parallel if(0)`` measures
-    // 691 ns against the 90 ns a 137-element scan takes, so the cloudsc-sized
-    // scans would pay 8x their own cost just to enter and leave a one-thread team.
-    if (want > 1 && n >= PARALLEL_MIN_ELEMENTS_CONTIGUOUS) {
+    // NO SIZE TEST HERE. Whether a scan is worth a team is a SPECIALIZATION verdict, taken once at
+    // compile time against the host's calibrated break-even
+    // (``compiler.cpu.parallel_min_work_per_region``, see
+    // ``auto_optimize.libnode_work_is_below_break_even``): a scan that is provably too small never
+    // reaches this entry point at all, it is expanded to the sequential shape instead. Re-testing
+    // the count on every call would be that decision taken twice, in the one place that cannot
+    // know the machine it was taken for. ``want > 1`` stays because it is not a threshold -- with a
+    // one-thread team there is no team to block for, and the tiled path below would be pure
+    // overhead around a single seeded ``simd inscan``.
+    if (want > 1) {
         TeamSlot<T> totals[MAX_TEAM];
         #pragma omp parallel num_threads(want)
         {
@@ -380,6 +426,68 @@ inline void blocked_scan(long n, long elem_bytes, T seed, Reduce reduce, Scan sc
     scan(0, n, seed);
 }
 
+/// The affine map ``x -> a*x + b``: the carry of a first-order linear recurrence.
+///
+/// A plain scan carries a value; this carries a FUNCTION, which is what makes
+/// ``out[k] = c[k]*out[k-1] + d[k]`` block at all. Composition is associative -- function
+/// composition always is -- so the three-phase shape above applies with no change to its
+/// structure. The map is only closed under composition because the recurrence is LINEAR in the
+/// carry: ``f(x) = x*x`` or ``f(x) = max(x, w)`` compose into something with no fixed-width
+/// representation, and the matcher that produces these buffers refuses them.
+template <typename E>
+struct affine_map {
+    E a;
+    E b;
+};
+
+/// Compose two affine maps: ``y`` applied AFTER ``x``.
+///
+/// ``y(x(v)) = y.a*(x.a*v + x.b) + y.b``. Argument order matches ``blocked_scan``'s combine,
+/// which folds the accumulated prefix on the left and the next block on the right.
+template <typename E>
+inline affine_map<E> affine_compose(const affine_map<E>& x, const affine_map<E>& y) {
+    return affine_map<E>{y.a * x.a, y.a * x.b + y.b};
+}
+
+/// Fold one block's coefficients and deltas into a single affine map.
+///
+/// ``m.a`` ends as the block's running product of ``c``, and that product is the ONLY one this
+/// lowering ever forms. The seed carries ``a == 0``, so every cross-block composition multiplies
+/// the accumulated ``a`` by zero and it never grows: the exponent is bounded by ONE BLOCK, which
+/// ``block_span`` sizes to L2, not by ``n``. The single-thread path skips this function entirely
+/// and forms no product at all. That is the difference between this lowering and the closed form
+/// ``out[k] = P[k] * (seed + sum_j d[j]/P[j])``, which divides by a product over the whole prefix
+/// and loses the result to overflow long before it finishes.
+template <typename E, typename CIt, typename DIt>
+inline affine_map<E> fold_affine(CIt c, DIt d, long lo, long hi) {
+    affine_map<E> m{static_cast<E>(1), static_cast<E>(0)};
+    for (long k = lo; k < hi; ++k) {
+        const E ck = static_cast<E>(c[k]);
+        m.b = ck * m.b + static_cast<E>(d[k]);
+        m.a = ck * m.a;
+    }
+    return m;
+}
+
+/// Write ``out[lo:hi]`` for the recurrence entered with the composed map ``off``.
+///
+/// ``off.a`` is zero by construction (see ``fold_affine``), so ``off.b`` IS the value the block
+/// starts from and the pass is the plain sequential recurrence -- bit-identical to what the
+/// sequential lowering computes for the same block.
+///
+/// No ``simd inscan`` here, unlike the four scalar ops: every element multiplies the carry by a
+/// coefficient known only at that element, so the chain is a genuine dependent multiply-add and
+/// the in-register shift network those ops use has nothing to shift. The parallelism is the
+/// blocking alone.
+template <typename E, typename CIt, typename DIt, typename OutIt>
+inline void scan_incl_affine(CIt c, DIt d, OutIt o, long lo, long hi, affine_map<E> off) {
+    E acc = off.b;
+    for (long k = lo; k < hi; ++k) {
+        acc = static_cast<E>(c[k]) * acc + static_cast<E>(d[k]);
+        o[k] = acc;
+    }
+}
+
 }  // namespace detail
 
 // --- INCLUSIVE -----------------------------------------------------------------
@@ -389,62 +497,64 @@ inline void blocked_scan(long n, long elem_bytes, T seed, Reduce reduce, Scan sc
 
 template <typename It, typename OutIt, typename T>
 inline void inclusive_sum(It first, It last, OutIt out_first, T seed) {
-    using E = typename std::iterator_traits<It>::value_type;
+    using E = typename std::iterator_traits<OutIt>::value_type;
     detail::blocked_scan<E>(
         static_cast<long>(last - first), static_cast<long>(sizeof(E)), static_cast<E>(seed),
-        [first](long lo, long hi) { return detail::fold_sum(first, lo, hi); },
+        [first](long lo, long hi) { return detail::fold_sum<E>(first, lo, hi); },
         [first, out_first](long lo, long hi, E off) { detail::scan_incl_sum(first, out_first, lo, hi, off); },
         [](E a, E b) { return a + b; });
 }
 
 template <typename It, typename OutIt>
 inline void inclusive_sum(It first, It last, OutIt out_first) {
-    inclusive_sum(first, last, out_first, typename std::iterator_traits<It>::value_type(0));
+    inclusive_sum(first, last, out_first, typename std::iterator_traits<OutIt>::value_type(0));
 }
 
 template <typename It, typename OutIt, typename T>
 inline void inclusive_product(It first, It last, OutIt out_first, T seed) {
-    using E = typename std::iterator_traits<It>::value_type;
+    using E = typename std::iterator_traits<OutIt>::value_type;
     detail::blocked_scan<E>(
         static_cast<long>(last - first), static_cast<long>(sizeof(E)), static_cast<E>(seed),
-        [first](long lo, long hi) { return detail::fold_product(first, lo, hi); },
+        [first](long lo, long hi) { return detail::fold_product<E>(first, lo, hi); },
         [first, out_first](long lo, long hi, E off) { detail::scan_incl_product(first, out_first, lo, hi, off); },
         [](E a, E b) { return a * b; });
 }
 
 template <typename It, typename OutIt>
 inline void inclusive_product(It first, It last, OutIt out_first) {
-    inclusive_product(first, last, out_first, typename std::iterator_traits<It>::value_type(1));
+    inclusive_product(first, last, out_first, typename std::iterator_traits<OutIt>::value_type(1));
 }
 
 template <typename It, typename OutIt, typename T>
 inline void inclusive_min(It first, It last, OutIt out_first, T seed) {
-    using E = typename std::iterator_traits<It>::value_type;
+    using E = typename std::iterator_traits<OutIt>::value_type;
     detail::blocked_scan<E>(
         static_cast<long>(last - first), static_cast<long>(sizeof(E)), static_cast<E>(seed),
-        [first](long lo, long hi) { return detail::fold_min(first, lo, hi); },
+        [first](long lo, long hi) { return detail::fold_min<E>(first, lo, hi); },
         [first, out_first](long lo, long hi, E off) { detail::scan_incl_min(first, out_first, lo, hi, off); },
         [](E a, E b) { return std::min<E>(a, b); });
 }
 
 template <typename It, typename OutIt>
 inline void inclusive_min(It first, It last, OutIt out_first) {
-    inclusive_min(first, last, out_first, detail::min_identity<typename std::iterator_traits<It>::value_type>());
+    inclusive_min(first, last, out_first,
+                 detail::min_identity<typename std::iterator_traits<OutIt>::value_type>());
 }
 
 template <typename It, typename OutIt, typename T>
 inline void inclusive_max(It first, It last, OutIt out_first, T seed) {
-    using E = typename std::iterator_traits<It>::value_type;
+    using E = typename std::iterator_traits<OutIt>::value_type;
     detail::blocked_scan<E>(
         static_cast<long>(last - first), static_cast<long>(sizeof(E)), static_cast<E>(seed),
-        [first](long lo, long hi) { return detail::fold_max(first, lo, hi); },
+        [first](long lo, long hi) { return detail::fold_max<E>(first, lo, hi); },
         [first, out_first](long lo, long hi, E off) { detail::scan_incl_max(first, out_first, lo, hi, off); },
         [](E a, E b) { return std::max<E>(a, b); });
 }
 
 template <typename It, typename OutIt>
 inline void inclusive_max(It first, It last, OutIt out_first) {
-    inclusive_max(first, last, out_first, detail::max_identity<typename std::iterator_traits<It>::value_type>());
+    inclusive_max(first, last, out_first,
+                 detail::max_identity<typename std::iterator_traits<OutIt>::value_type>());
 }
 
 // --- EXCLUSIVE -----------------------------------------------------------------
@@ -452,40 +562,40 @@ inline void inclusive_max(It first, It last, OutIt out_first) {
 
 template <typename It, typename OutIt, typename T>
 inline void exclusive_sum(It first, It last, OutIt out_first, T seed) {
-    using E = typename std::iterator_traits<It>::value_type;
+    using E = typename std::iterator_traits<OutIt>::value_type;
     detail::blocked_scan<E>(
         static_cast<long>(last - first), static_cast<long>(sizeof(E)), static_cast<E>(seed),
-        [first](long lo, long hi) { return detail::fold_sum(first, lo, hi); },
+        [first](long lo, long hi) { return detail::fold_sum<E>(first, lo, hi); },
         [first, out_first](long lo, long hi, E off) { detail::scan_excl_sum(first, out_first, lo, hi, off); },
         [](E a, E b) { return a + b; });
 }
 
 template <typename It, typename OutIt, typename T>
 inline void exclusive_product(It first, It last, OutIt out_first, T seed) {
-    using E = typename std::iterator_traits<It>::value_type;
+    using E = typename std::iterator_traits<OutIt>::value_type;
     detail::blocked_scan<E>(
         static_cast<long>(last - first), static_cast<long>(sizeof(E)), static_cast<E>(seed),
-        [first](long lo, long hi) { return detail::fold_product(first, lo, hi); },
+        [first](long lo, long hi) { return detail::fold_product<E>(first, lo, hi); },
         [first, out_first](long lo, long hi, E off) { detail::scan_excl_product(first, out_first, lo, hi, off); },
         [](E a, E b) { return a * b; });
 }
 
 template <typename It, typename OutIt, typename T>
 inline void exclusive_min(It first, It last, OutIt out_first, T seed) {
-    using E = typename std::iterator_traits<It>::value_type;
+    using E = typename std::iterator_traits<OutIt>::value_type;
     detail::blocked_scan<E>(
         static_cast<long>(last - first), static_cast<long>(sizeof(E)), static_cast<E>(seed),
-        [first](long lo, long hi) { return detail::fold_min(first, lo, hi); },
+        [first](long lo, long hi) { return detail::fold_min<E>(first, lo, hi); },
         [first, out_first](long lo, long hi, E off) { detail::scan_excl_min(first, out_first, lo, hi, off); },
         [](E a, E b) { return std::min<E>(a, b); });
 }
 
 template <typename It, typename OutIt, typename T>
 inline void exclusive_max(It first, It last, OutIt out_first, T seed) {
-    using E = typename std::iterator_traits<It>::value_type;
+    using E = typename std::iterator_traits<OutIt>::value_type;
     detail::blocked_scan<E>(
         static_cast<long>(last - first), static_cast<long>(sizeof(E)), static_cast<E>(seed),
-        [first](long lo, long hi) { return detail::fold_max(first, lo, hi); },
+        [first](long lo, long hi) { return detail::fold_max<E>(first, lo, hi); },
         [first, out_first](long lo, long hi, E off) { detail::scan_excl_max(first, out_first, lo, hi, off); },
         [](E a, E b) { return std::max<E>(a, b); });
 }
@@ -642,6 +752,33 @@ inline void strided_inclusive_max(It first, OutIt out, long n, long s) {
     using T = typename std::iterator_traits<It>::value_type;
     detail::strided_scan(first, out, n, s, [](const T& x) { return x; },
                          [](const T& a, const T& b) { return std::max<T>(a, b); });
+}
+
+// --- FIRST-ORDER LINEAR RECURRENCE ---------------------------------------------
+// ``out[k] = c[k]*out[k-1] + d[k]`` over ``k in [0, n)``, entered with ``out[-1] = seed``.
+//
+// This is a scan whose monoid is affine-map composition rather than one of the four scalar ops
+// above, so it reuses ``blocked_scan`` unchanged with ``T = affine_map<E>``; only the fold, the
+// seeded pass and the combine differ. The seed enters as the CONSTANT map ``{0, seed}``, which
+// is what pins the composed ``a`` at zero -- see ``fold_affine`` for why that is the numerically
+// load-bearing choice and not just a convenient encoding.
+//
+// Association: within a block the seeded pass reproduces the sequential left-to-right recurrence
+// exactly, so the result moves with ``OMP_NUM_THREADS`` only through the block-boundary carries,
+// and the one-thread path is exact. Callers needing a reproducible result take the sequential
+// shape, as with every other op in this header.
+
+template <typename CIt, typename DIt, typename OutIt, typename T>
+inline void inclusive_affine(CIt coef, DIt delta, OutIt out_first, long n, T seed) {
+    using E = typename std::iterator_traits<OutIt>::value_type;
+    using M = detail::affine_map<E>;
+    detail::blocked_scan<M>(
+        n, static_cast<long>(3 * sizeof(E)), M{static_cast<E>(0), static_cast<E>(seed)},
+        [coef, delta](long lo, long hi) { return detail::fold_affine<E>(coef, delta, lo, hi); },
+        [coef, delta, out_first](long lo, long hi, M off) {
+            detail::scan_incl_affine<E>(coef, delta, out_first, lo, hi, off);
+        },
+        [](M x, M y) { return detail::affine_compose<E>(x, y); });
 }
 
 }}  // namespace dace::scan

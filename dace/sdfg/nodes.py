@@ -922,15 +922,21 @@ class MapEntry(EntryNode):
 
     def new_symbols(self, sdfg, state, symbols) -> Dict[str, dtypes.typeclass]:
         result = {}
-        # Add map params
-        for p, rng in zip(self._map.params, self._map.range):
-            result[p] = dtypes.result_type_of(infer_expr_type(rng[0], symbols), infer_expr_type(rng[1], symbols))
-
-        # Handle the dynamic map ranges.
-        dyn_inputs = self.dynamic_input_connectors
+        # Dynamic map ranges first: a bound may name one, and the connector type is the declared
+        # answer for it. Inferring the parameter without them falls back to the dtype the bound's
+        # symbol instance happens to carry, and that is not a stable property -- symbol identity is
+        # by name, so an expression rebuilt from a string (any ``replace_dict`` substitution) mints
+        # its names untyped, while deserialization rebuilds them from the declared table. The same
+        # map would then report two different parameter types across a save/load round trip.
+        dyn_inputs = set(c for c in self.in_connectors if not c.startswith('IN_'))
         for e in state.in_edges(self):
             if e.dst_conn in dyn_inputs:
                 result[e.dst_conn] = (self.in_connectors[e.dst_conn] or sdfg.arrays[e.data.data].dtype)
+
+        # Add map params
+        known = {**symbols, **result}
+        for p, rng in zip(self._map.params, self._map.range):
+            result[p] = dtypes.result_type_of(infer_expr_type(rng[0], known), infer_expr_type(rng[1], known))
 
         return result
 
@@ -1097,6 +1103,10 @@ class Map(object):
                               default=0,
                               desc="OpenMP schedule chunk size",
                               serialize_if=lambda m: m.schedule in dtypes.CPU_SCHEDULES)
+    omp_simd = Property(dtype=bool,
+                        default=False,
+                        desc="Vectorize the innermost loop with an OpenMP simd clause",
+                        serialize_if=lambda m: m.omp_simd)
 
     gpu_block_size = ListProperty(element_type=int,
                                   default=None,
@@ -1418,6 +1428,11 @@ class LibraryNode(CodeNode):
                             "the node upon expansion, if expanded to a nested SDFG.",
                             default=dtypes.ScheduleType.Default)
     debuginfo = DebugInfoProperty(allow_none=True)
+    # Codegen dispatches ``on_node_begin``/``on_node_end`` for a library node like any other code
+    # node, and expansion carries this onto whatever the node expands into.
+    instrument = EnumProperty(dtype=dtypes.InstrumentationType,
+                              desc="Measure execution statistics with given method",
+                              default=dtypes.InstrumentationType.No_Instrumentation)
 
     #: Whether this node must be expanded before other library nodes in the same state.
     #: Set on nodes whose expansion *reads* neighbouring library nodes and therefore needs
@@ -1428,6 +1443,14 @@ class LibraryNode(CodeNode):
     #: node type, is not part of the serialised SDFG, and lets the core stay unaware of the
     #: libraries that set it.
     expand_before_peers: bool = False
+
+    #: Connector names whose descriptor must stay in HOST memory whatever the node's schedule is.
+    #: A node whose expansion is a device kernel can still keep part of its interface on the host:
+    #: ``ScatterConflictCheck`` tags on the device out of the CUB scratch pool but reads its flag,
+    #: and sizes its buffer from a scratch array, on the host. An offloader that moves every array a
+    #: node touches onto the device therefore has to be told. Class-level attribute for the same
+    #: reason as ``expand_before_peers``: it describes the node type, not a serialised value.
+    host_connectors: frozenset = frozenset()
 
     #: Whether device auto-selection (``auto_optimize.set_fast_implementations``) may overwrite
     #: :attr:`implementation`. False for nodes whose lowering is chosen DELIBERATELY by a

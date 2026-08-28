@@ -20,6 +20,7 @@ from dace.sdfg.utils import set_nested_sdfg_parent_references
 from dace.sdfg.graph import SubgraphView
 from dace.transformation import transformation
 from dace.transformation import helpers as xfh
+from ordered_set import OrderedSet
 
 
 @transformation.explicit_cf_compatible
@@ -444,6 +445,13 @@ class MoveIfIntoMap(transformation.MultiStateTransformation):
             arrays_to_pipe |= self._rewrite_inner_sdfg(cond_block, branch_cond, enclosing_sdfg, inner_nsdfg,
                                                        cond_free_syms, moved_assignments)
 
+        # Ask BEFORE the add: a derivable entry is left implicit, and ``add_node`` attaches
+        # ``new_branch_state`` unwired, so until the rewiring lands the region has two source
+        # blocks and the getter raises. The placeholder cleanup below reads the same answer:
+        # by then the emptied pre-states are isolated, which is the same ambiguity.
+        start_before = enclosing_sdfg.start_block
+        was_start = start_before is cond_block
+
         new_branch_state = copy.deepcopy(branch_state)
         enclosing_sdfg.add_node(new_branch_state, ensure_unique_name=True)
 
@@ -469,13 +477,12 @@ class MoveIfIntoMap(transformation.MultiStateTransformation):
                                               mm.Memlet.from_array(arr_name, enclosing_sdfg.arrays[arr_name]))
 
         out_edges = list(enclosing_sdfg.out_edges(cond_block))
-        was_start = enclosing_sdfg.start_block is cond_block
 
         # Wire in_edges to new_branch_state. If an edge has been emptied
         # by the moved-inside step (no assignments, no condition), drop it
         # and also drop its source state when the source is an empty
         # placeholder that exists only to feed the ConditionalBlock.
-        states_to_try_remove: Set[SDFGState] = set()
+        states_to_try_remove: OrderedSet[SDFGState] = OrderedSet()
         for e in in_edges:
             if e.data.is_unconditional() and not e.data.assignments:
                 if isinstance(e.src, SDFGState):
@@ -491,9 +498,8 @@ class MoveIfIntoMap(transformation.MultiStateTransformation):
 
         enclosing_sdfg.remove_node(cond_block)
 
-        # Repoint the start AFTER the removal: ``start_block`` is stored as a
-        # node index, and removing a node renumbers the ones after it -- so
-        # assigning it first would leave the index dangling.
+        # Repoint the start AFTER the removal, so the pin cannot name a block that is about to
+        # go away.
         if was_start or not in_edges:
             enclosing_sdfg.start_block = enclosing_sdfg.node_id(new_branch_state)
 
@@ -556,12 +562,9 @@ class MoveIfIntoMap(transformation.MultiStateTransformation):
             if sym in enclosing_sdfg.symbols and not _still_references(enclosing_sdfg, sym):
                 enclosing_sdfg.remove_symbol(sym)
 
-        # Drop empty placeholder pre-states that are no longer reachable.
-        #
-        # The start block is captured ONCE, before any removal: ``start_block``
-        # resolves a cached node *index*, and removing a node invalidates it --
-        # reading the property again mid-loop raises ``NodeNotFoundError``.
-        start_before = enclosing_sdfg.start_block if enclosing_sdfg.nodes() else None
+        # Drop empty placeholder pre-states that are no longer reachable. The entry was captured
+        # ONCE up top: the pin is a node *index*, so every removal invalidates it, and comparing
+        # by identity is what survives that.
         removed_start = False
         for s in states_to_try_remove:
             if (s in enclosing_sdfg.nodes() and s.is_empty() and enclosing_sdfg.in_degree(s) == 0

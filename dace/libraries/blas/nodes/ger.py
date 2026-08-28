@@ -8,7 +8,7 @@ from dace.sdfg.nodes import LibraryNode
 import dace.library as library
 from dace.sdfg import SDFG, SDFGState, nodes
 from dace.symbolic import equal_valued, symstr
-from dace import data as dt, memlet as mm, subsets as sbs
+from dace import data as dt, memlet as mm, subsets as sbs, symbolic
 import dace
 import copy
 
@@ -18,6 +18,7 @@ import dace.sdfg.nodes
 
 from dace.libraries.blas import blas_helpers
 from .. import environments
+from ordered_set import OrderedSet
 
 
 @library.expansion
@@ -196,8 +197,7 @@ class ExpandGerCuPy(ExpandTransformation):
     environments = []
 
     @staticmethod
-    def expansion(node: 'Ger', state: SDFGState,
-                  sdfg: SDFG) -> SDFG:
+    def expansion(node: 'Ger', state: SDFGState, sdfg: SDFG) -> SDFG:
         node.validate(sdfg, state)
 
         # Collect array descriptors from edges.
@@ -227,37 +227,34 @@ class ExpandGerCuPy(ExpandTransformation):
         nsdfg = dace.SDFG(node.label + '_cupy')
         nstate = nsdfg.add_state()
 
-        nsdfg.add_array('_A', shape_a, dtype_a, strides=adesc.strides,
-                        storage=adesc.storage)
-        nsdfg.add_array('_x', shape_x, dtype_x, strides=xdesc.strides,
-                        storage=xdesc.storage)
-        nsdfg.add_array('_y', shape_y, dtype_y, strides=ydesc.strides,
-                        storage=ydesc.storage)
-        nsdfg.add_array('_res', shape_res, dtype_res, strides=resdesc.strides,
-                        storage=resdesc.storage)
+        nsdfg.add_array('_A', shape_a, dtype_a, strides=adesc.strides, storage=adesc.storage)
+        nsdfg.add_array('_x', shape_x, dtype_x, strides=xdesc.strides, storage=xdesc.storage)
+        nsdfg.add_array('_y', shape_y, dtype_y, strides=ydesc.strides, storage=ydesc.storage)
+        nsdfg.add_array('_res', shape_res, dtype_res, strides=resdesc.strides, storage=resdesc.storage)
 
         # Build tasklet code.
         alpha = node.alpha
         code_lines = ['import cupy']
         if equal_valued(1, alpha):
-            code_lines.append(
-                '__res_out = cupy.asnumpy(cupy.outer(cupy.asarray(__x), '
-                'cupy.asarray(__y)) + cupy.asarray(__A))')
+            code_lines.append('__res_out = cupy.asnumpy(cupy.outer(cupy.asarray(__x), '
+                              'cupy.asarray(__y)) + cupy.asarray(__A))')
         elif equal_valued(0, alpha):
-            code_lines.append(
-                '__res_out = cupy.asnumpy(cupy.asarray(__A))')
+            code_lines.append('__res_out = cupy.asnumpy(cupy.asarray(__A))')
         else:
             alpha_str = symstr(alpha)
-            code_lines.append(
-                f'__res_out = cupy.asnumpy({alpha_str} '
-                f'* cupy.outer(cupy.asarray(__x), '
-                f'cupy.asarray(__y)) + cupy.asarray(__A))')
+            code_lines.append(f'__res_out = cupy.asnumpy({alpha_str} '
+                              f'* cupy.outer(cupy.asarray(__x), '
+                              f'cupy.asarray(__y)) + cupy.asarray(__A))')
 
         code = '\n'.join(code_lines)
 
         tasklet = dace.sdfg.nodes.Tasklet(
             node.label + '_cupy_tasklet',
-            {'__A': None, '__x': None, '__y': None},
+            {
+                '__A': None,
+                '__x': None,
+                '__y': None
+            },
             {'__res_out': None},
             code,
             language=dace.dtypes.Language.Python,
@@ -270,14 +267,10 @@ class ExpandGerCuPy(ExpandTransformation):
         y_read = nstate.add_read('_y')
         res_write = nstate.add_write('_res')
 
-        nstate.add_edge(a_read, None, tasklet, '__A',
-                        dace.Memlet.from_array('_A', nsdfg.arrays['_A']))
-        nstate.add_edge(x_read, None, tasklet, '__x',
-                        dace.Memlet.from_array('_x', nsdfg.arrays['_x']))
-        nstate.add_edge(y_read, None, tasklet, '__y',
-                        dace.Memlet.from_array('_y', nsdfg.arrays['_y']))
-        nstate.add_edge(tasklet, '__res_out', res_write, None,
-                        dace.Memlet.from_array('_res', nsdfg.arrays['_res']))
+        nstate.add_edge(a_read, None, tasklet, '__A', dace.Memlet.from_array('_A', nsdfg.arrays['_A']))
+        nstate.add_edge(x_read, None, tasklet, '__x', dace.Memlet.from_array('_x', nsdfg.arrays['_x']))
+        nstate.add_edge(y_read, None, tasklet, '__y', dace.Memlet.from_array('_y', nsdfg.arrays['_y']))
+        nstate.add_edge(tasklet, '__res_out', res_write, None, dace.Memlet.from_array('_res', nsdfg.arrays['_res']))
 
         return nsdfg
 
@@ -313,7 +306,7 @@ class Ger(LibraryNode):
         default=1, desc="A scalar which will be multiplied with the outer product x*yT before adding matrix A")
 
     def __init__(self, name, n=dace.symbolic.symbol("n"), m=dace.symbolic.symbol("m"), alpha=1, location=None):
-        super().__init__(name, location=location, inputs={"_x", "_y", "_A"}, outputs={"_res"})
+        super().__init__(name, location=location, inputs=OrderedSet(('_x', '_y', '_A')), outputs={"_res"})
 
         self.n = n
         self.m = m
@@ -371,7 +364,7 @@ class Ger(LibraryNode):
         if len(size_y) != 1:
             raise ValueError("y must be a vector")
 
-        if size_a[0] != size_x[0] or size_a[1] != size_y[0]:
+        if symbolic.inequal_symbols(size_a[0], size_x[0]) or symbolic.inequal_symbols(size_a[1], size_y[0]):
             raise ValueError("Input vectors x and y (outer product) must match with the matrix A dimensions.")
 
         out_edges = state.out_edges(self)

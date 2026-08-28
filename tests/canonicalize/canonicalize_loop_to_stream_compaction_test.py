@@ -18,6 +18,7 @@ import dace
 from dace.sdfg import nodes as nd
 from dace.sdfg.state import LoopRegion
 from dace.transformation.passes.canonicalize import canonicalize
+from dace.transformation.passes.cpu_specialization import cpu_specialize
 from dace.transformation.passes.canonicalize.loop_to_stream_compaction import (LoopToStreamCompaction, IDX_PREFIX,
                                                                                MASK_PREFIX, TOTAL_PREFIX)
 
@@ -62,8 +63,16 @@ def phases_under_a_loop(sdfg: dace.SDFG) -> bool:
 
 
 def build(program) -> dace.SDFG:
+    """Canonicalize, then specialize for the CPU -- the assertions below read emitted schedules.
+
+    The two are separate stages: ``canonicalize`` takes parallel wherever the choice is open and
+    ``cpu_specialize`` is what gives parallelism back for a scope that cannot pay for a region. A
+    test that counts ``#pragma omp parallel for`` is asking the second question, so it has to run
+    the second stage.
+    """
     sdfg = program.to_sdfg(simplify=True)
     canonicalize(sdfg, validate=True)
+    cpu_specialize(sdfg)
     sdfg.validate()
     return sdfg
 
@@ -234,19 +243,23 @@ def test_s343_static_extents_lift_the_whole_nest():
     ``total`` is a ``Reduce`` over the shaped mask, so the cursor the nest leaves behind counts
     every taken iteration of BOTH levels.
 
-    A literal extent is also a size the CPU cost model can read: 24x24 is 576 elements per phase,
-    PROVABLY under the 1024-element fork/join break-even, so the terminal ``cpu_specialize`` band
-    pins both phases sequential. That is a target decision, not a property of the lift, so the
-    default build is pinned to the verdict it must produce (no OMP region at all for this size)
-    and the lift's own parallelism is read with the cost model switched off -- threshold 0, its
-    documented A/B lever, which leaves the maps exactly as canonicalization built them.
+    A literal extent is also a size the CPU cost model can read, and the two phases land on
+    OPPOSITE sides of it: the mask phase is the 24x24 nest (576 iterations, above the 256-iteration
+    break-even) and the scatter phase is the 24-iteration cursor sweep (below it). So the terminal
+    ``cpu_specialize`` band must pin exactly one of them -- which is a sharper statement than a size
+    where both fall the same way, since it fails if the band stops running, if it runs on the wrong
+    phase, or if it stops reading iteration counts at all. That is a target decision and not a
+    property of the lift, so the lift's own parallelism is read separately with the cost model
+    switched off -- threshold 0, its documented A/B lever, which leaves the maps exactly as
+    canonicalization built them.
     """
     sdfg = build(s343_static_kernel)
     assert lifted(sdfg)
     assert nest_claimed(sdfg, 2)
     assert not phases_under_a_loop(sdfg)
     assert num_maps(sdfg) >= 2
-    assert omp_parallel_for(sdfg) == 0  # 576 elements per phase: the fork costs more than the work
+    # Exactly the 576-iteration mask phase; the 24-iteration scatter phase cannot pay for a fork.
+    assert omp_parallel_for(sdfg) == 1
     with dace.config.set_temporary('compiler', 'cpu', 'parallel_min_work_per_region', value=0):
         assert omp_parallel_for(build(s343_static_kernel)) >= 2
 

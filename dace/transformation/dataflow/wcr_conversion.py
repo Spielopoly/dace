@@ -12,6 +12,7 @@ from dace.transformation.helpers import get_parent_map_and_loop_scopes
 from dace.sdfg import utils as sdutil
 from dace import Memlet, SDFG, SDFGState
 from dace.sdfg.propagation import propagate_memlets_state
+from ordered_set import OrderedSet
 
 
 def _enclosing_map_params(state: SDFGState, node: nodes.Node) -> List[str]:
@@ -964,9 +965,11 @@ class AugAssignToWCR(transformation.SingleStateTransformation):
         newstate = state.parent_graph.add_state_after(state)
 
         # Bookkeeping
-        nodes_to_move = set([tlet])
-        boundary_nodes = set()
-        orig_edges = set()
+        # Ordered: these drive ``add_nodes_from`` / ``add_edge`` below, and a plain set of node
+        # objects iterates in id() order -- not even PYTHONHASHSEED-stable.
+        nodes_to_move = OrderedSet([tlet])
+        boundary_nodes = OrderedSet()
+        orig_edges = OrderedSet()
 
         for edge in state.in_edges(tlet):
             for e in state.memlet_path(edge):
@@ -1287,6 +1290,42 @@ class WCRToAugAssign(transformation.SingleStateTransformation):
 
         return True
 
+    def clear_boundary_wcr(self, sdfg: SDFG, data: str) -> None:
+        """Drop the reduction ``AugAssignToWCR`` stamped on the enclosing nested-SDFG boundaries.
+
+        ``AugAssignToWCR.apply`` does not stop at the state it rewrites: while the written array is
+        visible outside, it walks OUT of every nesting level and marks the connector's whole memlet
+        path with the same WCR, because a reduction inside a NestedSDFG is still a reduction where
+        the parent sees the write. Reverting the inner WCR without the mirror walk leaves that mark
+        behind as residue -- a boundary claiming an atomic no producer asks for any more. It is not
+        merely untidy: the multi-dim tile vectorizer refuses a whole kernel over a loose WCR inside
+        a map body (tsvc ``s212_d_single``, whose in-chunk sweep is nested), and re-running memlet
+        propagation erases the same edges, which is the definition of stale derived data.
+
+        Stops at a level that still has another WCR writer for the array, whose reduction the
+        boundary is legitimately carrying.
+        """
+        sd = sdfg
+        while sd.parent_nsdfg_node is not None:
+            desc = sd.arrays.get(data)
+            # A transient is invisible to the parent, so no boundary was stamped for it.
+            if desc is None or desc.transient:
+                return
+            if any(e.data is not None and e.data.wcr is not None and e.data.data == data for st in sd.states()
+                   for e in st.edges()):
+                return
+            nsdfg = sd.parent_nsdfg_node
+            nstate = sd.parent
+            sd = sd.parent_sdfg
+            outer = list(nstate.out_edges_by_connector(nsdfg, data))
+            if not outer:
+                return
+            for oe in outer:
+                path = nstate.memlet_path(oe)
+                for pe in path:
+                    pe.data.wcr = None
+                data = path[-1].data.data
+
     def apply(self, state: SDFGState, sdfg: SDFG):
         # WCR convention ``lambda acc, new``: ``__in1`` = existing dest value (read back),
         # ``__in2`` = incoming value the edge writes. ``_wcr_augassign_body`` binds by arg name
@@ -1298,17 +1337,20 @@ class WCRToAugAssign(transformation.SingleStateTransformation):
             edge = self._matched_wcr_edge(state, self.expr_index)
             for pe in state.memlet_path(edge):
                 pe.data.wcr = None
+            self.clear_boundary_wcr(sdfg, self.output.data)
             return
         if self.expr_index == 0:
             edge = state.edges_between(self.tasklet, self.output)[0]
             code = _wcr_augassign_body(edge.data.wcr)
             edge.data.wcr = None
             in_access = state.add_access(self.output.data)
-            new_tasklet = state.add_tasklet('augassign', {'__in1', '__in2'}, {'__out'}, f"__out = {code}")
-            scal_name, scal_desc = sdfg.add_scalar('tmp',
+            new_tasklet = state.add_tasklet('augassign', OrderedSet(('__in1', '__in2')), {'__out'}, f"__out = {code}")
+            # `tmp` is a generic name minted into a graph whose connectors this transformation did
+            # not choose, which is exactly the case that needs the connector-avoiding minter: an
+            # array named after an existing connector is a graph validation rejects.
+            scal_name, scal_desc = sdfg.add_scalar(sdfg.find_new_name_avoiding_connectors('tmp'),
                                                    sdfg.arrays[self.output.data].dtype,
-                                                   transient=True,
-                                                   find_new_name=True)
+                                                   transient=True)
             state.add_edge(in_access, None, new_tasklet, '__in1', copy.deepcopy(edge.data))
             state.add_edge(self.tasklet, edge.src_conn, new_tasklet, '__in2', Memlet.from_array(scal_name, scal_desc))
             state.add_edge(new_tasklet, '__out', self.output, edge.dst_conn, edge.data)
@@ -1320,11 +1362,13 @@ class WCRToAugAssign(transformation.SingleStateTransformation):
             for e in state.memlet_path(edge):
                 e.data.wcr = None
             in_access = state.add_access(self.output.data)
-            new_tasklet = state.add_tasklet('augassign', {'__in1', '__in2'}, {'__out'}, f"__out = {code}")
-            scal_name, scal_desc = sdfg.add_scalar('tmp',
+            new_tasklet = state.add_tasklet('augassign', OrderedSet(('__in1', '__in2')), {'__out'}, f"__out = {code}")
+            # `tmp` is a generic name minted into a graph whose connectors this transformation did
+            # not choose, which is exactly the case that needs the connector-avoiding minter: an
+            # array named after an existing connector is a graph validation rejects.
+            scal_name, scal_desc = sdfg.add_scalar(sdfg.find_new_name_avoiding_connectors('tmp'),
                                                    sdfg.arrays[self.output.data].dtype,
-                                                   transient=True,
-                                                   find_new_name=True)
+                                                   transient=True)
             state.add_memlet_path(in_access, map_entry, new_tasklet, memlet=copy.deepcopy(edge.data), dst_conn='__in1')
             state.add_edge(self.tasklet, edge.src_conn, new_tasklet, '__in2', Memlet.from_array(scal_name, scal_desc))
             state.add_edge(new_tasklet, '__out', self.map_exit, edge.dst_conn, edge.data)
@@ -1344,7 +1388,7 @@ class WCRToAugAssign(transformation.SingleStateTransformation):
             in_subset = m.get_src_subset(edge, state)
             dims = _multi_element_dims(out_subset) if out_subset is not None else []
             read_back = state.add_access(self.output.data)
-            new_tasklet = state.add_tasklet('augassign', {'__in1', '__in2'}, {'__out'}, f"__out = {code}")
+            new_tasklet = state.add_tasklet('augassign', OrderedSet(('__in1', '__in2')), {'__out'}, f"__out = {code}")
 
             if not dims:
                 # Scalar RMW: ``__in1``/``__out`` address DEST (output); ``__in2`` reads SOURCE
@@ -1417,9 +1461,11 @@ class WCRToAugAssign(transformation.SingleStateTransformation):
             for e in state.memlet_path(edge):
                 e.data.wcr = None
             in_access = state.add_access(self.output.data)
-            new_tasklet = state.add_tasklet('augassign', {'__in1', '__in2'}, {'__out'}, f"__out = {code}")
+            new_tasklet = state.add_tasklet('augassign', OrderedSet(('__in1', '__in2')), {'__out'}, f"__out = {code}")
             state.add_memlet_path(in_access, map_entry, new_tasklet, memlet=copy.deepcopy(edge.data), dst_conn='__in1')
             state.add_edge(self.inp, edge.src_conn, new_tasklet, '__in2',
                            Memlet.from_array(self.inp.data, sdfg.arrays[self.inp.data]))
             state.add_edge(new_tasklet, '__out', self.map_exit, edge.dst_conn, edge.data)
             state.remove_edge(edge)
+
+        self.clear_boundary_wcr(sdfg, self.output.data)

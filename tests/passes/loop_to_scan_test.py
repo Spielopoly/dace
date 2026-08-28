@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 import dace
-from dace.libraries.standard.nodes.scan import Scan, in_connector, init_connector, out_connector
+from dace.libraries.standard.nodes.scan import Scan, ScanOp, in_connector, init_connector, out_connector
 from dace.sdfg.state import ConditionalBlock, LoopRegion
 from dace.transformation.passes.insert_unit_copy_assign_tasklets import InsertAssignTaskletsForUnitCopies
 from dace.transformation.passes.lift_preprocess import LiftPreprocess
@@ -21,6 +21,12 @@ def _num_loops(sdfg):
 
 def _num_scan_nodes(sdfg):
     return sum(1 for n, _ in sdfg.all_nodes_recursive() if isinstance(n, Scan))
+
+
+def _scan_ops(sdfg):
+    """Which ops the lifted Scan nodes carry -- an AFFINE lift and a SUM lift are not the same
+    result, and several refusal tests here turn on exactly that difference."""
+    return [n.op for n, _ in sdfg.all_nodes_recursive() if isinstance(n, Scan)]
 
 
 def test_inclusive_sum_1d():
@@ -167,8 +173,14 @@ def test_tsvc_s1221_residue_class_scan_inplace():
     assert np.allclose(b, expected), f's1221 mismatch: got {b}, expected {expected}'
 
 
-def test_refuses_non_associative_op():
-    """Subtraction isn't associative; the pass refuses any op outside +, *, max, min."""
+def test_subtraction_lifts_through_the_affine_monoid_not_a_scalar_op():
+    """Subtraction is not associative, so none of the four scalar ops may claim this loop.
+
+    It is still a scan: ``out[i+1] = 1*out[i] + (-delta[i])`` is an affine map, and MAP COMPOSITION
+    is associative even though ``-`` is not. So the affine path lifts it -- and at ``c == 1`` the
+    composed coefficient is identically one, so no product is ever formed and the result is exact.
+    What must never happen is a SUM or PRODUCT node here; that would compute a different function.
+    """
 
     @dace.program
     def sub(out: dace.float64[N + 1], delta: dace.float64[N]):
@@ -178,7 +190,18 @@ def test_refuses_non_associative_op():
     sdfg = sub.to_sdfg(simplify=True)
     LiftPreprocess().apply_pass(sdfg, {})
     LoopToScan().apply_pass(sdfg, {})
-    assert _num_scan_nodes(sdfg) == 0
+    assert _scan_ops(sdfg) == [ScanOp.AFFINE]
+
+    n = 33
+    delta = np.random.default_rng(3).random(n)
+    want = np.zeros(n + 1)
+    want[0] = 0.7
+    for i in range(n):
+        want[i + 1] = want[i] - delta[i]
+    got = np.zeros(n + 1)
+    got[0] = 0.7
+    sdfg(out=got, delta=delta, N=n)
+    assert np.allclose(got, want, rtol=0, atol=1e-13)
 
 
 def test_refuses_delta_reads_carry_array():
@@ -201,9 +224,14 @@ def test_refuses_delta_reads_carry_array():
                                         "'delta' aa[j-1, i] is another read of the carry array.")
 
 
-def test_refuses_extra_non_transient_write():
-    """The body writes a *second* non-transient array (``aux[i]``); that's per-iteration
-    output we'd need to preserve outside the rewrite. The matcher refuses."""
+def test_extra_non_transient_write_survives_the_lift():
+    """A second per-iteration output (``aux[i]``) must still be written, and written correctly.
+
+    The scalar path refuses this shape because its rewrite reroutes "the body's final write" and a
+    second non-transient write makes that ambiguous. The affine rewrite is CHAIN-SCOPED -- it
+    removes only the nodes it proved belong to the recurrence -- so an unrelated write is not its
+    business and simply stays where it was, riding the same now-parallel loop.
+    """
 
     @dace.program
     def with_aux(out: dace.float64[N + 1], delta: dace.float64[N], aux: dace.float64[N]):
@@ -214,7 +242,20 @@ def test_refuses_extra_non_transient_write():
     sdfg = with_aux.to_sdfg(simplify=True)
     LiftPreprocess().apply_pass(sdfg, {})
     LoopToScan().apply_pass(sdfg, {})
-    assert _num_scan_nodes(sdfg) == 0
+    assert _scan_ops(sdfg) == [ScanOp.AFFINE]
+
+    n = 33
+    delta = np.random.default_rng(4).random(n)
+    want = np.zeros(n + 1)
+    want[0] = 0.3
+    for i in range(n):
+        want[i + 1] = want[i] + delta[i]
+    got = np.zeros(n + 1)
+    got[0] = 0.3
+    aux = np.full(n, -99.0)
+    sdfg(out=got, delta=delta, aux=aux, N=n)
+    assert np.allclose(got, want, rtol=0, atol=1e-13)
+    assert np.array_equal(aux, delta * 2.0), 'the unrelated per-iteration output was dropped'
 
 
 def test_refuses_double_buffer_ring_carry():
@@ -439,10 +480,14 @@ def test_v2_computed_delta_with_scale():
     assert np.allclose(out, expected)
 
 
-def test_refuses_when_delta_is_same_array():
-    """``out[i+1] = out[i] + out[i]`` -- the delta IS the carry. The rewrite would
-    self-alias; refused (this also catches scaling shapes like ``out[i+1] = 2*out[i]``
-    once the frontend lowers them)."""
+def test_delta_that_is_the_carry_is_a_scaling_recurrence():
+    """``out[i+1] = out[i] + out[i]`` has no delta at all -- it is ``out[i+1] = 2*out[i]``.
+
+    A SUM matcher would self-alias here, which is why the scalar path refuses. Read as an affine
+    map it is simply ``c == 2, d == 0``, so the affine path lifts it and the answer is EXACT: the
+    coefficients are integral, so the blocked product reproduces the sequential doubling bit for
+    bit.
+    """
 
     @dace.program
     def self_double(out: dace.float64[N + 1]):
@@ -452,9 +497,17 @@ def test_refuses_when_delta_is_same_array():
     sdfg = self_double.to_sdfg(simplify=True)
     LiftPreprocess().apply_pass(sdfg, {})
     LoopToScan().apply_pass(sdfg, {})
-    # Assert the refusal itself: apply_pass legitimately returns 0 rather than None when its
-    # preprocessing normalizes the body (here a frontend identity-copy tasklet) without lifting.
-    assert _num_scan_nodes(sdfg) == 0
+    assert _scan_ops(sdfg) == [ScanOp.AFFINE]
+
+    n = 20
+    want = np.zeros(n + 1)
+    want[0] = 1.5
+    for i in range(n):
+        want[i + 1] = want[i] + want[i]
+    got = np.zeros(n + 1)
+    got[0] = 1.5
+    sdfg(out=got, N=n)
+    assert np.array_equal(got, want)
 
 
 def test_multi_state_body_with_empty_wrappers():
@@ -1387,8 +1440,8 @@ def test_scalar_carry_acc_not_used_post_loop_no_writeback():
     res = LoopToScan().apply_pass(sdfg, {})
     sdfg.validate()
     assert res == 1
-    # Inspect: the rewrite added s_build, s_scan, s_write. The writeback state
-    # name suffix is ``_scan_acc_post`` -- absent here.
+    # Inspect: the rewrite added the scan state, plus whichever staging states its buffers
+    # needed. The writeback state name suffix is ``_scan_acc_post`` -- absent here.
     state_labels = {s.label for s in sdfg.all_states()}
     assert not any('_scan_acc_post' in lbl for lbl in state_labels)
 
@@ -1416,14 +1469,22 @@ def test_scalar_carry_preserves_iedge_assignments_on_loop_boundary():
     assert in_edges, 'test fixture: loop should have at least one in-edge'
     # Add a marker assignment to the first in-edge.
     in_edges[0].data.assignments['_marker_pre_loop'] = '42'
+    loop_label = loop.label
 
     LiftPreprocess().apply_pass(sdfg, {})
     LoopToScan().apply_pass(sdfg, {})
 
-    # After the rewrite, the marker must still be on an iedge feeding the new
-    # head state (``*_scan_build``).
-    new_head = next(s for s in sdfg.all_states() if s.label.endswith('_scan_build'))
-    head_in_edges = list(sdfg.in_edges(new_head))
+    # After the rewrite, the marker must still be on an iedge feeding the new head state.
+    # The head is found STRUCTURALLY -- the one state of the rewritten chain that is entered
+    # from outside it -- not by a label suffix: the chain is only ``build -> scan -> write``
+    # when both staging buffers are needed, and a contiguous 1-D delta/output elides the copy
+    # states around the libnode, which would leave a name-based lookup asserting on a state
+    # the rewrite is entitled not to emit.
+    chain = [s for s in sdfg.all_states() if s.label.startswith(loop_label)]
+    assert chain, f'the rewrite should have left states named after {loop_label}'
+    heads = [s for s in chain if any(e.src not in chain for e in sdfg.in_edges(s))]
+    assert len(heads) == 1, f'expected exactly one entry into the scan chain, got {[s.label for s in heads]}'
+    head_in_edges = list(sdfg.in_edges(heads[0]))
     found = any(e.data.assignments.get('_marker_pre_loop') == '42' for e in head_in_edges)
     assert found, 'iedge assignment ``_marker_pre_loop=42`` lost during rewrite'
 
@@ -1865,6 +1926,45 @@ def test_masked_conditional_scan_lifts_and_neutralizes_else_branch():
     assert np.allclose(out, exp), f'masked scan diverged: max diff {np.abs(out - exp).max():.2e}'
 
 
+def test_masked_scan_with_a_non_hold_sibling_is_refused():
+    """The sibling branch here writes a value of its OWN (``out[i] = delta[i]``), not a
+    hold of the carrier. The masked rewrite zero-fills the delta buffer for skipped
+    iterations and drops the sibling's write, which reproduces a hold and nothing else --
+    so lifting this shape would silently discard the sibling's value and run the scan's
+    running sum through iterations that never had one. Refusing is the only sound answer.
+
+    The shape is the ``[0,K)`` half of an index-set-split hybrid-sparse loop, where the
+    segment's clamped ``i < min(K, N)`` bound leaves the ``i < K`` guard standing.
+    """
+
+    @dace.program
+    def masked_non_hold(out: dace.float64[N], delta: dace.float64[N], mask: dace.int64[N]):
+        for i in range(1, N):
+            if mask[i] > 0:
+                out[i] = out[i - 1] + delta[i]
+            else:
+                out[i] = delta[i]
+
+    sdfg = masked_non_hold.to_sdfg(simplify=True)
+    LiftPreprocess().apply_pass(sdfg, {})
+    res = LoopToScan().apply_pass(sdfg, {})
+    sdfg.validate()
+    assert not res, f'a non-hold sibling must refuse the lift; got {res} rewrites'
+    assert _num_scan_nodes(sdfg) == 0
+    assert _num_loops(sdfg) == 1, 'the loop must survive as the sequential recurrence'
+
+    n = 32
+    rng = np.random.default_rng(11)
+    delta = rng.standard_normal(n)
+    mask = (rng.standard_normal(n) > 0.0).astype(np.int64)
+    out = rng.standard_normal(n)
+    exp = out.copy()
+    for i in range(1, n):
+        exp[i] = exp[i - 1] + delta[i] if mask[i] > 0 else delta[i]
+    sdfg(out=out, delta=delta, mask=mask, N=n)
+    assert np.allclose(out, exp), f'refused masked scan diverged: max diff {np.abs(out - exp).max():.2e}'
+
+
 def test_multi_slot_same_array_five_carries():
     """Five INDEPENDENT prefix sums carried in one loop body writing distinct
     constant slots of ONE array (TSVC-2.5 ``scan_multi_5carry`` / cloudsc
@@ -1916,6 +2016,70 @@ def test_multi_slot_same_array_five_carries():
             exp[r, i] = exp[r, i - 1] + delta[r, i]
     sdfg(acc=acc, delta=delta, N=n)
     assert np.allclose(acc, exp), f'multi-slot scan diverged: max diff {np.abs(acc - exp).max():.2e}'
+
+
+def test_linear_recurrence_lifts_as_affine_never_as_a_product_scan():
+    """``out[i] = out[i-1]*x[i] + x[i]`` is a first-order LINEAR recurrence.
+
+    Its inner ``_Mult_`` is a perfectly shaped PRODUCT update -- carry on one side, an array slice
+    on the other -- so a matcher that only looks at that tasklet claims the loop and lifts a product
+    scan, whose result is then ADDED to. That computes something else entirely; the kernel came back
+    wrong by five orders of magnitude. The guard against THAT is what this test exists for, and it
+    still holds: the node here must be AFFINE and nothing else.
+
+    What changed is the alternative. The recurrence needs the affine monoid, and ``Scan`` now has
+    it, so the right answer is no longer to leave the loop alone -- it is to lift it with a carry
+    that is the map ``x -> c*x + d`` rather than a value.
+    """
+
+    @dace.program
+    def linear_recurrence(out: dace.float64[N], x: dace.float64[N]):
+        for i in range(1, N):
+            out[i] = out[i - 1] * x[i] + x[i]
+
+    sdfg = linear_recurrence.to_sdfg(simplify=True)
+    LiftPreprocess().apply_pass(sdfg, {})
+    assert LoopToScan().apply_pass(sdfg, {}) == 1
+    assert _scan_ops(sdfg) == [ScanOp.AFFINE]
+
+    n = 32
+    rng = np.random.default_rng(3)
+    seed, x = rng.random(n) * 0.5 + 0.5, rng.random(n) * 0.5 + 0.5
+    want = seed.copy()
+    for i in range(1, n):
+        want[i] = want[i - 1] * x[i] + x[i]
+    got = seed.copy()
+    sdfg(out=got, x=x, N=n)
+    assert np.allclose(got, want), f'max|diff| = {np.max(np.abs(got - want)):.3e}'
+
+
+def test_delta_may_be_a_computed_expression():
+    """The delta is any per-iteration value, and the body may keep folding in with the SAME op.
+
+    ``out[i] = out[i-1] + x[i]*y[i] + x[i]*z[i]`` hands the carry to the inner ``+`` and combines the
+    second product afterwards; that is the same scan because ``+`` associates, and refusing it would
+    give up every kernel whose delta is more than one array slice.
+    """
+
+    @dace.program
+    def computed_delta(out: dace.float64[N], x: dace.float64[N], y: dace.float64[N], z: dace.float64[N]):
+        for i in range(1, N):
+            out[i] = out[i - 1] + x[i] * y[i] + x[i] * z[i]
+
+    sdfg = computed_delta.to_sdfg(simplify=True)
+    assert LoopToScan().apply_pass(sdfg, {}) == 1
+    assert _num_scan_nodes(sdfg) == 1
+
+    n = 32
+    rng = np.random.default_rng(4)
+    seed = rng.random(n)
+    x, y, z = rng.random(n), rng.random(n), rng.random(n)
+    want = seed.copy()
+    for i in range(1, n):
+        want[i] = want[i - 1] + x[i] * y[i] + x[i] * z[i]
+    got = seed.copy()
+    sdfg(out=got, x=x, y=y, z=z, N=n)
+    assert np.allclose(got, want), f'max|diff| = {np.max(np.abs(got - want)):.3e}'
 
 
 if __name__ == '__main__':
@@ -2029,3 +2193,39 @@ def test_scan_lift_inside_nested_sdfg_uses_the_nested_sdfgs_arrays():
     aa = aa0.copy()
     sdfg(aa=aa, bb=bb, L=n)
     assert np.allclose(aa, expected), 'second canonicalize diverged from the sequential oracle'
+
+
+def test_refuses_second_order_recurrence_behind_two_sided_copy_memlets():
+    """TSVC s322 ``a[i] = a[i] + a[i-1]*b[i] + a[i-2]*c[i]``: a TWO-step recurrence.
+
+    The multi-offset guard counts the carrier's distinct read subsets, but a folded unit copy
+    names the DESTINATION in ``Memlet.data`` and parks the carrier's index in ``other_subset``.
+    Reading ``subset`` reports the destination's scalar slot ``0`` for all three of ``a[i]``,
+    ``a[i-1]`` and ``a[i-2]``, so the guard sees ONE distinct read and blesses a one-step
+    recurrence that does not exist -- the scan lift then drops the ``a[i-2]`` term (max|diff|
+    3.1 on the corpus gate). Companion refusal to
+    :func:`test_scan_survives_two_sided_carry_copy_memlet`, which pins that a GENUINE one-step
+    carry in the same two-sided form still lifts.
+    """
+
+    @dace.program
+    def second_order(a: dace.float64[N], b: dace.float64[N], c: dace.float64[N]):
+        for i in range(2, N):
+            a[i] = a[i] + a[i - 1] * b[i] + a[i - 2] * c[i]
+
+    sdfg = second_order.to_sdfg(simplify=True)
+    InsertAssignTaskletsForUnitCopies().apply_pass(sdfg, {})
+    LiftPreprocess().apply_pass(sdfg, {})
+    LoopToScan().apply_pass(sdfg, {})
+    sdfg.validate()
+    assert _num_scan_nodes(sdfg) == 0, 'a two-step recurrence is not a scan, whichever side the memlet names'
+
+    rng = np.random.default_rng(0)
+    n = 64
+    a0, b, c = rng.random(n), rng.random(n), rng.random(n)
+    expected = a0.copy()
+    for i in range(2, n):
+        expected[i] = expected[i] + expected[i - 1] * b[i] + expected[i - 2] * c[i]
+    a = a0.copy()
+    sdfg(a=a, b=b, c=c, N=n)
+    assert np.allclose(a, expected), f'second-order recurrence diverged: max diff {np.abs(a - expected).max():.2e}'

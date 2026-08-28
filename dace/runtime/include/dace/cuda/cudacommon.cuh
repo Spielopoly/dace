@@ -2,43 +2,41 @@
 #ifndef __DACE_CUDACOMMON_CUH
 #define __DACE_CUDACOMMON_CUH
 
-#include <cstdio>
-
 #if defined(__HIPCC__) || defined(WITH_HIP)
+// The precompiled runtime header is force-included ahead of the generated file's own includes.
+#include <hip/hip_runtime.h>
 typedef hipStream_t gpuStream_t;
 typedef hipEvent_t gpuEvent_t;
 typedef hipError_t gpuError_t;
 #define gpuGetLastError hipGetLastError
 #define gpuGetErrorString hipGetErrorString
+#define gpuStreamSynchronize hipStreamSynchronize
+#define gpuDeviceSynchronize hipDeviceSynchronize
+#define gpuEventSynchronize hipEventSynchronize
 #else
 typedef cudaStream_t gpuStream_t;
 typedef cudaEvent_t gpuEvent_t;
 typedef cudaError_t gpuError_t;
 #define gpuGetLastError cudaGetLastError
 #define gpuGetErrorString cudaGetErrorString
+#define gpuStreamSynchronize cudaStreamSynchronize
+#define gpuDeviceSynchronize cudaDeviceSynchronize
+#define gpuEventSynchronize cudaEventSynchronize
 #endif
 
-#define DACE_GPU_CHECK(err)                                     \
-  do {                                                          \
-    (void)dace::cuda::report_error(__state->gpu_context, (err), \
-                                   __FILE__, __LINE__);         \
-  } while (0)
-
-// A failed allocation leaves the pointer unusable, so stop right here rather than let the rest
-// of the generated code dereference it before Python reads ``lasterror`` back.
-#define DACE_GPU_CHECK_RETURN(err)                              \
-  do {                                                          \
-    if (dace::cuda::report_error(__state->gpu_context, (err),   \
-                                 __FILE__, __LINE__))           \
-      return;                                                   \
-  } while (0)
-
-// Same, for the persistent allocations that codegen emits into the state-returning initializer.
-#define DACE_GPU_CHECK_RETURN_VAL(err, retval)                  \
-  do {                                                          \
-    if (dace::cuda::report_error(__state->gpu_context, (err),   \
-                                 __FILE__, __LINE__))           \
-      return retval;                                            \
+// The context guard covers the calls checked during __dace_init_cuda before the context has been
+// constructed (the runtime warm-up allocation). The message is printed either way; only the
+// recording needs a context to record into.
+#define DACE_GPU_CHECK(err)                                               \
+  do {                                                                    \
+    gpuError_t errr = (err);                                              \
+    if (errr != (gpuError_t)0) {                                          \
+      printf("GPU runtime error at %s:%d: %s (%d)\n", __FILE__, __LINE__, \
+             gpuGetErrorString(errr), errr);                              \
+      if (__state->gpu_context) {                                         \
+        __state->gpu_context->record_error(errr);                         \
+      }                                                                   \
+    }                                                                     \
   } while (0)
 
 #define DACE_KERNEL_LAUNCH_CHECK(err, kernel_name, gdimx, gdimy, gdimz, bdimx, \
@@ -73,6 +71,7 @@ struct Context {
   }
   ~Context() {
     delete[] streams;
+    delete[] internal_streams;
     delete[] events;
   }
   // Keep the first error. One failure tends to produce more, and only the first names the call that
@@ -84,16 +83,6 @@ struct Context {
     }
   }
 };
-
-// Records the failure where ``CompiledSDFG`` reads it back, and reports whether there was one.
-inline bool report_error(Context *ctx, gpuError_t err, const char *file,
-                         int line) {
-  if (err == (gpuError_t)0) return false;
-  printf("GPU runtime error at %s:%d: %s (%d)\n", file, line,
-         gpuGetErrorString(err), (int)err);
-  ctx->lasterror = err;
-  return true;
-}
 
 }  // namespace cuda
 }  // namespace dace

@@ -38,6 +38,14 @@ os.environ.setdefault("UCX_VFS_ENABLE", "n")
 os.environ.setdefault("OMPI_MCA_pml", "ob1")
 os.environ.setdefault("OMPI_MCA_btl", "self,vader")
 
+# Run parallel kernels on MORE THAN TWO threads unless the caller pinned a count. A race in a
+# generated kernel -- a dropped WCR, a parallelised reducing axis -- is invisible at one thread and
+# often still invisible at two, so a suite that leaves the thread count to the machine reports a
+# miscompile as a pass on any host that happens to run it serially. Four is the floor that made
+# polybench ``symm``'s dropped reduction reproducible; a smaller machine gets what it has, and a
+# test that needs a deterministic reduction order pins the variable itself.
+os.environ.setdefault("OMP_NUM_THREADS", str(max(1, min(4, os.cpu_count() or 1))))
+
 import warnings
 
 import pytest
@@ -54,54 +62,62 @@ def thread_count() -> int:
         return 0  # not Linux: no thread census, so the guard abstains
 
 
-def openmp_team_was_live() -> bool:
-    """True iff an OpenMP thread team was up -- and tear it down while finding out.
+#: Substrings identifying an OpenMP runtime in ``/proc/self/maps``; keep in step with
+#: ``dace.transformation.layout.isolation.OMP_RUNTIME_SONAMES``.
+OMP_RUNTIME_MARKERS = ("libgomp", "libomp", "libiomp", "libnvomp")
 
-    No OpenMP runtime reports team liveness, so this asks the only way that works: pause every
-    loaded runtime and see whether the process lost threads. Pausing is semantically transparent --
-    the next parallel region rebuilds the team -- which is what makes the probe safe to run on every
-    fork, and what keeps it quiet for a caller that (correctly) paused the pools itself first.
 
-    Cheap checks first: without ``libgomp`` mapped there is no team and no reason to import dace.
-    A runtime predating ``omp_pause_resource_all`` (OpenMP 5.0) cannot be torn down, so the probe
-    abstains there rather than guessing.
+def openmp_pool_may_outlive_fork() -> bool:
+    """True iff an OpenMP thread pool could still be standing after asking every loaded runtime to
+    tear its pool down -- i.e. iff the coming fork can still strand a team.
+
+    Team liveness is NOT observable: no OpenMP runtime reports it. Counting the process's threads
+    across the teardown looks like it answers the question and does not -- it cannot tell an
+    OpenMP worker exiting from any other thread that happened to exit in the same window, and that
+    window is wide because tearing a team down joins every worker in it. pytest-timeout's per-test
+    timer thread lands in exactly that window, which is how this fired on forks that ``run_isolated``
+    had already made safe. What IS observable is whether the teardown ran, and that is the property
+    fork safety actually rests on: a runtime that reports success has no pool left to strand.
+
+    Cheap checks first: a single-threaded process has nothing to strand, and without an OpenMP
+    runtime mapped there is no pool and no reason to import dace.
     """
-    before = thread_count()
-    if before <= 1:
+    if thread_count() <= 1:
         return False  # single-threaded: fork carries everything it has
     try:
         with open("/proc/self/maps") as maps:
-            if "libgomp" not in maps.read():
-                return False  # no OpenMP runtime loaded -> no team to strand
+            mapped = maps.read()
     except OSError:
-        return False
+        return False  # not Linux: no census, so the guard abstains
+    if not any(marker in mapped for marker in OMP_RUNTIME_MARKERS):
+        return False  # no OpenMP runtime loaded -> no pool to strand
     from dace.transformation.layout.isolation import pause_openmp_pools
     with warnings.catch_warnings():
-        warnings.simplefilter("ignore")  # a pause that could not run shows up as "no drop" below
-        pause_openmp_pools()
-    return thread_count() < before
+        warnings.simplefilter("ignore")  # the return value carries the same verdict as the warning
+        return not pause_openmp_pools()
 
 
 def guarded_fork() -> int:
-    """``os.fork`` that refuses to strand a live OpenMP team, turning a silent hang into an error.
+    """``os.fork`` that tears OpenMP pools down first and refuses the fork when it cannot, turning a
+    silent hang into an error.
 
     ``fork`` keeps only the calling thread, but the child inherits libgomp's heap-resident team
     barrier still recording the whole team -- so the child's first parallel region waits on a futex
     for threads that do not exist in it. 0 CPU, forever, and the parent blocks in ``waitpid`` behind
     it. A whole test directory then has no verdict, which is a worse failure than any assertion.
 
-    This does not ban ``fork``. It fires only when a team is actually up, so pytest-xdist (which
-    spawns its workers through ``subprocess``, never through ``os.fork``), a spawn-based child, a
-    suite pinned to ``OMP_NUM_THREADS=1``, and a caller that paused the pools itself all pass
-    straight through.
+    This does not ban ``fork``. Pausing the pools is semantically transparent -- the next parallel
+    region rebuilds the team -- so the common case is made safe rather than rejected, and the error
+    is reserved for a runtime that could not be paused at all (pre-OpenMP-5.0, or a fork from inside
+    a parallel region), where the deadlock is real and no teardown can prevent it.
     """
-    if openmp_team_was_live():
-        raise RuntimeError("os.fork() from a process holding a live OpenMP thread team deadlocks the child: the "
-                           "child inherits libgomp's team barrier recording threads that fork did not carry over, "
-                           "so its first parallel region waits on them forever. The team is up because a compiled "
-                           "DaCe CPU kernel has already run in this process. Run the kernel in a spawned child via "
-                           "tests.helpers.isolation instead, or pin OMP_NUM_THREADS=1 before dace is imported so no "
-                           "team is ever built.")
+    if openmp_pool_may_outlive_fork():
+        raise RuntimeError("os.fork() from a process whose OpenMP thread pool could not be torn down deadlocks the "
+                           "child: the child inherits libgomp's team barrier recording threads that fork did not "
+                           "carry over, so its first parallel region waits on them forever. omp_pause_resource_all "
+                           "refused or is missing -- a pre-OpenMP-5.0 runtime, or a fork from inside a parallel "
+                           "region. Run the kernel in a spawned child via tests.helpers.isolation instead, or pin "
+                           "OMP_NUM_THREADS=1 before dace is imported so no team is ever built.")
     return UNGUARDED_FORK()
 
 
@@ -117,8 +133,12 @@ GLOBAL_RANDOM_SEED = 0
 def xdist_build_folder():
     """Give each xdist worker its own build directory, so same-named SDFGs do not race.
 
-    Prefers the CONFIG: ``Config.get`` outranks it with the env var, which would defeat every
-    ``set_temporary('default_build_folder')``. An already-exported env var is moved too.
+    DaCe keys a build on the SDFG NAME and many tests reuse generic ones ("testing", "tester"), so two
+    workers compiling same-named SDFGs race on one build entry and load a half-written .so. Sets the
+    CONFIG rather than exporting ``DACE_default_build_folder``: ``Config.get`` returns an env var
+    before it consults the config, so exporting it would defeat every
+    ``set_temporary('default_build_folder')`` for the whole session. An already-exported env var is
+    moved too, or the config write it outranks buys no isolation. Serial runs are untouched.
     """
     worker = os.environ.get('PYTEST_XDIST_WORKER')
     if not worker:
@@ -157,6 +177,23 @@ def pytest_generate_tests(metafunc):
         ])
 
 
+@pytest.fixture(autouse=True)
+def old_gpu_transform_only(request):
+    """Run a test marked ``old_gpu_transform_only`` against ``GPUTransformSDFG``.
+
+    A test that asserts that transformation's own behaviour -- its ``host_maps`` / ``host_data``
+    parameters, or the ``gpu_A`` staging it leaves behind -- is about that transformation, not about
+    whichever offloader happens to be the default. This flips the config for the duration rather
+    than skipping, so the coverage survives the default moving to ``OffloadToAccelerator``.
+    """
+    if request.node.get_closest_marker('old_gpu_transform_only') is None:
+        yield
+        return
+    import dace
+    with dace.config.set_temporary('optimizer', 'new_gpu_offloading_pass', value=False):
+        yield
+
+
 def _active_cuda_impl():
     # Imported lazily so pytest collection works even if the dace package can't be imported.
     from dace.config import Config
@@ -182,10 +219,11 @@ _SUITE_DIRS = (
     (os.path.join('tests', 'npbench'), 'corpus'),
 )
 
-#: Library-node and loop-lifting tests introduced by this branch (absent from ``main``). They ran in
-#: general CI AND in each suite runner that happened to collect them; a dedicated runner gives them
-#: one home. Deliberately NOT the whole of ``tests/library`` -- upstream's own library tests stay
-#: where they are.
+#: Library-node and loop-to-libnode lift tests (loop2sym / loop2reduce / loop2scan / lift-einsum
+#: and the library nodes this branch adds). One home: the "LibNodes + LoopToLibNodeLifts" CI job.
+#: The file list beats the suite-directory marking below, so a lift test under a suite directory
+#: still lands here. MPI library tests are NOT here -- ``tests/library/mpi`` is directory-marked
+#: ``mpi`` and runs under the heterogeneous runner's ``mpirun``.
 _LIBNODE_FILES = (
     'allany_node_test.py',
     'arg_reduce_test.py',
@@ -199,26 +237,21 @@ _LIBNODE_FILES = (
     'fft_fftw3_test.py',
     'fft_interpolate_test.py',
     'fft_pure_ndim_test.py',
+    'fill_node_test.py',
     'fortran_io_test.py',
     'gemm_runtime_coeff_test.py',
     'integer_sort_test.py',
     'lapacke_link_test.py',
-    'loop_to_map_affine_coeffs_test.py',
-    'loop_to_map_conditional_e2e_test.py',
-    'loop_to_map_disjoint_writes_test.py',
-    'loop_to_map_happens_before_war_test.py',
-    'loop_to_map_level_indexed_test.py',
-    'loop_to_map_loop_independent_test.py',
-    'loop_to_map_overlapping_writes_test.py',
-    'loop_to_map_single_iteration_test.py',
-    'loop_to_map_triangular_test.py',
+    'lift_einsum_matmul_test.py',
+    'loop_to_reduce_test.py',
     'loop_to_scan_test.py',
+    'loop_to_symm_test.py',
+    'loop_to_symmetrize_test.py',
     'matmul_batched_test.py',
     'matmul_broadcast_test.py',
     'matmul_test.py',
     'matmul_trans_test.py',
     'matmul_unit_dim_squeeze_test.py',
-    'memset_node_test.py',
     'merge_node_test.py',
     'norm2_test.py',
     'preexpanded_libnode_stream_test.py',
@@ -248,16 +281,20 @@ def pytest_collection_modifyitems(config, items):
     old_gpu_codegen_only / new_gpu_codegen_only per ``compiler.cuda.implementation``."""
     for item in items:
         path = str(getattr(item, 'fspath', ''))
+        name = os.path.basename(path)
+        # File list beats directory: a loop-to-libnode lift test living under a suite directory
+        # (loop_to_symm* under tests/passes/canonicalize) belongs to the libnode runner, not the
+        # suite its directory would mark it into.
+        if name in _LIBNODE_FILES or os.path.join('tests', 'library', 'tileops') in path:
+            item.add_marker(pytest.mark.loop2x_libnodes)
+            continue
         for prefix, mark in _SUITE_DIRS:
             if prefix in path:
                 item.add_marker(getattr(pytest.mark, mark))
                 break
         else:
-            name = os.path.basename(path)
             if name in _CORPUS_FILES:
                 item.add_marker(pytest.mark.corpus)
-            elif name in _LIBNODE_FILES or os.path.join('tests', 'library', 'tileops') in path:
-                item.add_marker(pytest.mark.loop2x_libnodes)
 
     try:
         impl = _active_cuda_impl()

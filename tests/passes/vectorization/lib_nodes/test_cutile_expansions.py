@@ -332,6 +332,83 @@ def test_tile_binop_cutile_symbol_operand_inlines_expr():
     assert "alpha" in body
 
 
+def test_tile_binop_cutile_materializes_precise_float64_literal() -> None:
+    """A non-float32-exact float64 literal is built from two precise terms."""
+    body, _ = _expand_cutile_with_edges(
+        TileBinop(name="F64", widths=(8, ), op="*", kind_a="Symbol", expr_a="0.33333", kind_b="Tile"),
+        in_arrays={"_b": ("b", (8, ), dace.float64)},
+        out_arrays={"_c": ("c", (8, ), dace.float64)},
+    )
+    _assert_parses_as_python(body)
+    assert "ct.full((8,), 0.3333300054073334, ct.float64)" in body
+    assert "+ (- 5.407333247831048e-09)" in body
+
+
+def test_tile_binop_cutile_materializes_masked_float64_literal() -> None:
+    """Mask wrapping preserves precise float64 literal construction."""
+    body, _ = _expand_cutile_with_edges(
+        TileBinop(
+            name="F64_masked",
+            widths=(8, ),
+            op="*",
+            has_mask=True,
+            kind_a="Symbol",
+            expr_a="0.33333",
+            kind_b="Tile",
+        ),
+        in_arrays={
+            "_b": ("b", (8, ), dace.float64),
+            "_mask": ("mask", (8, ), dace.bool_)
+        },
+        out_arrays={"_c": ("c", (8, ), dace.float64)},
+    )
+    _assert_parses_as_python(body)
+    assert "ct.where(_mask" in body
+    assert "ct.full((8,), 0.3333300054073334, ct.float64)" in body
+    assert "+ (- 5.407333247831048e-09)" in body
+
+
+def test_tile_binop_cutile_uses_input_dtype_for_float64_comparison() -> None:
+    """A bool result still materializes its float64 comparison operand precisely."""
+    body, _ = _expand_cutile_with_edges(
+        TileBinop(
+            name="F64_compare",
+            widths=(8, ),
+            op=">",
+            kind_a="Symbol",
+            expr_a="1.0000000000009095",
+            kind_b="Tile",
+        ),
+        in_arrays={"_b": ("b", (8, ), dace.float64)},
+        out_arrays={"_c": ("c", (8, ), dace.bool_)},
+    )
+    _assert_parses_as_python(body)
+    assert "ct.full((8,), 1.0, ct.float64)" in body
+    assert "9.094947017729282e-13" in body
+
+
+def test_tile_binop_cutile_keeps_f32_exact_float64_literal_bare() -> None:
+    """A float32-exact literal needs no two-term materialization."""
+    body, _ = _expand_cutile_with_edges(
+        TileBinop(name="F64_exact", widths=(8, ), op="*", kind_a="Symbol", expr_a="0.5", kind_b="Tile"),
+        in_arrays={"_b": ("b", (8, ), dace.float64)},
+        out_arrays={"_c": ("c", (8, ), dace.float64)},
+    )
+    assert "ct.full" not in body
+    assert "0.5" in body
+
+
+@pytest.mark.parametrize("literal", ["1e300", "1e-45", "1e-300"])
+def test_tile_binop_cutile_rejects_unrepresentable_float64_literal(literal: str) -> None:
+    """Float64 literals that two float32 terms cannot reconstruct fail closed."""
+    with pytest.raises(NotImplementedError, match="cannot accurately materialize"):
+        _expand_cutile_with_edges(
+            TileBinop(name="F64_range", widths=(8, ), op="*", kind_a="Symbol", expr_a=literal, kind_b="Tile"),
+            in_arrays={"_b": ("b", (8, ), dace.float64)},
+            out_arrays={"_c": ("c", (8, ), dace.float64)},
+        )
+
+
 def test_tile_binop_cutile_uses_ct_minimum_for_min():
     """``min`` op routes to ``ct.minimum``."""
     body, _ = _expand_cutile(TileBinop(name="B", widths=(4, 8), op="min"))

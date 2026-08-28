@@ -1,10 +1,13 @@
 # Copyright 2019-2024 ETH Zurich and the DaCe authors. All rights reserved.
 """ Various tests for dead code elimination passes. """
 
+from typing import Tuple
+
 import numpy as np
 import pytest
 import dace
 from dace.properties import CodeBlock
+from dace.sdfg import nodes
 from dace.sdfg.state import ConditionalBlock, ControlFlowRegion, LoopRegion
 from dace.sdfg.validation import InvalidSDFGNodeError
 from dace.transformation.pass_pipeline import Pipeline
@@ -595,6 +598,125 @@ def test_dde_loop_condition():
     assert count_f_nodes == 2
 
 
+def _two_writes_to_one_transient(second_write_range: str) -> Tuple[dace.SDFG, dace.SDFGState, nodes.AccessNode]:
+    """``B[:] = 0`` then ``B[:, <range>] = A``, read back through a second access node.
+
+    The two ``B`` access nodes are joined by no path -- the initializer's only out-edge is an
+    ordering edge to ``A`` -- so deadness cannot be read off its out-edges.
+    """
+    sdfg = dace.SDFG('dde_two_writes')
+    sdfg.add_array('A', [6, 6], dace.float64)
+    sdfg.add_array('out', [6, 6], dace.float64)
+    sdfg.add_transient('B', [6, 6], dace.float64)
+    state = sdfg.add_state()
+
+    init = state.add_tasklet('init', {}, {'o'}, 'o = 0.0')
+    ient, iex = state.add_map('init_map', dict(i='0:6', j='0:6'))
+    b_init = state.add_access('B')
+    state.add_nedge(ient, init, dace.Memlet())
+    state.add_memlet_path(init, iex, b_init, src_conn='o', memlet=dace.Memlet('B[i, j]'))
+
+    a_read = state.add_access('A')
+    state.add_nedge(b_init, a_read, dace.Memlet())
+
+    copy = state.add_tasklet('copy', {'inp'}, {'o'}, 'o = inp')
+    went, wex = state.add_map('write_map', dict(i='0:6', j=second_write_range))
+    b_part = state.add_access('B')
+    state.add_memlet_path(a_read, went, copy, dst_conn='inp', memlet=dace.Memlet('A[i, j]'))
+    state.add_memlet_path(copy, wex, b_part, src_conn='o', memlet=dace.Memlet('B[i, j]'))
+
+    read = state.add_tasklet('read', {'inp'}, {'o'}, 'o = inp')
+    rent, rex = state.add_map('read_map', dict(i='0:6', j='0:6'))
+    out = state.add_access('out')
+    state.add_memlet_path(b_part, rent, read, dst_conn='inp', memlet=dace.Memlet('B[i, j]'))
+    state.add_memlet_path(read, rex, out, src_conn='o', memlet=dace.Memlet('out[i, j]'))
+
+    sdfg.validate()
+    return sdfg, state, b_init
+
+
+def test_dde_keeps_an_initializer_the_second_write_does_not_cover():
+    sdfg, state, b_init = _two_writes_to_one_transient('1:6')
+    Pipeline([DeadDataflowElimination()]).apply_pass(sdfg, {})
+
+    assert b_init in state.nodes(), 'the zero-init was removed although column 0 is still read'
+    assert any(isinstance(n, nodes.Tasklet) and n.label == 'init' for n in state.nodes())
+
+    A = np.random.rand(6, 6)
+    out = np.full((6, 6), 12345.0)
+    expected = A.copy()
+    expected[:, 0] = 0.0
+    sdfg(A=A.copy(), out=out)
+    assert np.allclose(out, expected)
+
+
+def test_dde_removes_an_initializer_the_second_write_fully_covers():
+    """Control: the same shape, but the second write covers all of ``B``."""
+    sdfg, state, b_init = _two_writes_to_one_transient('0:6')
+    Pipeline([DeadDataflowElimination()]).apply_pass(sdfg, {})
+
+    assert b_init not in state.nodes()
+    assert not any(isinstance(n, nodes.Tasklet) and n.label == 'init' for n in state.nodes())
+
+
+def _init_then_reduce(identity) -> Tuple[dace.SDFG, dace.SDFGState, nodes.AccessNode]:
+    """``s = 0`` then ``Reduce(s <- sum(A))``, read back through a second ``s`` access node.
+
+    The two ``s`` nodes are joined only by an ordering edge, so deadness of the initializer is
+    decided by whether the reduction's write is a full overwrite of ``s``.
+    """
+    sdfg = dace.SDFG('dde_init_then_reduce')
+    sdfg.add_array('A', [6], dace.float64)
+    sdfg.add_array('out', [1], dace.float64)
+    sdfg.add_transient('s', [1], dace.float64)
+    state = sdfg.add_state()
+
+    init = state.add_tasklet('init', {}, {'o'}, 'o = 0.0')
+    s_init = state.add_access('s')
+    state.add_edge(init, 'o', s_init, None, dace.Memlet('s[0]'))
+
+    a_read = state.add_access('A')
+    state.add_nedge(s_init, a_read, dace.Memlet())
+
+    red = state.add_reduce('lambda a, b: a + b', None, identity)
+    s_red = state.add_access('s')
+    state.add_nedge(a_read, red, dace.Memlet('A[0:6]'))
+    state.add_nedge(red, s_red, dace.Memlet('s[0]'))
+
+    copy = state.add_tasklet('copy', {'inp'}, {'o'}, 'o = inp')
+    out = state.add_access('out')
+    state.add_edge(s_red, None, copy, 'inp', dace.Memlet('s[0]'))
+    state.add_edge(copy, 'o', out, None, dace.Memlet('out[0]'))
+
+    sdfg.validate()
+    return sdfg, state, s_init
+
+
+def test_dde_keeps_an_initializer_a_reduction_without_identity_folds_onto():
+    """A reduction with no identity has nothing to start the fold from, so it accumulates onto
+    whatever ``s`` already holds. Removing the zero-init leaves it summing into garbage."""
+    sdfg, state, s_init = _init_then_reduce(None)
+    Pipeline([DeadDataflowElimination()]).apply_pass(sdfg, {})
+
+    assert s_init in state.nodes(), 'the zero-init was removed although the reduction folds onto it'
+    assert any(isinstance(n, nodes.Tasklet) and n.label == 'init' for n in state.nodes())
+
+    A = np.random.rand(6)
+    out = np.full((1, ), 12345.0)
+    sdfg(A=A.copy(), out=out)
+    assert np.allclose(out, A.sum())
+
+
+def test_dde_removes_an_initializer_a_reduction_with_identity_overwrites():
+    """Control: an identity makes the expansion emit its own init, so the write covers all of
+    ``s`` and the upstream zero-init is genuinely dead."""
+    sdfg, state, s_init = _init_then_reduce(0.0)
+    Pipeline([DeadDataflowElimination()]).apply_pass(sdfg, {})
+
+    assert s_init not in state.nodes()
+    assert not any(isinstance(n, nodes.Tasklet) and n.label == 'init' for n in state.nodes())
+
+
 if __name__ == '__main__':
     test_dse_simple()
     test_dse_unconditional()
@@ -619,5 +741,9 @@ if __name__ == '__main__':
     test_dce_add_type_hint_of_variable(dace.float64)
     test_dce_add_type_hint_of_variable(dace.bool)
     test_dce_add_type_hint_of_variable(np.float64)
+    test_dde_keeps_an_initializer_a_reduction_without_identity_folds_onto()
+    test_dde_removes_an_initializer_a_reduction_with_identity_overwrites()
     test_prune_single_branch_conditional_block()
     test_dde_loop_condition()
+    test_dde_keeps_an_initializer_the_second_write_does_not_cover()
+    test_dde_removes_an_initializer_the_second_write_fully_covers()

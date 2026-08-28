@@ -1,5 +1,7 @@
 # Copyright 2019-2026 ETH Zurich and the DaCe authors. All rights reserved.
 import copy
+import math
+
 import dace.library
 import dace.properties
 import dace.sdfg.nodes
@@ -7,6 +9,7 @@ from dace import dtypes
 
 from dace import Memlet
 from dace.libraries.lapack import Potrf
+from dace.libraries.linalg.nodes.solve import restride
 from dace.libraries.linalg.nodes.transpose import Transpose
 from dace.transformation.transformation import ExpandTransformation
 from dace.libraries.lapack import environments
@@ -86,15 +89,48 @@ def _make_sdfg(node, parent_state, parent_sdfg, implementation):
 
 @dace.library.expansion
 class ExpandCholeskyPure(ExpandTransformation):
-    """
-    Naive backend-agnostic expansion of LAPACK POTRF.
+    """Cholesky as loops and tasklets, with no library behind it.
+
+    Exists so a Cholesky can be rendered, read and edited on its own -- MPR emits one translation
+    unit with no BLAS to link, and an SDFG that reaches a vendor implementation cannot be rendered
+    at all. It is the textbook right-looking factorization, so it is correct rather than fast; a
+    build that has MKL or OpenBLAS should keep using them.
     """
 
     environments = []
 
     @staticmethod
-    def expansion(node, parent_state, parent_sdfg, n=None, **kwargs):
-        raise NotImplementedError
+    def expansion(node, parent_state, parent_sdfg, **kwargs):
+        inp_desc, inp_shape, out_desc, out_shape = node.validate(parent_sdfg, parent_state)
+        dtype = inp_desc.dtype
+        n = inp_shape[0]
+        lower = node.lower
+
+        @dace.program
+        def cholesky_pure(_a: dtype[n, n], _b: dtype[n, n]):
+            factor = dace.define_local([n, n], dtype)
+            factor[:] = 0  # the strict upper triangle is never assigned, and is read back on the copy
+            for j in range(n):
+                diagonal = _a[j, j]
+                for k in range(j):
+                    diagonal = diagonal - factor[j, k] * factor[j, k]
+                factor[j, j] = math.sqrt(diagonal)
+                for i in range(j + 1, n):
+                    off = _a[i, j]
+                    for k in range(j):
+                        off = off - factor[i, k] * factor[j, k]
+                    factor[i, j] = off / factor[j, j]
+            # ``factor`` is always the LOWER triangle; ``lower=False`` asks for the upper one, which
+            # is its transpose (A = L L^T = U^T U), so the orientation is a copy and not a second
+            # factorization.
+            for i, j in dace.map[0:n, 0:n]:
+                _b[i, j] = factor[i, j] if lower else factor[j, i]
+
+        nsdfg = cholesky_pure.to_sdfg(simplify=True)
+        # See ``restride``: a connector may be a strided slice of a bigger array, and a contiguous
+        # reading of it is silently wrong rather than an error.
+        restride(nsdfg, (('_a', inp_shape, inp_desc.strides), ('_b', out_shape, out_desc.strides)), dtype)
+        return nsdfg
 
 
 @dace.library.expansion
@@ -191,6 +227,7 @@ class Cholesky(dace.sdfg.nodes.LibraryNode):
 
     # Global properties
     implementations = {
+        "pure": ExpandCholeskyPure,
         "OpenBLAS": ExpandCholeskyOpenBLAS,
         "MKL": ExpandCholeskyMKL,
         "cuSolverDn": ExpandCholeskyCuSolverDn,

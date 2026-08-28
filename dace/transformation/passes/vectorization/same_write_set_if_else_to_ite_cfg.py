@@ -25,6 +25,7 @@ from dace.sdfg.construction_utils import (
 from dace.sdfg.state import ConditionalBlock, ControlFlowRegion, LoopRegion
 from dace.transformation import pass_pipeline as ppl
 from dace.transformation.helpers import get_parent_map_and_loop_scopes
+from ordered_set import OrderedSet
 
 
 def _singleton_zero_subset(desc: dace.data.Data) -> str:
@@ -818,7 +819,7 @@ class SameWriteSetIfElseToITECFG(ppl.Pass):
         state.remove_edge(edge)
         acc_t = state.add_tasklet(
             name=f"wcr_acc_{base_name}",
-            inputs={"_base", "_acc"},
+            inputs=OrderedSet(('_base', '_acc')),
             outputs={"_o"},
             code=f"_o = {op_code}",
         )
@@ -854,7 +855,7 @@ class SameWriteSetIfElseToITECFG(ppl.Pass):
             cond_access = cond_producer if cond_producer is not None else state.add_access(cond_array_name)
             t = state.add_tasklet(
                 name=f"ITE_{arr_name}",
-                inputs={"_c", "_t", "_e"},
+                inputs=OrderedSet(('_c', '_t', '_e')),
                 outputs={"_o"},
                 code="_o = ITE(_c, _t, _e)",
             )
@@ -864,7 +865,7 @@ class SameWriteSetIfElseToITECFG(ppl.Pass):
         else:
             t = state.add_tasklet(
                 name=f"ITE_{arr_name}",
-                inputs={"_t", "_e"},
+                inputs=OrderedSet(('_t', '_e')),
                 outputs={"_o"},
                 code=f"_o = ITE({cond_text}, _t, _e)",
             )
@@ -981,7 +982,7 @@ class SameWriteSetIfElseToITECFG(ppl.Pass):
 
         out_conn = f"_out_{cond_name}"
         t = state.add_tasklet(name=f"combine_cond_{cond_name}",
-                              inputs=set(in_conn_names.values()),
+                              inputs=dict.fromkeys(in_conn_names.values()),
                               outputs={out_conn},
                               code=f"{out_conn} = ({cleaned})")
         for name, conn in in_conn_names.items():
@@ -1330,7 +1331,7 @@ class SameWriteSetIfElseToITECFG(ppl.Pass):
 
         out_conn = f"_out_{cond_name}"
         t = state.add_tasklet(name=f"lift_cond_{cond_sym}",
-                              inputs=set(in_conn_names.values()),
+                              inputs=dict.fromkeys(in_conn_names.values()),
                               outputs={out_conn},
                               code=f"{out_conn} = ({cleaned_rhs})")
         for arr, conn in in_conn_names.items():
@@ -1448,7 +1449,7 @@ class SameWriteSetIfElseToITECFG(ppl.Pass):
             cond_text, in_conn_names, set(sdfg.arrays.keys()))
         out_conn = f"_out_{cond_name}"
         t = state.add_tasklet(name="lift_cond_expr",
-                              inputs=set(in_conn_names.values()),
+                              inputs=dict.fromkeys(in_conn_names.values()),
                               outputs={out_conn},
                               code=f"{out_conn} = ({cleaned_rhs})")
         for arr, conn in in_conn_names.items():

@@ -8,6 +8,7 @@ from dace import library, nodes, properties
 from dace.utils import prod as _prod
 from dace.symbolic import symstr
 from dace.transformation.transformation import ExpandTransformation
+from ordered_set import OrderedSet
 
 
 @library.expansion
@@ -302,7 +303,8 @@ class ExpandCuTensor(ExpandTransformation):
             std::vector<int32_t> modeC{{{','.join(str(m) for m in out_modes)}}};
         """
 
-        extents = "std::unordered_map<int, int64_t> extent;\n"
+        # Modes are dense indices into the concatenated shapes, so a vector indexes them directly.
+        extents = f"std::vector<int64_t> extent({len(left_tensor.shape) + len(right_tensor.shape)});\n"
         for i, s in zip(left_modes, left_tensor.shape):
             extents += f"extent[{i}] = {s};\n"
         for i, s in zip(right_modes, right_tensor.shape):
@@ -497,7 +499,11 @@ class TensorDot(nodes.LibraryNode):
                                           desc="Permutation of the output tensor")
 
     def __init__(self, name, left_axes=[], right_axes=[], permutation=None, *args, **kwargs):
-        super().__init__(name, *args, inputs={"_left_tensor", "_right_tensor"}, outputs={"_out_tensor"}, **kwargs)
+        super().__init__(name,
+                         *args,
+                         inputs=OrderedSet(('_left_tensor', '_right_tensor')),
+                         outputs={"_out_tensor"},
+                         **kwargs)
         self.left_axes = left_axes
         self.right_axes = right_axes
         self.permutation = permutation

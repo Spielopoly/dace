@@ -23,6 +23,7 @@ from dace.memlet import Memlet
 from dace.sdfg import SDFG
 from dace.sdfg.nodes import AccessNode, MapEntry, NestedSDFG
 from dace.sdfg.state import SDFGState
+from dace.symbolic import has_one_marker
 from dace.transformation import pass_pipeline as ppl, transformation
 from dace.transformation.passes.vectorization.utils.map_predicates import is_vectorizable_map
 from dace.transformation.passes.vectorization.utils.name_schemes import sanitize_transient_name_hint
@@ -31,9 +32,11 @@ from dace.transformation.passes.vectorization.utils.pass_invariants import (asse
                                                                             no_duplicate_connector_edges,
                                                                             no_memlet_dim_mismatch,
                                                                             no_transient_scalar_stores)
+from dace.transformation.passes.vectorization.utils.errors import VectorizeUnsupported
 from dace.transformation.passes.vectorization.utils.subsets import an_side_subset, infer_edge_endpoints
 from dace.transformation.passes.vectorization.utils.tile_access import (PerDimKind, classify_tile_access,
                                                                         build_symbol_definition_map)
+from ordered_set import OrderedSet
 
 
 def _assert_post_stage_invariants(state: SDFGState) -> None:
@@ -159,14 +162,6 @@ def stage_constant_access(state: SDFGState,
     return bridge_name
 
 
-def _shape_dim_is_one_symbol(s) -> bool:
-    """True when a descriptor extent is the :data:`~dace.symbolic.ONE` broadcast
-    marker (a collapsed gather-index dim), as opposed to a literal width."""
-    import sympy
-    from dace.symbolic import ONE
-    return isinstance(s, sympy.Basic) and ONE in s.free_symbols
-
-
 def _safe_bridge_hint(name_hint: str) -> str:
     """Keep a staged-transient name out of the reserved ``__return`` namespace.
 
@@ -180,6 +175,27 @@ def _safe_bridge_hint(name_hint: str) -> str:
     if name_hint.startswith("__return"):
         return "tile_" + name_hint.lstrip("_")
     return name_hint
+
+
+def refuse_linearized_multi_var_dim(record, array_name: str, subset, iter_vars: Tuple[str, ...]) -> None:
+    """Refuse an access whose single array dim is indexed JOINTLY by several tile iter-vars.
+
+    ``flat[N*i + j]`` under a ``(i, j)`` tile is a 2-D access flattened onto a 1-D array. The
+    classifier reports that dim as AFFINE with NO stride (no single iter-var owns it), so
+    ``_pad_to_tile_dims`` finds nothing for the second iter-var and pads it to a BROADCAST stride
+    of 0 -- a read would then splat one cell across its lanes, and a write would have every lane
+    of that dim race for the same cell. The cell set is a ``W_0 x W_1`` box at strides
+    ``(N, 1)`` over ONE array dim, which a per-array-dim tile window cannot spell, so refuse and
+    leave the kernel un-tiled rather than emit a broadcast in place of a stride.
+    """
+    for d, kind in enumerate(record.per_dim_kind):
+        # Stop 4 of ``classify_tile_access`` is the only site pairing AFFINE with a ``None``
+        # stride: jointly affine in more than one tile iter-var.
+        if kind == PerDimKind.AFFINE and record.dim_strides[d] is None:
+            raise VectorizeUnsupported(
+                f"{array_name}{subset} dim {d} is indexed jointly by several of the tile iter-vars "
+                f"{iter_vars} (a linearized multi-dimensional access); the lane set is a strided box "
+                f"over ONE array dim, which a per-dim tile window cannot express")
 
 
 def stage_tile_load(state: SDFGState,
@@ -234,7 +250,7 @@ def stage_tile_load(state: SDFGState,
     bridge_shape = tuple(dst_shape) if dst_shape is not None else tuple(widths)
     # A ``ONE``-marked (collapsed) descriptor dim needs the ``ONE`` constant on
     # the SDFG; ``ONE == 1`` so the broadcast dim is genuinely length-1.
-    if any(_shape_dim_is_one_symbol(s) for s in bridge_shape) and "ONE" not in sdfg.constants_prop:
+    if any(has_one_marker(s) for s in bridge_shape) and "ONE" not in sdfg.constants_prop:
         sdfg.add_constant("ONE", 1, data.Scalar(dtypes.int32))
     bridge_name, _ = sdfg.add_array(name_hint,
                                     shape=bridge_shape,
@@ -476,6 +492,7 @@ class InsertTileLoadStore(ppl.Pass):
             record = classify_tile_access(subset, iter_vars=iter_vars, inner_sdfg=inner_sdfg, state=inner_state)
             if not record.per_dim_kind:
                 continue
+            refuse_linearized_multi_var_dim(record, an.data, subset, iter_vars)
             kinds = set(record.per_dim_kind)
             if PerDimKind.GATHER in kinds:
                 # GATHER read: build per-lane idx tile(s) as TILE LIB NODES + TileLoad. One AN
@@ -696,6 +713,7 @@ class InsertTileLoadStore(ppl.Pass):
             wrecord = classify_tile_access(wsubset, iter_vars=iter_vars, inner_sdfg=inner_sdfg, state=inner_state)
             if not wrecord.per_dim_kind:
                 continue
+            refuse_linearized_multi_var_dim(wrecord, an.data, wsubset, iter_vars)
             wkinds = set(wrecord.per_dim_kind)
             if wkinds == {PerDimKind.CONSTANT}:
                 continue  # Loop-invariant write stays as direct producer -> AN copy (design 3.6).
@@ -1077,7 +1095,7 @@ class InsertTileLoadStore(ppl.Pass):
                 f"_stage_index_via_tileops: arithmetic gather index {begin_str!r} mixes index tiles of "
                 f"differing shapes {in_shapes}; broadcasting collapsed index tiles through tile-op "
                 f"arithmetic is a design boundary (discuss before extending).")
-        if any(_shape_dim_is_one_symbol(s) for s in common):
+        if any(has_one_marker(s) for s in common):
             raise NotImplementedError(
                 f"_stage_index_via_tileops: arithmetic gather index {begin_str!r} over a partially-"
                 f"collapsed index tile {common}; tile-op arithmetic carries integer widths and cannot "
@@ -1094,7 +1112,7 @@ class InsertTileLoadStore(ppl.Pass):
                                            find_new_name=True)
         out_an = inner_state.add_access(out_name)
         t = inner_state.add_tasklet(name=f"idxarith_{out_name}",
-                                    inputs=set(conn for conn, _ in sym_to_conn.values()),
+                                    inputs=OrderedSet(conn for conn, _ in sym_to_conn.values()),
                                     outputs={"_out"},
                                     code=f"_out = {body}",
                                     language=dtypes.Language.Python)

@@ -1,4 +1,4 @@
-# Copyright 2019-2023 ETH Zurich and the DaCe authors. All rights reserved.
+# Copyright 2019-2026 ETH Zurich and the DaCe authors. All rights reserved.
 """ Contains test cases for the operational intensity analysis. """
 import contextlib
 import io
@@ -139,7 +139,7 @@ test_cases: Dict[str, Tuple[DaceProgram, int, int, Dict[str, int], SymbolicType]
     }, 21 / (13 * 3 * 8)),
     'nested_reuse': (nested_reuse, 1024, 64, {
         'N': 1024
-    }, 2048 / (3 * 1024 * 8 + 128)),
+    }, 2048 / (3 * 1024 * 8 + 64)),
     'mmm': (mmm, 20, 16, {
         'N': 24
     }, (2 * 24**3) / ((36 * 24**2 + 24 * 12) * 16)),

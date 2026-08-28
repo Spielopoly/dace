@@ -8,6 +8,7 @@ from numbers import Integral
 import os
 import json
 from hashlib import md5, sha256
+import pathlib
 import random
 import shutil
 import sys
@@ -19,7 +20,7 @@ from dace.sdfg.graph import generate_element_id, SubgraphView
 import dace.serialize
 from dace import (data as dt, hooks, memlet as mm, subsets as sbs, dtypes, symbolic)
 from dace.sdfg.replace import replace_properties_dict
-from dace.sdfg.validation import (InvalidSDFGError, check_symbol_assumption_collisions, validate_sdfg)
+from dace.sdfg.validation import (InvalidSDFGError, validate_sdfg)
 from dace.config import Config
 from dace.frontend.python import astutils
 from dace.sdfg import nodes as nd
@@ -35,9 +36,10 @@ from typing import BinaryIO
 ShapeType = Sequence[Union[Integral, str, symbolic.symbol, symbolic.SymExpr, symbolic.sympy.Basic]]
 RankType = Union[Integral, str, symbolic.symbol, symbolic.SymExpr, symbolic.sympy.Basic]
 
-#: How a launcher tells a task its rank, most specific first. Read instead of importing mpi4py,
-#: which is optional and initializes MPI. All are job-unique; node-local counters are not.
-LAUNCHER_RANK_VARS = (
+#: How an MPI launcher tells a rank its rank, most specific first. Read instead of importing
+#: mpi4py, which is optional and initializes MPI. All are job-unique; node-local counters are not.
+#: Only these mean "this process is a rank of an MPI job" -- a Slurm task is not.
+MPI_RANK_VARS = (
     'OMPI_COMM_WORLD_RANK',  # Open MPI and the vendor MPIs built on it
     'MV2_COMM_WORLD_RANK',  # MVAPICH2
     'PMIX_RANK',  # Open MPI 4+, Slurm pmix
@@ -46,8 +48,11 @@ LAUNCHER_RANK_VARS = (
     'FLUX_TASK_RANK',  # Flux
     'PALS_RANKID',  # HPE/Cray PALS
     'ALPS_APP_PE',  # Cray ALPS
-    'SLURM_PROCID',  # srun with no MPI
 )
+
+#: How any launcher tells a task its rank. Adds the Slurm task id, which srun sets whether or not
+#: the step runs MPI at all -- enough to name a build folder, not enough to call MPI_Init on.
+LAUNCHER_RANK_VARS = MPI_RANK_VARS + ('SLURM_PROCID', )  # srun with no MPI
 
 if TYPE_CHECKING:
     from dace.codegen.instrumentation.report import InstrumentationReport
@@ -61,8 +66,6 @@ def build_folder_root() -> str:
     """The build cache root, one per rank if ``cache_distaware`` is on and a launcher set a rank.
 
     Ranks that each compile otherwise share a folder and can load each other's half-written library.
-    A process no launcher started has no rank variable and keeps the unsuffixed root, so ordinary
-    single-process runs name their cache exactly as they always did.
     """
     base = Config.get('default_build_folder')
     if not Config.get_bool('cache_distaware'):
@@ -156,10 +159,64 @@ def _replace_dict_values(d, old, new):
             d[k] = new
 
 
+def _sdfg_build_folder_getter(sdfg: "SDFG") -> str:
+    """Returns the path to the build cache folder for ``sdfg``.
+
+    If the build folder was explicitly set it is returned. If not set, then the function
+    will derive the root through ``build_folder_root()``, i.e. from the configuration keys
+    ``default_build_folder`` and ``cache_distaware``, and name the folder inside it according
+    to the configuration key ``cache``.
+    It is also important that retrieving the folder through this function does not set
+    the build folder in the SDFG.
+
+    :note: This function is used as getter for the ``SDFG.build_folder`` property, do not use directly.
+    :note: It is unspecific if the path is absolute or not.
+    """
+    if getattr(sdfg, "_build_folder", None) is not None:
+        return sdfg._build_folder
+    cache_config = Config.get('cache')
+    base_folder = build_folder_root()
+    if cache_config == 'single':
+        # Always use the same directory, overwriting any other program,
+        # preventing parallelism and caching of multiple programs, but
+        # saving space and potentially build time
+        return os.path.join(base_folder, 'single_cache')
+    elif cache_config == 'hash':
+        # Any change to the SDFG will result in a new cache folder
+        md5_hash = md5(str(sdfg.to_json()).encode('utf-8')).hexdigest()
+        return os.path.join(base_folder, f'{sdfg.name}_{md5_hash}')
+    elif cache_config == 'unique':
+        # Base name on location in memory, so no caching is possible between
+        # processes or subsequent invocations
+        md5_hash = md5(str(os.getpid()).encode('utf-8')).hexdigest()
+        return os.path.join(base_folder, f'{sdfg.name}_{md5_hash}')
+    elif cache_config == 'name':
+        # Overwrites previous invocations, and can clash with other programs
+        # if executed in parallel in the same working directory
+        return os.path.join(base_folder, sdfg.name)
+    else:
+        raise ValueError(f'Unknown cache configuration: {cache_config}')
+
+
+def _sdfg_build_folder_setter(sdfg: "SDFG", new_build_folder: Union[str, None, pathlib.Path]) -> None:
+    if new_build_folder is None:
+        sdfg._build_folder = None
+    elif isinstance(new_build_folder, (str, pathlib.Path)):
+        sdfg._build_folder = str(new_build_folder)
+        if len(sdfg._build_folder) == 0:
+            raise ValueError(
+                f'Passed the empty string as new build folder to SDFG "{sdfg.name}", to clear it use `None`.')
+    else:
+        raise TypeError(
+            f'Can not assign "{new_build_folder}" ({type(new_build_folder).__name__}) as new build folder to SDFG "{sdfg.name}".'
+        )
+
+
 def memlets_in_ast(node: ast.AST, arrays: Dict[str, dt.Data], *, include_scalars: bool = False) -> List[mm.Memlet]:
     """
     Generates a list of memlets from each of the subscripts that appear in the Python AST.
     Assumes the subscript slice can be coerced to a symbolic expression (e.g., no indirect access).
+    Can also parse a None check of the form `array is [not] None`.
 
     :param node: The AST node to find memlets in.
     :param arrays: A dictionary mapping array names to their data descriptors (a-la ``sdfg.arrays``)
@@ -170,10 +227,16 @@ def memlets_in_ast(node: ast.AST, arrays: Dict[str, dt.Data], *, include_scalars
 
     for subnode in ast.walk(node):
         if isinstance(subnode, ast.Subscript):
-            data = astutils.rname(subnode.value)
             data, slc = astutils.subscript_to_slice(subnode, arrays)
             subset = sbs.Range(slc)
             result.append(mm.Memlet(data=data, subset=subset))
+        elif (isinstance(subnode, ast.Compare) and len(subnode.ops) == 1
+              and isinstance(subnode.ops[0], (ast.Is, ast.IsNot)) and len(subnode.comparators) == 1
+              and isinstance(subnode.comparators[0], ast.Constant) and subnode.comparators[0].value is None):
+            # Parsing `array is [not] None`
+            data = astutils.rname(subnode.left)
+            if data in arrays:
+                result.append(mm.Memlet.from_array(data, arrays[data]))
         elif include_scalars and isinstance(subnode, ast.Name):
             data = astutils.rname(subnode)
             if data in arrays and isinstance(arrays[data], dace.data.Scalar):
@@ -471,6 +534,46 @@ class InterstateEdge(object):
         return ret
 
 
+class _UsedNames:
+    """Membership view over the names an SDFG already uses.
+
+    :func:`dace.utils.find_new_name` only ever asks whether a candidate is taken, so this
+    answers ``in`` from :meth:`SDFG.is_name_used` rather than materializing the union of
+    arrays, constants and symbols on every mint. Not a container in any other sense --
+    it is deliberately not iterable, because there is no cheap order to iterate in.
+
+    ``include_connectors`` additionally rejects names in use as a tasklet connector, because a
+    connector may not share its name with a data descriptor, constant or symbol -- see
+    ``validation.py``, "Connector name '%s' is already used as a symbol, constant, or array name".
+    That answer costs a walk over every state and every node, so it is opt in, and
+    :meth:`SDFG.find_new_name_avoiding_connectors` is the caller-visible name for the cost. The
+    walk is memoised per instance, so a name needing several attempts (``tmp``, ``tmp_0``, ...)
+    still walks once. ``states()`` stays inside this SDFG's own namespace: it descends into
+    control flow regions but not into NestedSDFG nodes, which have namespaces of their own.
+    """
+
+    __slots__ = ('sdfg', 'include_connectors', 'connectors')
+
+    def __init__(self, sdfg: 'SDFG', include_connectors: bool = False) -> None:
+        self.sdfg = sdfg
+        self.include_connectors = include_connectors
+        self.connectors: Optional[Set[str]] = None
+
+    def __contains__(self, name: str) -> bool:
+        if self.sdfg.is_name_used(name):
+            return True
+        if not self.include_connectors:
+            return False
+        if self.connectors is None:
+            self.connectors = {
+                conn
+                for st in self.sdfg.states()
+                for n in st.nodes() if isinstance(n, nd.CodeNode)
+                for conn in (n.in_connectors.keys() | n.out_connectors.keys())
+            }
+        return name in self.connectors
+
+
 @make_properties
 class SDFG(ControlFlowRegion):
     """ The main intermediate representation of code in DaCe.
@@ -542,8 +645,24 @@ class SDFG(ControlFlowRegion):
                                            default=False,
                                            desc="Whether the SDFG contains explicit control flow constructs")
 
-    # Explicitly-set build folder, or None to derive it from the configuration
-    _build_folder = None
+    build_folder = Property(
+        dtype=str,
+        default=None,
+        allow_none=True,
+        desc='Returns the path to the build cache folder for SDFG. For a in dept '
+        'description see ``_sdfg_build_folder_getter()``.',
+        serialize_if=lambda sdfg: sdfg._build_folder is not None,
+        getter=_sdfg_build_folder_getter,
+        setter=_sdfg_build_folder_setter,
+    )
+
+    @property
+    def build_folder_is_default(self) -> bool:
+        """Whether the build folder follows the ``cache`` policy rather than being assigned.
+
+        An assigned folder belongs to whoever assigned it, so nothing may reclaim it.
+        """
+        return self._build_folder is None
 
     def __init__(self,
                  name: str,
@@ -788,7 +907,10 @@ class SDFG(ControlFlowRegion):
             ret.add_edge(nodelist[int(e.src)], nodelist[int(e.dst)], e.data)
 
         if json_obj.get('start_block') is not None:
-            ret._start_block = nodelist[int(json_obj['start_block'])]
+            # An INDEX into the node list, which is what ``to_json`` wrote and what the getter
+            # resolves through ``self.node()``. Storing the block here instead makes every read of
+            # a pinned entry raise on a deserialized SDFG.
+            ret._start_block = int(json_obj['start_block'])
 
         if 'source_files' in json_obj:  # This will only happen on the root SDFG, once deserialization is complete
             ret.rematerialize_debuginfo_files(json_obj['source_files'])
@@ -823,9 +945,12 @@ class SDFG(ControlFlowRegion):
                 keys_to_delete = []
                 kv_to_recurse = []
                 for key, value in json_obj.items():
-                    if (isinstance(key, str)
-                            and (key.startswith('_meta_')
-                                 or key in ['name', 'hash', 'orig_sdfg', 'transformation_hist', 'instrument', 'guid'])):
+                    # 'scope_dict' is a derived cache of scope_children() that to_json emits for
+                    # the viewer and from_json never reads back. It restates node ids the 'nodes'
+                    # list already carries, and being ordered first it masks the real divergence.
+                    if (isinstance(key, str) and
+                        (key.startswith('_meta_') or key
+                         in ['name', 'hash', 'orig_sdfg', 'transformation_hist', 'instrument', 'guid', 'scope_dict'])):
                         keys_to_delete.append(key)
                     else:
                         kv_to_recurse.append((key, value))
@@ -952,9 +1077,6 @@ class SDFG(ControlFlowRegion):
                 raise FileExistsError(f'Cannot create symbol "{name}", the name is used by a data descriptor.')
         if not isinstance(stype, dtypes.typeclass):
             stype = dtypes.dtype_to_typeclass(stype)
-        # Catch a same-name/different-assumptions collision here, not at the next full validation.
-        if Config.get_bool('experimental.check_symbol_assumption_collisions'):
-            check_symbol_assumption_collisions(self, name)
         self.symbols[name] = stype
         return name
 
@@ -1340,46 +1462,6 @@ class SDFG(ControlFlowRegion):
         # Avoid import loop
         from dace.sdfg.analysis.schedule_tree import sdfg_to_tree as s2t
         return s2t.as_schedule_tree(self, in_place=in_place)
-
-    @property
-    def build_folder_is_default(self) -> bool:
-        """Whether the build folder follows the ``cache`` policy rather than being assigned.
-
-        An assigned folder belongs to whoever assigned it, so nothing may reclaim it.
-        """
-        return self._build_folder is None
-
-    @property
-    def build_folder(self) -> str:
-        """ Returns a relative path to the build cache folder for this SDFG. """
-        if self._build_folder is not None:
-            return self._build_folder
-        cache_config = Config.get('cache')
-        base_folder = build_folder_root()
-        if cache_config == 'single':
-            # Always use the same directory, overwriting any other program,
-            # preventing parallelism and caching of multiple programs, but
-            # saving space and potentially build time
-            return os.path.join(base_folder, 'single_cache')
-        elif cache_config == 'hash':
-            # Any change to the SDFG will result in a new cache folder
-            md5_hash = md5(str(self.to_json()).encode('utf-8')).hexdigest()
-            return os.path.join(base_folder, f'{self.name}_{md5_hash}')
-        elif cache_config == 'unique':
-            # Base name on location in memory, so no caching is possible between
-            # processes or subsequent invocations
-            md5_hash = md5(str(os.getpid()).encode('utf-8')).hexdigest()
-            return os.path.join(base_folder, f'{self.name}_{md5_hash}')
-        elif cache_config == 'name':
-            # Overwrites previous invocations, and can clash with other programs
-            # if executed in parallel in the same working directory
-            return os.path.join(base_folder, self.name)
-        else:
-            raise ValueError(f'Unknown cache configuration: {cache_config}')
-
-    @build_folder.setter
-    def build_folder(self, newfolder: str):
-        self._build_folder = newfolder
 
     def remove_data(self, name, validate=True):
         """ Removes a data descriptor from the SDFG.
@@ -1964,15 +2046,22 @@ class SDFG(ControlFlowRegion):
     def _find_new_name(self, name: str):
         """ Tries to find a new name by adding an underscore and a number. """
 
-        names = (self._arrays.keys() | self.constants_prop.keys() | self.symbols.keys())
-        # Also avoid clashing with existing tasklet connector names: a transform
-        # minting e.g. ``add_scalar('tmp', find_new_name=True)`` must not pick a
-        # name already used as a connector (validation rejects the collision).
-        for st in self.states():
-            for n in st.nodes():
-                if isinstance(n, nd.CodeNode):
-                    names |= n.in_connectors.keys() | n.out_connectors.keys()
-        return dt.find_new_name(name, names)
+        # ``find_new_name`` only ever tests membership, so the union set never has to be built:
+        # a view answering ``in`` from :meth:`is_name_used` costs three dict lookups per probe
+        # instead of one set the size of every name in the SDFG per call.
+        return dt.find_new_name(name, _UsedNames(self))
+
+    def find_new_name_avoiding_connectors(self, name: str) -> str:
+        """Like the private name minter, but also dodges names in use as a tasklet connector.
+
+        For a caller minting a GENERIC name (``tmp``, ``val``) into a graph whose connectors it did
+        not choose: an array named after an existing connector is a graph validation rejects
+        ("Connector name '%s' is already used as a symbol, constant, or array name").
+
+        Costs a walk over every state and every node, so it is separate from the ordinary minter
+        rather than folded into it -- the ordinary one runs thousands of times in a single parse.
+        """
+        return dt.find_new_name(name, _UsedNames(self, include_connectors=True))
 
     def is_name_used(self, name: str) -> bool:
         """ Checks if `name` is already used inside the SDFG."""
@@ -3230,6 +3319,29 @@ class SDFG(ControlFlowRegion):
         """
         # Avoiding import loops
         from dace.transformation.interstate import GPUTransformSDFG
+
+        # ``OffloadToAccelerator`` decides placement from the whole control flow rather than per
+        # kernel, so it has nowhere to honour a caller-supplied host pin: ``host_maps`` /
+        # ``host_data`` name what must STAY on the host, which is an answer, not an input. A caller
+        # that pins anything therefore gets the old transformation, whatever the config says.
+        pinned = bool(host_maps) or bool(host_data)
+        # A Stream is a queue with a device-side push/pop protocol, not a buffer whose location can
+        # be decided and copied; the new pass classifies descriptors as array / scalar / view and
+        # has nowhere to put one. ``GPUTransformSDFG`` already handles them, so decline rather than
+        # raise out of the middle of a rewrite.
+        streams = any(
+            isinstance(desc, dt.Stream) for nsdfg in self.all_sdfgs_recursive() for desc in nsdfg.arrays.values())
+        # A library node that keeps part of its interface on the host whatever its schedule
+        # (``ScatterConflictCheck``'s flag and its tag scratch, cuBLAS's alpha and beta) needs no
+        # escape hatch: ``OffloadToAccelerator.host_pinned_arrays`` reads ``host_connectors`` and
+        # places those descriptors on the host with the rest of the state around them.
+        if Config.get_bool('optimizer', 'new_gpu_offloading_pass') and not pinned and not streams:
+            # Avoiding import loops
+            from dace.transformation.passes.offloading import OffloadToAccelerator
+            OffloadToAccelerator().apply_pass(self, {})
+            if validate or validate_all:
+                self.validate()
+            return
 
         self.apply_transformations(GPUTransformSDFG,
                                    options=dict(sequential_innermaps=sequential_innermaps,

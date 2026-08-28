@@ -22,6 +22,12 @@ tokenize_cpp = re.compile(r'\b\w+\b')
 
 
 def _internal_replace(sym, symrepl):
+    # A SymExpr is a (exact, over-approximation) pair, not a sympy.Basic, so the guard below
+    # would hand it back untouched. Strip-mined bounds are SymExprs and sit in the same range
+    # tuple as plain ones, so skipping them renames a range's start and leaves its end naming
+    # the old symbol. Rewrite both halves; SymExpr collapses back when they agree.
+    if isinstance(sym, symbolic.SymExpr):
+        return symbolic.SymExpr(_internal_replace(sym.expr, symrepl), _internal_replace(sym.approx, symrepl))
     if not isinstance(sym, sp.Basic):
         return sym
 
@@ -120,7 +126,7 @@ def replace_dict(subgraph: 'StateSubgraphView',
 
     # Replace in node properties
     for node in subgraph.nodes():
-        replace_properties_dict(node, repl, symrepl)
+        replace_properties_dict(node, repl, symrepl, sdfg)
         node.replace_dict(repl)
 
     # Replace in memlets
@@ -150,7 +156,23 @@ def replace(subgraph: 'StateSubgraphView', name: str, new_name: str):
     replace_dict(subgraph, {name: new_name})
 
 
-def replace_in_codeblock(codeblock: properties.CodeBlock, repl: Dict[str, str], node: Optional[Any] = None):
+def declared_ctype(name: str, sdfg: Optional['dace.SDFG']) -> Optional[str]:
+    """C type ``name`` is declared with in ``sdfg``: a symbol's type, or a scalar's. ``None`` when
+    ``name`` is neither, as a map parameter is."""
+    if sdfg is None:
+        return None
+    if name in sdfg.symbols:
+        return sdfg.symbols[name].ctype
+    desc = sdfg.arrays.get(name)
+    if isinstance(desc, data.Scalar):
+        return desc.dtype.ctype
+    return None
+
+
+def replace_in_codeblock(codeblock: properties.CodeBlock,
+                         repl: Dict[str, str],
+                         node: Optional[Any] = None,
+                         sdfg: Optional['dace.SDFG'] = None):
     code = codeblock.code
     if isinstance(code, str) and code:
         lang = codeblock.language
@@ -161,16 +183,18 @@ def replace_in_codeblock(codeblock: properties.CodeBlock, repl: Dict[str, str], 
             for name, new_name in repl.items():
                 if name not in tokenized:
                     continue
-                new_code = cppunparse.pyexpr2cpp(new_name)
-                if new_code == name:
-                    # Textual no-op: the replacement prints to the same token as the
-                    # name (e.g. rebuilding a symbol with only a different SymPy
-                    # assumption such as ``nonnegative=True``). Emitting the shadow
-                    # ``auto k = k;`` would be a self-referential declaration that
-                    # does not compile ("use of 'k' before deduction of 'auto'").
+                new_text = cppunparse.pyexpr2cpp(new_name)
+                if new_text == name:
+                    # A same-name rebind -- a symbol re-minted to carry new sympy assumptions
+                    # (``AssumeSymbolConstraints``) keeps its spelling. The C++ already names the
+                    # right thing, and shadowing it would emit ``int inc = inc;``: a local
+                    # initialized from ITSELF, i.e. an uninitialized read.
                     continue
-                # Use local variables and shadowing to replace
-                replacement = f'auto {name} = {new_code};\n'
+                # Shadow with the declared type: ``auto`` deduces from the replacement expression,
+                # so ``i = 2`` would narrow an int64 symbol to int. A map parameter has no declared
+                # type here, and ``auto`` then copies the index variable's own.
+                ctype = declared_ctype(name, sdfg) or 'auto'
+                replacement = f'{ctype} {name} = {new_text};\n'
                 prefix = replacement + prefix
                 active_replacements.add(name)
 
@@ -192,7 +216,8 @@ def replace_in_codeblock(codeblock: properties.CodeBlock, repl: Dict[str, str], 
 
 def replace_properties_dict(node: Any,
                             repl: Dict[str, str],
-                            symrepl: Optional[Dict[symbolic.SymbolicType, symbolic.SymbolicType]] = None):
+                            symrepl: Optional[Dict[symbolic.SymbolicType, symbolic.SymbolicType]] = None,
+                            sdfg: Optional['dace.SDFG'] = None):
     symrepl = symrepl or {
         symbolic.pystr_to_symbolic(symname):
         symbolic.pystr_to_symbolic(new_name) if isinstance(new_name, str) else new_name
@@ -221,7 +246,7 @@ def replace_properties_dict(node: Any,
             if isinstance(node, nodes.Node):
                 reduced_repl -= set(node.in_connectors.keys()) | set(node.out_connectors.keys())
             reduced_repl = {k: repl[k] for k in reduced_repl}
-            replace_in_codeblock(propval, reduced_repl, node)
+            replace_in_codeblock(propval, reduced_repl, node, sdfg)
         elif (isinstance(propclass, properties.DictProperty) and pname == 'symbol_mapping'):
             # Symbol mappings for nested SDFGs
             for symname, sym_mapping in propval.items():

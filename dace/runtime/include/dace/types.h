@@ -62,6 +62,7 @@
     #include <cuda_bf16.h>
     #include <cuda_fp8.h>
     #include <thrust/complex.h>
+    #define DACE_THRUST_COMPLEX
     #include "cuda/multidim_gbar.cuh"
 
     // Workaround so that the native low-precision types are scalars (for reductions)
@@ -80,6 +81,11 @@
     #include <hip/hip_fp16.h>
     #include <hip/hip_bf16.h>
     #include <hip/hip_fp8.h>
+    // rocThrust, the AMD port. Optional: without it the complex types below fall back to std.
+    #if __has_include(<thrust/complex.h>)
+        #include <thrust/complex.h>
+        #define DACE_THRUST_COMPLEX
+    #endif
 
     namespace std {
         template <> struct is_scalar<half> : std::integral_constant<bool, true> {};
@@ -135,9 +141,13 @@ namespace dace
     typedef double float64;
 
     #if defined(__CUDACC__) || defined(__HIPCC__)
-    #ifdef __CUDACC__
+    // std::complex is not usable in device code, so thrust's is preferred wherever it exists.
+    #ifdef DACE_THRUST_COMPLEX
     typedef thrust::complex<float> complex64;
     typedef thrust::complex<double> complex128;
+    #else
+    typedef std::complex<float> complex64;
+    typedef std::complex<double> complex128;
     #endif
     // GPU native low-precision types. Bit-identical to the CPU structs below (checked next).
     // e4m3fn == the OCP finite E4M3 (max +-448): __nv_fp8_e4m3 / __hip_fp8_e4m3, NOT the fnuz form.
@@ -351,17 +361,16 @@ namespace dace
 }
 
 #if !defined(__CUDACC__) && !defined(__HIPCC__)
-// ``std::numeric_limits`` for the low-precision structs. Without these the PRIMARY template answers
-// ``max() == lowest() == infinity() == T()``, i.e. ZERO, for every one of them -- so a consumer that
-// picks a min/max reduction identity that way (``dace/scan.hpp``, ``libraries/tileops``) silently
-// folds into zero instead of failing. Values are the IEEE binary16 / bfloat16 / OCP e5m2 / OCP
-// e4m3fn ones; e4m3fn is the FINITE format, so it alone has no infinity.
-#define DACE_LP_LIMITS(TYPE, DIGITS, DIG10, MAXDIG10, MINEXP, MINEXP10, MAXEXP, MAXEXP10, INF, IEC, MAXV, MINV,     \
+// ``std::numeric_limits`` for the 16-bit low-precision structs. Without these the PRIMARY template
+// answers ``max() == lowest() == infinity() == T()``, i.e. ZERO -- so a consumer that seeds a
+// min/max reduction identity that way (``libraries/torch/dispatchers``) silently folds into zero
+// instead of failing. Values are the IEEE binary16 / bfloat16 ones.
+#define DACE_LP_LIMITS(TYPE, DIGITS, DIG10, MAXDIG10, MINEXP, MINEXP10, MAXEXP, MAXEXP10, IEC, HAS_INF, MAXV, MINV, \
                        EPSV, DENV)                                                                                  \
     template <>                                                                                                     \
     struct numeric_limits<::dace::TYPE> {                                                                           \
         static constexpr bool is_specialized = true, is_signed = true, is_integer = false;                          \
-        static constexpr bool is_exact = false, has_infinity = INF, has_quiet_NaN = true;                           \
+        static constexpr bool is_exact = false, has_infinity = HAS_INF, has_quiet_NaN = true;                         \
         static constexpr bool has_signaling_NaN = false, is_bounded = true, is_modulo = false;                      \
         static constexpr bool is_iec559 = IEC, traps = false, tinyness_before = false;                              \
         static constexpr int radix = 2, digits = DIGITS, digits10 = DIG10, max_digits10 = MAXDIG10;                 \
@@ -376,19 +385,19 @@ namespace dace
         static constexpr ::dace::TYPE denorm_min() noexcept { return ::dace::TYPE(DENV); }                          \
         static constexpr ::dace::TYPE quiet_NaN() noexcept { return ::dace::TYPE(__builtin_nanf("")); }             \
         static constexpr ::dace::TYPE signaling_NaN() noexcept { return ::dace::TYPE(__builtin_nanf("")); }         \
-        static constexpr ::dace::TYPE infinity() noexcept {                                                         \
-            return INF ? ::dace::TYPE(__builtin_huge_valf()) : ::dace::TYPE();                                      \
-        }                                                                                                           \
+        static constexpr ::dace::TYPE infinity() noexcept { return ::dace::TYPE(__builtin_huge_valf()); }           \
     }
-namespace std {
-DACE_LP_LIMITS(half, 11, 3, 5, -13, -4, 16, 4, true, true, 6.5504e+4f, 6.103515625e-05f, 9.765625e-04f,
-               5.9604644775390625e-08f);
-DACE_LP_LIMITS(bfloat16, 8, 2, 4, -125, -37, 128, 38, true, false, 3.38953139e+38f, 1.17549435e-38f, 7.8125e-03f,
-               9.18354962e-41f);
-DACE_LP_LIMITS(float8_e5m2, 3, 1, 2, -13, -4, 16, 4, true, false, 5.7344e+4f, 6.103515625e-05f, 2.5e-01f,
-               1.52587890625e-05f);
-DACE_LP_LIMITS(float8_e4m3fn, 4, 1, 3, -5, -1, 9, 2, false, false, 4.48e+2f, 1.5625e-02f, 1.25e-01f, 1.953125e-03f);
-}  // namespace std
+namespace std
+{
+    DACE_LP_LIMITS(half, 11, 3, 5, -13, -4, 16, 4, true, true, 6.5504e+4f, 6.103515625e-05f, 9.765625e-04f,
+                   5.9604644775390625e-08f);
+    DACE_LP_LIMITS(bfloat16, 8, 2, 4, -125, -37, 128, 38, false, true, 3.38953139e+38f, 1.17549435e-38f, 7.8125e-03f,
+                   9.18354962e-41f);
+    DACE_LP_LIMITS(float8_e5m2, 3, 0, 1, -13, -4, 16, 4, false, true, 5.7344e+4f, 6.103515625e-05f, 2.5e-01f,
+                   1.52587890625e-05f);
+    DACE_LP_LIMITS(float8_e4m3fn, 4, 0, 2, -5, -2, 9, 2, false, false, 4.48e+2f, 1.5625e-02f, 1.25e-01f,
+                   1.953125e-03f);
+}
 #undef DACE_LP_LIMITS
 
 // The finite bounds are the whole point of the specializations; pin their bit patterns so a typo in

@@ -91,7 +91,7 @@ def _inner_maps(sdfg):
 def test_assume_even_single_strided_gpu_map_no_mask():
     """``assume_even=True`` emits ONE ``0:N:2`` GPU_Device map per original map --
     no remainder split, no ``TileMaskGen`` (so no mismatched thread-block sizes on
-    GPU). ``assume_even`` is opt-in: the GPU K=1 default is ``branched_tail``."""
+    GPU). ``assume_even`` is opt-in: the GPU K=1 default is ``branched_masked_tail``."""
     sdfg = _prep(_add16)
     VectorizeGPU(VectorizeConfig(widths=(2, ), assume_even=True)).apply_pass(sdfg, {})
     maps = _inner_maps(sdfg)
@@ -120,12 +120,15 @@ def test_deferred_tile_nodes_are_cuda_stamped():
 
 def test_scalar_cast_constant_broadcasts():
     """The canonical constant-input shape ``tmp = float16(0.5); C = A * tmp`` -- a
-    scalar cast feeding a binop -- vectorizes both default remainder arms to
-    ``TileBinop`` nodes (the scalar is cast to tile precision and broadcast), and compiles."""
+    scalar cast feeding a binop -- vectorizes to one ``TileBinop`` per branch arm (the
+    scalar is cast to the tile precision and broadcast into the tile), and compiles."""
     sdfg = _prep(_scale_const16)
     VectorizeGPU(VectorizeConfig(widths=(2, ))).apply_pass(sdfg, {})
     binops = [n for n, _ in sdfg.all_nodes_recursive() if isinstance(n, TileBinop)]
-    assert len(binops) == 2, f"expected one TileBinop per remainder arm; got {len(binops)}"
+    # ONE per branch arm: the K=1 remainder default is ``branched_masked_tail`` (640c9e8d9), whose
+    # else-arm is a MASKED tile body rather than a scalar lane loop, so the multiply is a tile op in
+    # both arms. The cast is still broadcast, not re-materialized -- that would show up as a third.
+    assert len(binops) == 2, f"expected one TileBinop per branch arm for A*const; got {len(binops)}"
     sdfg.expand_library_nodes()
     # the constant stays at the input (fp16) precision -- no fp64 container leaked
     assert all(d.dtype != dace.float64 for d in sdfg.arrays.values())

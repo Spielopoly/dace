@@ -3,7 +3,7 @@
 
 from copy import deepcopy as dc
 import itertools
-from typing import Dict, List
+from typing import Any, Dict, List, Set
 
 from dace import Memlet, symbolic, subsets
 from dace.sdfg import nodes
@@ -11,10 +11,63 @@ from dace.sdfg.graph import MultiConnectorEdge
 from dace.sdfg import InterstateEdge, SDFG, SDFGState
 from dace.sdfg import utils as sdutil
 from dace.sdfg.replace import replace_datadesc_names, replace_properties_dict
+from dace.sdfg.tasklet_utils import tasklet_replace_code, token_replace_dict
 from dace.transformation import transformation, helpers
-from dace.properties import make_properties
+from dace.properties import make_properties, CodeBlock
 from dace import data
 from dace.sdfg.state import LoopRegion, ReturnBlock
+
+
+def _same_layout(outer_desc: data.Data, inner_desc: data.Data) -> bool:
+    """Whether two descriptors carry the same shape and the same strides.
+
+    ``Scalar`` reports strides as a list and ``Array`` as a tuple, and ``same_value`` counts the
+    sequence type -- so a ``Scalar`` facing a length-1 ``Array``, the ordinary nested-SDFG boundary,
+    would refuse the inline over a container type. Compare by value.
+    """
+    return (symbolic.same_value(tuple(outer_desc.shape), tuple(inner_desc.shape))
+            and symbolic.same_value(tuple(outer_desc.strides), tuple(inner_desc.strides)))
+
+
+def _disambiguate_code_connectors(nsdfg: SDFG, reserved_names: Set[str]) -> None:
+    """Rename tasklet connectors that clash with outer-scope names.
+
+    After inlining, a tasklet connector whose name coincides with an outer
+    array, symbol, constant, or assignment target would fail validation (and
+    could confuse code generation). Rename such connectors to fresh names and
+    update the connecting edges and the tasklet code.
+
+    Library nodes are exempt: their connector names are part of the node's
+    interface (ONNX schema parameters, BLAS operand names), and expansions look
+    them up by name. Renaming one silently unbinds the node from its schema --
+    the name is not recoverable from connector order either, e.g. an ONNX Gemm
+    carries ``B, A, C`` against schema order ``A, B, C``. A library-node
+    connector is not emitted as an identifier at this point anyway: expansion
+    turns it into a nested-SDFG boundary, which has its own scope.
+    """
+    for nstate in nsdfg.states():
+        for node in list(nstate.nodes()):
+            if not isinstance(node, nodes.Tasklet):
+                continue
+            used = set(node.in_connectors.keys()) | set(node.out_connectors.keys())
+            renames: Dict[str, str] = {}
+            for conn in used:
+                if conn in reserved_names:
+                    renames[conn] = data.find_new_name(conn, reserved_names | used)
+            if not renames:
+                continue
+            node.in_connectors = {renames.get(k, k): v for k, v in node.in_connectors.items()}
+            node.out_connectors = {renames.get(k, k): v for k, v in node.out_connectors.items()}
+            for edge in list(nstate.in_edges(node)):
+                if edge.dst_conn in renames:
+                    helpers.redirect_edge(nstate, edge, new_dst_conn=renames[edge.dst_conn])
+            for edge in list(nstate.out_edges(node)):
+                if edge.src_conn in renames:
+                    helpers.redirect_edge(nstate, edge, new_src_conn=renames[edge.src_conn])
+            tasklet_replace_code(node, renames)
+            # tasklet_replace_code only rewrites symbols on the right-hand side;
+            # also rename connector names that appear as assignment targets.
+            node.code = CodeBlock(token_replace_dict(node.code.as_string, renames), language=node.code.language)
 
 
 @make_properties
@@ -105,8 +158,7 @@ class InlineMultistateSDFG(transformation.SingleStateTransformation):
             #  for that. Clone the descriptor because the operation is inplace.
             inner_desc = nested_sdfg.sdfg.arrays[edge.dst_conn].clone()
             symbolic.safe_replace(nested_sdfg.symbol_mapping, lambda m: replace_properties_dict(inner_desc, m))
-            if (not symbolic.same_value(outer_desc.shape, inner_desc.shape)
-                    or not symbolic.same_value(outer_desc.strides, inner_desc.strides)):
+            if not _same_layout(outer_desc, inner_desc):
                 return False
 
         for edge in state.out_edges(nested_sdfg):
@@ -125,8 +177,7 @@ class InlineMultistateSDFG(transformation.SingleStateTransformation):
 
             inner_desc = nested_sdfg.sdfg.arrays[edge.src_conn].clone()
             symbolic.safe_replace(nested_sdfg.symbol_mapping, lambda m: replace_properties_dict(inner_desc, m))
-            if (not symbolic.same_value(outer_desc.shape, inner_desc.shape)
-                    or not symbolic.same_value(outer_desc.strides, inner_desc.strides)):
+            if not _same_layout(outer_desc, inner_desc):
                 return False
 
         if not helpers.isolate_nested_sdfg(state, nsdfg_node=nested_sdfg, test_if_applicable=True):
@@ -334,6 +385,11 @@ class InlineMultistateSDFG(transformation.SingleStateTransformation):
                 node_name = data.find_new_name(node.label, node_names)
                 node.label = node_name
             node_names.add(node.label)
+
+        # Rename code-node connectors that would clash with outer arrays, symbols,
+        # constants, or interstate assignments once the nodes are in the parent.
+        reserved_names = allnames | set(sdfg.constants) | set(sdfg.constants_prop.keys()) | outer_assignments
+        _disambiguate_code_connectors(nsdfg, reserved_names)
 
         #######################################################
         # Add nested SDFG states into top-level SDFG

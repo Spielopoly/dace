@@ -2,15 +2,15 @@
 """Tests for ``VectorizeCuTile(use_gpu_storage=True)``.
 
 The knob marks non-transient arrays ``GPU_Global`` (via ``auto_optimize``'s
-``apply_gpu_storage``) before GPU scheduling, so ``GPUTransformSDFG`` creates
-no ``gpu_*`` transient clones and no copy-in/copy-out states. The compiled
+``apply_gpu_storage``) before GPU scheduling, so offloading creates no device
+staging transients and no copy-in/copy-out states. The compiled
 Python-backend SDFG then takes device (cupy) arrays directly — the calling
 convention NPBench uses to keep H2D/D2H transfers out of the timed region.
 
 Structural tests need no GPU; runtime tests (``@pytest.mark.gpu``) compile,
 run with cupy arrays, and compare against NumPy references.
 """
-from typing import Iterator, Tuple
+from typing import Iterator, Optional, Tuple
 
 import numpy as np
 import pytest
@@ -85,34 +85,59 @@ def _has_host_device_copy_edge(sdfg: SDFG) -> bool:
     return False
 
 
+def _gpu_clone_name(sdfg: SDFG, host_name: str) -> Optional[str]:
+    """Find a transient GPU clone connected to a host array copy edge.
+
+    :param sdfg: The SDFG to inspect.
+    :param host_name: The original non-transient array name.
+    :returns: The clone name, or ``None`` if no clone is connected.
+    """
+    host_desc = sdfg.arrays.get(host_name)
+    if host_desc is None or host_desc.storage == dtypes.StorageType.GPU_Global:
+        return None
+    for state in sdfg.states():
+        for edge in state.edges():
+            if not (isinstance(edge.src, nodes.AccessNode) and isinstance(edge.dst, nodes.AccessNode)):
+                continue
+            if edge.src.data == host_name:
+                clone_name = edge.dst.data
+            elif edge.dst.data == host_name:
+                clone_name = edge.src.data
+            else:
+                continue
+            clone = sdfg.arrays.get(clone_name)
+            if clone is not None and clone.transient and clone.storage == dtypes.StorageType.GPU_Global:
+                return clone_name
+    return None
+
+
 # ============================================================
 # Structural tests (no GPU)
 # ============================================================
 
 
 def test_gpu_storage_marks_args_and_skips_clones():
-    """With the knob on, argument arrays are GPU_Global and GPUTransformSDFG
-    creates neither ``gpu_*`` clones nor copy edges."""
+    """With the knob on, GPU_Global arguments need no staging copies."""
     sdfg = _axpy_sdfg("gs_knob_on", use_gpu_storage=True)
 
     args = dict(_nontransient_arrays(sdfg))
     assert set(args) == {"x", "y"}
     for name, desc in args.items():
         assert desc.storage == dtypes.StorageType.GPU_Global, f"'{name}' storage is {desc.storage}"
-        assert f"gpu_{name}" not in sdfg.arrays, f"unexpected clone gpu_{name}"
     assert not _has_host_device_copy_edge(sdfg)
     sdfg.validate()
 
 
 def test_default_keeps_host_arrays():
     """Regression guard: with the knob off (default), argument arrays stay on
-    host and the ``gpu_*`` clones + copy edges DO exist."""
+    host and transient GPU clones plus copy edges exist."""
     sdfg = _axpy_sdfg("gs_knob_off", use_gpu_storage=False)
 
     for name, desc in _nontransient_arrays(sdfg):
         assert desc.storage != dtypes.StorageType.GPU_Global, f"'{name}' unexpectedly on GPU"
-        clone = sdfg.arrays.get(f"gpu_{name}")
-        assert clone is not None, f"missing clone gpu_{name}"
+        clone_name = _gpu_clone_name(sdfg, name)
+        assert clone_name is not None, f"missing GPU clone for {name}"
+        clone = sdfg.arrays[clone_name]
         assert clone.transient and clone.storage == dtypes.StorageType.GPU_Global
     assert _has_host_device_copy_edge(sdfg)
     sdfg.validate()
@@ -120,7 +145,7 @@ def test_default_keeps_host_arrays():
 
 def test_gpu_storage_read_only_scalar_stays_host():
     """The read-only scalar ``a`` keeps host storage (``apply_gpu_storage``
-    skips unwritten non-transient scalars; GPUTransformSDFG later stamps
+    skips unwritten non-transient scalars; GPU scheduling later stamps
     remaining host data CPU_Heap)."""
     sdfg = _axpy_sdfg("gs_scalar_host", use_gpu_storage=True)
 
@@ -144,14 +169,14 @@ def test_gpu_storage_written_scalar_becomes_gpu_global():
 
 def test_gpu_storage_warns_when_ineffective():
     """On an SDFG already GPU-transformed WITHOUT gpu storage (existing
-    ``gpu_*`` clones + copy states), the knob cannot remove the copies and
+    transient GPU clones and copy states), the knob cannot remove the copies and
     emits a UserWarning."""
     sdfg = _axpy.to_sdfg(simplify=False)
     sdfg.name = "gs_warn_ineffective"
     VectorizeCuTile.canonicalize_for_cutile(sdfg)
     sdfg.apply_gpu_transformations(sequential_innermaps=True, register_transients=True, simplify=False)
 
-    with pytest.warns(UserWarning, match="use_gpu_storage had no effect"):
+    with pytest.warns(UserWarning, match="use_gpu_storage could not establish direct device arguments"):
         VectorizeCuTile(widths=(32, ), run_canonicalize=False, use_gpu_storage=True).apply_pass(sdfg, {})
 
 
@@ -171,7 +196,6 @@ def test_gpu_storage_pre_scheduled_noop():
 
     for name, desc in _nontransient_arrays(sdfg):
         assert desc.storage == dtypes.StorageType.GPU_Global
-        assert f"gpu_{name}" not in sdfg.arrays
     assert not _has_host_device_copy_edge(sdfg)
     sdfg.validate()
 
@@ -241,9 +265,9 @@ def test_gpu_storage_rejects_host_arrays():
     x = rng.random(n)
     y = rng.random(n)
 
-    # Observed error: `RuntimeError: NumPy only supports stream=None` from
-    # cuda.tile/cupy when handed host arrays.
-    with pytest.raises(RuntimeError, match="NumPy"):
+    # cuda.tile/cupy rejects a host array before launch. Runtime versions use
+    # either ValueError or RuntimeError for the same contract violation.
+    with pytest.raises((ValueError, RuntimeError), match="NumPy"):
         csdfg(a=2.5, x=x, y=y, N=n)
 
 

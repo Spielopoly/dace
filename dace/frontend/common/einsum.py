@@ -240,7 +240,10 @@ def _create_einsum_internal(sdfg: SDFG,
         if len(inp) != len(inparr.shape):
             raise ValueError('Dimensionality mismatch in input "%s"' % inpname)
         for char, shp in zip(inp, inparr.shape):
-            if char in chardict and shp != chardict[char]:
+            # Equalized, not raw '!=': one name can reach here as several sympy instances (a
+            # descriptor a layout pass rebuilt against one parsed from a string), which compare
+            # unequal by identity and would reject a shape that matches.
+            if char in chardict and symbolic.inequal_symbols(shp, chardict[char]):
                 raise ValueError('Dimension mismatch in einsum expression')
             chardict[char] = shp
 
@@ -504,6 +507,45 @@ def _create_einsum_internal(sdfg: SDFG,
                 if str(s) not in sym_mapping:
                     sym_mapping[str(s)] = s
         nsdfg_node = state.add_nested_sdfg(nsdfg, {'X', 'Y'}, {'Z'}, sym_mapping)
+
+        # InlineSDFG composes inner and outer memlets by coordinate-wise offsetting. That is
+        # only valid when the nested SDFG's array shape matches the outer array shape. If the
+        # GEMM view permutes dimensions (e.g., an outer [B, M, 1] reinterpreted as [B, 1, M]),
+        # inlining would produce an out-of-bounds memlet. Keep such nested SDFGs as calls.
+        def _is_permutation(s1, s2):
+            # The inner GEMM array shapes are expressed in terms of the symbols M, K, N
+            # and BATCH, but those symbols are bound to the concrete outer dimensions by
+            # ``strides``. Resolve them before comparing, otherwise a transposed view is
+            # invisible to the permutation check and gets inlined into an invalid memlet.
+            s1 = tuple(strides.get(str(d), d) for d in s1)
+            if len(s1) != len(s2):
+                return False
+            s2 = list(s2)
+            for a in s1:
+                for i, b in enumerate(s2):
+                    if not symbolic.inequal_symbols(a, b):
+                        del s2[i]
+                        break
+                else:
+                    return False
+            return True
+
+        def _shape_equal(s1, s2):
+            s1 = tuple(strides.get(str(d), d) for d in s1)
+            if len(s1) != len(s2):
+                return False
+            return all(not symbolic.inequal_symbols(a, b) for a, b in zip(s1, s2))
+
+        if ((_is_permutation(nsdfg.arrays['X'].shape,
+                             a.desc(sdfg).shape) and not _shape_equal(nsdfg.arrays['X'].shape,
+                                                                      a.desc(sdfg).shape))
+                or (_is_permutation(nsdfg.arrays['Y'].shape,
+                                    b.desc(sdfg).shape) and not _shape_equal(nsdfg.arrays['Y'].shape,
+                                                                             b.desc(sdfg).shape))
+                or (_is_permutation(nsdfg.arrays['Z'].shape,
+                                    c.desc(sdfg).shape) and not _shape_equal(nsdfg.arrays['Z'].shape,
+                                                                             c.desc(sdfg).shape))):
+            nsdfg_node.no_inline = True
         state.add_edge(a, None, nsdfg_node, 'X', Memlet.from_array(a.data, a.desc(sdfg)))
         state.add_edge(b, None, nsdfg_node, 'Y', Memlet.from_array(b.data, b.desc(sdfg)))
         state.add_edge(nsdfg_node, 'Z', c, None, Memlet.from_array(c.data, c.desc(sdfg)))

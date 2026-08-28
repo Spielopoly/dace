@@ -1,4 +1,4 @@
-# Copyright 2019-2025 ETH Zurich and the DaCe authors. All rights reserved.
+# Copyright 2019-2026 ETH Zurich and the DaCe authors. All rights reserved.
 import dace.serialize
 from dace import symbolic
 import sympy as sp
@@ -129,13 +129,23 @@ def bounding_box_symbolic_positive(subset_a, subset_b, approximation=False) -> b
     return True
 
 
+def _hashable_bound(bound):
+    """``bound`` with every symbol reduced to a bare same-named one, so instances of a name hash alike."""
+    if not isinstance(bound, sp.Basic):
+        return bound
+    free = bound.free_symbols
+    if not free:
+        return bound
+    return bound.xreplace({s: sp.Symbol(s.name) for s in free})
+
+
 class Subset(object):
     """ Defines a subset of a data descriptor. """
 
     def ndrange(self) -> list[tuple[symbolic.SymbolicType, symbolic.SymbolicType, symbolic.SymbolicType]]:
         """
         Implements an iterator over strided N-dimensional rectangular regions of the subset.
-        Note that this may be an overapproximation of the actual subset, based on the subclass.
+        Note that this may be an over-approximation of the actual subset, based on the subclass.
 
         :return: An iterator over N-dimensional ranges.
         """
@@ -153,8 +163,7 @@ class Subset(object):
 
         if Config.get('optimizer', 'symbolic_positive'):
             return bounding_box_symbolic_positive(self, other, approximation=True)
-        else:
-            return bounding_box_cover_exact(self, other, approximation=True)
+        return bounding_box_cover_exact(self, other, approximation=True)
 
     def covers_precise(self, other):
         """ Returns True if self contains all the elements in other. """
@@ -169,7 +178,7 @@ class Subset(object):
         symbolic_positive = Config.get('optimizer', 'symbolic_positive')
         if symbolic_positive and (not bounding_box_cover_exact(self, other)):
             return False
-        elif not bounding_box_symbolic_positive(self, other):
+        if not bounding_box_symbolic_positive(self, other):
             return False
 
         # NOTE: The original implementation always called ``nng()``. However, it was decided that
@@ -308,7 +317,7 @@ def tuple_to_symexpr(val):
     A ``(main, approx)`` tuple becomes a ``SymExpr``; anything else -- a Python ``int``, a
     string, an already-symbolic value -- goes through ``pystr_to_symbolic``.
     """
-    return (symbolic.SymExpr(val[0], val[1]) if isinstance(val, tuple) else symbolic.pystr_to_symbolic(val))
+    return symbolic.SymExpr(val[0], val[1]) if isinstance(val, tuple) else symbolic.pystr_to_symbolic(val)
 
 
 def symbolic_range_tuple(value):
@@ -342,10 +351,7 @@ class Range(Subset):
             if len(r) != 3 and len(r) != 4:
                 raise ValueError("Expected 3-tuple or 4-tuple")
             parsed_ranges.append((tuple_to_symexpr(r[0]), tuple_to_symexpr(r[1]), tuple_to_symexpr(r[2])))
-            if len(r) == 3:
-                parsed_tiles.append(symbolic.pystr_to_symbolic(1))
-            else:
-                parsed_tiles.append(symbolic.pystr_to_symbolic(r[3]))
+            parsed_tiles.append(symbolic.pystr_to_symbolic(1) if len(r) == 3 else tuple_to_symexpr(r[3]))
         self.ranges = parsed_ranges
         self.tile_sizes = parsed_tiles
 
@@ -395,7 +401,10 @@ class Range(Subset):
         return result
 
     def __hash__(self):
-        return hash(tuple(r for r in self.ranges))
+        # Symbols reduced to bare names, matching __eq__: two Ranges that compare equal must hash
+        # equal, or they miss each other in every dict and set they are keyed by. Equalizing inside
+        # one expression is not enough -- the two instances live in DIFFERENT objects here.
+        return hash(tuple(tuple(_hashable_bound(b) for b in r) for r in self.ranges))
 
     def __add__(self, other):
         return Range(
@@ -780,31 +789,41 @@ class Range(Subset):
 
     def __setitem__(self, key, value):
         # ``__init__`` coerces every bound; this path did not, so ``r[i] = (0, n - 1, 1)``
-        # quietly put Python ints into a container whose contract says symbolic. A 4-tuple
-        # carries the tile size, which lives in its own list rather than in ``ranges``.
-        if isinstance(key, slice):
-            entries = [symbolic_range_tuple(v) for v in value]
-            if any(len(e) == 4 for e in entries):
-                self.tile_sizes[key] = [e[3] if len(e) == 4 else old for e, old in zip(entries, self.tile_sizes[key])]
-            return self.ranges.__setitem__(key, [e[:3] for e in entries])
-        if isinstance(value, (tuple, list)):
-            value = symbolic_range_tuple(value)
-            if len(value) == 4:
-                self.tile_sizes[key] = value[3]
-            value = value[:3]
-        else:
+        # quietly put Python ints into a container whose contract says symbolic.
+        # A 4-tuple carries the tile size, which lives in its own list rather than in ``ranges``.
+        def coerce(idx, v):
+            if isinstance(v, (tuple, list)):
+                v = symbolic_range_tuple(v)
+                if len(v) == 4:
+                    self.tile_sizes[idx] = v[3]
+                return v[:3]
             # Single-index write (e.g. the frontend replacing one dimension by an
             # expression): still coerce so no raw Python number slips in.
-            value = tuple_to_symexpr(value)
-        return self.ranges.__setitem__(key, value)
+            return symbolic.pystr_to_symbolic(v)
+
+        if isinstance(key, slice):
+            indices = range(*key.indices(len(self.ranges)))
+            return self.ranges.__setitem__(key, [coerce(i, v) for i, v in zip(indices, value)])
+        return self.ranges.__setitem__(key, coerce(key, value))
 
     def __eq__(self, other):
+        # By NAME, not by sympy identity. A name denotes one value in an SDFG, but a bound rebuilt
+        # by a pass and one reparsed from a string are distinct sympy objects, so raw '==' called
+        # two spellings of `0:N` different -- while covers() and intersects() called them the same.
         if not isinstance(other, Range):
             return False
         if len(self.ranges) != len(other.ranges):
             return False
-        return all([(rb == orb and re == ore and rs == ors)
-                    for (rb, re, rs), (orb, ore, ors) in zip(self.ranges, other.ranges)])
+        for mine, theirs in zip(self.ranges, other.ranges):
+            for a, b in zip(mine, theirs):
+                # Equalize, then compare STRUCTURALLY. A simplify-based test would call
+                # structurally different bounds equal, and no structural __hash__ could agree.
+                # Bounds are not always sympy: a raw int reaches here and equalizing would raise.
+                if isinstance(a, sp.Basic) and isinstance(b, sp.Basic):
+                    a, b = symbolic.equalize_symbols_across(a, b)
+                if a != b:
+                    return False
+        return True
 
     def __ne__(self, other):
         return not self.__eq__(other)
@@ -998,12 +1017,9 @@ class Range(Subset):
             array: array descriptor to check against
 
         Returns:
-            True if the subset is contiguous, False otherwise.
-            A subset is contiguous if it addresses one uninterrupted run of memory.
-            This holds when the whole array has a packed layout, or -- even on a
-            non-packed (padded) descriptor -- when the subset is a 1D slice: at most
-            one dimension has size > 1 and that dimension has stride 1 (all other
-            dimensions are extent-1 and never stepped).
+            True if the subset addresses one uninterrupted run of memory: the whole array has a
+            packed layout, or -- even on a non-packed (padded) descriptor -- the subset is a 1D
+            slice (at most one dimension has size > 1, and that dimension has stride 1).
         """
         # Any step size != 1 -> not contiguous
         if any(s != 1 for (_, _, s) in self):

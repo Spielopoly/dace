@@ -43,7 +43,12 @@ class CUB:
     cmake_link_flags = []
     cmake_files = []
 
-    headers = {'frame': ['cub/cub.cuh', 'dace/cub_scratch.cuh', 'dace/cub_compat.cuh']}
+    # cub/cub.cuh does not compile under a host compiler from CCCL 3 (CUDA 13) on, so only the
+    # host-safe scratch header goes to the frame; the wrappers that call CUB live in the .cu.
+    headers = {
+        'frame': ['dace/cub_scratch.cuh'],
+        'cuda': ['cub/cub.cuh', 'dace/cub_scratch.cuh', 'dace/cub_compat.cuh'],
+    }
     state_fields = []
     init_code = ""
     finalize_code = ""
@@ -99,7 +104,9 @@ class ScanScratch:
     cmake_link_flags = []
     cmake_files = []
 
-    headers = {'frame': []}
+    #: CUDA unit only: the affine expansion's kernels and its map monoid. The host translation
+    #: unit never sees it -- it includes ``cub/cub.cuh``, which the host compiler cannot parse.
+    headers = {'frame': [], 'cuda': ['dace/cuda/scan_affine.cuh']}
     state_fields = []
     init_code = f"::dace::cub::get_scratch<::dace::cub::ScanTag>({_CUB_INITIAL_BYTES_PER_STREAM}ull, 0);"
     finalize_code = "::dace::cub::release_scratch<::dace::cub::ScanTag>();"
@@ -128,4 +135,38 @@ class ReduceScratch:
     state_fields = []
     init_code = f"::dace::cub::get_scratch<::dace::cub::ReduceTag>({_CUB_INITIAL_BYTES_PER_STREAM}ull, 0);"
     finalize_code = "::dace::cub::release_scratch<::dace::cub::ReduceTag>();"
+    dependencies = [CUB]
+
+
+@dace.library.environment
+class DetectScratch:
+    """Device detection primitives (``dace/cuda/detect.cuh``) plus their scratch pools.
+
+    Used by the CUDA expansions of :class:`~dace.libraries.standard.nodes.find_first.FindFirst`
+    and :class:`~dace.libraries.sort.nodes.scatter_conflict_check.ScatterConflictCheck`.
+
+    The FLAG pool is claimed at init, the way the sort / scan / reduce pools are: it is one word,
+    its size never depends on the problem, and taking it here keeps the first call off the
+    allocator -- which otherwise shows up inside whatever that first call was being timed for. The
+    TAG pool is left alone: it is sized by the scattered array's domain, which init does not know,
+    and ``get_scratch`` grows it in place on first use. Both are freed at SDFG finalize.
+
+    The header goes to the ``cuda`` file only -- it instantiates ``cub::BlockReduce`` and launches
+    kernels, neither of which a host compiler can parse.
+    """
+
+    cmake_minimum_version = None
+    cmake_packages = []
+    cmake_variables = {}
+    cmake_includes = []
+    cmake_libraries = []
+    cmake_compile_flags = []
+    cmake_link_flags = []
+    cmake_files = []
+
+    headers = {'frame': [], 'cuda': ['dace/cuda/detect.cuh']}
+    state_fields = []
+    init_code = "::dace::cub::get_scratch<::dace::cub::DetectFlagTag>(sizeof(unsigned long long), 0);"
+    finalize_code = ("::dace::cub::release_scratch<::dace::cub::DetectFlagTag>();\n"
+                     "::dace::cub::release_scratch<::dace::cub::DetectOwnerTag>();")
     dependencies = [CUB]

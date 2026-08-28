@@ -35,6 +35,11 @@ using std::abs;
 //     return (a > b) ? a : b;
 // }
 
+// A later argument wins only by comparing STRICTLY better, so a tie -- and a
+// comparison that is false because an operand is NaN -- keeps the earlier one.
+// That is what Python's ``max``/``min`` do, and what ``std::max``/``std::min``
+// do; picking the later operand instead would disagree with the program these
+// are compiled from on every NaN and on ``max(0.0, -0.0)``.
 template <typename T>
 DACE_CONSTEXPR DACE_HDFI T min(const T& val) {
   return val;
@@ -42,7 +47,7 @@ DACE_CONSTEXPR DACE_HDFI T min(const T& val) {
 template <typename T, typename... Ts>
 DACE_CONSTEXPR DACE_HDFI typename std::common_type<T, Ts...>::type min(
     const T& a, const Ts&... ts) {
-  return (a < min(ts...)) ? a : min(ts...);
+  return (min(ts...) < a) ? min(ts...) : a;
 }
 
 template <typename T>
@@ -52,7 +57,7 @@ DACE_CONSTEXPR DACE_HDFI T max(const T& val) {
 template <typename T, typename... Ts>
 DACE_CONSTEXPR DACE_HDFI typename std::common_type<T, Ts...>::type max(
     const T& a, const Ts&... ts) {
-  return (a > max(ts...)) ? a : max(ts...);
+  return (a < max(ts...)) ? max(ts...) : a;
 }
 
 template <typename T, typename T2>
@@ -220,32 +225,32 @@ static DACE_CONSTEXPR DACE_HDFI T ROUND(const T& value) {
 template <typename... Ts>
 DACE_CONSTEXPR __device__ __forceinline__ dace::float16 min(
     const dace::float16& a, const dace::float16& b, const Ts&... c) {
-  return (a < b) ? min(a, c...) : min(b, c...);
+  return (b < a) ? min(b, c...) : min(a, c...);
 }
 template <typename T, typename... Ts>
 DACE_CONSTEXPR __device__ __forceinline__ dace::float16 min(
     const dace::float16& a, const T& b, const Ts&... c) {
-  return (a < dace::float16(b)) ? min(a, c...) : min(dace::float16(b), c...);
+  return (dace::float16(b) < a) ? min(dace::float16(b), c...) : min(a, c...);
 }
 template <typename T, typename... Ts>
 DACE_CONSTEXPR __device__ __forceinline__ dace::float16 min(
     const T& a, const dace::float16& b, const Ts&... c) {
-  return (dace::float16(a) < b) ? min(dace::float16(a), c...) : min(b, c...);
+  return (b < dace::float16(a)) ? min(b, c...) : min(dace::float16(a), c...);
 }
 template <typename... Ts>
 DACE_CONSTEXPR __device__ __forceinline__ dace::float16 max(
     const dace::float16& a, const dace::float16& b, const Ts&... c) {
-  return (a > b) ? max(a, c...) : max(b, c...);
+  return (a < b) ? max(b, c...) : max(a, c...);
 }
 template <typename T, typename... Ts>
 DACE_CONSTEXPR __device__ __forceinline__ dace::float16 max(
     const dace::float16& a, const T& b, const Ts&... c) {
-  return (a > dace::float16(b)) ? max(a, c...) : max(dace::float16(b), c...);
+  return (a < dace::float16(b)) ? max(dace::float16(b), c...) : max(a, c...);
 }
 template <typename T, typename... Ts>
 DACE_CONSTEXPR __device__ __forceinline__ dace::float16 max(
     const T& a, const dace::float16& b, const Ts&... c) {
-  return (dace::float16(a) > b) ? max(dace::float16(a), c...) : max(b, c...);
+  return (dace::float16(a) < b) ? max(b, c...) : max(dace::float16(a), c...);
 }
 #endif
 
@@ -257,9 +262,15 @@ template <typename T, std::enable_if_t<std::is_integral<T>::value &&
                                        std::is_signed<T>::value>* = nullptr>
 static DACE_CONSTEXPR DACE_HDFI T int_floor_ni(const T& numerator,
                                                const T& denominator) {
-  auto divresult = std::div(numerator, denominator);
-  T corr = (divresult.rem != 0 && ((divresult.rem < 0) != (denominator < 0)));
-  return (T)divresult.quot - corr;
+  // ``/`` and ``%``, not ``std::div``: that one is HOST-ONLY, and nvcc answers a call to it from
+  // device code with a warning rather than an error. The guarded region holding the call is then
+  // deleted outright -- tsvc s315's ``a[i] = (7*i) % LEN`` compiled to an EMPTY kernel and the
+  // program read whatever the buffer already held. C++11 pins ``/`` to truncation toward zero, so
+  // the correction below is exact, and this form is ``constexpr`` where ``std::div`` is not.
+  const T quotient = numerator / denominator;
+  const T remainder = numerator % denominator;
+  const T corr = (remainder != 0 && ((remainder < 0) != (denominator < 0)));
+  return quotient - corr;
 }
 template <typename T, std::enable_if_t<std::is_integral<T>::value &&
                                        std::is_unsigned<T>::value>* = nullptr>
@@ -283,6 +294,16 @@ template <typename T,
 static DACE_CONSTEXPR DACE_HDFI T py_floor(const T& numerator,
                                            const T& denominator) {
   return (T)std::floor(numerator / denominator);
+}
+// Mixed-operand-type overload, the same shape ``py_mod`` carries below: ``a // 7`` deduces
+// nothing from an ``int64_t`` numerator and an ``int`` literal, so promote both to their common
+// arithmetic type and delegate. Guarded so a same-type call still binds the more specialized
+// overloads above.
+template <typename T1, typename T2, std::enable_if_t<!std::is_same<T1, T2>::value>* = nullptr>
+static DACE_CONSTEXPR DACE_HDFI auto py_floor(const T1& numerator, const T2& denominator)
+    -> decltype(numerator + denominator) {
+  using T = decltype(numerator + denominator);
+  return py_floor<T>((T)numerator, (T)denominator);
 }
 template <typename T>
 static DACE_CONSTEXPR DACE_HDFI std::complex<T> py_floor(
@@ -651,39 +672,27 @@ DACE_CONSTEXPR DACE_HDFI thrust::complex<T> pow(const thrust::complex<T>& a,
   return (thrust::complex<T>)thrust::pow(a, b);
 }
 #endif
-template <typename T, typename U>
+template <typename T, typename U,
+          typename std::enable_if<!(std::is_integral<T>::value &&
+                                    std::is_integral<U>::value)>::type* = nullptr>
 DACE_CONSTEXPR DACE_HDFI auto pow(const T& a, const U& b) {
   return std::pow(a, b);
 }
 
-// Keep a residual low-precision FMA well-typed and single-rounded. std::fma has
-// no half/bfloat16 overload, while integer fusion is ordinary arithmetic.
-template <typename T>
-DACE_CONSTEXPR DACE_HDFI T fma(const T& a, const T& b, const T& c) {
-  if constexpr (std::is_integral<T>::value) {
-    return T(a * b + c);
-  } else if constexpr (sizeof(T) < sizeof(float)) {
-    return T(std::fma(double(a), double(b), double(c)));
-  } else {
-    return T(std::fma(a, b, c));
-  }
-}
-template <typename T, typename U, typename V>
-DACE_CONSTEXPR DACE_HDFI auto fma(const T& a, const U& b, const V& c) -> decltype(std::fma(a, b, c)) {
-  return std::fma(a, b, c);
-}
-
-static DACE_CONSTEXPR DACE_HDFI int pow(const int& a, const int& b) {
-  if (b < 0) return 0;
-  int result = 1;
-  for (int i = 0; i < b; ++i) result *= a;
-  return result;
-}
-
-static DACE_CONSTEXPR DACE_HDFI unsigned int pow(const unsigned int& a,
-                                                 const unsigned int& b) {
-  unsigned int result = 1;
-  for (unsigned int i = 0; i < b; ++i) result *= a;
+// An integer base raised to an integer exponent STAYS an integer. This used to hold for ``int``
+// and ``unsigned int`` only, through two hand-written overloads; every other width -- ``int64_t``
+// above all, which is what a dace size symbol is -- fell through to ``std::pow`` and came back
+// ``double``. A symbolic ``R ** (K - 1)`` then reached C++ as a floating value in two places that
+// cannot take one: an OpenMP loop bound (gcc: "invalid controlling predicate") and a pointer
+// offset (``complex128* + double``), which is what stopped stockham_fft from building at all.
+// Negative exponents answer 0, the convention the ``int`` overload already set.
+template <typename T, typename U,
+          typename std::enable_if<std::is_integral<T>::value &&
+                                  std::is_integral<U>::value>::type* = nullptr>
+DACE_CONSTEXPR DACE_HDFI T pow(const T& a, const U& b) {
+  if (b < U(0)) return T(0);
+  T result = T(1);
+  for (U i = U(0); i < b; ++i) result *= a;
   return result;
 }
 
@@ -847,6 +856,52 @@ template <typename T>
 DACE_CONSTEXPR DACE_HDFI T hypot(const T& a, const T& b) {
   return std::hypot(a, b);
 }
+
+// Fused multiply-add ``a*b + c``, where ``cppunparse`` sends the tasklet-body
+// ``fma(a, b, c)``.  Forwards verbatim, so 32/64-bit stay bit-identical.
+template <typename T,
+          typename std::enable_if<std::is_integral<T>::value>::type* = nullptr>
+DACE_CONSTEXPR DACE_HDFI T fma(const T& a, const T& b, const T& c) {
+  return T(a * b + c);
+}
+template <typename T, typename U, typename V>
+DACE_CONSTEXPR DACE_HDFI auto fma(const T& a, const U& b, const V& c) {
+  return std::fma(a, b, c);
+}
+
+// A 16-bit float reaches ``float`` through one user-defined conversion, making
+// all three ``std::fma`` overloads equally good -- ambiguous, not a call.  Go
+// through ``float``, as ``tileops::tile_fma`` does for lanes it cannot pack
+// into ``__hfma2``.  Not ``DACE_CONSTEXPR``: ``__half(float)`` never folds, and
+// a non-template ``constexpr`` that cannot is -Winvalid-constexpr.
+#define DACE_MATH_FMA_LP(TYPE)                                             \
+  static DACE_HDFI TYPE fma(const TYPE& a, const TYPE& b, const TYPE& c) { \
+    return TYPE(std::fma(float(a), float(b), float(c)));                   \
+  }
+DACE_MATH_FMA_LP(dace::float16)
+DACE_MATH_FMA_LP(dace::bfloat16)
+#undef DACE_MATH_FMA_LP
+
+// 16-bit floats have no libm entry of their own: cast to fp32, call that, cast back -- the same
+// route ``fma`` above needed, rather than leaning on user-defined-conversion ranking between the
+// float/double/long double overloads of ``std::sqrt``/``exp``/``log``.
+#define DACE_MATH_UNARY_LP(NAME, TYPE)         \
+  static DACE_HDFI TYPE NAME(const TYPE& a) {  \
+    return TYPE(std::NAME(float(a)));          \
+  }
+DACE_MATH_UNARY_LP(sqrt, dace::float16)
+DACE_MATH_UNARY_LP(sqrt, dace::bfloat16)
+// ``dace::float16`` IS ``half`` under CUDA, where dace/cuda/halfvec.cuh already declares a native
+// ``exp(half)``: a second, equally viable overload makes every fp16 ``exp`` ambiguous and nvcc
+// rejects the whole translation unit. halfvec gates that group on ``!__HIPCC__``, so HIP-on-NVIDIA
+// -- which defines both macros -- gets no ``exp(half)`` from either header unless excluded here.
+#if !defined(__CUDACC__) || defined(__HIPCC__)
+DACE_MATH_UNARY_LP(exp, dace::float16)
+#endif
+DACE_MATH_UNARY_LP(exp, dace::bfloat16)
+DACE_MATH_UNARY_LP(log, dace::float16)
+DACE_MATH_UNARY_LP(log, dace::bfloat16)
+#undef DACE_MATH_UNARY_LP
 }  // namespace math
 
 namespace cmath {

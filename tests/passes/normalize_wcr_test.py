@@ -24,6 +24,7 @@ import numpy as np
 import pytest
 
 import dace
+from dace.config import set_temporary
 from dace.sdfg import nodes
 from dace.sdfg.state import ConditionalBlock, ControlFlowRegion
 from dace.transformation.passes.normalize_wcr import NormalizeWCR
@@ -442,35 +443,38 @@ def _body_wcr_edges(sdfg):
             for ist in _n.sdfg.all_states() for e in ist.edges() if e.data is not None and e.data.wcr is not None]
 
 
-def test_readwrite_redundant_interior_wcr_current_gap():
-    """DOCUMENTS the current gap (TSVC s212): NormalizeWCR does NOT clear the redundant
-    interior WCR on a read-write connector, so a body-local WCR survives. When the fix lands
-    (drop the redundant interior WCR to a plain write), flip this to assert it is cleared."""
+def test_readwrite_redundant_interior_wcr_is_cleared():
+    """The redundant interior WCR on a read-write connector is rewritten to an explicit
+    plain read-modify-write, so no self-contained WCR survives inside the body NSDFG."""
     sdfg = _build_readwrite_redundant_interior_wcr()
     NormalizeWCR().apply_pass(sdfg, {})
     surviving = _body_wcr_edges(sdfg)
-    # Current behavior: the interior WCR is left in place (the `write_only` filter skips a
-    # read-write connector). This is the s212 break; asserting it here so a future fix is noticed.
-    assert surviving, ('read-write redundant interior WCR unexpectedly cleared -- if this is the '
-                       'intended fix, replace this assertion with `assert not surviving`')
+    assert not surviving, f'read-write redundant interior WCR should be cleared; got {surviving}'
 
 
-@pytest.mark.xfail(reason='s212: the read-write aug-assign ``b[i] += addend`` is a DOUBLE-'
-                   'accumulation encoding (interior WCR into the body-local ``b`` sink + boundary '
-                   'WCR), and DaCe WCR first-write semantics reset a location to the op identity, '
-                   'so the body-WCR cannot simply be dropped to a plain write -- that discards the '
-                   'incoming ``b_old`` (verified divergence). The fix must rewrite to a single '
-                   'accumulation the tiler accepts: wire the input ``b`` into the body as an '
-                   'explicit read-modify-write (``b_out = b_in + addend``, plain) with a PLAIN '
-                   'boundary, OR have canon emit a single-WCR form. Neither is a NormalizeWCR '
-                   'one-liner; pinned here so the fix flips this xfail.',
-                   strict=True)
 def test_readwrite_redundant_interior_wcr_should_be_cleared():
-    """The DESIRED behavior once s212 is fixed: no self-contained WCR survives in the body,
-    achieved by an explicit read-modify-write (NOT a naive drop-to-plain, which loses ``b_old``)."""
+    """The redundant interior WCR on a read-write connector is rewritten to an explicit
+    plain read-modify-write, so no self-contained WCR survives in the body."""
     sdfg = _build_readwrite_redundant_interior_wcr()
     NormalizeWCR().apply_pass(sdfg, {})
     assert not _body_wcr_edges(sdfg), 'interior WCR should become a read-modify-write, no body WCR'
+
+
+def test_readwrite_redundant_interior_wcr_value_preserving():
+    """After normalization the aug-assign ``b[i] += data[i]`` is bit-exact, including
+    the pre-existing ``b`` values (the bug a naive drop-to-plain would lose)."""
+    N = 24
+    sdfg = _build_readwrite_redundant_interior_wcr()
+    res = NormalizeWCR().apply_pass(sdfg, {})
+    assert res is not None
+    sdfg.validate()
+
+    rng = np.random.default_rng(8)
+    data = rng.uniform(-1.0, 1.0, N)
+    b = rng.uniform(-1.0, 1.0, N)
+    expected = b + data
+    sdfg(data=data, b=b, N=N)
+    assert np.allclose(b, expected), f'got {b}, expected {expected}'
 
 
 def test_canonicalize_emits_reduction_clause_for_indirect_read_reduction():
@@ -493,7 +497,11 @@ def test_canonicalize_emits_reduction_clause_for_indirect_read_reduction():
     sdfg.validate()
 
     assert not _write_only_scalar_wcr_conns(sdfg), 'WCR still trapped inside a nested SDFG body'
-    code = sdfg.generate_code()[0].clean_code
+    # The clause is emitted only where tree reductions are: always under the generator
+    # canonicalize targets, and under ``legacy`` only behind ``compiler.emit_tree_reductions``
+    # (default off). Name the generator rather than inherit whichever one the box selects.
+    with set_temporary('compiler', 'cpu', 'implementation', value='experimental_readable'):
+        code = sdfg.generate_code()[0].clean_code
     assert 'reduce_atomic' not in code
     assert 'reduction(+:' in code.replace(' ', '')
 

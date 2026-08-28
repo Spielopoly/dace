@@ -6,11 +6,12 @@ import dace.library
 import dace.properties
 import dace.sdfg.nodes
 from dace.transformation.transformation import ExpandTransformation
-from dace import data as dt, memlet as mm, SDFG, SDFGState
+from dace import data as dt, memlet as mm, symbolic, SDFG, SDFGState
 from dace.symbolic import equal_valued, symstr
 from dace.frontend.common import op_repository as oprepo
 from dace.libraries.blas import blas_helpers
 from .. import environments
+from ordered_set import OrderedSet
 
 
 @dace.library.expansion
@@ -196,8 +197,7 @@ class ExpandAxpyCuPy(ExpandTransformation):
     environments = []
 
     @staticmethod
-    def expansion(node: 'Axpy', state: SDFGState,
-                  sdfg: SDFG) -> SDFG:
+    def expansion(node: 'Axpy', state: SDFGState, sdfg: SDFG) -> SDFG:
         node.validate(sdfg, state)
 
         # Collect array descriptors from edges.
@@ -223,35 +223,31 @@ class ExpandAxpyCuPy(ExpandTransformation):
         nsdfg = dace.SDFG(node.label + '_cupy')
         nstate = nsdfg.add_state()
 
-        nsdfg.add_array('_x', shape_x, dtype_x, strides=xdesc.strides,
-                        storage=xdesc.storage)
-        nsdfg.add_array('_y', shape_y, dtype_y, strides=ydesc.strides,
-                        storage=ydesc.storage)
-        nsdfg.add_array('_res', shape_res, dtype_res,
-                        strides=resdesc.strides,
-                        storage=resdesc.storage)
+        nsdfg.add_array('_x', shape_x, dtype_x, strides=xdesc.strides, storage=xdesc.storage)
+        nsdfg.add_array('_y', shape_y, dtype_y, strides=ydesc.strides, storage=ydesc.storage)
+        nsdfg.add_array('_res', shape_res, dtype_res, strides=resdesc.strides, storage=resdesc.storage)
 
         # Build tasklet code.
         a = node.a
         code_lines = ['import cupy']
         if equal_valued(1, a):
-            code_lines.append(
-                '__res_out = cupy.asnumpy('
-                'cupy.asarray(__x) + cupy.asarray(__y))')
+            code_lines.append('__res_out = cupy.asnumpy('
+                              'cupy.asarray(__x) + cupy.asarray(__y))')
         elif equal_valued(0, a):
-            code_lines.append(
-                '__res_out = cupy.asnumpy(cupy.asarray(__y))')
+            code_lines.append('__res_out = cupy.asnumpy(cupy.asarray(__y))')
         else:
             a_str = symstr(a)
-            code_lines.append(
-                f'__res_out = cupy.asnumpy({a_str} '
-                f'* cupy.asarray(__x) + cupy.asarray(__y))')
+            code_lines.append(f'__res_out = cupy.asnumpy({a_str} '
+                              f'* cupy.asarray(__x) + cupy.asarray(__y))')
 
         code = '\n'.join(code_lines)
 
         tasklet = dace.sdfg.nodes.Tasklet(
             node.label + '_cupy_tasklet',
-            {'__x': None, '__y': None},
+            {
+                '__x': None,
+                '__y': None
+            },
             {'__res_out': None},
             code,
             language=dace.dtypes.Language.Python,
@@ -263,12 +259,9 @@ class ExpandAxpyCuPy(ExpandTransformation):
         y_read = nstate.add_read('_y')
         res_write = nstate.add_write('_res')
 
-        nstate.add_edge(x_read, None, tasklet, '__x',
-                        dace.Memlet.from_array('_x', nsdfg.arrays['_x']))
-        nstate.add_edge(y_read, None, tasklet, '__y',
-                        dace.Memlet.from_array('_y', nsdfg.arrays['_y']))
-        nstate.add_edge(tasklet, '__res_out', res_write, None,
-                        dace.Memlet.from_array('_res', nsdfg.arrays['_res']))
+        nstate.add_edge(x_read, None, tasklet, '__x', dace.Memlet.from_array('_x', nsdfg.arrays['_x']))
+        nstate.add_edge(y_read, None, tasklet, '__y', dace.Memlet.from_array('_y', nsdfg.arrays['_y']))
+        nstate.add_edge(tasklet, '__res_out', res_write, None, dace.Memlet.from_array('_res', nsdfg.arrays['_res']))
 
         return nsdfg
 
@@ -296,7 +289,7 @@ class Axpy(dace.sdfg.nodes.LibraryNode):
     n = dace.properties.SymbolicProperty(allow_none=False, default=dace.symbolic.symbol("n"))
 
     def __init__(self, name, a=None, n=None, *args, **kwargs):
-        super().__init__(name, *args, inputs={"_x", "_y"}, outputs={"_res"}, **kwargs)
+        super().__init__(name, *args, inputs=OrderedSet(('_x', '_y')), outputs={"_res"}, **kwargs)
         self.a = a or dace.symbolic.symbol("a")
         self.n = n or dace.symbolic.symbol("n")
 
@@ -325,10 +318,10 @@ class Axpy(dace.sdfg.nodes.LibraryNode):
         if len(size) != 1:
             raise ValueError("axpy only supported on 1-dimensional arrays")
 
-        if size != in_memlets[1].subset.size():
+        if not symbolic.shapes_equal(size, in_memlets[1].subset.size()):
             raise ValueError("Inputs to axpy must have equal size")
 
-        if size != out_memlet.subset.size():
+        if not symbolic.shapes_equal(size, out_memlet.subset.size()):
             raise ValueError("Output of axpy must have same size as input")
 
         if (in_memlets[0].wcr is not None or in_memlets[1].wcr is not None or out_memlet.wcr is not None):

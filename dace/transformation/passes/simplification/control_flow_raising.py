@@ -6,6 +6,7 @@ import warnings
 
 from dace import graphlib as nx
 import sympy
+from ordered_set import OrderedSet
 
 from dace import properties
 from dace.frontend.python import astutils
@@ -193,7 +194,7 @@ class ControlFlowRaising(ppl.Pass):
                             graph.remove_edge(oe)
                             continue
 
-                        branch_nodes = set(dfs_conditional(graph, [oe.dst], lambda _, x: x is not merge_block))
+                        branch_nodes = OrderedSet(dfs_conditional(graph, [oe.dst], lambda _, x: x is not merge_block))
                         branch_start = branch.add_state(branch_name + '_start', is_start_block=True)
                         branch.add_nodes_from(branch_nodes)
                         branch.add_edge(branch_start, oe.dst, InterstateEdge(assignments=oe.data.assignments))
@@ -253,17 +254,12 @@ class ControlFlowRaising(ppl.Pass):
             structured_edges = dfs_tree_edges | back_edges
 
             # Unstructured edges: all edges not in structured set
-            unstructured_edges = set(cfg.nx.edges) - structured_edges
+            unstructured_edges = [e for e in cfg.nx.edges if e not in structured_edges]
 
             # Find the single entry / single exit region around the unstructured edges and turn it into a region
             # of unstructured control flow.
             if len(unstructured_edges) > 0:
-                tgt_nodes = set()
-                for u, v in unstructured_edges:
-                    if u not in tgt_nodes:
-                        tgt_nodes.add(u)
-                    if v not in tgt_nodes:
-                        tgt_nodes.add(v)
+                tgt_nodes = OrderedSet.union(*unstructured_edges)
                 unstructured_nodes, region_entry, region_exit = cfg_analysis.find_sese_region(cfg, tgt_nodes)
 
                 unstructured_region = UnstructuredControlFlow('unstructured_' + str(cfg.name) + '_' + str(lifted))
@@ -271,6 +267,14 @@ class ControlFlowRaising(ppl.Pass):
                 for edge in cfg.edges():
                     if edge.src in unstructured_nodes and edge.dst in unstructured_nodes or edge.dst is region_exit:
                         unstructured_region.add_edge(edge.src, edge.dst, edge.data)
+                # Re-assert the start block: adding edges (in particular back-edges
+                # to the entry when the unstructured region contains a cycle) may
+                # have invalidated the manually-set start block, leaving it
+                # ambiguous since the region has no source nodes.
+                try:
+                    assert unstructured_region.start_block is region_entry
+                except ValueError:
+                    unstructured_region.start_block = unstructured_region.node_id(region_entry)
                 if cfg.in_degree(region_entry) == 0:
                     # If there is no incoming edge, this is a start block.
                     cfg.add_node(unstructured_region, is_start_block=True)

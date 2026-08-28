@@ -58,8 +58,8 @@ def test_scalar_to_symbol_in_nested_sdfg():
     assert np.array_equal(out, np.array([0, 10] * 5, dtype=np.int32))
 
 
-def test_transient_array_used_on_interstate_edge_is_copied_to_host():
-    """A transient moved to GPU storage is staged before host control flow."""
+def test_transient_array_used_on_interstate_edge_stays_on_host():
+    """Default-stored interstate data and its producer stay on the host."""
     sdfg = dace.SDFG("gpu_transient_interstate")
     sdfg.add_array("I", (1, ), dace.int32, transient=True)
     first = sdfg.add_state("first")
@@ -68,10 +68,31 @@ def test_transient_array_used_on_interstate_edge_is_copied_to_host():
     first.add_edge(write, "out", first.add_write("I"), None, dace.Memlet("I[0]"))
     sdfg.add_edge(first, done, dace.InterstateEdge(condition="I[0] > 0"))
 
-    assert sdfg.apply_transformations(GPUTransformSDFG) == 1
+    assert sdfg.apply_transformations(GPUTransformSDFG, options={"simplify": False}) == 1
+    sdfg.validate()
+    assert sdfg.arrays["I"].storage is dace.StorageType.Default
+    assert not any(name.startswith("host_I") for name in sdfg.arrays)
+    assert any(mem.data == "I" for edge in sdfg.all_interstate_edges()
+               for mem in edge.data.get_read_memlets(sdfg.arrays))
+    assert not any(isinstance(node, dace.nodes.MapEntry) for node in first.nodes())
+
+
+@pytest.mark.gpu
+def test_device_transient_used_on_interstate_edge_is_copied_to_host():
+    """An explicitly device-resident transient is staged before host control flow."""
+    sdfg = dace.SDFG("gpu_device_transient_interstate")
+    sdfg.add_array("I", (1, ), dace.int32, transient=True, storage=dace.StorageType.GPU_Global)
+    first = sdfg.add_state("first")
+    done = sdfg.add_state("done")
+    write = first.add_tasklet("write", {}, {"out"}, "out = 1")
+    first.add_edge(write, "out", first.add_write("I"), None, dace.Memlet("I[0]"))
+    sdfg.add_edge(first, done, dace.InterstateEdge(condition="I[0] > 0"))
+
+    assert sdfg.apply_transformations(GPUTransformSDFG, options={"simplify": False}) == 1
     sdfg.validate()
     assert any(name.startswith("host_I") for name in sdfg.arrays)
     assert all("I[0]" not in str(edge.data.condition) for edge in sdfg.all_interstate_edges())
+    sdfg()
 
 
 @pytest.mark.gpu

@@ -60,7 +60,7 @@ class VectorizeCuTile(ppl.Pass):
                                           "non-transient scalars included) become GPU_Global, so no "
                                           "host<->device copy states are generated and the compiled SDFG "
                                           "requires device (cupy) arrays. On an SDFG already GPU-transformed "
-                                          "with existing gpu_* clones the copy states remain (a UserWarning "
+                                          "with existing staging clones the copy states remain (a UserWarning "
                                           "is emitted).")
 
     def __init__(self,
@@ -93,7 +93,7 @@ class VectorizeCuTile(ppl.Pass):
             storage (written non-transient scalars included) become
             ``GPU_Global``, so no host<->device copy states are generated and
             the compiled SDFG requires device (cupy) arrays. On an SDFG
-            already GPU-transformed with existing ``gpu_*`` clones the copy
+            already GPU-transformed with existing staging clones the copy
             states remain (a ``UserWarning`` is emitted).
         :param debug_save: When ``True``, save intermediate SDFG files
             after each pipeline stage for debugging.
@@ -171,6 +171,30 @@ class VectorizeCuTile(ppl.Pass):
             register_transients=True,
             simplify=False,
         )
+
+    @staticmethod
+    def _has_device_staging_copy(sdfg: SDFG, name: str) -> bool:
+        """Return whether ``name`` has a direct device-staging copy.
+
+        :param sdfg: The SDFG to inspect.
+        :param name: The non-transient array name.
+        :returns: Whether a host/device copy edge connects the array to a
+            transient ``GPU_Global`` descriptor.
+        """
+        for state in sdfg.states():
+            for edge in state.edges():
+                if not (isinstance(edge.src, nodes.AccessNode) and isinstance(edge.dst, nodes.AccessNode)):
+                    continue
+                if edge.src.data == name:
+                    clone_name = edge.dst.data
+                elif edge.dst.data == name:
+                    clone_name = edge.src.data
+                else:
+                    continue
+                clone = sdfg.arrays.get(clone_name)
+                if clone is not None and clone.transient and clone.storage == dtypes.StorageType.GPU_Global:
+                    return True
+        return False
 
     @staticmethod
     def _remove_trivial_gpu_maps(sdfg: SDFG) -> int:
@@ -256,28 +280,37 @@ class VectorizeCuTile(ppl.Pass):
         # Device-resident calling convention: mark non-transient arrays
         # GPU_Global so GPUTransformSDFG creates no clones/copy states.
         if self.use_gpu_storage:
+            # Detect legacy/pre-offloaded staging while the original argument
+            # storage still distinguishes it from ordinary device dataflow.
+            preexisting_staging = []
+            for name, desc in sdfg.arrays.items():
+                if (not desc.transient and isinstance(desc, data.Array)
+                        and desc.storage != dtypes.StorageType.GPU_Global
+                        and self._has_device_staging_copy(sdfg, name)):
+                    preexisting_staging.append(name)
+
             # Deferred import: a module-level import would be circular
             # (auto_optimize -> dace.transformation.passes.__init__ ->
             # canonicalize -> this vectorization subpackage).
             from dace.transformation.auto.auto_optimize import apply_gpu_storage
             apply_gpu_storage(sdfg)
-            # Loud no-op detection (read-only scalars legitimately stay host):
-            # an argument array is unaffected if it kept host storage (non-
-            # Default storage is skipped by apply_gpu_storage) or if a
-            # pre-existing gpu_* clone means copy states remain either way.
-            ineffective = []
+            # Loud no-op detection (read-only scalars legitimately stay host).
+            not_promoted = []
             for name, desc in sdfg.arrays.items():
                 if desc.transient or not isinstance(desc, data.Array):
                     continue
-                clone = sdfg.arrays.get(f"gpu_{name}")
-                has_clone = clone is not None and clone.transient and clone.storage == dtypes.StorageType.GPU_Global
-                if desc.storage != dtypes.StorageType.GPU_Global or has_clone:
-                    ineffective.append(name)
+                if desc.storage != dtypes.StorageType.GPU_Global:
+                    not_promoted.append(name)
+            ineffective = list(dict.fromkeys(not_promoted + preexisting_staging))
             if ineffective:
+                details = []
+                if not_promoted:
+                    details.append(f"not promoted: {not_promoted}")
+                if preexisting_staging:
+                    details.append(f"pre-existing staging copies: {preexisting_staging}")
                 warnings.warn(
-                    f"use_gpu_storage had no effect for arrays {ineffective} "
-                    "(e.g. the SDFG was already GPU-transformed); the compiled "
-                    "SDFG will still expect and copy host arrays.", UserWarning)
+                    f"use_gpu_storage could not establish direct device arguments for arrays {ineffective}; "
+                    f"{'; '.join(details)}.", UserWarning)
             debug_save_sdfg()
 
         # GPU-first order: GPU-schedule BEFORE vectorizing so

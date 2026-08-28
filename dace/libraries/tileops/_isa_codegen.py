@@ -12,6 +12,7 @@ Each ``make_<op>_tasklet`` returns the finished :class:`~dace.sdfg.nodes.Tasklet
 (its ``label`` carries the backend ``suffix`` for readability); the calling
 expansion class attaches the backend environment.
 """
+import warnings
 from typing import Tuple
 
 import dace
@@ -261,7 +262,7 @@ def make_binop_tasklet(node, parent_state, parent_sdfg, suffix: str) -> nodes.Ta
             desc = parent_sdfg.arrays[in_e[conn].data.data]
             val = f"({out_dtype})({_scalar_ref(conn, desc, in_e[conn].data.subset)})"
         buf = f"_bc{conn}"
-        pre.append(f"{out_dtype} {buf}[1] = {{ {val} }};")
+        pre.append(f"const {out_dtype} {buf}[1] = {{ {val} }};")
         return "true", buf
 
     a_bcast, a_ptr = operand(node.kind_a, "_a", node.expr_a)
@@ -339,7 +340,7 @@ def make_fma_tasklet(node, parent_state, parent_sdfg, suffix: str) -> nodes.Task
             desc = parent_sdfg.arrays[in_e[conn].data.data]
             val = f"({out_dtype})({_scalar_ref(conn, desc, in_e[conn].data.subset)})"
         buf = f"_bc{conn}"
-        pre.append(f"{out_dtype} {buf}[1] = {{ {val} }};")
+        pre.append(f"const {out_dtype} {buf}[1] = {{ {val} }};")
         return "true", buf
 
     a_bcast, a_ptr = operand(node.kind_a, "_a", node.expr_a)
@@ -426,7 +427,7 @@ def make_unop_tasklet(node, parent_state, parent_sdfg, suffix: str) -> nodes.Tas
             desc = parent_sdfg.arrays[in_e["_a"].data.data]
             val = f"({out_dtype})({_scalar_ref('_a', desc, in_e['_a'].data.subset)})"
         a_ptr = "_bc_a"
-        pre.append(f"{out_dtype} {a_ptr}[1] = {{ {val} }};")
+        pre.append(f"const {out_dtype} {a_ptr}[1] = {{ {val} }};")
         a_bcast = "true"
     op_char = _UNOP_TO_CHAR[node.op]
     masked = "true" if node.has_mask else "false"
@@ -475,7 +476,7 @@ def make_ite_tasklet(node, parent_state, parent_sdfg, suffix: str) -> nodes.Task
             desc = parent_sdfg.arrays[in_e[conn].data.data]
             val = f"({out_dtype})({_scalar_ref(conn, desc, in_e[conn].data.subset)})"
         buf = f"_bc{conn}"
-        pre.append(f"{out_dtype} {buf}[1] = {{ {val} }};")
+        pre.append(f"const {out_dtype} {buf}[1] = {{ {val} }};")
         return "true", buf
 
     t_bcast, t_ptr = arm(node.kind_t, "_t", node.expr_t)
@@ -695,19 +696,24 @@ def _linear_base_offset(node, parent_state, parent_sdfg, edge):
     # False and every param stays un-substituted, which leaves the residue undecidable for reasons
     # that have nothing to do with the shape.
     by_name = {str(s): s for s in offset.free_symbols}
+    size = dace.symbolic.pystr_to_symbolic(arr.total_size)
+    # Built BEFORE the coefficient test, not after: a stride of ``N - 2`` (the shape a transient
+    # holding a stencil's interior gets) is not provably non-negative as written, while the very
+    # extent fact that makes its parity decidable, ``N = 2t + 2``, also makes it ``2t``. Testing
+    # the raw coefficient refused every such transient for a reason the substitution answers.
+    subs = _even_extent_substitutions(even)
+    _add_stride_substitutions(subs, _guarded_stride_divisors(parent_sdfg), (offset, size))
     for idx, (param, (start, end, step)) in enumerate(ranges.items()):
         sym = by_name.get(param)
         if sym is None:
             continue
-        if dace.symbolic.simplify(offset.diff(sym)).is_nonnegative is not True:
+        coeff = dace.symbolic.simplify(dace.symbolic.equalize_symbol(offset.diff(sym).subs(subs)))
+        if coeff.is_nonnegative is not True:
             return None
         k = dace.symbolic.symbol(f"__dace_align_k{idx}", nonnegative=True, integer=True)
         start, end, step = (dace.symbolic.pystr_to_symbolic(x) for x in (start, end, step))
         at_base = at_base.subs(sym, start + step * k)
         at_end = at_end.subs(sym, end)
-    size = dace.symbolic.pystr_to_symbolic(arr.total_size)
-    subs = _even_extent_substitutions(even)
-    _add_stride_substitutions(subs, _guarded_stride_divisors(parent_sdfg), (at_base, at_end, size))
     return tuple(e.subs(subs) for e in (at_base, at_end, size))
 
 
@@ -736,6 +742,30 @@ def _add_stride_substitutions(subs: dict, facts: dict, exprs) -> None:
         subs[sym] = modulus * dace.symbolic.symbol(f"__dace_align_s{n}", positive=True, integer=True)
 
 
+def _declined(arr, edge, elem_bytes: int, allow_shift: bool) -> Tuple[int, int]:
+    """The per-element result, plus the reason a SUB-32-bit access had to take it.
+
+    Silence here is expensive and invisible: fp16 is a CLIFF, not a slope. Two elements make one
+    32-bit word, which is both the minimum vector and the minimum aligned load, so an access the
+    proof cannot place on an even element has NOTHING between ``half2`` and a per-element
+    ``LDG.E.U16`` -- roughly six scalar loads where one wide one would do. A 4-byte or wider dtype
+    merely degrades a step (128 -> 64 -> 32 bit) and is left unreported.
+
+    The actionable half is the shape: every dimension of a sub-32-bit array has to be a multiple of
+    the elements-per-word, or the row start's parity alternates and no access off it is decidable.
+
+    Only the SHIFT-eligible side (the loads) reports. A store never widens off a boundary by
+    design -- the widened word covers neighbours it must not overwrite -- so warning there would
+    fire on every correct program.
+    """
+    if elem_bytes < 4 and allow_shift:
+        warnings.warn(f'"{edge.data.data}" ({arr.dtype}) is loaded/stored per element: its access could not be '
+                      f'placed on a {4 // elem_bytes}-element boundary. Sub-32-bit arrays need EVERY dimension '
+                      f'to be a multiple of {4 // elem_bytes} for the vectorized path -- pad the shape, or pin '
+                      f'the symbolic extents so their parity is decidable.')
+    return elem_bytes, 0
+
+
 def _array_align_shift(node, parent_state, parent_sdfg, edge, vlen: int, allow_shift: bool) -> Tuple[int, int]:
     """``(alignment bytes of the aligned base, element shift of the access from it)``.
 
@@ -761,10 +791,10 @@ def _array_align_shift(node, parent_state, parent_sdfg, edge, vlen: int, allow_s
     elem_bytes = arr.dtype.bytes
     base_bytes = base_align_bytes(arr)
     if base_bytes < elem_bytes:
-        return elem_bytes, 0
+        return _declined(arr, edge, elem_bytes, allow_shift)
     offsets = _linear_base_offset(node, parent_state, parent_sdfg, edge)
     if offsets is None:
-        return elem_bytes, 0
+        return _declined(arr, edge, elem_bytes, allow_shift)
     at_base, at_end, size = offsets
     for chunk in (8, 4, 2):
         if chunk * elem_bytes > base_bytes:
@@ -776,12 +806,12 @@ def _array_align_shift(node, parent_state, parent_sdfg, edge, vlen: int, allow_s
     # consecutive words -- guaranteed by chunk | vlen.
     chunk = 4 // elem_bytes
     if not allow_shift or chunk < 2 or vlen % chunk != 0 or chunk * elem_bytes > base_bytes:
-        return elem_bytes, 0
+        return _declined(arr, edge, elem_bytes, allow_shift)
     shift = dace.symbolic.simplify(at_base % chunk)
     if not shift.is_Integer:
-        return elem_bytes, 0
+        return _declined(arr, edge, elem_bytes, allow_shift)
     if dace.symbolic.simplify(at_end + vlen + chunk - int(shift) - size).is_nonpositive is not True:
-        return elem_bytes, 0
+        return _declined(arr, edge, elem_bytes, allow_shift)
     return chunk * elem_bytes, int(shift)
 
 

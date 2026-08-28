@@ -109,7 +109,7 @@ _TILE_NODE_TYPES = (TileBinop, TileFMA, TileIota, TileLoad, TileMaskGen, TileITE
 
 #: ``canonicalize()`` knobs for the vectorizer's own entry normalization (see
 #: :meth:`VectorizeMultiDim.apply_pass`). ``semantic_lifting=False`` is the whole point: canon's
-#: map -> library-node lifts (Einsum / Copy / Memset) would hand the tiler an opaque node with no
+#: map -> library-node lifts (Einsum / Copy / Fill) would hand the tiler an opaque node with no
 #: per-lane body to widen. The CPU-only privatized-WCR form is also opaque to the tile reduction
 #: lift, so the vectorizer keeps both forms as their sequential/raw inputs.
 #: ``unroll_limit=0``: ShortLoopUnroll would straight-line a short constant-trip loop and delete
@@ -1499,11 +1499,16 @@ class VectorizeGPUMultiDim(VectorizeMultiDim):
         :param config: The vectorizer configuration; its ``device`` / ``target_isa`` /
             ``assume_even`` are overridden with the GPU values.
         """
-        # GPU K=1 defaults to one branched kernel with a mask-free full-tile arm and a masked-tile
-        # remainder arm. This is the only device-specific strategy choice: the base default stays
-        # ``masked_tail`` for CPU callers. Apply it only when the caller left that default and the
-        # tile is one-dimensional; K>1 keeps the even-extent fast path. Explicit strategies are
-        # honored unchanged.
+        # GPU multidim DEFAULT (K=1): the ``branched_masked_tail`` remainder strategy -- one kernel
+        # with ``if(full-tile) -> mask-free (widened) tile body / else -> MASKED tile body`` -- so
+        # vectorization works out of the box on ANY extent (assume_even=False, no RAISE on a
+        # provably-non-divisible extent, no second remainder kernel) and the remainder stays a tile:
+        # no scalar lane loop is emitted at all. This is the ONLY place the device picks a strategy
+        # for the caller: the base :class:`VectorizeMultiDim` default (``masked_tail``) stays
+        # untouched, so the CPU path is unaffected. Applied only when the caller left that base
+        # default and the tile is single-dim; the branched strategies are K=1-only, so a K>1 request
+        # keeps the even-extent fast path. Any explicitly requested strategy is honored as given --
+        # ``branched_tail`` (scalar else-arm) remains reachable by naming it.
         resolved = config
         if (len(config.widths) == 1 and not config.assume_even
                 and coerce_remainder_strategy(config.remainder_strategy) == RemainderStrategy.MASKED_TAIL):

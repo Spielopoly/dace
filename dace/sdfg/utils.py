@@ -22,6 +22,8 @@ from dace.sdfg import nodes as nd, graph as gr, propagation
 from dace import config, data as dt, dtypes, memlet as mm, subsets as sbs
 from dace.cli.progress import optional_progressbar
 from typing import Any, Callable, Dict, Generator, List, Optional, Set, Sequence, Tuple, Type, Union
+
+from ordered_set import OrderedSet
 from dace.properties import CodeBlock
 
 
@@ -184,7 +186,7 @@ def _find_nodes_impl(
     seen: Optional[Set[Node]],
 ) -> Set[Node]:
     to_scan: List[Node] = [node_to_start]
-    scanned_nodes: Set[Node] = set() if seen is None else seen
+    scanned_nodes: OrderedSet[Node] = OrderedSet() if seen is None else seen
     if forward:
         get_edges = state.out_edges
         get_node = lambda e: e.dst
@@ -811,7 +813,9 @@ def consolidate_edges_scope(state: SDFGState, scope_node: Union[nd.EntryNode, nd
             e.data.dst_subset = new_subset
 
     edges_by_connector = collections.defaultdict(list)
-    connectors_to_remove = set()
+    # Ordered: the disjointness guard below keeps the first write of an overlapping pair and refuses
+    # the rest, so a plain set would let PYTHONHASHSEED decide which one survives.
+    connectors_to_remove = OrderedSet()
     for e in inner_edges(scope_node):
         if e.data.is_empty():
             continue
@@ -823,14 +827,19 @@ def consolidate_edges_scope(state: SDFGState, scope_node: Union[nd.EntryNode, nd
         elif data_to_conn[odata] != conn:  # Need to consolidate
             connectors_to_remove.add(conn)
 
+    # Per retained (write-side) connector, the exact subset of each write folded into it
+    # so far. ``sbs.union`` only computes a bounding box, so checking a new candidate
+    # against the already-widened outer subset would false-positive once enough merges
+    # have coarsened it -- track the precise per-write subsets instead.
+    merged_write_subsets: Dict[str, List[sbs.Subset]] = collections.defaultdict(list)
+
     for conn in connectors_to_remove:
         e = edges_by_connector[conn][0]
         odata = get_outer_data(e)
         offset = 3 if conn.startswith('IN_') else (4 if conn.startswith('OUT_') else len(oprefix))
-        # Outer side of the scope - remove edge and union subsets
+        # Outer side of the scope - find the edges first, mutate nothing yet
         target_conn = prefix + data_to_conn[odata][offset:]
         conn_to_remove = prefix + conn[offset:]
-        remove_outer_connector(conn_to_remove)
         if isinstance(scope_node, nd.EntryNode):
             out_edges = [ed for ed in outer_edges(scope_node) if ed.dst_conn == target_conn]
             edges_to_remove = [ed for ed in outer_edges(scope_node) if ed.dst_conn == conn_to_remove]
@@ -840,6 +849,22 @@ def consolidate_edges_scope(state: SDFGState, scope_node: Union[nd.EntryNode, nd
         assert len(edges_to_remove) == 1 and len(out_edges) == 1
         edge_to_remove = edges_to_remove[0]
         out_edge = out_edges[0]
+
+        if isinstance(scope_node, nd.ExitNode):
+            # These are two write paths merging into one outer edge. Consolidation drops
+            # one of the writes' individual position in program order, so it is only safe
+            # when the subsets provably cannot overlap. ``Range.intersects`` both returns
+            # None *and* raises on a bound sympy won't decide; the module-level helper
+            # folds both into None, so anything but a hard False means "may overlap".
+            incoming = get_outer_subset(edge_to_remove)
+            history = merged_write_subsets[target_conn]
+            if not history:
+                history.append(get_outer_subset(out_edge))
+            if any(sbs.intersects(incoming, prior) is not False for prior in history):
+                continue
+            history.append(incoming)
+
+        remove_outer_connector(conn_to_remove)
         set_outer_subset(out_edge, sbs.union(get_outer_subset(out_edge), get_outer_subset(edge_to_remove)))
 
         # Check if dangling connectors have been created and remove them,
@@ -1675,48 +1700,32 @@ def load_precompiled_sdfg(*args, **kwargs) -> csdfg.CompiledSDFG:
     return sdfg_compiler.load_precompiled_sdfg(*args, **kwargs)
 
 
-def distributed_compile(sdfg: SDFG, comm, *, validate: bool = True) -> csdfg.CompiledSDFG:
+def distributed_compile(sdfg: Optional[SDFG], comm, *, validate: bool = True) -> csdfg.CompiledSDFG:
     """
     Compiles an SDFG in rank 0 of MPI communicator ``comm``. Then, the compiled SDFG is loaded in all other ranks.
 
-    :param sdfg: SDFG to be compiled.
+    :param sdfg: SDFG to be compiled. Ranks other than 0 only load, and may pass ``None``.
     :param comm: MPI communicator. ``Intracomm`` is the base mpi4py communicator class.
     :param validate: If True, validates the SDFG prior to generating code.
     :return: Compiled SDFG.
     :note: This method can be used only if the module mpi4py is installed.
-    :note: If rank 0's compilation raises, the error is broadcast and re-raised
-           on *every* rank, so a build failure fails the whole job fast instead
-           of deadlocking the other ranks at the build-folder broadcast below
-           (rank 0 would never reach the broadcast, leaving the rest blocked).
-    :note: Only rank 0 builds, so every rank is pinned to its folder, whatever ``cache`` or
-           ``cache_distaware`` would otherwise name.
+    :note: Only rank 0 builds, so a rank holding the SDFG is pinned to rank 0's folder.
     :todo: Relocate this function to `dace.codegen.compiler`.
     """
 
     rank = comm.Get_rank()
     func = None
     folder = None
-    error = None
 
     # Rank 0 compiles SDFG.
     if rank == 0:
-        try:
-            func = sdfg.compile(validate=validate)
-            folder = sdfg.build_folder
-        except BaseException as exc:  # noqa: BLE001 -- re-raised on every rank
-            import traceback
-            error = f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
+        func = sdfg.compile(validate=validate)
+        folder = sdfg.build_folder
 
-    # Broadcast the build folder (or rank 0's compile error).  Sending both in
-    # one bcast keeps the collective sequence identical on every rank.
-    error, folder = comm.bcast((error, folder), root=0)
-    if error is not None:
-        raise RuntimeError("distributed_compile: rank 0 compilation failed; all ranks abort "
-                           f"to avoid a collective deadlock. Rank 0 traceback:\n{error}")
-
-    # Pin every rank to the one folder rank 0 built in. Under ``cache_distaware`` each rank would
-    # otherwise name a folder of its own and find nothing there.
-    sdfg.build_folder = folder
+    # Broadcasts build folder.
+    folder = comm.bcast(folder, root=0)
+    if sdfg is not None:
+        sdfg.build_folder = folder
 
     # Loads compiled SDFG.
     if rank > 0:
@@ -2880,6 +2889,57 @@ def specialize_symbols(sdfg: 'dace.SDFG', values: Dict[str, Union[float, int, st
                 node.symbol_mapping.pop(name, None)
 
 
+def symbol_demotes_to_transient_scalar(sdfg: 'dace.SDFG', symbol_str: str) -> bool:
+    """Whether demoting ``symbol_str`` would produce a TRANSIENT scalar of ``sdfg``.
+
+    False for a symbol that enters ``sdfg`` from outside -- a top-level argument (shape,
+    stride or loop bound, i.e. a member of :attr:`~dace.sdfg.SDFG.free_symbols`) or a value
+    bound by the parent nested-SDFG node's symbol mapping. Such a symbol has no definition
+    inside ``sdfg`` to turn into a scalar assignment, so :func:`demote_symbol_to_scalar`
+    needs an ``in_scalar_name`` to write into and raises without one. Callers that demote
+    opportunistically test this first and leave the symbol alone.
+
+    :param sdfg: The SDFG holding the symbol.
+    :param symbol_str: Name of the symbol.
+    :return: ``True`` if the demoted scalar would be transient.
+    """
+    if sdfg.parent_nsdfg_node is None:
+        return symbol_str not in sdfg.free_symbols
+    return symbol_str not in sdfg.parent_nsdfg_node.symbol_mapping
+
+
+def symbol_carries_graph_structure(sdfg: 'dace.SDFG', symbol_str: str) -> bool:
+    """Whether ``symbol_str`` is load-bearing anywhere outside tasklet code in ``sdfg``.
+
+    A demoted symbol becomes a scalar container of the demotion dtype, so any use that
+    the graph itself evaluates symbolically -- a descriptor shape or stride, a memlet
+    subset, a map range, a loop iteration variable -- stops being expressible. Those uses
+    make the symbol undemotable; a symbol read only by tasklet code (typically bound by an
+    interstate-edge assignment) is free to become a scalar.
+
+    Scanned at the same depth :func:`demote_symbol_to_scalar` rewrites: this SDFG's own
+    blocks, not the bodies of nested SDFGs.
+
+    :param sdfg: The SDFG to scan.
+    :param symbol_str: Name of the symbol.
+    :return: ``True`` if some structural use would break under demotion.
+    """
+    for desc in sdfg.arrays.values():
+        if symbol_str in (str(s) for s in desc.free_symbols):
+            return True
+    for cfr in sdfg.all_control_flow_regions():
+        if isinstance(cfr, LoopRegion) and cfr.loop_variable == symbol_str:
+            return True
+    for state in sdfg.all_states():
+        for node in state.nodes():
+            if isinstance(node, nd.MapEntry) and symbol_str in (str(s) for s in node.map.range.free_symbols):
+                return True
+        for edge in state.edges():
+            if symbol_str in (str(s) for s in edge.data.free_symbols):
+                return True
+    return False
+
+
 def demote_symbol_to_scalar(sdfg: 'dace.SDFG',
                             symbol_str: str,
                             default_type: 'dace.dtypes.typeclass' = None,
@@ -2901,10 +2961,7 @@ def demote_symbol_to_scalar(sdfg: 'dace.SDFG',
 
     # If top-level and in free symbols
     # Or not top-level and in symbol mapping need to make it non transient
-    # TODO:
-    is_top_level = sdfg.parent_nsdfg_node is None
-    is_transient = not ((is_top_level and symbol_str in sdfg.free_symbols) or
-                        ((not is_top_level) and symbol_str in sdfg.parent_nsdfg_node.symbol_mapping))
+    is_transient = symbol_demotes_to_transient_scalar(sdfg, symbol_str)
 
     if is_transient is False:
         if in_scalar_name is None:

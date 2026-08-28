@@ -36,6 +36,7 @@ from dace.sdfg.nodes import AccessNode, MapEntry, NestedSDFG, Tasklet
 from dace.sdfg.state import SDFGState
 from dace.transformation import pass_pipeline as ppl, transformation
 from dace.transformation.passes.vectorization.convert_tasklets_to_tile_ops import is_same_domain_constant
+from dace.transformation.passes.vectorization.utils.errors import VectorizeUnsupported
 from dace.transformation.passes.vectorization.utils.map_predicates import is_vectorizable_map
 from dace.transformation.passes.vectorization.utils.name_schemes import LaneIdScheme
 from dace.transformation.passes.vectorization.utils.pass_invariants import (assert_invariant,
@@ -43,6 +44,7 @@ from dace.transformation.passes.vectorization.utils.pass_invariants import (asse
                                                                             no_memlet_dim_mismatch)
 from dace.transformation.passes.vectorization.utils.subsets import an_side_subset
 from dace.transformation.passes.vectorization.utils.tile_access import PerDimKind, classify_tile_access
+from ordered_set import OrderedSet
 
 
 def _is_single_element(size) -> bool:
@@ -290,10 +292,40 @@ class WidenAccesses(ppl.Pass):
             if per_dim_kinds is not None and d < len(per_dim_kinds) and per_dim_kinds[d] == PerDimKind.GATHER:
                 continue
             w = widths[dominating_k]
-            new_end = dace.symbolic.pystr_to_symbolic(f"({beg}) + {w} - 1")
-            ranges[d] = (beg, new_end, step)
+            lane_stride = self._lane_stride(beg, iter_vars[dominating_k])
+            if lane_stride is None:
+                new_end, new_step = dace.symbolic.pystr_to_symbolic(f"({beg}) + {w} - 1"), step
+            else:
+                new_end = dace.symbolic.simplify(beg + lane_stride * w - 1)
+                new_step = lane_stride
+            ranges[d] = (beg, new_end, new_step)
             modified = True
         return subsets.Range(ranges) if modified else None
+
+    @staticmethod
+    def _lane_stride(beg, iter_var: str):
+        """Per-lane element step of index expression ``beg`` along ``iter_var``.
+
+        Lane ``l`` of a tile evaluates ``beg`` at ``iter_var + l``, so the widened window must be
+        ``beg : beg + c*W : c`` (exclusive end) where ``c`` is that step -- ``a[i * inc]`` walks ``inc`` cells
+        per lane, not one, and the contiguous ``beg : beg + W`` window names the wrong cells for
+        every ``inc != 1``. Returns ``None`` when ``beg`` is not affine in ``iter_var``
+        (``a[i % 4]``), or when the step is a negative constant: the tile-op base pointer is lane
+        0's address, which a descending window would no longer be.
+        """
+        if not dace.symbolic.issymbolic(beg):
+            return None
+        # Resolve the iter-var INSTANCE out of ``beg`` instead of minting one from its name: a
+        # fresh ``symbol(name)`` carries different sympy assumptions / dtype, so ``subs`` and
+        # ``in free_symbols`` answer against the wrong object and the stride silently reads as
+        # "not affine" (see the symbol-identity rule in dace/symbolic.py).
+        iv = next((sym for sym in beg.free_symbols if str(sym) == iter_var), None)
+        if iv is None:
+            return None
+        step = dace.symbolic.simplify(beg.subs(iv, iv + 1) - beg)
+        if any(str(sym) == iter_var for sym in step.free_symbols) or step.is_negative:
+            return None
+        return step
 
     def _widen_non_transient_memlets(self, inner_sdfg: SDFG, name: str, iter_vars: Tuple[str, ...]) -> bool:
         """Widen single-element memlets on edges incident to a non-transient AN.
@@ -369,6 +401,36 @@ class WidenAccesses(ppl.Pass):
                 except Exception:  # noqa: BLE001 -- unparseable RHS -> token fallback
                     promoted |= {tok for tok in re.findall(r"\b[A-Za-z_]\w*\b", str(rhs)) if tok in names}
         return promoted
+
+    def staged_lane_dependent_index(self, inner_sdfg: SDFG, iter_vars: Tuple[str, ...],
+                                    nt_lane_dep: Set[str]) -> Optional[str]:
+        """The name of a per-lane gather index staged through a transient scalar, if any.
+
+        The per-lane fanout (:func:`emit_per_lane_symbol_fanout`) needs the Bypass form
+        ``__sym = idx[i]``: the iter-var must appear in the interstate assignment itself so lane
+        ``l`` can be given ``idx[i + l]``. When the read is instead staged -- ``idx[i]`` copied
+        into a scalar in one state, promoted by ``__sym = scalar`` on the edge out of it -- the
+        assignment carries no iter-var, every lane resolves to the same index, and the scatter
+        would write one element W times. The staging cannot be folded away either: the source is
+        typically a reshape ``View``, which an interstate assignment cannot read.
+
+        Returns the staged scalar so the caller can refuse the kernel instead of mis-lowering it.
+        """
+        index_symbols = self._index_promoted_names(inner_sdfg)
+        if not index_symbols:
+            return None
+        for state in inner_sdfg.states():
+            for edge in state.edges():
+                if not (isinstance(edge.src, AccessNode) and isinstance(edge.dst, AccessNode)):
+                    continue
+                if edge.dst.data not in index_symbols or edge.src.data not in nt_lane_dep:
+                    continue
+                desc = inner_sdfg.arrays.get(edge.dst.data)
+                if desc is None or not desc.transient:
+                    continue
+                if self._edge_reads_lane_dependent(edge, state, inner_sdfg, iter_vars):
+                    return edge.dst.data
+        return None
 
     def _propagate_lane_dep(self, inner_sdfg: SDFG, iter_vars: Tuple[str, ...], nt_lane_dep: Set[str]) -> Set[str]:
         """Forward-propagate lane-dep through Tasklets AND AN -> AN copies to a fixed point. Two
@@ -777,7 +839,7 @@ class WidenAccesses(ppl.Pass):
         priv_sub = copy.deepcopy(edge.data.subset)
         oc_sub = (copy.deepcopy(edge.data.other_subset) if edge.data.other_subset is not None else subsets.Range([(0, 0,
                                                                                                                    1)]))
-        tasklet = ist.add_tasklet('reduce_accum', {'__in1', '__in2'}, {'__out'}, f'__out = {body_expr}')
+        tasklet = ist.add_tasklet('reduce_accum', OrderedSet(('__in1', '__in2')), {'__out'}, f'__out = {body_expr}')
         ist.add_edge(ist.add_access(oc), None, tasklet, '__in1', Memlet(data=oc, subset=copy.deepcopy(oc_sub)))
         ist.add_edge(priv_node, None, tasklet, '__in2', Memlet(data=priv_node.data, subset=priv_sub))
         ist.add_edge(tasklet, '__out', edge.dst, None, Memlet(data=oc, subset=copy.deepcopy(oc_sub)))
@@ -814,6 +876,14 @@ class WidenAccesses(ppl.Pass):
             total += self._lower_reduction_copybacks(_state, nsdfg_node, inner_sdfg)
             # Step 1: classify non-transients (which need lane-dep treatment).
             nt_lane_dep = self._classify_non_transients(inner_sdfg, iter_vars)
+            # A per-lane gather index that only reaches its subset through a staged scalar has
+            # no Bypass form to fan out, so every lane would share lane 0's index. Refuse the
+            # kernel here -- before any widening -- so the caller restores the pristine input and
+            # leaves it correct but un-tiled.
+            staged_index = self.staged_lane_dependent_index(inner_sdfg, iter_vars, nt_lane_dep)
+            if staged_index is not None:
+                raise VectorizeUnsupported(f"gather index staged through transient scalar ``{staged_index}`` in "
+                                           f"{inner_sdfg.name}: the per-lane fanout needs the ``__sym = idx[i]`` form")
             # Step 2: widen non-transient boundary memlets. SYMMETRIC over
             # gather/scatter edges.
             for name in sorted(nt_lane_dep):

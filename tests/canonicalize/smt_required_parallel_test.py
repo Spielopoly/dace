@@ -11,9 +11,11 @@ Every case is asserted twice:
 * **numerics** -- unconditionally. Canonicalize is value-preserving, so whatever it decides,
   the kernel must still compute the reference. These assertions guard against the far worse
   outcome than "left sequential": wrongly parallelizing one of these shapes.
-* **parallelism** -- ``xfail(strict=True)``. Today the analysis refuses, which is the SOUND
-  answer without a solver. When the oracle lands these XPASS and fail the suite, forcing the
-  author to flip them rather than letting the new capability land unnoticed.
+* **parallelism** -- ``xfail(strict=True)`` while the analysis still refuses, which is the SOUND
+  answer without a solver. When the oracle reaches a case it XPASSes and fails the suite, forcing
+  the author to flip the case to a plain assertion rather than letting the new capability land
+  unnoticed. The quadratic scatter is flipped: the oracle proves it, and the case skips where z3
+  is absent.
 
 The negative case must stay refused forever; it is marked as a normal (non-xfail) assertion
 because no solver should ever certify it.
@@ -35,6 +37,7 @@ import pytest
 
 import dace
 from dace.sdfg.state import LoopRegion
+from dace.transformation.passes.analysis import smt_dependence
 from dace.transformation.passes.canonicalize import canonicalize
 
 N = dace.symbol('N')
@@ -98,8 +101,13 @@ def test_guarded_poly_indirection_is_value_preserving():
     assert np.allclose(got, expected), 'canonicalize must preserve the guarded indirection'
 
 
-@pytest.mark.xfail(strict=True, reason='needs an SMT oracle: guard makes the RAW chain UNSAT')
 def test_guarded_poly_indirection_parallelizes():
+    """The oracle closes this one in ``BreakAntiDependence``, not in ``LoopToMap``: the guard
+    ``P > i`` refutes a read-BEHIND, which leaves a pure anti-dependence (iteration ``i`` reads
+    ``A[P]`` with ``P > i``, written later), and a pre-loop snapshot of ``A`` breaks it. The
+    affine matcher cannot even phrase the question -- the frontend hands the branch condition
+    and the subscript two DIFFERENT copies of ``IDX[i]``, so the guard has to be resolved back
+    through its interstate bindings before it says anything about the read."""
     sdfg = cpu_canon(guarded_poly_indirection.to_sdfg(simplify=True))
     assert residual_loops(sdfg) == 0
 
@@ -188,10 +196,6 @@ def hybrid_sparse(y: dace.float64[N], val: dace.float64[N], x: dace.float64[N], 
             y[i] = acc + y[i - 1]
 
 
-@pytest.mark.xfail(strict=True,
-                   reason='BUG: canonicalize raises InvalidSDFGEdgeError "Memlet subset negative '
-                   'out-of-bounds (y[-1...])" -- the y[i-1] read is hoisted without respecting the '
-                   'i >= K guard that makes it in-range')
 def test_hybrid_sparse_is_value_preserving():
     n, ksplit = 10, 4
     rng = np.random.default_rng(3)
@@ -210,11 +214,13 @@ def test_hybrid_sparse_is_value_preserving():
     assert np.allclose(got, expected), 'the conditional recurrence must be preserved'
 
 
-@pytest.mark.xfail(strict=True,
-                   reason='blocked by the same InvalidSDFGEdgeError as above; then needs an SMT oracle '
-                   'to refute FULL sequentiality and split at K')
 def test_hybrid_sparse_partitions_at_k():
-    """The ``[0,K)`` half is parallel; only ``[K,N)`` need remain a loop."""
+    """The ``[0,K)`` half is parallel; only ``[K,N)`` need remain a loop.
+
+    Reached without a solver: the index-set split at ``K`` partitions the range, and the
+    ``[0,K)`` segment carries nothing once its branch is specialized. Flipped from
+    ``xfail`` to a plain assertion per this file's contract when it started passing.
+    """
     sdfg = cpu_canon(hybrid_sparse.to_sdfg(simplify=True))
     assert residual_loops(sdfg) == 1
 
@@ -288,9 +294,12 @@ def test_quadratic_scatter_is_value_preserving():
     assert np.allclose(got, expected), 'the quadratic scatter must be preserved'
 
 
-@pytest.mark.xfail(strict=True, reason='needs an SMT oracle: i1^2 == i2^2 with i1 < i2 is UNSAT on [0,N)')
 def test_quadratic_scatter_parallelizes():
+    """The oracle discharges ``i1*i1 == i2*i2 AND 0 <= i1 < i2 < N`` as UNSAT, so the write is
+    injective and the loop lifts. Without z3 the affine classifier refuses and the loop stays."""
     sdfg = cpu_canon(quadratic_scatter.to_sdfg(simplify=True))
+    if not smt_dependence.has_z3():
+        pytest.skip('needs z3: the affine classifier cannot reach a quadratic subscript')
     assert residual_loops(sdfg) == 0
 
 

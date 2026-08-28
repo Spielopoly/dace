@@ -8,6 +8,9 @@ on:
   merge_group:
     branches: [ main, ci-fix ]
 
+env:
+  PYTHONHASHSEED: '0'
+
 concurrency:
   group: ${{github.workflow}}-${{github.ref}}
   cancel-in-progress: true
@@ -36,6 +39,9 @@ jobs:
     - name: Test with pytest
       run: |
         export NOSTATUSBAR=1
+        ulimit -s 65536 || true
+        export OMP_STACKSIZE=64M
+        export DACE_compiler_max_stack_array_size=65536
         export DACE_testing_serialization=1
         export DACE_testing_deserialize_exception=1
         export DACE_cache=unique
@@ -46,7 +52,7 @@ jobs:
         else
             export DACE_optimizer_automatic_simplification=${{ matrix.simplify }}
         fi
-        pytest --cov-report=xml --cov=dace --tb=short --timeout_method thread --timeout=600 -v -m "(torch or onnx or autodiff) and not gpu"
+        uv run pytest --cov-report=xml --cov=dace --tb=short --timeout_method thread --timeout=600 -v -m "(torch or onnx or autodiff) and not gpu"
         ./codecov
 
     - uses: codecov/codecov-action@v6

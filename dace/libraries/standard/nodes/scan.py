@@ -41,9 +41,12 @@ op must be associative -- ``+``, ``*``, ``min``, ``max`` -- so the order of the
 partial reductions does not change the result.
 """
 
+import numpy
+
 import dace
-from dace import library, nodes, symbolic
+from dace import dtypes, library, nodes, symbolic
 from dace.codegen.common import sym2cpp
+from dace.libraries.standard.helper import GPU_RESIDENT_STORAGES
 from dace.properties import Property, EnumProperty
 from dace.transformation.transformation import ExpandTransformation
 import enum
@@ -61,6 +64,10 @@ OUTPUT_CONNECTOR_NAME = "_scan_out"
 #: which lets the LoopToScan rewrite skip its separate seed-add Map.
 INIT_CONNECTOR_NAME = "_scan_init"
 
+#: Second input array, wired only when ``op is ScanOp.AFFINE``: the per-element
+#: coefficient ``c`` of ``out[k] = c[k] * out[k-1] + d[k]``. ``_scan_in`` carries ``d``.
+COEF_CONNECTOR_NAME = "_scan_coef"
+
 
 def in_connector(chain: int = 0) -> str:
     """Input connector of scan chain ``chain`` (chain 0 keeps the bare name)."""
@@ -70,6 +77,11 @@ def in_connector(chain: int = 0) -> str:
 def out_connector(chain: int = 0) -> str:
     """Output connector of scan chain ``chain``."""
     return OUTPUT_CONNECTOR_NAME if chain == 0 else f'{OUTPUT_CONNECTOR_NAME}_{chain}'
+
+
+def coef_connector(chain: int = 0) -> str:
+    """Coefficient-input connector name for ``chain`` (affine scans only)."""
+    return COEF_CONNECTOR_NAME if chain == 0 else f'{COEF_CONNECTOR_NAME}_{chain}'
 
 
 def init_connector(chain: int = 0) -> str:
@@ -83,6 +95,18 @@ class ScanOp(enum.Enum):
     PRODUCT = 'product'
     MIN = 'min'
     MAX = 'max'
+    #: ``out[k] = c[k] * out[k-1] + d[k]`` -- a first-order LINEAR recurrence. The four ops above
+    #: carry a value; this one carries the affine map ``x -> a*x + b``, and its monoid is map
+    #: composition. It is a scan in every structural sense (associative, fixed-width carry, same
+    #: blocked lowering) but it reads a SECOND array through ``_scan_coef`` and cannot borrow any
+    #: of the scalar-op plumbing: no ``std`` functor, no OpenMP built-in reduction identifier, no
+    #: CUB functor. Every shape that would need one refuses it explicitly rather than KeyError.
+    #:
+    #: Only linearity in the carry makes the map close under composition. ``out[k] = f(out[k-1])``
+    #: for a nonlinear ``f`` is still associative under composition, but the carry is then the
+    #: whole function and there is nothing of bounded width to scan over; ``LoopToScan``'s matcher
+    #: proves linearity symbolically before it ever builds these buffers.
+    AFFINE = 'affine'
 
 
 #: Map op enum to the C++ binary-op functor for ``std::inclusive_scan`` / ``std::exclusive_scan``
@@ -101,6 +125,7 @@ _OP_TO_OMP_SUFFIX = {
     ScanOp.PRODUCT: 'product',
     ScanOp.MIN: 'min',
     ScanOp.MAX: 'max',
+    ScanOp.AFFINE: 'affine',
 }
 
 #: Map op enum to the OpenMP reduction identifier used by the ``reduction(inscan, <id>: ...)``
@@ -171,13 +196,38 @@ def _validate_chain(node: "Scan", state: dace.SDFGState, sdfg: dace.SDFG, chain:
     if not isinstance(in_desc, dace.data.Array) or not isinstance(out_desc, dace.data.Array):
         raise ValueError(f"Scan requires Array inputs/outputs; got {type(in_desc).__name__} -> "
                          f"{type(out_desc).__name__}.")
-    if in_desc.dtype != out_desc.dtype:
-        raise ValueError(f"Scan input/output dtype mismatch: {in_desc.dtype} vs {out_desc.dtype}.")
+    if in_desc.dtype != out_desc.dtype and not widening_is_value_preserving(in_desc.dtype, out_desc.dtype):
+        raise ValueError(f"Scan input/output dtype mismatch: {in_desc.dtype} vs {out_desc.dtype}. Only a "
+                         f"value-preserving integer WIDENING is allowed, and only on the unit-stride "
+                         f"single-chain host expansions.")
+    coef_edges = [e for e in state.in_edges(node) if e.dst_conn == coef_connector(chain)]
+    if node.op is ScanOp.AFFINE:
+        if len(coef_edges) != 1:
+            raise ValueError(f"Scan node {node.label}: ``op=AFFINE`` requires exactly one "
+                             f"``{coef_connector(chain)}`` in-edge; got {len(coef_edges)}.")
+        coef_desc = sdfg.arrays[coef_edges[0].data.data]
+        if not isinstance(coef_desc, dace.data.Array):
+            raise ValueError(f"Scan node {node.label}: ``{coef_connector(chain)}`` must be an Array; "
+                             f"got {type(coef_desc).__name__}.")
+        # The ACCUMULATOR's type: the coefficient multiplies the carry, so a coefficient in a
+        # different type would silently pick the promotion C++ happens to give it.
+        if coef_desc.dtype != out_desc.dtype:
+            raise ValueError(f"Scan node {node.label}: ``{coef_connector(chain)}`` dtype "
+                             f"{coef_desc.dtype} must match output dtype {out_desc.dtype}.")
+        if symbolic.equal(coef_edges[0].data.subset.num_elements(), in_edges[0].data.subset.num_elements()) is False:
+            raise ValueError(f"Scan node {node.label}: ``{coef_connector(chain)}`` spans "
+                             f"{coef_edges[0].data.subset.num_elements()} elements against "
+                             f"``{in_conn}``'s {in_edges[0].data.subset.num_elements()}.")
+    elif coef_edges:
+        raise ValueError(f"Scan node {node.label}: ``{coef_connector(chain)}`` is wired but "
+                         f"``op`` is {node.op.value!r}, not AFFINE.")
     if init_edges:
         init_desc = sdfg.arrays[init_edges[0].data.data]
-        if init_desc.dtype != in_desc.dtype:
+        # The OUTPUT dtype, not the input's: ``_scan_init`` is the accumulator's entry value, and
+        # the accumulator is the output element type (identical to the input's unless widening).
+        if init_desc.dtype != out_desc.dtype:
             raise ValueError(f"Scan node {node.label}: ``{init_conn}`` dtype "
-                             f"{init_desc.dtype} must match input dtype {in_desc.dtype}.")
+                             f"{init_desc.dtype} must match output dtype {out_desc.dtype}.")
     return in_desc, out_desc, in_edges[0], out_edges[0], (init_edges[0] if init_edges else None)
 
 
@@ -194,9 +244,10 @@ def _validate_inputs_and_outputs(node: "Scan", state: dace.SDFGState, sdfg: dace
         if first is None:
             first = (in_desc, out_desc, in_edge, out_edge)
             continue
-        if in_desc.dtype != first[0].dtype:
-            raise ValueError(f"Scan node {node.label}: chain {chain} dtype {in_desc.dtype} differs from "
-                             f"chain 0 dtype {first[0].dtype}; chains share one scan loop.")
+        if in_desc.dtype != first[0].dtype or out_desc.dtype != first[1].dtype:
+            raise ValueError(f"Scan node {node.label}: chain {chain} dtypes {in_desc.dtype} -> "
+                             f"{out_desc.dtype} differ from chain 0's {first[0].dtype} -> "
+                             f"{first[1].dtype}; chains share one scan loop.")
         if symbolic.equal(in_edge.data.subset.num_elements(), first[2].data.subset.num_elements()) is False:
             raise ValueError(f"Scan node {node.label}: chain {chain} spans "
                              f"{in_edge.data.subset.num_elements()} elements against chain 0's "
@@ -204,9 +255,88 @@ def _validate_inputs_and_outputs(node: "Scan", state: dace.SDFGState, sdfg: dace
     return first
 
 
+def widening_is_value_preserving(in_dtype, out_dtype) -> bool:
+    """Whether a scan may read ``in_dtype`` and accumulate into a wider ``out_dtype``.
+
+    The accumulator is the OUTPUT element type, so a narrow input is read and widened per element.
+    That is what lets stream compaction carry its predicate mask as ``int8`` -- one byte per
+    element instead of eight -- while the ranks it prefix-sums into stay ``int64``, which they must
+    (a rank is an index). Summing in the input type would wrap at 127.
+
+    Only integers, only strictly wider, and never signed -> unsigned: every other pair either loses
+    range (``float64 -> float32``) or reinterprets negatives, and a scan that silently changes a
+    value is worse than one that refuses.
+
+    :param in_dtype: the input array's element type.
+    :param out_dtype: the output array's element type, which is also the accumulator's.
+    :returns: True if the widening is value-preserving.
+    """
+    if not (numpy.issubdtype(in_dtype.type, numpy.integer) and numpy.issubdtype(out_dtype.type, numpy.integer)):
+        return False
+    if out_dtype.bytes <= in_dtype.bytes:
+        return False
+    return not (numpy.issubdtype(in_dtype.type, numpy.signedinteger)
+                and numpy.issubdtype(out_dtype.type, numpy.unsignedinteger))
+
+
+def refuse_widening(node: "Scan", in_desc, out_desc, shape: str) -> None:
+    """Raise when a widening scan reaches a shape that has no widening implementation.
+
+    The widening accumulator lives in the unit-stride single-chain host routines only. The strided
+    form carries one accumulator per residue class seeded from the input, the multi-chain form
+    spells K accumulators into one ``inscan`` clause at a single ctype, and ``cub::DeviceScan``
+    deduces its accumulator from the input iterator -- each would need its own widening design.
+    Refuse loudly; a silent narrow accumulator is a wrong answer, not a slow one.
+    """
+    if in_desc.dtype != out_desc.dtype:
+        raise NotImplementedError(f"Scan {node.label}: a widening scan ({in_desc.dtype} -> {out_desc.dtype}) "
+                                  f"is not supported with {shape}.")
+
+
+def refuse_affine_shape(node: "Scan", shape: str) -> None:
+    """Raise when an affine scan reaches a shape whose lowering only exists for the scalar ops.
+
+    The affine carry is a PAIR, so every place the scalar plumbing names a single accumulator has
+    to be redesigned rather than reused: an ``inscan`` reduction needs a built-in or declared
+    identifier for the pair, and a residue-class split needs one pair per class. The unit-stride
+    CUDA path has its pair and its functor (``dace/cuda/scan_affine.cuh``); the shapes still listed
+    here do not, and a silent fallback to a scalar op would compute a different function. Refuse.
+    """
+    if node.op is ScanOp.AFFINE:
+        raise NotImplementedError(f"Scan {node.label}: ``op=AFFINE`` is not supported with {shape}.")
+
+
+def has_coef(node: "Scan", chain: int = 0) -> bool:
+    """``True`` iff chain ``chain`` has the affine ``_scan_coef`` connector wired."""
+    return coef_connector(chain) in node.in_connectors
+
+
 def _has_init(node: "Scan", chain: int = 0) -> bool:
     """``True`` iff chain ``chain`` has the optional ``_scan_init`` connector wired."""
     return init_connector(chain) in node.in_connectors
+
+
+def seed_desc(node: "Scan", state: dace.SDFGState, sdfg: dace.SDFG, chain: int):
+    """Descriptor behind chain ``chain``'s wired ``_scan_init``, or None when it carries no seed."""
+    conn = init_connector(chain)
+    edge = next((e for e in state.in_edges(node) if e.dst_conn == conn), None)
+    return None if edge is None else sdfg.arrays[edge.data.data]
+
+
+def seed_arg(node: "Scan", state: dace.SDFGState, sdfg: dace.SDFG, chain: int) -> str:
+    """The ``init_value`` argument of the cub call for chain ``chain``."""
+    conn = init_connector(chain)
+    desc = seed_desc(node, state, sdfg, chain)
+    if desc is None or desc.storage not in GPU_RESIDENT_STORAGES:
+        return conn
+    return f"::cub::FutureValue<{desc.dtype.base_type.ctype}>({conn})"
+
+
+def coef_desc(node: "Scan", state: dace.SDFGState, sdfg: dace.SDFG, chain: int = 0):
+    """Descriptor behind chain ``chain``'s ``_scan_coef``; affine scans always wire one."""
+    conn = coef_connector(chain)
+    edge = next(e for e in state.in_edges(node) if e.dst_conn == conn)
+    return sdfg.arrays[edge.data.data]
 
 
 def _resolve_length(node: "Scan", state: dace.SDFGState, _sdfg: dace.SDFG) -> str:
@@ -244,27 +374,32 @@ def _degenerate_single_element_tasklet(node: "Scan", in_desc) -> nodes.Tasklet:
     else:
         code = f"{OUTPUT_CONNECTOR_NAME} = {INPUT_CONNECTOR_NAME}"
     return nodes.Tasklet(node.name,
-                         inputs={INPUT_CONNECTOR_NAME},
-                         outputs={OUTPUT_CONNECTOR_NAME},
+                         inputs={INPUT_CONNECTOR_NAME: None},
+                         outputs={OUTPUT_CONNECTOR_NAME: None},
                          code=code,
                          language=dace.Language.Python)
 
 
-def _identity_expr(node: "Scan", in_desc) -> str:
-    """C++ expression for the exclusive-scan identity element.
+def _identity_expr(node: "Scan", acc_desc) -> str:
+    """C++ expression for the exclusive-scan identity element, at the ACCUMULATOR's type.
+
+    ``acc_desc`` is the OUTPUT descriptor: the identity is the accumulator's entry value, and on a
+    widening scan the accumulator is wider than the input.
 
     The user-supplied ``identity`` property wins. Otherwise the per-op default
     from :data:`_OP_TO_IDENTITY_CPP` is used; if the op has no universal
     identity (``min``/``max``) the user *must* set ``identity``.
     """
-    if node.identity is not None:
-        return str(node.identity)
-    default = _OP_TO_IDENTITY_CPP[node.op]
-    if default is None:
-        raise ValueError(f"Scan op {node.op.value!r} has no universal identity in C++ literal form; "
-                         f"set ``identity`` explicitly when using ``exclusive=True``.")
-    # Cast to the element type for completeness (avoids signed/unsigned warnings on integer dtypes).
-    return f"static_cast<{in_desc.dtype.ctype}>({default})"
+    literal = node.identity
+    if literal is None:
+        literal = _OP_TO_IDENTITY_CPP[node.op]
+        if literal is None:
+            raise ValueError(f"Scan op {node.op.value!r} has no universal identity in C++ literal form; "
+                             f"set ``identity`` explicitly when using ``exclusive=True``.")
+    # ALWAYS cast, including a user-supplied identity. Beyond avoiding signed/unsigned warnings, the
+    # cast is what pins the accumulator's width: ``cub::DeviceScan::ExclusiveScan`` deduces ``AccumT``
+    # from the init value, so a bare ``0`` would make an int8 -> int64 scan accumulate in ``int``.
+    return f"static_cast<{acc_desc.dtype.ctype}>({literal})"
 
 
 def _combine_expr(op: ScanOp, ctype: str, a: str, b: str) -> str:
@@ -362,7 +497,10 @@ def _multi_chain_parallel_code(node: "Scan", ctype: str, n_expr: str, accs, acc_
         '    }',
         '};',
         f'const int __want = {d}::team_size();',
-        f'if (__want > 1 && __n >= {d}::PARALLEL_MIN_ELEMENTS_CONTIGUOUS) {{',
+        # No size test: the multi-chain shape follows the single-chain one, where whether a
+        # scan earns a team is decided ONCE at compile time against the host's calibrated
+        # break-even, not re-tested on every call. ``__want > 1`` is not a threshold.
+        'if (__want > 1) {',
         f'    {d}::TeamSlot<{ctype}, {k}> __tot[{d}::MAX_TEAM];',
         '    #pragma omp parallel num_threads(__want)',
         '    {',
@@ -463,14 +601,122 @@ def _multi_chain_tasklet(node: "Scan", state: dace.SDFGState, sdfg: dace.SDFG, p
     else:
         code = _multi_chain_parallel_code(node, ctype, n_expr, accs, acc_list, seeds, first, second, scan_kind,
                                           _multi_chain_udr(node.op, dtype, ctype))
-    inputs = {in_connector(c) for c in range(node.chains)}
-    inputs |= {init_connector(c) for c in range(node.chains) if init_connector(c) in node.in_connectors}
+    inputs = {in_connector(c): None for c in range(node.chains)}
+    inputs.update({init_connector(c): None for c in range(node.chains) if init_connector(c) in node.in_connectors})
     return nodes.Tasklet(node.name,
                          inputs=inputs,
-                         outputs={out_connector(c)
+                         outputs={out_connector(c): None
                                   for c in range(node.chains)},
                          code=code,
                          language=dace.Language.CPP)
+
+
+#: Map op enum to the identity the header's single-block scan is seeded with when the caller
+#: supplies none. ``min``/``max`` have no C++ literal identity, so the header's own neutral
+#: elements are named instead of a number.
+_OP_TO_SEED_CPP = {
+    ScanOp.SUM: '{ct}(0)',
+    ScanOp.PRODUCT: '{ct}(1)',
+    ScanOp.MIN: '::dace::scan::detail::min_identity<{ct}>()',
+    ScanOp.MAX: '::dace::scan::detail::max_identity<{ct}>()',
+}
+
+
+def affine_scan_body(node: "Scan", ctype: str, n_expr: str, parallel: bool) -> str:
+    """Body for ``out[k] = c[k] * out[k-1] + d[k]``, entered at ``_scan_init`` (or 0).
+
+    ``parallel`` picks the blocked runtime entry point over the naked loop. The two agree
+    exactly within a block -- the blocked form's seeded pass IS this loop -- so they differ
+    only in the association at block boundaries, same contract as every other op here.
+
+    :param node: the Scan node, read for ``_scan_init``.
+    :param ctype: the accumulator's C type, which is the output element type.
+    :param n_expr: C++ expression for the element count.
+    :param parallel: emit the blocked runtime call rather than the sequential loop.
+    """
+    seed = INIT_CONNECTOR_NAME if _has_init(node) else f'static_cast<{ctype}>(0)'
+    if parallel:
+        return (f'::dace::scan::inclusive_affine({COEF_CONNECTOR_NAME}, {INPUT_CONNECTOR_NAME}, '
+                f'{OUTPUT_CONNECTOR_NAME}, static_cast<long>({n_expr}), {seed});')
+    return (f'{{ const long _n = static_cast<long>({n_expr});\n'
+            f'  {ctype} _acc = {seed};\n'
+            f'  for (long _k = 0; _k < _n; ++_k) {{\n'
+            f'      _acc = {COEF_CONNECTOR_NAME}[_k] * _acc + {INPUT_CONNECTOR_NAME}[_k];\n'
+            f'      {OUTPUT_CONNECTOR_NAME}[_k] = _acc;\n'
+            f'  }}\n'
+            f'}}')
+
+
+def degenerate_affine_tasklet(node: "Scan") -> nodes.Tasklet:
+    """The one-element affine scan: ``out[0] = c[0]*seed + d[0]``, as a PYTHON tasklet.
+
+    A statically length-1 subset arrives at the codegen scalar-typed, not as a pointer, so the
+    C++ loop shape would index a scalar. The four scalar ops hit the same wall and answer it the
+    same way (:func:`_degenerate_single_element_tasklet`); affine needs its own because the
+    answer is an expression over two inputs rather than a copy.
+    """
+    seed = INIT_CONNECTOR_NAME if _has_init(node) else '0'
+    inputs = {INPUT_CONNECTOR_NAME: None, COEF_CONNECTOR_NAME: None}
+    if _has_init(node):
+        inputs[INIT_CONNECTOR_NAME] = None
+    return nodes.Tasklet(node.name,
+                         inputs=inputs,
+                         outputs={OUTPUT_CONNECTOR_NAME: None},
+                         code=f'{OUTPUT_CONNECTOR_NAME} = {COEF_CONNECTOR_NAME} * {seed} + {INPUT_CONNECTOR_NAME}',
+                         language=dace.Language.Python)
+
+
+def affine_tasklet(node: "Scan", state: dace.SDFGState, sdfg: dace.SDFG, out_desc, n_expr: str,
+                   parallel: bool) -> nodes.Tasklet:
+    """Assemble the affine-scan tasklet with its coefficient (and optional init) connectors."""
+    inputs = {INPUT_CONNECTOR_NAME: None, COEF_CONNECTOR_NAME: None}
+    if _has_init(node):
+        inputs[INIT_CONNECTOR_NAME] = None
+    return nodes.Tasklet(node.name,
+                         inputs=inputs,
+                         outputs={OUTPUT_CONNECTOR_NAME: None},
+                         code=affine_scan_body(node, out_desc.dtype.ctype, n_expr, parallel),
+                         language=dace.Language.CPP)
+
+
+def refuse_unsupported_affine_flags(node: "Scan") -> None:
+    """Refuse the affine shapes whose lowering does not exist, before anything is emitted."""
+    if node.op is not ScanOp.AFFINE:
+        return
+    if node.exclusive:
+        refuse_affine_shape(node, '``exclusive=True``')
+    if node.chains > 1:
+        refuse_affine_shape(node, '``chains > 1``')
+    if symbolic.pystr_to_symbolic(sym2cpp(node.stride)) != 1:
+        refuse_affine_shape(node, '``stride > 1``')
+
+
+def single_block_scan_call(op: ScanOp, exclusive: bool, n_expr: str, seed: str) -> str:
+    """A unit-stride scan as ONE call into the runtime header's single-block routine.
+
+    That routine is a ``#pragma omp simd reduction(inscan, op:acc)`` loop and nothing else: no
+    parallel region, no allocation, no barrier -- which is what a scan that already sits inside an
+    OpenMP region or a loop should be. It is also the SAME function the blocked parallel shape runs
+    per block, so there is one implementation of the vector scan rather than one per call site.
+    (The four op variants exist because an OpenMP reduction identifier cannot be a template
+    parameter; ``complex`` works through them because the header declares its ``+``/``*`` UDRs in
+    the same namespace, where unqualified lookup finds them.)
+
+    Measured against the scalar dependent loop, fp64, one thread, GCC 15.2: 2.5x at n=1024, 2.5x at
+    n=65536, 1.3x at n=8.4M. Clang 21 declines to vectorize the pragma and stays at 1.0x -- correct
+    either way. FP association becomes the vector network's, not left-to-right, so a float result
+    moves by ~3e-10 relative; ``min``/``max`` and every integer type stay exact.
+
+    :param op: the scan's binary operator.
+    :param exclusive: call the exclusive variant.
+    :param n_expr: C++ expression for the element count.
+    :param seed: C++ expression the accumulator starts at; it takes part in the prefix.
+    :returns: the tasklet body.
+    """
+    kind = 'excl' if exclusive else 'incl'
+    fn = f'::dace::scan::detail::scan_{kind}_{_OP_TO_OMP_SUFFIX[op]}'
+    return (f'{fn}({INPUT_CONNECTOR_NAME}, {OUTPUT_CONNECTOR_NAME}, 0L, '
+            f'static_cast<long>({n_expr}), {seed});')
 
 
 @library.expansion
@@ -481,17 +727,30 @@ class ExpandPure(ExpandTransformation):
 
     @staticmethod
     def expansion(node: "Scan", state: dace.SDFGState, sdfg: dace.SDFG) -> nodes.Tasklet:
-        in_desc, _out_desc, in_edge, _out_edge = _validate_inputs_and_outputs(node, state, sdfg)
+        refuse_unsupported_affine_flags(node)
+        in_desc, out_desc, in_edge, _out_edge = _validate_inputs_and_outputs(node, state, sdfg)
+        if node.op is ScanOp.AFFINE:
+            refuse_widening(node, in_desc, out_desc, 'op=AFFINE')
+            if _is_length_one(node, state):
+                return degenerate_affine_tasklet(node)
+            return affine_tasklet(node, state, sdfg, out_desc, _resolve_length(node, state, sdfg), parallel=False)
         if node.chains > 1:
+            refuse_widening(node, in_desc, out_desc, 'chains > 1')
             return _multi_chain_tasklet(node, state, sdfg, parallel=False)
         if _is_length_one(node, state):
             return _degenerate_single_element_tasklet(node, in_desc)
         n_expr = _resolve_length(node, state, sdfg)
         op_cpp = _OP_TO_STD_CPP[node.op]
+        # The ACCUMULATOR's type, which is the output's: a widening scan reads a narrower input.
+        ctype = out_desc.dtype.ctype
         stride_expr = sym2cpp(node.stride)
         is_stride_one = (symbolic.pystr_to_symbolic(stride_expr) == 1)
 
         if not is_stride_one:
+            refuse_widening(node, in_desc, out_desc, 'stride > 1')
+            # No ``inscan`` here: the reduction spans one canonical loop, and a strided scan is one
+            # independent chain PER RESIDUE CLASS, so the vectorizable axis is across classes -- not
+            # the axis the dependence runs along. The classes stay scalar.
             if node.exclusive:
                 raise NotImplementedError("Scan(pure): exclusive with stride > 1 is not supported.")
             # Outer loop over residue classes ``_k in [0, s)``; inner sequential scan.
@@ -510,38 +769,20 @@ class ExpandPure(ExpandTransformation):
                     f"  }}\n"
                     f"}}")
         elif node.exclusive:
-            seed = _identity_expr(node, in_desc)
-            body = (f"{{ auto _acc = {seed};\n"
-                    f"  for (decltype({n_expr}) _i = 0; _i < ({n_expr}); ++_i) {{\n"
-                    f"      auto _v = {INPUT_CONNECTOR_NAME}[_i];\n"
-                    f"      {OUTPUT_CONNECTOR_NAME}[_i] = _acc;\n"
-                    f"      _acc = ({op_cpp})(_acc, _v);\n"
-                    f"  }}\n"
-                    f"}}")
+            body = single_block_scan_call(node.op, True, n_expr, _identity_expr(node, out_desc))
         elif _has_init(node):
-            # Inclusive scan with explicit init: ``out[k] = init OP in[0] OP ... OP in[k]``.
-            # The connector materialises a scalar; dereference to get the seed value.
-            body = (f"{{ auto _acc = {INIT_CONNECTOR_NAME};\n"
-                    f"  for (decltype({n_expr}) _i = 0; _i < ({n_expr}); ++_i) {{\n"
-                    f"      _acc = ({op_cpp})(_acc, {INPUT_CONNECTOR_NAME}[_i]);\n"
-                    f"      {OUTPUT_CONNECTOR_NAME}[_i] = _acc;\n"
-                    f"  }}\n"
-                    f"}}")
+            # Inclusive with an explicit init: ``out[k] = init OP in[0] OP ... OP in[k]``. The seed
+            # is the accumulator's entry value, which the inscan prefix carries.
+            body = single_block_scan_call(node.op, False, n_expr, INIT_CONNECTOR_NAME)
         else:
-            body = (f"{{ auto _acc = {INPUT_CONNECTOR_NAME}[0];\n"
-                    f"  {OUTPUT_CONNECTOR_NAME}[0] = _acc;\n"
-                    f"  for (decltype({n_expr}) _i = 1; _i < ({n_expr}); ++_i) {{\n"
-                    f"      _acc = ({op_cpp})(_acc, {INPUT_CONNECTOR_NAME}[_i]);\n"
-                    f"      {OUTPUT_CONNECTOR_NAME}[_i] = _acc;\n"
-                    f"  }}\n"
-                    f"}}")
-        inputs = {INPUT_CONNECTOR_NAME}
+            body = single_block_scan_call(node.op, False, n_expr, _OP_TO_SEED_CPP[node.op].format(ct=ctype))
+        inputs = {INPUT_CONNECTOR_NAME: None}
         if _has_init(node):
-            inputs.add(INIT_CONNECTOR_NAME)
+            inputs[INIT_CONNECTOR_NAME] = None
         return nodes.Tasklet(
             node.name,
             inputs=inputs,
-            outputs={OUTPUT_CONNECTOR_NAME},
+            outputs={OUTPUT_CONNECTOR_NAME: None},
             code=body,
             language=dace.Language.CPP,
         )
@@ -573,7 +814,8 @@ class ExpandCPU(ExpandTransformation):
 
     @staticmethod
     def expansion(node: "Scan", state: dace.SDFGState, sdfg: dace.SDFG) -> nodes.Tasklet:
-        in_desc, _out_desc, _in_edge, _out_edge = _validate_inputs_and_outputs(node, state, sdfg)
+        refuse_unsupported_affine_flags(node)
+        in_desc, out_desc, _in_edge, _out_edge = _validate_inputs_and_outputs(node, state, sdfg)
         # SCOPE decides the shape, not ``node.schedule``: that is storage-derived, so a Scan
         # nested in a parallel map (directly, or one level down through a NestedSDFG) arrives
         # carrying ``CPU_Multicore``. A re-entered node opens no region of its own.
@@ -581,9 +823,15 @@ class ExpandCPU(ExpandTransformation):
         if libnode_is_sequential(node, state, sdfg):
             # Already inside an OpenMP region or a loop: take the sequential naked-loop shape.
             return ExpandPure.expansion(node, state, sdfg)
+        if node.op is ScanOp.AFFINE:
+            refuse_widening(node, in_desc, out_desc, 'op=AFFINE')
+            if _is_length_one(node, state):
+                return degenerate_affine_tasklet(node)
+            return affine_tasklet(node, state, sdfg, out_desc, _resolve_length(node, state, sdfg), parallel=True)
         if node.chains > 1:
             # K independent chains, ONE ``inscan`` loop == one fork/join. See
             # :func:`_multi_chain_tasklet` for the OpenMP-spec argument.
+            refuse_widening(node, in_desc, out_desc, 'chains > 1')
             return _multi_chain_tasklet(node, state, sdfg, parallel=True)
         if _is_length_one(node, state):
             return _degenerate_single_element_tasklet(node, in_desc)
@@ -593,6 +841,7 @@ class ExpandCPU(ExpandTransformation):
         is_stride_one = (symbolic.pystr_to_symbolic(stride_expr) == 1)
 
         if not is_stride_one:
+            refuse_widening(node, in_desc, out_desc, 'stride > 1')
             if node.exclusive:
                 raise NotImplementedError("Scan: ``exclusive=True`` with ``stride > 1`` is not yet supported.")
             if _has_init(node):
@@ -600,7 +849,7 @@ class ExpandCPU(ExpandTransformation):
             call = (f"::dace::scan::strided_inclusive_{suffix}("
                     f"{INPUT_CONNECTOR_NAME}, {OUTPUT_CONNECTOR_NAME}, ({n_expr}), ({stride_expr}));")
         elif node.exclusive:
-            seed = _identity_expr(node, in_desc)
+            seed = _identity_expr(node, out_desc)
             call = (f"::dace::scan::exclusive_{suffix}("
                     f"{INPUT_CONNECTOR_NAME}, {INPUT_CONNECTOR_NAME} + ({n_expr}), "
                     f"{OUTPUT_CONNECTOR_NAME}, {seed});")
@@ -612,16 +861,66 @@ class ExpandCPU(ExpandTransformation):
             call = (f"::dace::scan::inclusive_{suffix}("
                     f"{INPUT_CONNECTOR_NAME}, {INPUT_CONNECTOR_NAME} + ({n_expr}), "
                     f"{OUTPUT_CONNECTOR_NAME}{init});")
-        inputs = {INPUT_CONNECTOR_NAME}
+        inputs = {INPUT_CONNECTOR_NAME: None}
         if _has_init(node):
-            inputs.add(INIT_CONNECTOR_NAME)
+            inputs[INIT_CONNECTOR_NAME] = None
         return nodes.Tasklet(
             node.name,
             inputs=inputs,
-            outputs={OUTPUT_CONNECTOR_NAME},
+            outputs={OUTPUT_CONNECTOR_NAME: None},
             code=call,
             language=dace.Language.CPP,
         )
+
+
+def affine_cuda_tasklet(node: "Scan", state: dace.SDFGState, sdfg: dace.SDFG, out_desc) -> nodes.Tasklet:
+    """The first-order linear recurrence on the device, as a call into ``dace::cuda_scan``.
+
+    The header's monoid is affine-map composition, so the recurrence is a plain cub prefix scan
+    over the maps -- see :file:`dace/runtime/include/dace/cuda/scan_affine.cuh` for why the seed is
+    folded into element 0 rather than handed to cub as an init value. Only the shape
+    :func:`refuse_unsupported_affine_flags` admits arrives here: one chain, unit stride, inclusive.
+
+    The seed reaches the wrapper twice over, as a pointer and as a value, and exactly one of the
+    two is live: a device-resident seed must not be dereferenced by the host code issuing the
+    launch, and a host-readable one has no device address to hand over.
+    """
+    coef = coef_desc(node, state, sdfg)
+    in_desc = sdfg.arrays[next(e for e in state.in_edges(node) if e.dst_conn == INPUT_CONNECTOR_NAME).data.data]
+    e_ctype = out_desc.dtype.base_type.ctype
+    c_ctype = coef.dtype.base_type.ctype
+    d_ctype = in_desc.dtype.base_type.ctype
+
+    seed = seed_desc(node, state, sdfg, 0) if _has_init(node) else None
+    on_device = seed is not None and seed.storage in GPU_RESIDENT_STORAGES
+    s_ctype = seed.dtype.base_type.ctype if seed is not None else e_ctype
+    seed_ptr = init_connector(0) if on_device else f'static_cast<const {s_ctype}*>(nullptr)'
+    live_seed_value = seed is not None and not on_device
+    seed_val = f'static_cast<{e_ctype}>({init_connector(0)})' if live_seed_value else f'static_cast<{e_ctype}>(0)'
+
+    state_id = state.parent_graph.node_id(state)
+    wrapper = f'__dace_scan_affine_{sdfg.name}_{state_id}_{state.node_id(node)}'
+    params = (f'const {c_ctype}* __sc_c, const {d_ctype}* __sc_d, const {s_ctype}* __sc_seed_ptr, '
+              f'{e_ctype} __sc_seed_val, {e_ctype}* __sc_out, long long __sc_n, cudaStream_t __sc_stream')
+    prototype = f'DACE_EXPORTED cudaError_t {wrapper}({params});'
+    sdfg.append_global_code(prototype + '\n')
+    sdfg.append_global_code(
+        f'{prototype}\n'
+        f'cudaError_t {wrapper}({params}) {{\n'
+        f'    return ::dace::cuda_scan::inclusive_affine<{e_ctype}, {c_ctype}, {d_ctype}, {s_ctype}>(\n'
+        f'        __sc_c, __sc_d, __sc_seed_ptr, __sc_seed_val, __sc_out, __sc_n, __sc_stream);\n'
+        f'}}\n', 'cuda')
+
+    inputs = {INPUT_CONNECTOR_NAME: None, COEF_CONNECTOR_NAME: None}
+    if _has_init(node):
+        inputs[init_connector(0)] = dtypes.pointer(seed.dtype.base_type) if on_device else None
+    code = (f'DACE_GPU_CHECK({wrapper}({COEF_CONNECTOR_NAME}, {INPUT_CONNECTOR_NAME}, {seed_ptr}, {seed_val}, '
+            f'{OUTPUT_CONNECTOR_NAME}, ({_resolve_length(node, state, sdfg)}), __dace_current_stream));')
+    return nodes.Tasklet(node.name,
+                         inputs=inputs,
+                         outputs={OUTPUT_CONNECTOR_NAME: None},
+                         code=code,
+                         language=dace.Language.CPP)
 
 
 @library.expansion
@@ -646,7 +945,19 @@ class ExpandCUDA(ExpandTransformation):
         if not ExpandCUDA.environments:
             from dace.libraries.sort.environments.cub import ScanScratch
             ExpandCUDA.environments = [ScanScratch]
-        in_desc, _out_desc, _in_edge, _out_edge = _validate_inputs_and_outputs(node, state, sdfg)
+        in_desc, out_desc, _in_edge, _out_edge = _validate_inputs_and_outputs(node, state, sdfg)
+        if node.op is ScanOp.AFFINE:
+            refuse_unsupported_affine_flags(node)
+            if _is_length_one(node, state):
+                return degenerate_affine_tasklet(node)
+            return affine_cuda_tasklet(node, state, sdfg, out_desc)
+        # A widening scan is safe here exactly where the accumulator's type is pinned by an argument
+        # this expansion controls. ``ExclusiveScan`` deduces ``AccumT`` from the init value, so
+        # seeding at the OUTPUT type accumulates there. An inclusive scan has no such argument -- it
+        # deduces from the input iterator, and a device-resident seed arrives as a ``FutureValue`` of
+        # the seed's own type -- so that shape still refuses rather than accumulate narrow.
+        if not node.exclusive:
+            refuse_widening(node, in_desc, out_desc, 'the CUDA expansion without an exclusive seed')
         if _is_length_one(node, state):
             return _degenerate_single_element_tasklet(node, in_desc)
         n_expr = _resolve_length(node, state, sdfg)
@@ -668,38 +979,74 @@ class ExpandCUDA(ExpandTransformation):
         # The chains are independent, so on the device they stay independent cub
         # launches -- the CPU-side fork/join fusion the multi-chain shape exists for
         # has no GPU analogue (a kernel launch is not a parallel region).
+        # ``cub/cub.cuh`` is a CUDA header: the host translation unit is compiled by the host
+        # compiler and cannot parse it, which is why the CUB call cannot be emitted here directly.
+        # Emit a wrapper into the CUDA unit and CALL it from the host tasklet -- the same shape
+        # ``ExpandFindFirstCUDA`` uses for ``dace::find_first_index_device``.
+        state_id = state.parent_graph.node_id(state)
+        idstr = f'{sdfg.name}_{state_id}_{state.node_id(node)}'
+        in_ctype, out_ctype = in_desc.dtype.base_type.ctype, out_desc.dtype.base_type.ctype
         blocks = []
         for chain in range(node.chains):
             in_conn, out_conn = in_connector(chain), out_connector(chain)
+            seed_param, seed_expr, seed_actual = '', '', ''
             if node.exclusive:
-                seed = _identity_expr(node, in_desc)
-                args = f"{in_conn}, {out_conn}, {op_cub}, {seed}, ({n_expr}), __dace_current_stream);"
-                scan_call = f"::cub::DeviceScan::ExclusiveScan(_sc_scratch, _sc_needed, {args}"
-                query_call = f"::cub::DeviceScan::ExclusiveScan(nullptr, _sc_needed, {args}"
+                # The OUTPUT descriptor, not the input: this argument is what fixes cub's accumulator
+                # width, and on a widening scan the accumulator is the output's type.
+                seed_expr = _identity_expr(node, out_desc)
+                call = 'ExclusiveScan'
+                extra = f', {seed_expr}'
             elif _has_init(node, chain):
                 # Inclusive scan with init. ``cub::DeviceScan::InclusiveScanInit`` is the
                 # direct API (CUB >= 2.0 / CUDA 12+); on older CUB it'd need an
                 # ``ExclusiveScan`` + tail-add fallback, which can be added when
                 # supporting CUDA 11 becomes a requirement.
-                args = (f"{in_conn}, {out_conn}, {op_cub}, {init_connector(chain)}, "
-                        f"({n_expr}), __dace_current_stream);")
-                scan_call = f"::cub::DeviceScan::InclusiveScanInit(_sc_scratch, _sc_needed, {args}"
-                query_call = f"::cub::DeviceScan::InclusiveScanInit(nullptr, _sc_needed, {args}"
+                # A seed the host cannot read is passed as a ``cub::FutureValue``, which cub
+                # dereferences on the device; a host-resident one goes by value as before.
+                desc = seed_desc(node, state, sdfg, chain)
+                seed_ctype = desc.dtype.base_type.ctype
+                if desc is not None and desc.storage in GPU_RESIDENT_STORAGES:
+                    seed_param = f', const {seed_ctype}* __sc_init'
+                    extra = f', ::cub::FutureValue<{seed_ctype}>(__sc_init)'
+                else:
+                    seed_param = f', {seed_ctype} __sc_init'
+                    extra = ', __sc_init'
+                seed_actual = f', {init_connector(chain)}'
+                call = 'InclusiveScanInit'
             else:
-                args = f"{in_conn}, {out_conn}, {op_cub}, ({n_expr}), __dace_current_stream);"
-                scan_call = f"::cub::DeviceScan::InclusiveScan(_sc_scratch, _sc_needed, {args}"
-                query_call = f"::cub::DeviceScan::InclusiveScan(nullptr, _sc_needed, {args}"
-            blocks.append(f"{{\nsize_t _sc_needed = 0;\n"
-                          f"{query_call}\n"
-                          f"void* _sc_scratch = ::dace::cub::get_scratch<::dace::cub::ScanTag>("
-                          f"_sc_needed, __dace_current_stream);\n"
-                          f"{scan_call}\n}}")
-        inputs = {in_connector(c) for c in range(node.chains)}
-        inputs |= {init_connector(c) for c in range(node.chains) if _has_init(node, c)}
+                call = 'InclusiveScan'
+                extra = ''
+
+            wrapper = f'__dace_scan_{idstr}_c{chain}'
+            params = (f'const {in_ctype}* __sc_in, {out_ctype}* __sc_out{seed_param}, '
+                      f'long long __sc_n, cudaStream_t __sc_stream')
+            prototype = f'DACE_EXPORTED cudaError_t {wrapper}({params});'
+            args = f'__sc_in, __sc_out, {op_cub}{extra}, __sc_n, __sc_stream'
+            sdfg.append_global_code(prototype + '\n')
+            sdfg.append_global_code(
+                f'{prototype}\n'
+                f'cudaError_t {wrapper}({params}) {{\n'
+                f'    size_t _sc_needed = 0;\n'
+                f'    ::cub::DeviceScan::{call}(nullptr, _sc_needed, {args});\n'
+                f'    void* _sc_scratch = ::dace::cub::get_scratch<::dace::cub::ScanTag>('
+                f'_sc_needed, __sc_stream);\n'
+                f'    return ::cub::DeviceScan::{call}(_sc_scratch, _sc_needed, {args});\n'
+                f'}}\n', 'cuda')
+            blocks.append(f'DACE_GPU_CHECK({wrapper}({in_conn}, {out_conn}{seed_actual}, '
+                          f'({n_expr}), __dace_current_stream));')
+        inputs = {in_connector(c): None for c in range(node.chains)}
+        # A device-resident seed reaches ``FutureValue`` as a POINTER; a scalar connector would be
+        # dereferenced by the host code issuing the launch, which validation rejects.
+        for chain in range(node.chains):
+            if not _has_init(node, chain):
+                continue
+            desc = seed_desc(node, state, sdfg, chain)
+            device = desc is not None and desc.storage in GPU_RESIDENT_STORAGES
+            inputs[init_connector(chain)] = dtypes.pointer(desc.dtype.base_type) if device else None
         return nodes.Tasklet(
             node.name,
             inputs=inputs,
-            outputs={out_connector(c)
+            outputs={out_connector(c): None
                      for c in range(node.chains)},
             code='\n'.join(blocks),
             language=dace.Language.CPP,
@@ -733,7 +1080,9 @@ class ExpandCUDAStrided(ExpandTransformation):
         if not ExpandCUDAStrided.environments:
             from dace.libraries.standard.environments.scan_strided import ScanStrided
             ExpandCUDAStrided.environments = [ScanStrided]
-        in_desc, _out_desc, _in_edge, _out_edge = _validate_inputs_and_outputs(node, state, sdfg)
+        in_desc, out_desc, _in_edge, _out_edge = _validate_inputs_and_outputs(node, state, sdfg)
+        refuse_affine_shape(node, 'the CUDA_strided expansion')
+        refuse_widening(node, in_desc, out_desc, 'the CUDA_strided expansion')
         if _is_length_one(node, state):
             return _degenerate_single_element_tasklet(node, in_desc)
         n_expr = _resolve_length(node, state, sdfg)
@@ -766,8 +1115,8 @@ class ExpandCUDAStrided(ExpandTransformation):
                 f"(long)({n_expr}), (long)({stride_expr}), __dace_current_stream);")
         return nodes.Tasklet(
             node.name,
-            inputs={INPUT_CONNECTOR_NAME},
-            outputs={OUTPUT_CONNECTOR_NAME},
+            inputs={INPUT_CONNECTOR_NAME: None},
+            outputs={OUTPUT_CONNECTOR_NAME: None},
             code=code,
             language=dace.Language.CPP,
         )
@@ -779,7 +1128,9 @@ class Scan(nodes.LibraryNode):
 
     Inputs / outputs:
 
-    - ``_scan_in``:  input 1-D contiguous array of length ``N``.
+    - ``_scan_in``:  input 1-D contiguous array of length ``N``. For ``op=AFFINE`` this is the
+      recurrence's per-element DELTA ``d``.
+    - ``_scan_coef``: (``op=AFFINE`` only) the per-element coefficient ``c``, same length/dtype.
     - ``_scan_out``: output 1-D contiguous array, same dtype, same shape.
     - chain ``c > 0`` (only when ``chains > 1``) adds ``_scan_in_c`` / ``_scan_out_c``
       and the optional ``_scan_init_c``: an INDEPENDENT scan over the same index range,
@@ -787,7 +1138,11 @@ class Scan(nodes.LibraryNode):
 
     Properties:
 
-    - ``op``: one of :class:`ScanOp` (``SUM`` / ``PRODUCT`` / ``MIN`` / ``MAX``).
+    - ``op``: one of :class:`ScanOp` (``SUM`` / ``PRODUCT`` / ``MIN`` / ``MAX`` / ``AFFINE``).
+      ``AFFINE`` is the first-order linear recurrence ``out[k] = c[k]*out[k-1] + d[k]``; it
+      carries the affine map ``x -> a*x + b`` instead of a value, reads the extra ``_scan_coef``
+      array, and is supported on the host expansions at unit stride, single chain, inclusive
+      only. Every other shape refuses rather than falling back to a scalar op.
     - ``exclusive``: ``False`` (inclusive: ``out[k] = in[0] OP ... OP in[k]``);
       ``True`` (exclusive: ``out[0] = identity``, ``out[k] = identity OP in[0] OP ... OP in[k-1]``).
     - ``identity``: the exclusive-scan seed. Defaults to ``0`` for ``SUM`` and ``1`` for
@@ -795,8 +1150,9 @@ class Scan(nodes.LibraryNode):
 
     Implementations:
 
-    - ``'CPU'`` (default) -- ``std::inclusive_scan`` / ``std::exclusive_scan`` (C++17 ``<numeric>``).
-    - ``'CUDA'``           -- ``cub::DeviceScan::InclusiveScan`` / ``ExclusiveScan``.
+    - ``'CPU'`` (default) -- ``std::inclusive_scan`` / ``std::exclusive_scan`` (C++17 ``<numeric>``),
+      or ``dace::scan::inclusive_affine`` for ``op=AFFINE``.
+    - ``'CUDA'``           -- ``cub::DeviceScan::InclusiveScan`` / ``ExclusiveScan``. No ``AFFINE``.
     - ``'pure'``           -- portable single-loop fallback.
 
     The libnode is contractually pure: no aliasing between ``in`` and ``out`` is required
@@ -824,6 +1180,7 @@ class Scan(nodes.LibraryNode):
                       "element count, and the parallel CPU expansion lowers them as list items of ONE "
                       "``reduction(inscan, op: ...)`` clause -- K carry chains, one fork/join, one pass "
                       "over the index space. Unit stride only.")
+
     stride = Property(dtype=object,
                       default=1,
                       allow_none=False,
@@ -854,13 +1211,12 @@ class Scan(nodes.LibraryNode):
                  chains: int = 1,
                  *args,
                  **kwargs):
-        super().__init__(name,
-                         *args,
-                         inputs={in_connector(c)
-                                 for c in range(chains)},
-                         outputs={out_connector(c)
-                                  for c in range(chains)},
-                         **kwargs)
+        # ``_scan_coef`` is part of the node's shape, not an optional extra like ``_scan_init``:
+        # an affine scan with no coefficients is not a scan of some other kind, it is unwired.
+        conns = {in_connector(c): None for c in range(chains)}
+        if op is ScanOp.AFFINE:
+            conns.update({coef_connector(c): None for c in range(chains)})
+        super().__init__(name, *args, inputs=conns, outputs={out_connector(c): None for c in range(chains)}, **kwargs)
         self.op = op
         self.exclusive = exclusive
         self.identity = identity

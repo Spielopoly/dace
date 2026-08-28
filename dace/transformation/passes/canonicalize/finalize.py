@@ -21,21 +21,23 @@ to the backend. It mirrors ``auto_optimize``'s library-and-storage finalization
 """
 import os
 
-from dace import SDFG, dtypes
+from dace import SDFG, dtypes, symbolic
 from dace.config import Config
 from dace.sdfg import infer_types, nodes
+from dace.sdfg.state import SDFGState
 from dace.libraries.blas.environments import openblas
 from dace.transformation.auto.auto_optimize import (apply_cpu_library_parallelism, apply_gpu_storage,
                                                     libnode_is_sequential, make_transients_persistent,
                                                     move_small_arrays_to_stack, set_fast_implementations)
-from dace.transformation.passes.cpu_specialization.sequentialize_parallel_scopes import SequentializeParallelScopes
-from dace.transformation.passes.cpu_specialization.specialize_cpu_transfers import SpecializeCpuTransfers
+from dace.transformation.passes.cpu_specialization.pipeline import cpu_specialize
 from dace.transformation.passes.gpu_block_size_selection import select_gpu_device_block_size
 from dace.transformation.passes.gpu_specialization.sequentialize_nested_device_scopes import (
     SequentializeNestedDeviceScopes)
 from dace.transformation.passes.length_one_array_scalar_conversion import ConvertLengthOneArraysToScalars
 from dace.libraries.standard.nodes.scan import Scan
+from dace.libraries.standard.nodes.symmetrize import Symmetrize
 from dace.transformation.dataflow import OTFMapFusion
+from dace.transformation import helpers as xfh
 
 #: Map the canonicalize target string to the codegen device type.
 _TARGET_DEVICE = {'cpu': dtypes.DeviceType.CPU, 'gpu': dtypes.DeviceType.GPU}
@@ -76,8 +78,15 @@ def canonicalize_fast_library_priority(device: dtypes.DeviceType):
     * CPU: ``OpenBLAS`` (if installed), ``HPTT`` (tensor transpose, if ``HPTT_ROOT`` is set),
       ``TTGT`` (tensor contraction via transpose+GEMM, no external dependency), ``OpenMP`` (``Reduce``),
       ``CPU`` (OpenMP-5 ``Scan``, radix ``IntegerSort``, ``ska_sort`` ``ScatterConflictCheck``).
-    * GPU: ``cuBLAS``, ``cuSolverDn``, ``cuTENSOR``, ``GPUAuto``, ``CUB``, ``CUDA`` (``cub::DeviceScan``
-      / device sort).
+    * GPU: ``cuBLAS``, ``cuSolverDn``, ``GPUAuto``, ``cuTENSOR``, ``CUB``, ``CUDA`` (``cub::DeviceScan``
+      / device sort / ``DeviceReduce::ArgMax`` / the bounding-box ``Symmetrize``).
+
+    Both lists are the SAME ORDER as ``auto_optimize``'s :func:`~dace.transformation.auto.
+    auto_optimize.find_fast_library`, deliberately and for the reason stated there: the two pipelines
+    are compared column against column, so a node that lowers to a tuned expansion under one and to
+    the serial ``pure`` loop under the other measures the priority list rather than the pipeline.
+    ``CUDA`` is appended to BOTH, because it is the key every CUB-backed node this tree adds
+    registers under.
 
     Only impls whose environment is available on this host are listed, so forcing a pick never selects
     an unbuilt library. ``MatMul``/``Gemm`` still get the tiny-matmul ``rowwise`` override in
@@ -85,7 +94,7 @@ def canonicalize_fast_library_priority(device: dtypes.DeviceType):
     """
     if device == dtypes.DeviceType.GPU:
         # GPU perf runs where these are present; each node's own environment gates the actual build.
-        return ['cuBLAS', 'cuSolverDn', 'cuTENSOR', 'GPUAuto', 'CUB', 'CUDA']
+        return ['cuBLAS', 'cuSolverDn', 'GPUAuto', 'cuTENSOR', 'CUB', 'CUDA']
     prio = []
     if openblas.OpenBLAS.is_installed():
         prio.append('OpenBLAS')
@@ -94,6 +103,19 @@ def canonicalize_fast_library_priority(device: dtypes.DeviceType):
     prio.append('TTGT')
     prio += ['OpenMP', 'CPU']
     return prio
+
+
+def libnode_is_device_code(node: nodes.LibraryNode, state: SDFGState, sdfg: SDFG) -> bool:
+    """``node`` sits inside a GPU kernel, so whatever it lowers to has to be device code.
+
+    Reuses the walk :func:`~dace.transformation.auto.auto_optimize.libnode_is_sequential` relies on:
+    it crosses every nested-SDFG boundary out to the root, so a node several nsdfg levels under a
+    kernel is still seen to be in one. A node whose only enclosing scopes are host loops and
+    ``Sequential`` taskloops is host code, and free to issue a device library call.
+    """
+    return any(
+        isinstance(scope, nodes.MapEntry) and scope.map.schedule in dtypes.GPU_SCHEDULES
+        for scope in xfh.get_parent_map_and_loop_scopes(sdfg, node, state))
 
 
 def canonicalize_set_fast_implementations(sdfg: SDFG, device: dtypes.DeviceType, small_dim: int = _SMALL_MATMUL_DIM):
@@ -111,6 +133,7 @@ def canonicalize_set_fast_implementations(sdfg: SDFG, device: dtypes.DeviceType,
     does a node with no ``'rowwise'`` expansion.
     """
     set_fast_implementations(sdfg, device, blocklist=['MKL'], find_fast_library_fn=canonicalize_fast_library_priority)
+    gpu_priority = canonicalize_fast_library_priority(device) if device == dtypes.DeviceType.GPU else []
     for node, state in sdfg.all_nodes_recursive():
         if not isinstance(node, nodes.LibraryNode):
             continue
@@ -129,7 +152,7 @@ def canonicalize_set_fast_implementations(sdfg: SDFG, device: dtypes.DeviceType,
         if sequential and node.schedule != dtypes.ScheduleType.Sequential:
             node.schedule = dtypes.ScheduleType.Sequential
 
-        # The CPU parallel-lowering rule for Reduce / ArgReduce / Scan / Copy / Memset lives in
+        # The CPU parallel-lowering rule for Reduce / ArgReduce / Scan / Copy / Fill lives in
         # :func:`~dace.transformation.auto.auto_optimize.apply_cpu_library_parallelism`, shared with
         # ``set_fast_implementations`` so the canonicalize and auto_optimize paths cannot drift onto
         # different implementations of the same node. It has the last word on the types it governs
@@ -137,15 +160,54 @@ def canonicalize_set_fast_implementations(sdfg: SDFG, device: dtypes.DeviceType,
         # override below, which only means to catch GEMMs.
         if device == dtypes.DeviceType.CPU and apply_cpu_library_parallelism(node, state, sdfg):
             continue
-        # GPU ``Scan``: a top-level parallel scan -> host-launched ``cub::DeviceScan``; a sequential
-        # (device-level, or map-/loop-nested) scan MUST stay ``pure`` -- ``ExpandCUDA`` emits a
-        # HOST-side ``cub::DeviceScan`` call that cannot be issued from inside a kernel (and it
-        # rejects stride>1). Guarding on ``sequential`` mirrors the CPU rule; without it a
-        # device-level scan that ``set_fast_implementations`` correctly left ``pure`` was clobbered
-        # to an uncompilable in-kernel ``cub::DeviceScan``.
+        # GPU ``Scan``: a scan INSIDE a kernel must stay ``pure`` -- ``ExpandCUDA`` emits a HOST-side
+        # ``cub::DeviceScan`` call, which device code cannot issue. Everything else is host code and
+        # takes the device expansion, a host loop around it included: there the ``pure`` lowering is
+        # a host loop indexing ``GPU_Global`` operands, which is not slow but wrong (tsvc s256, an
+        # affine scan under the outer loop). Decide by SCOPE, as the generic rule below does; the
+        # schedule says ``Sequential`` for a host loop and a kernel alike.
         if isinstance(node, Scan) and device == dtypes.DeviceType.GPU:
-            node.implementation = 'pure' if sequential else ('CUDA' if 'CUDA' in impls else node.implementation)
+            # ``cub::DeviceScan`` is one contiguous scan, so a strided scan has its own expansion and
+            # ``ExpandCUDA`` refuses the case outright rather than walk past a residue boundary
+            # (tsvc_2_5 ext_floordiv_offset_m). Pick by stride instead of handing it the refusal.
+            device_impl = 'CUDA' if symbolic.equal(node.stride, 1) else 'CUDA_strided'
+            node.implementation = ('pure' if libnode_is_device_code(node, state, sdfg) else
+                                   (device_impl if device_impl in impls else node.implementation))
             continue
+        # ``Transpose`` / ``TensorTranspose`` deliberately get NO override here. Our tiled kernel is
+        # registered as ``CUDA`` and the priority list already puts ``cuBLAS`` and ``cuTENSOR`` ahead
+        # of it, which is the right order: measured on an RTX 4050 at 8192x8192 float64, cuBLAS
+        # ``geam`` transposes at 169 GB/s against our kernel's 150 and the pure map's 140 -- geam is
+        # essentially at copy bandwidth. Ours is the fallback that matters when the vendor library is
+        # absent (this box has a cuTENSOR that does not link), where it beats ``pure``.
+        # GPU ``Symmetrize``: the ``pure`` expansion walks the triangle as nested maps, whose inner
+        # extent depends on the row. That cannot be a thread-block dimension, so ``pure`` pins the
+        # column axis Sequential and leaves one thread per ROW. At host level the node becomes a
+        # kernel of its own and the bounding-box expansion is the right lowering -- both axes
+        # parallel, constant extents. Inside a kernel there is no launch to configure and the
+        # triangular walk is the cheaper one, so keep ``pure`` there.
+        if isinstance(node, Symmetrize) and device == dtypes.DeviceType.GPU:
+            node.implementation = ('pure' if libnode_is_device_code(node, state, sdfg) else
+                                   ('CUDA' if 'CUDA' in impls else node.implementation))
+            continue
+        # ``set_fast_implementations`` leaves every ``Sequential`` GPU node ``pure``, reading
+        # Sequential as "inside a kernel", where only device code may be emitted. A host loop and a
+        # taskloop body are Sequential too, and there the pure expansion is HOST code over
+        # ``GPU_Global`` operands -- polybench trisolv's Dot, npbench stockham_fft's Gemm and
+        # TensorTranspose. Host code is where a device library call belongs, so decide by SCOPE.
+        # A node with no device expansion falls through and keeps what it had.
+        if device == dtypes.DeviceType.GPU and node.schedule == dtypes.ScheduleType.Sequential \
+                and not libnode_is_device_code(node, state, sdfg):
+            fast = next((impl for impl in gpu_priority if impl in impls), None)
+            if fast is not None:
+                node.implementation = fast
+                continue
+        # That same rule pins a node to ``pure`` without checking that the node HAS one:
+        # ``CopyLibraryNode`` does not, and expansion then raises ``Unknown implementation``
+        # (polybench durbin). Its own default is the lowering that reads the schedule.
+        if node.implementation == 'pure' and 'pure' not in impls:
+            node.implementation = type(node).default_implementation
+
         if 'pure' not in impls:
             continue
         # Only the row-wise (ikj) expansion: a vectorizable row update with a sequential K
@@ -277,16 +339,24 @@ def assert_offloaded(sdfg: SDFG) -> None:
     :func:`offload_to_gpu` sets both, while a caller-supplied recipe may schedule kernels without
     moving every non-transient (or vice versa for an all-library graph with no maps of its own).
 
+    A graph with neither a map nor a library node anywhere is the one case this cannot be about: no
+    offload could have placed anything, so the target has nothing to run (npbench crc16 is a purely
+    sequential loop nest). Host code is then the right answer, not a missing call.
+
     :param sdfg: The SDFG to check, including nested SDFGs.
     :raises ValueError: If no ``GPU_Device`` map and no ``GPU_Global`` array is present.
     """
+    offloadable = False
     for node, _ in sdfg.all_nodes_recursive():
         if isinstance(node, nodes.MapEntry) and node.map.schedule == dtypes.ScheduleType.GPU_Device:
             return
+        offloadable = offloadable or isinstance(node, (nodes.MapEntry, nodes.LibraryNode))
     for nested in sdfg.all_sdfgs_recursive():
         for desc in nested.arrays.values():
             if desc.storage == dtypes.StorageType.GPU_Global:
                 return
+    if not offloadable:
+        return
     raise ValueError(f"finalize_for_target(sdfg, 'gpu') needs an already-offloaded SDFG, but '{sdfg.name}' has no "
                      "GPU_Device map and no GPU_Global array. Offload is a separate step so passes can run between "
                      "canonicalization and the device move: call offload_to_gpu(sdfg), or your own offload recipe, "
@@ -336,7 +406,10 @@ def assert_no_nested_parallel_maps(sdfg: SDFG, device: dtypes.DeviceType) -> Non
                     f"schedule (only top-level maps parallelize) -- nesting emits stacked parallel regions.")
 
 
-def finalize_for_target(sdfg: SDFG, target: str = 'cpu', validate: bool = True) -> SDFG:
+def finalize_for_target(sdfg: SDFG,
+                        target: str = 'cpu',
+                        validate: bool = True,
+                        break_anti_dependence: bool = True) -> SDFG:
     """Apply the performance finalization tail to a canonicalized ``sdfg``.
 
     Selects fast library implementations (leaving the nodes un-expanded for
@@ -352,6 +425,9 @@ def finalize_for_target(sdfg: SDFG, target: str = 'cpu', validate: bool = True) 
     :param sdfg: A canonicalized SDFG; for ``target='gpu'``, an offloaded one.
     :param target: ``'cpu'`` or ``'gpu'`` (selects the fast-library priority).
     :param validate: Validate the SDFG once at the end.
+    :param break_anti_dependence: Forwarded to the CPU specialization stage: chunk the
+                                  anti-dependence snapshots canonicalization left behind. Pass
+                                  ``False`` when canonicalization did not break anti dependences.
     :returns: The same ``sdfg`` instance, finalized.
     :raises ValueError: If ``target='gpu'`` and ``sdfg`` was never offloaded.
     """
@@ -370,21 +446,20 @@ def finalize_for_target(sdfg: SDFG, target: str = 'cpu', validate: bool = True) 
     # Infer schedules BEFORE selecting library-node implementations so the selection can adhere to
     # each node's schedule: DaCe sets a library node nested in a parallel map (or re-entered per loop
     # iteration) to ``Sequential`` and a top-level one to the device default. A ``Sequential``
-    # Reduce/Scan/Copy/Memset must lower to its efficient single-core expansion, NOT open its own
+    # Reduce/Scan/Copy/Fill must lower to its efficient single-core expansion, NOT open its own
     # (nested) OpenMP region per outer iteration -- the "constant parallel reductions" slowdown.
     infer_types.set_default_schedule_and_storage_types(sdfg, None)
 
-    # Storage-derived scheduling can leave a map/libnode/nested-SDFG on the device-parallel schedule
-    # while it is re-entered inside a parallel map or a long loop. Resolving that is the device
-    # specialization band's job, not canonicalization's, so the tail runs the band's own pass here
-    # -- BEFORE library selection, so libnode_is_sequential sees the corrected schedules. On CPU the
-    # pass is the fork/join cost model (idempotent, so a graph canonicalized with ``target='cpu'``
-    # is simply re-confirmed); on GPU it is the nested-kernel resolution.
+    # Canonicalization stops at the maximally parallel form, so the target's specialization stage
+    # runs here -- BEFORE library selection, so libnode_is_sequential sees the corrected schedules.
+    # On CPU that is the whole cpu_specialize stage (calibration, anti-dependence chunking,
+    # oversized-intermediate recompute, the fork/join cost model, transfer specialization); on GPU
+    # it is the nested-kernel resolution. Both are idempotent, so finalizing an already-specialized
+    # graph re-confirms the same verdicts rather than compounding them.
     if device == dtypes.DeviceType.GPU:
         SequentializeNestedDeviceScopes().apply_pass(sdfg, {})
     else:
-        SequentializeParallelScopes().apply_pass(sdfg, {})
-        SpecializeCpuTransfers().apply_pass(sdfg, {})
+        cpu_specialize(sdfg, break_anti_dependence=break_anti_dependence, validate=False)
 
     canonicalize_set_fast_implementations(sdfg, device)
     # Select the fast implementation per library node but DO NOT expand here: a library

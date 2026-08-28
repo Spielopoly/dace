@@ -14,10 +14,10 @@ import warnings
 
 import sympy as sp
 from io import StringIO
-from typing import IO, TYPE_CHECKING, List, Optional, Sequence, Tuple, Union
+from typing import IO, TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple, Union
 
 import dace
-from dace import data, subsets, symbolic, dtypes, memlet as mmlt, nodes
+from dace import data, mpr_lowering, subsets, symbolic, dtypes, memlet as mmlt, nodes
 from dace.codegen import common, cppunparse
 from dace.codegen.common import (sym2cpp, find_incoming_edges, codeblock_to_cpp)
 from dace.codegen.dispatcher import DefinedType
@@ -65,8 +65,12 @@ def const_scalar_by_value() -> bool:
     generator always binds by reference, so its output stays byte-identical. The two forms are
     semantically identical -- which is faster is a backend artifact (see the config description),
     so it is a knob rather than a hardcoded choice."""
-    return (readable_cpu_codegen_active()
-            and Config.get('compiler', 'cpu', 'codegen_params', 'const_scalar_abi') == 'by_value')
+    # C has no references at all, so the choice is not a knob there: a read-only scalar binds by
+    # value, which is semantically the same thing and keeps every use of the connector a plain name.
+    # Only a WRITTEN scalar is left needing an indirection, and that one becomes a pointer below.
+    return (mpr_lowering.standalone_c()
+            or (readable_cpu_codegen_active()
+                and Config.get('compiler', 'cpu', 'codegen_params', 'const_scalar_abi') == 'by_value'))
 
 
 def copy_expr(
@@ -853,6 +857,49 @@ def unparse_cr_split(sdfg, wcr_ast):
         raise NotImplementedError("INVALID TYPE OF WCR: " + type(wcr_ast).__name__)
 
 
+class WcrOperandSubstitution(ast.NodeTransformer):
+    """Replace a WCR's parameters by the caller's operand text, printed as verbatim identifiers."""
+
+    def __init__(self, mapping: Dict[str, str]):
+        self.mapping = mapping
+
+    def visit_Name(self, node: ast.Name):
+        replacement = self.mapping.get(node.id)
+        return ast.Name(id=replacement, ctx=node.ctx) if replacement is not None else node
+
+
+def unparse_cr_inline(sdfg, wcr_ast, operands: Tuple[str, str]) -> str:
+    """The WCR body as one plain C expression, its parameters replaced by ``operands``.
+
+    :func:`unparse_cr` builds a C++ lambda, which the C dialect cannot spell. Substituting at the
+    AST instead leaves an expression both dialects accept, and reproduces
+    ``wcr_custom<T>::reduce`` (``*ptr = wcr(*ptr, value)``) exactly. Each operand is pasted where
+    its parameter stood, so a body naming a parameter twice loads it twice -- which is what the
+    functor does as well, the operands being a dereference and a local.
+
+    :param sdfg: the SDFG owning the WCR, for struct initializers.
+    :param wcr_ast: the conflict resolution, as a lambda string or AST.
+    :param operands: the C text for the accumulator and the incoming value, already parenthesised.
+    :returns: the substituted body, without a trailing semicolon.
+    :raises NotImplementedError: if the WCR is not a single ``return`` of one expression.
+    """
+    node = wcr_ast
+    if isinstance(node, str):
+        node = LambdaProperty.from_string(node)
+    if isinstance(node, ast.Module):
+        node = node.body[0].value
+    if isinstance(node, ast.Lambda):
+        node = LambdaToFunction().visit(node)
+    if (not isinstance(node, ast.FunctionDef) or len(node.body) != 1 or not isinstance(node.body[0], ast.Return)):
+        raise NotImplementedError('a conflict resolution that is not a single expression has no inline spelling')
+    args = [a.arg for a in node.args.args]
+    if len(args) != len(operands):
+        raise NotImplementedError(f'conflict resolution takes {len(args)} parameters, not {len(operands)}')
+    body = StructInitializer(sdfg).visit(node.body[0].value)
+    body = WcrOperandSubstitution(dict(zip(args, operands))).visit(body)
+    return cppunparse.cppunparse(body, expr_semicolon=False)
+
+
 def unparse_cr(sdfg, wcr_ast, dtype):
     """ Outputs a C++ version of a conflict resolution lambda. """
     body_cpp, args = unparse_cr_split(sdfg, wcr_ast)
@@ -864,14 +911,13 @@ def unparse_cr(sdfg, wcr_ast, dtype):
 
 
 def connected_to_gpu_memory(node: nodes.Node, state: SDFGState, sdfg: SDFG):
+    # Both ends of the path count: a host tasklet that only WRITES GPU memory needs the stream just
+    # as much as one that reads it. Same rule as the stream-retention walk in ``cuda.py``.
     for e in state.all_edges(node):
         path = state.memlet_path(e)
-        if (((isinstance(path[0].src, nodes.AccessNode)
-              and path[0].src.desc(sdfg).storage is dtypes.StorageType.GPU_Global))
-                or ((isinstance(path[-1].dst, nodes.AccessNode)
-                     and path[-1].dst.desc(sdfg).storage is dtypes.StorageType.GPU_Global))):
-            return True
-
+        for endpoint in (path[0].src, path[-1].dst):
+            if isinstance(endpoint, nodes.AccessNode) and endpoint.desc(sdfg).storage is dtypes.StorageType.GPU_Global:
+                return True
     return False
 
 
@@ -993,7 +1039,13 @@ def unparse_tasklet(sdfg, cfg, state_id, dfg, node, function_stream, callsite_st
             callsite_stream.write(mlir_out_name + " = mlir_entry" + mlir_func_uid + "(" + mlir_in_untyped + ");")
 
         if node.language == dtypes.Language.CPP:
-            callsite_stream.write(codegen.rewrite_cpp_tasklet_body(node, sdfg, state_dfg), cfg, state_id, node)
+            # A native body is emitted verbatim, so this is the only point where MPR can re-spell the
+            # ``dace::`` names a library expansion wrote by hand (see mpr_lowering.rewrite_native_code).
+            # A no-op outside a standalone rendering.
+            body = codegen.rewrite_cpp_tasklet_body(node, sdfg, state_dfg)
+            if mpr_lowering.standalone():
+                body = mpr_lowering.rewrite_native_code(body)
+            callsite_stream.write(body, cfg, state_id, node)
 
         if not is_devicelevel_gpu(sdfg, state_dfg, node) and hasattr(node, "_cuda_stream"):
             # Resolve the active CUDA codegen class based on configuration.
@@ -1007,7 +1059,17 @@ def unparse_tasklet(sdfg, cfg, state_id, dfg, node, function_stream, callsite_st
                 gpu_codegen = next(cg for cg in codegen._dispatcher.used_targets if isinstance(cg, cuda.CUDACodeGen))
             except StopIteration:
                 return
-            synchronize_streams(sdfg, cfg, state_dfg, state_id, node, node, callsite_stream, gpu_codegen)
+            # The tasklet's own code names the stream through the local defined above, so the
+            # synchronization it may need must name the same expression.
+            synchronize_streams(sdfg,
+                                cfg,
+                                state_dfg,
+                                state_id,
+                                node,
+                                node,
+                                callsite_stream,
+                                gpu_codegen,
+                                stream_expr='__dace_current_stream')
         return
 
     body = node.code.code
@@ -1490,17 +1552,18 @@ def gpu_alloc_check(call: str, nodedesc: data.Data) -> str:
     :param nodedesc: Descriptor of the data being allocated.
     :return: A C++ statement, newline-terminated.
     """
-    # Persistent allocations are emitted into ``__dace_init_<name>``, which hands back the state pointer.
-    if nodedesc.lifetime == dtypes.AllocationLifetime.Persistent:
-        return f'DACE_GPU_CHECK_RETURN_VAL({call}, nullptr);\n'
-    return f'DACE_GPU_CHECK_RETURN({call});\n'
+    # PR #2489 keeps a single DACE_GPU_CHECK, which records the error and carries on rather than
+    # returning early; the _RETURN/_RETURN_VAL variants this used to emit no longer exist.
+    return f'DACE_GPU_CHECK({call});\n'
 
 
 # TODO: This should be in the CUDA code generator. Add appropriate conditions to node dispatch predicate
-def synchronize_streams(sdfg, cfg, dfg, state_id, node, scope_exit, callsite_stream, codegen):
+def synchronize_streams(sdfg, cfg, dfg, state_id, node, scope_exit, callsite_stream, codegen, stream_expr=None):
     # Post-kernel stream synchronization (with host or other streams)
     max_streams = int(Config.get("compiler", "cuda", "max_concurrent_streams"))
-    if max_streams >= 0:
+    if stream_expr is not None:
+        cudastream = stream_expr
+    elif max_streams >= 0:
         cudastream = common.gpu_stream_expr(node._cuda_stream)
     else:  # Only default stream is used
         cudastream = 'nullptr'
@@ -1544,22 +1607,55 @@ def synchronize_streams(sdfg, cfg, dfg, state_id, node, scope_exit, callsite_str
     if max_streams >= 0 and hasattr(node, "_cuda_stream"):
         backend = common.get_gpu_backend()
 
+        synced_host = False
         for edge in dfg.out_edges(scope_exit):
+
+            # A host-located destination is read by plain host code as soon as the asynchronous
+            # work is issued -- a kernel launch packing a by-value argument counts -- and neither
+            # events nor consumer stream stamps order the host. Wait on the issuing stream once
+            # (copy-edge analog: ``_emit_copy`` in cuda.py).
+            hostnode = edge.dst
+            while (isinstance(hostnode, nodes.AccessNode) and hostnode.data is not None
+                   and isinstance(sdfg.arrays[hostnode.data], data.View)):
+                hostnode = dfg.out_edges(hostnode)[0].dst
+            if (isinstance(hostnode, nodes.AccessNode) and hostnode.data is not None
+                    and sdfg.arrays[hostnode.data].storage
+                    not in (dtypes.StorageType.GPU_Global, dtypes.StorageType.GPU_Shared)):
+                if not synced_host:
+                    callsite_stream.write(
+                        "DACE_GPU_CHECK(%sStreamSynchronize(%s));" % (backend, cudastream),
+                        cfg,
+                        state_id,
+                        [edge.src, edge.dst],
+                    )
+                    synced_host = True
+                continue
 
             if (isinstance(edge.dst, nodes.AccessNode) and hasattr(edge.dst, '_cuda_stream')
                     and edge.dst._cuda_stream != node._cuda_stream):
-                callsite_stream.write(
-                    """DACE_GPU_CHECK({backend}EventRecord(__state->gpu_context->events[{ev}], {src_stream}));
+                # Stream assignment gives a cross-stream edge its own event. Event 0 belongs to some
+                # other edge, so recording into it when this edge has none breaks that edge's
+                # ordering instead of establishing this one -- let the host wait instead.
+                if hasattr(edge, "_cuda_event"):
+                    callsite_stream.write(
+                        """DACE_GPU_CHECK({backend}EventRecord(__state->gpu_context->events[{ev}], {src_stream}));
 DACE_GPU_CHECK({backend}StreamWaitEvent({dst_stream}, __state->gpu_context->events[{ev}], 0));""".format(
-                        ev=edge._cuda_event if hasattr(edge, "_cuda_event") else 0,
-                        src_stream=cudastream,
-                        dst_stream=common.gpu_stream_expr(edge.dst._cuda_stream),
-                        backend=backend,
-                    ),
-                    cfg,
-                    state_id,
-                    [edge.src, edge.dst],
-                )
+                            ev=edge._cuda_event,
+                            src_stream=cudastream,
+                            dst_stream=common.gpu_stream_expr(edge.dst._cuda_stream),
+                            backend=backend,
+                        ),
+                        cfg,
+                        state_id,
+                        [edge.src, edge.dst],
+                    )
+                else:
+                    callsite_stream.write(
+                        "DACE_GPU_CHECK(%sStreamSynchronize(%s));" % (backend, cudastream),
+                        cfg,
+                        state_id,
+                        [edge.src, edge.dst],
+                    )
                 continue
 
             # If a view, get the relevant access node
@@ -1572,24 +1668,37 @@ DACE_GPU_CHECK({backend}StreamWaitEvent({dst_stream}, __state->gpu_context->even
             for e in dfg.out_edges(dstnode):
                 if isinstance(e.dst, nodes.AccessNode):
                     continue
-                # If no stream at destination: synchronize stream with host.
+                # If no stream at destination: the consumer runs on the host, so wait for the stream.
                 if not hasattr(e.dst, "_cuda_stream"):
-                    pass
-                    # Done at destination
-
-                # If different stream at destination: record event and wait
-                # for it in target stream.
-                elif e.dst._cuda_stream != node._cuda_stream:
                     callsite_stream.write(
-                        """{backend}EventRecord(__state->gpu_context->events[{ev}], {src_stream});
-    {backend}StreamWaitEvent({dst_stream}, __state->gpu_context->events[{ev}], 0);""".format(
-                            ev=e._cuda_event if hasattr(e, "_cuda_event") else 0,
-                            src_stream=cudastream,
-                            dst_stream=common.gpu_stream_expr(e.dst._cuda_stream),
-                            backend=backend,
-                        ),
+                        "DACE_GPU_CHECK(%sStreamSynchronize(%s));" % (backend, cudastream),
                         cfg,
                         state_id,
                         [e.src, e.dst],
                     )
+
+                # If different stream at destination: record event and wait
+                # for it in target stream.
+                elif e.dst._cuda_stream != node._cuda_stream:
+                    # Same as above: without an event of its own there is nothing to record into.
+                    if hasattr(e, "_cuda_event"):
+                        callsite_stream.write(
+                            """DACE_GPU_CHECK({backend}EventRecord(__state->gpu_context->events[{ev}], {src_stream}));
+DACE_GPU_CHECK({backend}StreamWaitEvent({dst_stream}, __state->gpu_context->events[{ev}], 0));""".format(
+                                ev=e._cuda_event,
+                                src_stream=cudastream,
+                                dst_stream=common.gpu_stream_expr(e.dst._cuda_stream),
+                                backend=backend,
+                            ),
+                            cfg,
+                            state_id,
+                            [e.src, e.dst],
+                        )
+                    else:
+                        callsite_stream.write(
+                            "DACE_GPU_CHECK(%sStreamSynchronize(%s));" % (backend, cudastream),
+                            cfg,
+                            state_id,
+                            [e.src, e.dst],
+                        )
                 # Otherwise, no synchronization necessary

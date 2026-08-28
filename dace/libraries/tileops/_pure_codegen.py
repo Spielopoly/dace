@@ -596,20 +596,13 @@ def resolve_gather_deps(idx_shape, widths):
     :returns: Sorted tuple of tile dim indices, ``()`` for the scalar case,
         or ``None`` when the shape cannot be reconciled with ``widths``.
     """
-    import sympy
     import dace
-    from dace.symbolic import ONE
-
-    def _is_one(s):
-        """True only for the :data:`ONE` broadcast marker -- NOT a literal ``1``.
-
-        ``ONE`` is the deliberate broadcast / collapsed-dim marker; a literal
-        ``1`` extent means a genuine width-1 tile dim (a real dependency). The
-        two must stay distinct here -- that disambiguation (broadcast vs a
-        coincidental width-1 dep) is the whole reason ``ONE`` is a symbol and
-        not just ``1`` (user 2026-06-14), and it is what keeps the index-tile
-        rank aligned with the data tile (cuTile-faithful broadcast dims)."""
-        return isinstance(s, sympy.Basic) and ONE in s.free_symbols
+    # ``has_one_marker`` is True only for the ONE broadcast marker -- NOT a literal ``1``. A
+    # literal ``1`` extent means a genuine width-1 tile dim (a real dependency). The two must
+    # stay distinct here -- that disambiguation (broadcast vs a coincidental width-1 dep) is the
+    # whole reason ONE is a symbol and not just ``1`` (user 2026-06-14), and it is what keeps the
+    # index-tile rank aligned with the data tile (cuTile-faithful broadcast dims).
+    from dace.symbolic import has_one_marker
 
     def _extent_eq(a, b):
         """Symbolic-safe extent equality."""
@@ -631,7 +624,7 @@ def resolve_gather_deps(idx_shape, widths):
         return None
     deps = []
     for d in range(K):
-        if _is_one(idx_shape[d]):
+        if has_one_marker(idx_shape[d]):
             continue  # broadcast dim -- not a dependency
         if not _extent_eq(idx_shape[d], widths[d]):
             return None  # non-marker extent disagrees with the tile width
@@ -682,7 +675,11 @@ def _strides_match_packed(shape, strides, order):
         try:
             # relax_ipow so the canonicalized packed-C stride ``ipow(N, 2)`` compares equal to
             # ``N*N``; the opaque ``ipow`` never simplifies against ``expected`` (heat3d).
-            diff = dace.symbolic.simplify(dace.symbolic.relax_ipow(sympy.sympify(strides[d] - expected)))
+            # Equalize before simplifying: a stride and a shape dim can carry two same-named symbol
+            # INSTANCES (different dtype/assumptions) whose subtraction never cancels (channel_flow).
+            diff = strides[d] - expected
+            if isinstance(diff, sympy.Basic):
+                diff = dace.symbolic.simplify(dace.symbolic.relax_ipow(dace.symbolic.equalize_symbol(diff)))
             if diff != 0:
                 return False
         except Exception:  # noqa: BLE001 -- conservative refusal on un-comparable expressions.

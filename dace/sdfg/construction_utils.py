@@ -612,8 +612,8 @@ def generate_assignment_as_tasklet_in_state(state: dace.SDFGState, lhs: str, rhs
 
     # Ass tasklets
     t = state.add_tasklet(name=f"assign_{lhs}",
-                          inputs=set(in_connectors.values()),
-                          outputs=set(out_connectors.values()),
+                          inputs=OrderedSet(in_connectors.values()),
+                          outputs=OrderedSet(out_connectors.values()),
                           code=f"{lhs} = {rhs}")
 
     # Add connectors and accesses, do not duplicate array access nodes
@@ -657,10 +657,6 @@ def generate_assignment_as_tasklet_in_state(state: dace.SDFGState, lhs: str, rhs
 
 def get_num_parent_map_scopes(root_sdfg: dace.SDFG, node: dace.nodes.MapEntry, parent_state: dace.SDFGState):
     return len(get_parent_maps(root_sdfg, node, parent_state))
-
-
-def get_num_parent_map_and_loop_scopes(root_sdfg: dace.SDFG, node: dace.nodes.MapEntry, parent_state: dace.SDFGState):
-    return len(get_parent_map_and_loop_scopes(root_sdfg, node, parent_state))
 
 
 def get_parent_map_and_loop_scopes_cfg(root_cfg: ControlFlowRegion, node: Union[dace.nodes.MapEntry, ControlFlowRegion,
@@ -844,6 +840,7 @@ from typing import Set
 import dace
 from dace.properties import CodeBlock
 from dace.sdfg.state import ConditionalBlock, LoopRegion
+from ordered_set import OrderedSet
 
 _TOKEN_SPLIT_RE = re.compile(r'[()\[\]\s,+\-*/%<>!=&|^~?:]+')
 

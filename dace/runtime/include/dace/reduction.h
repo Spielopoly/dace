@@ -18,6 +18,9 @@
 #include <thrust/iterator/transform_iterator.h>
 
 #include <cub/cub.cuh>
+// The cub iterators are deprecated in favour of these, and warn from CCCL 2.8 on (CUDA 12.8).
+// Only the bundled cub predates thrust here, so that fallback keeps the cub spelling.
+#define DACE_THRUST_ITERATORS
 #else
 #include "../../../external/cub/cub/block/block_reduce.cuh"
 #include "../../../external/cub/cub/device/device_reduce.cuh"
@@ -27,7 +30,8 @@
 #endif
 #endif
 
-#ifdef __HIPCC__
+// Not __HIPCC__: hip_common.h defines it in the host pass too on the NVIDIA platform.
+#ifdef __HIP_DEVICE_COMPILE__
 // HIP supports the same set of atomic ops as CUDA SM 6.0+
 #define DACE_USE_GPU_ATOMICS
 #define DACE_USE_GPU_DOUBLE_ATOMICS
@@ -935,7 +939,7 @@ struct StridedIteratorHelper {
 };
 
 inline auto stridedIterator(size_t stride) {
-#if __CUDACC_VER_MAJOR__ >= 13
+#ifdef DACE_THRUST_ITERATORS
   thrust::counting_iterator
 #else
   cub::CountingInputIterator
@@ -943,7 +947,7 @@ inline auto stridedIterator(size_t stride) {
       <int>
           counting_iterator(0);
   StridedIteratorHelper conversion_op(stride);
-#if __CUDACC_VER_MAJOR__ >= 13
+#ifdef DACE_THRUST_ITERATORS
   thrust::transform_iterator<decltype(conversion_op),
                              decltype(counting_iterator)>
       itr(counting_iterator, conversion_op);

@@ -9,12 +9,13 @@ import warnings
 
 import numpy as np
 
-from dace import data, dtypes, registry, memlet as mmlt, subsets, symbolic, Config
+from dace import data, dtypes, mpr_lowering, registry, memlet as mmlt, subsets, symbolic, Config
+from dace.config import set_temporary
 from dace.codegen import compiler_family, cppunparse, exceptions as cgx
 from dace.codegen.codeobject import CodeObject
 from dace.codegen.prettycode import CodeIOStream
 from dace.codegen.targets import cpp
-from dace.codegen.common import codeblock_to_cpp, sym2cpp, update_persistent_desc
+from dace.codegen.common import codeblock_to_cpp, emits_tree_reductions, sym2cpp, update_persistent_desc
 from dace.codegen.target import TargetCodeGenerator, make_absolute
 from dace.codegen.dispatcher import DefinedType, TargetDispatcher
 from dace.frontend import operations
@@ -32,20 +33,26 @@ if TYPE_CHECKING:
     from dace.codegen.targets.framecode import DaCeCodeGenerator
 
 
+def stack_variable_length_array(sdfg: SDFG, nodedesc: data.Data, arrsize, lifetime, declared: bool) -> bool:
+    """ Whether a symbolically-sized register array is declared as a stack variable-length array,
+        which GCC, Clang and NVHPC all accept. A VLA is defined at its declaration and dies with
+        its block, so a lifetime that outlives the block keeps the heap, and so does a split
+        declare/allocate: ``declare_array`` has already emitted the pointer at SDFG scope, and a
+        VLA here would shadow it. Allocation and deallocation both ask here so they cannot disagree.
+    """
+    return (nodedesc.storage == dtypes.StorageType.Register and not declared
+            and symbolic.issymbolic(arrsize, sdfg.constants) and lifetime
+            in (dtypes.AllocationLifetime.Scope, dtypes.AllocationLifetime.State, dtypes.AllocationLifetime.SDFG))
+
+
 def use_aligned_operator_new(desc: data.Data) -> bool:
     """Whether heap arrays are allocated with aligned ``operator new``.
 
-    The function considers the selected C++ standard and the `alignment` property
-    of the data descriptor.
+    DaCe always builds against C++20 or newer (see ``dace.codegen.common.cpp_standard``), where
+    aligned ``operator new``/``operator delete`` are guaranteed available, so this follows the
+    descriptor's ``alignment`` property alone.
     """
-    try:
-        if int(Config.get('compiler', 'cpp_standard')) < 17:
-            return False  # Aligned `new` not supported by the standard.
-        if desc.alignment >= 0:
-            return True  # Alignment requested either default (0) or concrete value
-        return False
-    except ValueError:
-        return False
+    return desc.alignment >= 0  # Alignment requested either default (0) or concrete value
 
 
 def aligned_new_value(desc: data.Data) -> int:
@@ -167,34 +174,37 @@ def map_schedule_is_sequential(node: nodes.MapEntry) -> bool:
     return node.map.schedule not in (dtypes.ScheduleType.CPU_Multicore, dtypes.ScheduleType.CPU_Persistent)
 
 
-def hoist_loop_decls(node: nodes.MapEntry) -> bool:
+def hoist_loop_decls(node: nodes.MapEntry, will_have_openmp_pragma: bool = False) -> bool:
     """Whether this map's induction variables are declared ahead of their loops (``T i = begin; for (;
     ...)``) instead of in the for-statement's init clause, per ``codegen_params.loop_decl_style``.
 
-    Never for an OpenMP-scheduled map: the pragma must be immediately followed by a CANONICAL loop
-    whose init clause declares the induction variable, so hoisting leaves the pragma facing a
-    declaration and the compiler rejects it ("loop nest expected"). The knob therefore applies to
-    sequential maps only.
+    Never for a loop that will be immediately preceded by an OpenMP directive: the pragma must be
+    immediately followed by a CANONICAL loop whose init clause declares the induction variable, so
+    hoisting leaves the pragma facing a declaration and the compiler rejects it ("loop nest
+    expected"). The knob therefore applies to sequential loops that do not get an OpenMP ``simd``
+    pragma, and to the non-innermost loops of a Sequential map even when ``MarkSIMDMaps`` marked
+    it.
     """
     if Config.get('compiler', 'cpu', 'codegen_params', 'loop_decl_style') != 'hoisted':
         return False
-    return map_schedule_is_sequential(node)
+    return map_schedule_is_sequential(node) and not will_have_openmp_pragma
 
 
-def loop_exit_test(begin, end, skip, node: nodes.MapEntry) -> Tuple[str, str]:
+def loop_exit_test(begin, end, skip, node: nodes.MapEntry, will_have_openmp_pragma: bool = False) -> Tuple[str, str]:
     """The ``(comparison, bound)`` of a map loop's exit test, per ``codegen_params.loop_bound_cmp``.
 
     Every spelling covers the identical iteration space ``[begin, end]`` at stride ``skip``.
 
-    ``ne`` supports any stride on a SEQUENTIAL loop. A naive ``i != end + 1`` is only correct when the
+    ``ne`` supports any stride on a non-OpenMP loop. A naive ``i != end + 1`` is only correct when the
     stride divides the range -- otherwise the counter steps OVER that bound, never compares equal, and
     the loop does not terminate. So for a non-unit stride the bound is normalised to the first value
     the counter actually LANDS on at or past the end, ``begin + int_ceil(end + 1 - begin, skip) *
     skip``, which the induction variable is guaranteed to hit exactly.
 
-    On an OpenMP-scheduled map, ``ne`` is legal ONLY with a stride the compiler can see is +/-1: the
-    canonical loop form the pragma requires rejects ``!=`` otherwise (``g++``: "increment is not
-    constant 1 or -1 for '!=' condition"). A non-unit / symbolic stride there falls back to ``<``.
+    On a loop that will be immediately preceded by an OpenMP directive, ``ne`` is legal ONLY with a
+    stride the compiler can see is +/-1: the canonical loop form the pragma requires rejects ``!=``
+    otherwise (``g++``: "increment is not constant 1 or -1 for '!=' condition"). A non-unit / symbolic
+    stride there falls back to ``<``.
     """
     mode = Config.get('compiler', 'cpu', 'codegen_params', 'loop_bound_cmp')
     if mode == 'le':
@@ -202,8 +212,7 @@ def loop_exit_test(begin, end, skip, node: nodes.MapEntry) -> Tuple[str, str]:
     if mode == 'ne':
         if symbolic.pystr_to_symbolic(skip) == 1:
             return '!=', sym2cpp(end + 1)
-        openmp = node.map.schedule in (dtypes.ScheduleType.CPU_Multicore, dtypes.ScheduleType.CPU_Persistent)
-        if not openmp:
+        if not will_have_openmp_pragma:
             return '!=', sym2cpp(begin + symbolic.int_ceil(end + 1 - begin, skip) * skip)
     return '<', sym2cpp(end + 1)
 
@@ -445,6 +454,9 @@ class CPUCodeGen(TargetCodeGenerator):
     target_name = "cpu"
     language = "cpp"
 
+    #: Legacy target: tree reductions are opt-in. The experimental subclass overrides this.
+    experimental_codegen = False
+
     def _define_sdfg_arguments(self, sdfg, arglist):
         # NOTE: Multi-nesting with container arrays must be further investigated.
         def _visit_structure(struct: data.Structure, args: dict, prefix: str = ''):
@@ -523,6 +535,10 @@ class CPUCodeGen(TargetCodeGenerator):
         # strictly wasted work (and would be incorrect in the rare case
         # the OMP runtime privatizes-by-value rather than by-pointer).
         self._omp_reduction_scope_stack = []
+        #: Per sequential-map scope: ``{data name: {'var', 'op', 'subset', 'target'}}`` for WCR
+        #: accumulators hoisted into a local scalar for the duration of the loop nest. Pushed by
+        #: ``_generate_MapEntry``, read by ``write_and_resolve_expr``, drained by ``_generate_MapExit``.
+        self._seq_accumulator_stack = []
 
         # id(Map) -> whether its MapEntry opened an encapsulating C scope, so the matching MapExit
         # closes exactly the braces that were opened. Keyed on the Map, which the entry and exit
@@ -832,8 +848,17 @@ class CPUCodeGen(TargetCodeGenerator):
         # Allocate the viewed data before the view, if necessary
         mpath = dfg.memlet_path(edge)
         viewed_dnode: nodes.AccessNode = mpath[-1].dst if is_write else mpath[0].src
-        self._dispatcher.dispatch_allocate(sdfg, cfg, dfg, state_id, viewed_dnode, viewed_dnode.desc(sdfg),
-                                           global_stream, allocation_stream)
+        viewed_desc = viewed_dnode.desc(sdfg)
+        # "If necessary" is decided by the FRAME generator, not here. A DECLARED array is one it
+        # already owns: it picked the single state that allocates it and emitted the declaration at a
+        # scope dominating every use. Allocating it again from a view -- which is what happens
+        # whenever the view sits in a LATER state, where the allocating state's ``defined_vars``
+        # scope has already been popped, so ``allocate_array``'s own guard cannot see it -- hands the
+        # view a fresh buffer and silently discards everything the earlier state wrote. stockham_fft
+        # read zeros out of two transients for exactly this.
+        if not self._dispatcher.declared_arrays.has(self.ptr(viewed_dnode.data, viewed_desc, sdfg)):
+            self._dispatcher.dispatch_allocate(sdfg, cfg, dfg, state_id, viewed_dnode, viewed_desc, global_stream,
+                                               allocation_stream)
 
         # Memlet points to view, construct mirror memlet
         memlet = edge.data
@@ -1039,6 +1064,8 @@ class CPUCodeGen(TargetCodeGenerator):
         if not isinstance(nodedesc.dtype, dtypes.opaque):
             arrsize_bytes = arrsize * nodedesc.dtype.bytes
 
+        variable_length_array = stack_variable_length_array(sdfg, nodedesc, arrsize, top_lifetime, declared)
+
         if isinstance(nodedesc, data.Structure) and not isinstance(nodedesc, data.StructureView):
             declaration_stream.write(f"{nodedesc.ctype} {name} = new {nodedesc.dtype.base_type};\n")
             define_var(name, DefinedType.Pointer, nodedesc.ctype)
@@ -1116,7 +1143,7 @@ class CPUCodeGen(TargetCodeGenerator):
 
         elif (nodedesc.storage == dtypes.StorageType.CPU_Heap
               or (nodedesc.storage == dtypes.StorageType.Register and
-                  ((symbolic.issymbolic(arrsize, sdfg.constants)) or
+                  ((symbolic.issymbolic(arrsize, sdfg.constants) and not variable_length_array) or
                    (arrsize_bytes and ((arrsize_bytes > Config.get("compiler", "max_stack_array_size")) == True))))):
 
             if nodedesc.storage == dtypes.StorageType.Register:
@@ -1174,10 +1201,16 @@ class CPUCodeGen(TargetCodeGenerator):
             ctypedef = dtypes.pointer(nodedesc.dtype).ctype
             if nodedesc.start_offset != 0:
                 raise NotImplementedError('Start offset unsupported for registers')
-            align = register_align_attribute(nodedesc)
-            if node.setzero:
+            # A VLA is neither alignable nor brace-initializable, so it zeroes by assignment.
+            alignment = '' if variable_length_array else '  DACE_ALIGN(64)'
+            # ``alignas`` says the same thing without a DaCe macro, and is a keyword in both C++11
+            # and C23, so a standalone unit that includes no DaCe header can still be aligned.
+            prefix = ''
+            if alignment and mpr_lowering.standalone():
+                alignment, prefix = '', 'alignas(64) '
+            if node.setzero and not variable_length_array:
                 declaration_stream.write(
-                    "%s %s[%s]%s = {0};\n" % (nodedesc.dtype.ctype, name, cpp.sym2cpp(arrsize), align),
+                    "%s%s %s[%s]%s = {0};\n" % (prefix, nodedesc.dtype.ctype, name, cpp.sym2cpp(arrsize), alignment),
                     cfg,
                     state_id,
                     node,
@@ -1185,11 +1218,15 @@ class CPUCodeGen(TargetCodeGenerator):
                 define_var(name, DefinedType.Pointer, ctypedef)
                 return
             declaration_stream.write(
-                "%s %s[%s]%s;\n" % (nodedesc.dtype.ctype, name, cpp.sym2cpp(arrsize), align),
+                "%s%s %s[%s]%s;\n" % (prefix, nodedesc.dtype.ctype, name, cpp.sym2cpp(arrsize), alignment),
                 cfg,
                 state_id,
                 node,
             )
+            if node.setzero:
+                allocation_stream.write(
+                    "memset(%s, 0, sizeof(%s)*(%s));\n" % (name, nodedesc.dtype.ctype, cpp.sym2cpp(arrsize)), cfg,
+                    state_id, node)
             define_var(name, DefinedType.Pointer, ctypedef)
             return
         elif nodedesc.storage is dtypes.StorageType.CPU_ThreadLocal:
@@ -1204,20 +1241,17 @@ class CPUCodeGen(TargetCodeGenerator):
                 )
                 self._dispatcher.declared_arrays.add_global(name, DefinedType.Pointer, '%s *' % nodedesc.dtype.ctype)
 
-            # Allocate in each OpenMP thread
-            aligned = ''
-            if use_aligned_operator_new(nodedesc):
-                align_value = 64 if nodedesc.alignment == 0 else nodedesc.alignment
-                aligned = f'(std::align_val_t({align_value}))'
-
+            # Allocate in each OpenMP thread, through the same statement builder as CPU_Heap so a
+            # generator that spells allocation differently (MPR's C dialect: aligned_alloc) is not
+            # bypassed by this branch.
             allocation_stream.write(
-                """
-                #pragma omp parallel
-                {{
-                    {name} = new {aligned}{ctype} [{arrsize}];""".format(aligned=aligned,
-                                                                         ctype=nodedesc.dtype.ctype,
-                                                                         name=alloc_name,
-                                                                         arrsize=cpp.sym2cpp(arrsize)),
+                '\n#pragma omp parallel\n{\n' + self.heap_alloc_stmt(alloc_name,
+                                                                     nodedesc.dtype.ctype,
+                                                                     cpp.sym2cpp(arrsize),
+                                                                     nodedesc.alignment,
+                                                                     sdfg=sdfg,
+                                                                     nodedesc=nodedesc,
+                                                                     data_name=node.data),
                 cfg,
                 state_id,
                 node,
@@ -1246,7 +1280,8 @@ class CPUCodeGen(TargetCodeGenerator):
         if isinstance(nodedesc, data.Array) and nodedesc.start_offset != 0:
             alloc_name = f'({alloc_name} - {cpp.sym2cpp(nodedesc.start_offset)})'
 
-        if self._dispatcher.declared_arrays.has(alloc_name):
+        declared = self._dispatcher.declared_arrays.has(alloc_name)
+        if declared:
             is_global = nodedesc.lifetime in (dtypes.AllocationLifetime.Global, dtypes.AllocationLifetime.Persistent,
                                               dtypes.AllocationLifetime.External)
             self._dispatcher.declared_arrays.remove(alloc_name, is_global=is_global)
@@ -1258,23 +1293,14 @@ class CPUCodeGen(TargetCodeGenerator):
             return
         elif (nodedesc.storage == dtypes.StorageType.CPU_Heap
               or (nodedesc.storage == dtypes.StorageType.Register and
-                  (symbolic.issymbolic(arrsize, sdfg.constants) or
+                  ((symbolic.issymbolic(arrsize, sdfg.constants)
+                    and not stack_variable_length_array(sdfg, nodedesc, arrsize, nodedesc.lifetime, declared)) or
                    (arrsize_bytes and ((arrsize_bytes > Config.get("compiler", "max_stack_array_size")) == True))))):
             callsite_stream.write(self.heap_free_stmt(alloc_name, isinstance(nodedesc, data.Array), nodedesc), cfg,
                                   state_id, node)
         elif nodedesc.storage is dtypes.StorageType.CPU_ThreadLocal:
-            # Deallocate in each OpenMP thread
-            if isinstance(nodedesc, data.Array):
-                # Aligned pairing + trivial-destructibility guard as above.
-                if use_aligned_operator_new(nodedesc):
-                    align_value = 64 if nodedesc.alignment == 0 else nodedesc.alignment
-                    delete_stmt = (f"static_assert(std::is_trivially_destructible<{nodedesc.dtype.ctype}>::value, "
-                                   f"\"aligned heap deallocation skips destructors\"); "
-                                   f"::operator delete[]({alloc_name}, std::align_val_t({align_value}));")
-                else:
-                    delete_stmt = f"delete[] {alloc_name};"
-            else:
-                delete_stmt = f"delete {alloc_name};"
+            # Deallocate in each OpenMP thread, through the same statement builder as the allocation.
+            delete_stmt = self.heap_free_stmt(alloc_name, isinstance(nodedesc, data.Array), nodedesc)
             callsite_stream.write(
                 f"""#pragma omp parallel
                 {{
@@ -1638,6 +1664,13 @@ class CPUCodeGen(TargetCodeGenerator):
         # target in a ``reduction(...)`` clause -- the OMP runtime privatizes
         # the variable per thread and tree-reduces at the end, so adding an
         # atomic on top is strictly wasted work.
+        # A sequential map hoisted this accumulator into a local scalar: accumulate there. The
+        # subset has to match the one the hoist was taken for -- a different element of the same
+        # array is a different location and still goes to memory.
+        for frame in reversed(self._seq_accumulator_stack):
+            acc = frame.get(memlet.data)
+            if acc is not None and str(memlet.subset) == str(acc['subset']):
+                return f"{acc['var']} = {acc['var']} {acc['op']} ({inname})"
         _omp_covered = any(memlet.data in frame for frame in self._omp_reduction_scope_stack)
         atomic = "" if (nc or _omp_covered) else "_atomic"
         wcr_desc = sdfg.arrays[memlet.data]
@@ -1676,6 +1709,9 @@ class CPUCodeGen(TargetCodeGenerator):
         if isinstance(dtype, dtypes.pointer):
             dtype = dtype.base_type
 
+        if mpr_lowering.standalone():
+            return self.standalone_wcr(sdfg, memlet, redtype, ptr, inname, dtype, bool(atomic))
+
         # If there is a type mismatch and more than one element is used, cast
         # pointer (vector->vector WCR). Otherwise, generate vector->scalar
         # (horizontal) reduction.
@@ -1701,6 +1737,60 @@ class CPUCodeGen(TargetCodeGenerator):
         return (
             f'const auto __dace__reduction_lambda = {custom_reduction};\ndace::wcr_custom<{dtype.ctype}>::{func}<decltype(__dace__reduction_lambda)>(__dace__reduction_lambda, {ptr}, {inname})'
         )
+
+    def standalone_wcr(self, sdfg: SDFG, memlet, redtype, ptr: str, inname: str, dtype, atomic: bool) -> str:
+        """The MPR spelling of a conflict resolution, or a refusal.
+
+        MPR admits exactly the WCR forms that are TREE-reducible: one an enclosing OpenMP map folds
+        through a ``reduction(op:...)`` clause, and one that has no conflict at all (``nc``) and so
+        is a plain read-modify-write. The remaining form is a per-element atomic, which the runtime
+        provides as ``dace::wcr_fixed<...>::reduce_atomic`` -- serialized machinery, and a runtime
+        symbol MPR does not have. It is refused rather than rendered as an ``omp atomic``: the point
+        of MPR is to show the maximally parallel form of the program, and an atomic accumulation is
+        the form that says the parallelization was not resolved.
+
+        :param sdfg: the SDFG owning the memlet, for unparsing a custom resolution.
+        :param memlet: the memlet carrying the WCR, for the message.
+        :param redtype: the detected reduction type.
+        :param ptr: the C++ pointer expression for the target element.
+        :param inname: the value being accumulated.
+        :param dtype: the element type.
+        :param atomic: whether the write conflicts (no enclosing fold, more than one writer).
+        :returns: the C++ statement performing the accumulation.
+        :raises NotImplementedError: for a conflicting, custom or vector-typed WCR.
+        """
+        target = f'{memlet.data}[{memlet.subset}]'
+        if atomic:
+            raise NotImplementedError(
+                f'MPR cannot render the conflicting write-conflict resolution on {target}: it lowers to an '
+                'atomic, and MPR admits only tree-reducible WCR (an OpenMP reduction clause, or a '
+                'non-conflicting accumulation). Parallelize the map so the accumulator is reduced, or '
+                'render the SDFG that does.')
+        if isinstance(dtype, dtypes.vector):
+            raise NotImplementedError(f'MPR cannot render the vector WCR on {target}: the vector type is a DaCe '
+                                      'runtime template. Scalarize the map before rendering.')
+        # No OpenMP clause spells these two, so they never reach the fold above -- but both are a
+        # plain expression in either dialect, and both match the runtime functor exactly
+        # (``reduction.h``: Logical_Xor is ``a != b``, Exchange is ``b``).
+        if redtype is dtypes.ReductionType.Exchange:
+            return f'*({ptr}) = ({inname})'
+        if redtype is dtypes.ReductionType.Logical_Xor:
+            return f'*({ptr}) = (*({ptr}) != ({inname}))'
+        operator = _REDUCTION_TO_OMP_OP.get(redtype)
+        if operator in ('+', '*', '&', '|', '^', '&&', '||'):
+            return f'*({ptr}) = *({ptr}) {operator} ({inname})'
+        if operator in ('min', 'max'):
+            # C has no ``std::min``; MPR emits its own typed pair (see mpr_lowering.C_MINMAX_TYPES).
+            spelling = f'mpr_{operator}' if mpr_lowering.standalone_c() else f'std::{operator}'
+            return f'*({ptr}) = {spelling}(*({ptr}), {inname})'
+        if redtype is dtypes.ReductionType.Custom:
+            # Not conflicting by here, so the runtime would take ``wcr_custom<T>::reduce``, which is
+            # ``*ptr = wcr(*ptr, value)`` with no critical section. Inlining the body reproduces that
+            # without a lambda, which the C dialect could not spell. ``Sub`` and ``Div`` arrive here
+            # too: no OpenMP clause names them, so they detect as Custom.
+            return f'*({ptr}) = {cpp.unparse_cr_inline(sdfg, memlet.wcr, (f"*({ptr})", f"({inname})"))}'
+        raise NotImplementedError(f'MPR has no standalone spelling for the {redtype} write-conflict resolution '
+                                  f'on {target}; it is provided by the DaCe reduction runtime.')
 
     def process_out_memlets(self,
                             sdfg: SDFG,
@@ -2004,17 +2094,15 @@ class CPUCodeGen(TargetCodeGenerator):
                             result += "const {} {} = {};".format(memlet_type, local_name, expr)
                         elif (var_type == DefinedType.Scalar and isinstance(conntype, dtypes.pointer)
                               and not isinstance(desc.dtype, dtypes.opaque)):
-                            # Scalar source feeding a pointer-typed connector
-                            # (e.g. CopyLibraryNode -> cudaMemcpyAsync from a host
-                            # scalar argument). The connector's pointer type wins
-                            # over the source's scalar ctypedef, and we have to
-                            # take the address of the host variable. Skip for
-                            # opaque dtypes (MPI_Comm / MPI_Request / cuda handles
-                            # etc.) -- the value is already a pointer-like handle,
-                            # so address-of would add an unwanted indirection
-                            # that breaks the libnode call (e.g. ``MPI_Bcast``
-                            # expects ``MPI_Comm``, not ``MPI_Comm *``).
-                            result += "{} {} = &{};".format(conntype.ctype, local_name, expr)
+                            # Scalar source feeding a pointer-typed connector (e.g. CopyLibraryNode
+                            # -> cudaMemcpyAsync from a host scalar argument). The connector's
+                            # pointer type wins over the source's scalar ctypedef, and the address
+                            # of the variable is what the callee wants; `define_out_memlet` already
+                            # does this on the write side. Skip opaque dtypes (MPI_Comm /
+                            # MPI_Request / GPU handles) -- the value is already a pointer-like
+                            # handle, so address-of adds an indirection the callee rejects
+                            # (``MPI_Bcast`` expects ``MPI_Comm``, not ``MPI_Comm *``).
+                            result += "{}* {} = &{};".format(ctypedef, local_name, expr)
                         else:
                             # Pointer reference. ``ctypedef`` may already include
                             # ``__restrict__`` (from a parent scope's Scalar->Pointer
@@ -2429,8 +2517,29 @@ class CPUCodeGen(TargetCodeGenerator):
         else:
             callsite_stream.write(f'{cdtype.ctype} {edge.src_conn};', cfg, state_id, src_node)
 
+    @staticmethod
+    def nsdfg_symbol_argument(symbol: dtypes.typeclass, name: str) -> str:
+        """One nested-SDFG symbol parameter, widened to ``int64_t`` for MPR.
+
+        A loop iterator carries the int32 default symbol type, so a nested body that takes one names
+        it ``int`` while every index and ``_size`` helper MPR emits beside it is ``int64_t`` -- the
+        call then narrows an EXTENT (a dot product's trip count, in cholesky) and truncates past
+        2^31. Only the standalone dialect is widened: main's signatures are not this generator's to
+        change.
+        """
+        if mpr_lowering.standalone() and symbol in (dtypes.int8, dtypes.int16, dtypes.int32, dtypes.int64):
+            return dtypes.int64.as_arg(name)
+        return symbol.as_arg(name)
+
     def generate_nsdfg_header(self, sdfg, cfg, state, state_id, node, memlet_references, sdfg_label, state_struct=True):
         arguments = []
+
+        # MPR emits no state struct at all (see framecode.generate_fileheader), so a nested function
+        # cannot take a pointer to it. Anything that would have been READ through it -- persistent
+        # buffers, instrumentation, environment handles -- is refused or demoted before rendering,
+        # so dropping the parameter drops nothing the body still needs.
+        if state_struct and mpr_lowering.standalone():
+            state_struct = False
 
         if state_struct:
             toplevel_sdfg: SDFG = sdfg.cfg_list[0]
@@ -2457,14 +2566,16 @@ class CPUCodeGen(TargetCodeGenerator):
         ]
         fsyms = node.sdfg.used_symbols(all_symbols=False, keep_defined_in_mapping=True)
         arguments += [
-            f'{node.sdfg.symbols[aname].as_arg(aname)}' for aname in sorted(node.symbol_mapping.keys())
-            if aname in fsyms and aname not in sdfg.constants
+            f'{self.nsdfg_symbol_argument(node.sdfg.symbols[aname], aname)}'
+            for aname in sorted(node.symbol_mapping.keys()) if aname in fsyms and aname not in sdfg.constants
         ]
         arguments = ', '.join(arguments)
         return f'void {sdfg_label}({arguments}) {{'
 
     def generate_nsdfg_call(self, sdfg, cfg, state, node, memlet_references, sdfg_label, state_struct=True):
         prepend = []
+        if state_struct and mpr_lowering.standalone():
+            state_struct = False  # matches generate_nsdfg_header, which drops the parameter
         if state_struct:
             prepend = ['__state']
         fsyms = node.sdfg.used_symbols(all_symbols=False, keep_defined_in_mapping=True)
@@ -2907,6 +3018,87 @@ class CPUCodeGen(TargetCodeGenerator):
                                   '__dace_%s_%s_%s' % (kind, target, child_name), code)
             obj.code = code
 
+    def _collect_sequential_accumulators(self, sdfg: SDFG, state: SDFGState, map_entry: nodes.MapEntry):
+        """WCR accumulators of a SEQUENTIAL map that can live in a local scalar for the loop's
+        duration, as ``(data_name, subset, op_str, ctype, target_expr)`` tuples.
+
+        A sequential map has no concurrency, so its WCR write needs no atomic -- but the plain
+        ``wcr_fixed`` form still reads and writes memory every iteration for a location that never
+        changes. Accumulating in a register and storing once at the exit is the same arithmetic in
+        the same order (bit-identical), with one load and one store instead of ``trip`` of each.
+
+        Eligibility mirrors :meth:`_collect_omp_reductions`, minus what only privatization needs and
+        plus the two a live target imposes:
+
+        * the target is a single element (``num_elements() == 1``) whose subset does not mention
+          THIS map's parameters -- a param-dependent subset is a scatter, not one accumulator;
+        * the operator has a plain C++ infix form (``min`` / ``max`` do not, and keep the
+          ``wcr_fixed`` path, which is already the non-atomic one here);
+        * the array is not also READ through the map entry. The accumulator holds the running value
+          in a register until the exit, so such a read would see the stale memory copy;
+        * the value reaches the exit from a TASKLET. That is the only write resolved through
+          :meth:`write_and_resolve_expr`, which is where the accumulation is redirected into the
+          register. Every other source writes the destination directly and never sees the
+          register, so hoisting one declares an accumulator the loop never adds to and then
+          stores the pre-loop value back over the real result at the exit. Two such sources
+          exist: an AccessNode is a memlet COPY, emitted as a ``CopyND::Accumulate``; and a
+          NestedSDFG resolves the conflict INSIDE its own body -- codegen outlines that body
+          into its own function, which calls ``wcr_fixed::reduce`` through the connector
+          pointer it was handed.
+        """
+        out = []
+        seen = set()
+        try:
+            map_exit = state.exit_node(map_entry)
+        except (KeyError, StopIteration):
+            return out
+        read_names = {e.src.data for e in state.in_edges(map_entry) if isinstance(e.src, nodes.AccessNode)}
+        map_param_set = set(map_entry.map.params)
+        for iedge in state.in_edges(map_exit):
+            if iedge.data is None or iedge.data.wcr is None or iedge.data.subset is None:
+                continue
+            in_conn = iedge.dst_conn
+            if not in_conn or not in_conn.startswith("IN_"):
+                continue
+            out_edges = [e for e in state.out_edges(map_exit) if e.src_conn == "OUT_" + in_conn[3:]]
+            if len(out_edges) != 1 or not isinstance(out_edges[0].dst, nodes.AccessNode):
+                continue
+            desc = sdfg.arrays.get(out_edges[0].dst.data)
+            if desc is None or out_edges[0].dst.data in read_names:
+                continue
+            if iedge.data.subset.num_elements() != 1:
+                continue
+            if any(sname in map_param_set for sname in (str(x) for x in iedge.data.subset.free_symbols)):
+                continue
+            op_str = _REDUCTION_TO_OMP_OP.get(operations.detect_reduction_type(iedge.data.wcr))
+            if op_str not in ("+", "*", "&", "|", "^", "&&", "||"):
+                continue
+            # THIS map being sequential is not enough: an enclosing parallel scope makes the
+            # target shared, and a register accumulator would drop every other thread's
+            # contribution where the atomic the conflict check asks for would not.
+            if cpp.is_write_conflicted(state, iedge, sdfg_schedule=self._toplevel_schedule):
+                continue
+            path = state.memlet_path(iedge)
+            if not path or not isinstance(path[0].src, nodes.Tasklet):
+                continue
+            key = (iedge.data.data, str(iedge.data.subset))
+            if key in seen:
+                continue
+            seen.add(key)
+            # Render the destination the way the WCR write itself does: a true ``Scalar`` is a
+            # plain C variable, so ``cpp_array_expr``'s ``tmp[0]`` does not compile. The pointer
+            # form covers both that and an array element, and it is the same lookup
+            # ``write_and_resolve_expr`` performs, so hoisted and un-hoisted name one location.
+            ptrname = self.ptr(iedge.data.data, desc, sdfg)
+            try:
+                defined_type, _ = self._dispatcher.defined_vars.get(ptrname)
+            except KeyError:
+                continue  # not in scope where the accumulator would be declared -> leave it alone
+            target = '*(%s)' % cpp.cpp_ptr_expr(sdfg, iedge.data, defined_type, codegen=self)
+            var = f'__acc_{len(self._seq_accumulator_stack)}_{len(out)}_{iedge.data.data}'
+            out.append((iedge.data.data, iedge.data.subset, op_str, desc.dtype.ctype, target, var))
+        return out
+
     def _collect_omp_reductions(self, sdfg: SDFG, state: SDFGState, map_entry: nodes.MapEntry):
         """Walk the map's WCR-write edges that target an accumulator outside the scope and
         return ``(op_str, clause_target, data_name, declare_line)`` tuples for OpenMP
@@ -2916,7 +3108,9 @@ class CPUCodeGen(TargetCodeGenerator):
         true ``Scalar`` (clause ``reduction(op:var)``, always eligible) or -- only when
         ``sdfg.openmp_array_reductions`` is on -- a plain 0-offset C-contiguous ``Array``
         buffer (clause ``reduction(op:A[0:n])`` over the whole buffer), (c) non-persistent
-        with a subset independent of THIS map's iter variables, and (d) a WCR operator
+        with a subset independent of THIS map's iter variables, (c2) NOT also read by the
+        map (a privatized copy starts at the operator identity, so a read inside the region
+        would see that instead of the shared value), and (d) a WCR operator
         OpenMP supports (see ``_REDUCTION_TO_OMP_OP``); complex element types additionally
         need a ``#pragma omp declare reduction`` (returned as ``declare_line``, ``+``/``*``
         only). Anything else falls through to the atomic path -- correct but contended.
@@ -2970,6 +3164,18 @@ class CPUCodeGen(TargetCodeGenerator):
                 continue
             var_name = self.ptr(oedge.dst.data, desc, sdfg)
 
+            # A reduction clause privatizes the target per thread, identity-initialized, for
+            # the whole region. If the map body also READS the accumulator, those reads see
+            # the private identity instead of the shared value -- silently wrong, and for a
+            # Scalar exactly as for an array section. polybench ``trisolv``: the
+            # forward-substitution map reduces into ``x[i]`` but also reads ``x[j]`` (j < i);
+            # a whole-``x`` reduction makes every ``x[j]`` read ``0``, dropping the sum
+            # (``x[i]=b[i]/L[i,i]``). A sound reduction is a WRITE-ONLY accumulate; if the
+            # container is also read, fall through to the (correct, contended) atomic path.
+            if any(
+                    isinstance(e.src, nodes.AccessNode) and e.src.data == oedge.dst.data
+                    for e in state.in_edges(map_entry)):
+                continue
             # A true Scalar is always eligible for a plain ``reduction(op:var)`` clause
             # (the pre-existing, flag-independent behavior). A whole contiguous Array
             # buffer is eligible for an array-section clause ``reduction(op:A[0:n])`` ONLY
@@ -2984,18 +3190,8 @@ class CPUCodeGen(TargetCodeGenerator):
                 clause_target = var_name
             elif sdfg.openmp_array_reductions:
                 # An array-section reduction ``reduction(op:A[0:n])`` privatizes the WHOLE
-                # buffer per thread (identity-initialized) for the region. If the map body
-                # also READS ``A`` (a non-WCR input flowing through the map entry), those
-                # reads see the private identity copy instead of the shared values -- silently
-                # wrong. polybench ``trisolv``: the forward-substitution map reduces into
-                # ``x[i]`` but also reads ``x[j]`` (j < i); a whole-``x`` reduction makes every
-                # ``x[j]`` read ``0``, dropping the sum (``x[i]=b[i]/L[i,i]``). A sound array
-                # reduction must be a WRITE-ONLY accumulate; if the array is also read, fall
-                # through to the (correct, contended) atomic path.
-                if any(
-                        isinstance(e.src, nodes.AccessNode) and e.src.data == oedge.dst.data
-                        for e in state.in_edges(map_entry)):
-                    continue
+                # buffer per thread for the region; only a provably contiguous buffer is
+                # eligible, anything else falls through to the atomic path.
                 count = _contiguous_element_count(desc)
                 if count is None:
                     continue
@@ -3018,6 +3214,26 @@ class CPUCodeGen(TargetCodeGenerator):
             seen.add(key)
             out.append((op_str, clause_target, oedge.dst.data, declare))
         return out
+
+    def _map_loop_will_have_openmp_pragma(self, sdfg: SDFG, state: SDFGState, map_entry: nodes.MapEntry,
+                                          loop_idx: int) -> bool:
+        """Whether the ``for`` loop at dimension ``loop_idx`` of ``map_entry`` will be immediately
+        preceded by an OpenMP directive. OpenMP canonical form requires the loop after the directive to
+        declare its induction variable in the init clause and to use ``<``/``>`` (or ``<=``/``>=``)
+        with a non-unit stride; callers use this predicate to suppress non-canonical rewrites.
+        """
+        schedule = map_entry.map.schedule
+        if schedule in (dtypes.ScheduleType.CPU_Multicore, dtypes.ScheduleType.CPU_Persistent):
+            return True
+        if schedule != dtypes.ScheduleType.Sequential:
+            return False
+        # ``simd`` goes on the innermost loop of a non-unrolled Sequential map, and only where
+        # ``MarkSIMDMaps`` marked the map -- the pass owns the decision, this reads its verdict.
+        if map_entry.map.unroll:
+            return False
+        if loop_idx != len(map_entry.map.range) - 1:
+            return False
+        return map_entry.map.omp_simd
 
     def _generate_MapEntry(
         self,
@@ -3097,39 +3313,57 @@ class CPUCodeGen(TargetCodeGenerator):
             if node.map.schedule == dtypes.ScheduleType.CPU_Multicore and node.map.collapse > 1:
                 map_header += ' collapse(%d)' % node.map.collapse
 
-            # OpenMP reduction clauses for WCR writes to scalar accumulators outside
-            # the map. Atomic-add via wcr_fixed::reduce_atomic is correct but
-            # contended -- replacing the (implicit) per-iter atomic with the OMP
-            # runtime's per-thread privatization + final tree-reduce is what makes
-            # scalar reductions in parallel maps fast. The covered ``(var, op)``
-            # pairs are pushed onto ``_omp_reduction_scope_stack`` so the
-            # downstream ``write_and_resolve_expr`` skips the now-redundant
-            # ``reduce_atomic`` for them.
-            # Gated by compiler.emit_tree_reductions: OFF leaves omp_reductions empty, so no
-            # reduction(op:var) clause is emitted and the WCR write below takes the plain
-            # atomic path (correct but contended) instead of privatize-and-tree-reduce.
+            # OpenMP reduction clauses for WCR writes to accumulators outside the map. Atomic-add
+            # via wcr_fixed::reduce_atomic is correct but contended -- replacing the (implicit)
+            # per-iteration atomic with the OMP runtime's per-thread privatization + final tree
+            # reduce is what makes reductions in parallel maps fast. The covered targets are pushed
+            # onto ``_omp_reduction_scope_stack`` so the downstream ``write_and_resolve_expr`` skips
+            # the now-redundant ``reduce_atomic``.
             omp_reductions = []
             if (node.map.schedule == dtypes.ScheduleType.CPU_Multicore
-                    and Config.get_bool('compiler', 'emit_tree_reductions')):
+                    and emits_tree_reductions(self.experimental_codegen)):
                 omp_reductions = self._collect_omp_reductions(sdfg, state_dfg, node)
                 declares = []
                 for op_str, clause_target, _dname, declare in omp_reductions:
                     map_header += f' reduction({op_str}:{clause_target})'
                     if declare is not None and declare not in declares:
                         declares.append(declare)
-                # ``simd`` too: the clause already sanctions reassociation inside the combining op, so
-                # vector partials are legal. No min/max, per ``dace/runtime/include/dace/reduction.h``.
-                if omp_reductions and all(op not in ('min', 'max') for op, _ct, _dn, _dec in omp_reductions):
-                    head, sep, rest = map_header.partition(' for')
-                    map_header = f'{head}{sep} simd{rest}'
                 # ``declare reduction`` directives must be in scope before the pragma; emit
                 # each unique one on its own line ahead of the ``parallel for``.
                 for declare in declares:
                     map_header = declare + '\n' + map_header
+
+            # ``MarkSIMDMaps`` decided this map vectorizes -- it owns the analysis (leaf body, no
+            # directive-carrying tasklet, no min/max WCR) and expands a multidimensional map so the
+            # marked one is the innermost. Stamp its verdict onto the pragma the map already has;
+            # a covered reduction composes with it, the clause already sanctions reassociation
+            # inside the combining op, so vector partials are legal.
+            if node.map.schedule == dtypes.ScheduleType.CPU_Multicore and node.map.omp_simd:
+                head, sep, rest = map_header.partition(' for')
+                map_header = f'{head}{sep} simd{rest}'
+
             # Push scope frame even if empty -- ``_generate_MapExit`` always pops. Keyed by
             # target data name so the nested WCR write's covered-check (``memlet.data in
             # frame``) skips the now-redundant atomic and accumulates into the private copy.
             self._omp_reduction_scope_stack.append({dname: op for op, _ct, dname, _dec in omp_reductions})
+
+        # A sequential map's WCR accumulator lives in a local scalar for the loop's duration --
+        # same arithmetic, same order, one load and one store instead of one pair per iteration.
+        # The frame is pushed unconditionally so ``_generate_MapExit`` always has one to drain.
+        seq_accumulators = []
+        if node.map.schedule == dtypes.ScheduleType.Sequential:
+            seq_accumulators = self._collect_sequential_accumulators(sdfg, state_dfg, node)
+            for _dname, _subset, _op, ctype, target, var in seq_accumulators:
+                result.write(f'{ctype} {var} = {target};', cfg, state_id, node)
+        self._seq_accumulator_stack.append({
+            dname: {
+                'var': var,
+                'op': op,
+                'subset': subset,
+                'target': target
+            }
+            for dname, subset, op, _ctype, target, var in seq_accumulators
+        })
 
         if node.map.unroll:
             if node.map.schedule in (dtypes.ScheduleType.CPU_Multicore, dtypes.ScheduleType.CPU_Persistent):
@@ -3179,13 +3413,31 @@ class CPUCodeGen(TargetCodeGenerator):
                         unroll_pragma += f" {node.map.unroll_factor}"
                     result.write(unroll_pragma, cfg, state_id, node)
 
-                comparison, bound = loop_exit_test(begin, end, skip, node)
+                # Determine whether this loop will be immediately preceded by an OpenMP directive.
+                # CPU_Multicore / CPU_Persistent emit the pragma in map_header above. A Sequential
+                # map emits ``#pragma omp simd`` here, before its innermost loop, exactly when
+                # ``MarkSIMDMaps`` marked it -- the pass owns the safety analysis, this renders its
+                # verdict. One write site, because the pragma must sit immediately before the
+                # ``for``, and only once: a second one has no loop after it ("loop nest expected").
+                will_have_openmp = node.map.schedule in (dtypes.ScheduleType.CPU_Multicore,
+                                                         dtypes.ScheduleType.CPU_Persistent)
+                pragma = None
+                if (not will_have_openmp and not node.map.unroll and i == len(node.map.range) - 1
+                        and node.map.schedule == dtypes.ScheduleType.Sequential and node.map.omp_simd):
+                    pragma = "#pragma omp simd"
+                    will_have_openmp = True
+
+                comparison, bound = loop_exit_test(begin, end, skip, node, will_have_openmp)
                 init = '%s %s = %s' % (loop_index_ctype(), var, cpp.sym2cpp(begin))
-                if hoist_loop_decls(node):
+                if hoist_loop_decls(node, will_have_openmp):
                     # Declared ahead of the loop, so it outlives it -- the map's encapsulating scope is
                     # what bounds it (experimental keeps that brace when hoisting).
                     result.write('%s;\n' % init, cfg, state_id, node)
                     init = ''
+                if pragma is not None:
+                    # ``#pragma omp simd`` must immediately precede the ``for``; ``None`` means
+                    # ``MarkSIMDMaps`` did not mark this map.
+                    result.write(pragma, cfg, state_id, node)
                 result.write(
                     "for (%s; %s %s %s; %s += %s) {\n" % (init, var, comparison, bound, var, cpp.sym2cpp(skip)),
                     cfg,
@@ -3229,6 +3481,12 @@ class CPUCodeGen(TargetCodeGenerator):
                 result.write("}", cfg, state_id, node)
 
         result.write(outer_stream.getvalue())
+
+        # Drain the sequential accumulators the matching MapEntry hoisted: the loop nest is closed,
+        # so the register holds the final value and the single store lands here.
+        if self._seq_accumulator_stack:
+            for acc in self._seq_accumulator_stack.pop().values():
+                result.write(f"{acc['target']} = {acc['var']};", cfg, state_id, node)
 
         # Close the encapsulating C scope only if the matching MapEntry opened one.
         if self._map_scope_braced.pop(self.map_scope_key(cfg, state_id, state_dfg, map_node), True):

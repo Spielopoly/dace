@@ -3,7 +3,6 @@
 from abc import ABC, abstractmethod
 
 from dace import dtypes, subsets, symbolic
-from dace.config import Config
 from dace.sdfg import SDFG, ScopeSubgraphView, nodes, SDFGState
 from dace.sdfg.state import ControlFlowRegion
 from dace.codegen.prettycode import CodeIOStream
@@ -11,8 +10,8 @@ from dace.codegen.targets.framecode import DaCeCodeGenerator
 from dace.codegen.dispatcher import DefinedType, TargetDispatcher
 from dace.transformation import helpers
 from dace.codegen.targets.cpp import sym2cpp
-from dace.codegen.targets.cpu import (collect_gpu_block_reductions, register_gpu_block_reduction,
-                                      drain_gpu_block_reduction)
+from dace.codegen.targets.cpu import (collect_gpu_block_reductions, drain_gpu_block_reduction,
+                                      register_gpu_block_reduction)
 from dace.codegen.targets.experimental_cuda import ExperimentalCUDACodeGen, KernelSpec
 from dace.codegen.targets.experimental_cuda_helpers.gpu_utils import get_cuda_dim
 from dace.transformation.dataflow.add_threadblock_map import product
@@ -20,7 +19,7 @@ from dace.transformation.dataflow.add_threadblock_map import product
 
 def _emit_dim_index_definitions(scope_map, axis: str, ctype: str, callsite_stream: CodeIOStream, cfg: ControlFlowRegion,
                                 state_id: int, anchor_node, dispatcher: TargetDispatcher):
-    """Emit ``{ctype} {var_name} = {expr};`` per map dim from the symbolic map coordinates.
+    """Emit ``const {ctype} {var_name} = {expr};`` per map dim from the symbolic map coordinates.
 
     ``axis`` is ``'blockIdx'`` (kernel scope) or ``'threadIdx'`` (thread-block scope). The first
     three dims map directly to ``axis.{x|y|z}``; further dims delinearize off ``axis.z``.
@@ -44,7 +43,9 @@ def _emit_dim_index_definitions(scope_map, axis: str, ctype: str, callsite_strea
             tail = product(dim_sizes[dim + 1:])
             expr = f"(({axis}.z / ({sym2cpp(tail)})) % ({sym2cpp(dim_sizes[dim])}))"
         var_def = sym2cpp(sym_coords[dim]).replace(f'__SYM_IDX{dim}', expr)
-        callsite_stream.write(f'{ctype} {var_name} = {var_def};', cfg, state_id, anchor_node)
+        # A map coordinate derived from blockIdx/threadIdx is assigned once and never written
+        # again; const says so to the reader and refuses any later emission that would.
+        callsite_stream.write(f'const {ctype} {var_name} = {var_def};', cfg, state_id, anchor_node)
         dispatcher.defined_vars.add(var_name, DefinedType.Scalar, ctype)
 
     return map_range, sym_indices, sym_coords
@@ -166,7 +167,6 @@ class ThreadBlockScopeGenerator(ScopeGenerationStrategy):
             node = dfg_scope.source_nodes()[0]
             scope_map = node.map
             kernel_block_dims = self._current_kernel_spec.block_dims
-            state = cfg.state(state_id)
 
             map_range, symbolic_indices, _sym_coords = _emit_dim_index_definitions(
                 scope_map, 'threadIdx', self._current_kernel_spec.gpu_index_ctype, callsite_stream, cfg, state_id, node,
@@ -179,63 +179,52 @@ class ThreadBlockScopeGenerator(ScopeGenerationStrategy):
 
             self.codegen._frame.allocate_arrays_in_scope(sdfg, cfg, node, function_stream, callsite_stream)
 
-            # Tree reduction: a scalar WCR accumulator written from this thread-block map folds
-            # via one cub::BlockReduce + one atomic per block instead of one atomic per thread.
-            # Each thread's register partial is declared and identity-initialized BEFORE the
-            # bounds guard (so out-of-range threads still carry the identity into the barrier
-            # fold); the per-thread atomic is redirected into that partial while the covered
-            # entry is registered; the block fold is drained AFTER the guard closes.
-            reductions = []
-            if Config.get_bool('compiler', 'emit_tree_reductions'):
-                reductions = collect_gpu_block_reductions(sdfg, state, node, kernel_block_dims, self.codegen._frame)
+            # Fold this block's map-exit WCR accumulators through cub::BlockReduce (one atomic per
+            # block, not per thread) -- the GPU mirror of an OpenMP reduction clause. Unconditional:
+            # this target always tree-reduces, so ``compiler.emit_tree_reductions`` (legacy-only)
+            # is not consulted. Partials are declared BEFORE the bounds guard so out-of-range
+            # threads carry the identity into the barrier; ``covered`` redirects the per-thread WCR
+            # writes the dispatch below emits.
+            reductions = collect_gpu_block_reductions(sdfg, cfg.state(state_id), node, kernel_block_dims,
+                                                      self.codegen._frame)
             covered = self.codegen._cpu_codegen._gpu_block_reduction_covered
             for red in reductions:
                 callsite_stream.write(register_gpu_block_reduction(red, covered), cfg, state_id, node)
 
-            # Bounds guards go in their own manager so they close before the block fold: cub's
-            # Reduce is a block-wide barrier, so every thread (in-range or not) must reach it.
-            with ScopeManager(frame_codegen=self.codegen._frame,
-                              sdfg=sdfg,
-                              cfg=cfg,
-                              dfg_scope=dfg_scope,
-                              state_id=state_id,
-                              function_stream=function_stream,
-                              callsite_stream=callsite_stream,
-                              comment=self.SCOPE_COMMENT,
-                              brackets_on_enter=False) as guard_manager:
+            guard_mark = scope_manager.opened
 
-                # Guard each dim so out-of-bounds threads in a trailing block are skipped.
-                minels = map_range.min_element()
-                maxels = map_range.max_element()
-                for dim, (var_name, start, end) in enumerate(zip(scope_map.params[::-1], minels, maxels)):
+            # Guard each dim so out-of-bounds threads in a trailing block are skipped.
+            minels = map_range.min_element()
+            maxels = map_range.max_element()
+            for dim, (var_name, start, end) in enumerate(zip(scope_map.params[::-1], minels, maxels)):
 
-                    # Emit only the bounds that are not provably always-true.
-                    condition = ''
+                # Emit only the bounds that are not provably always-true.
+                condition = ''
 
-                    if dim >= 3 or (symbolic_indices[dim] >= start) != True:
-                        condition += f'{var_name} >= {sym2cpp(start)}'
+                if dim >= 3 or (symbolic_indices[dim] >= start) != True:
+                    condition += f'{var_name} >= {sym2cpp(start)}'
 
-                    # Special case: block size is exactly the range of the map (0:b)
-                    if dim >= 3:
-                        skipcond = False
-                    else:
-                        skipcond = symbolic_index_bounds[dim].subs({symbolic_indices[dim]: start}) == end
+                # Special case: block size is exactly the range of the map (0:b)
+                if dim >= 3:
+                    skipcond = False
+                else:
+                    skipcond = symbolic_index_bounds[dim].subs({symbolic_indices[dim]: start}) == end
 
-                    if dim >= 3 or (not skipcond and (symbolic_index_bounds[dim] < end) != True):
-                        if len(condition) > 0:
-                            condition += ' && '
-                        condition += f'{var_name} < {sym2cpp(end + 1)}'
-
+                if dim >= 3 or (not skipcond and (symbolic_index_bounds[dim] < end) != True):
                     if len(condition) > 0:
-                        guard_manager.open(condition=condition)
+                        condition += ' && '
+                    condition += f'{var_name} < {sym2cpp(end + 1)}'
 
-                self._dispatch_and_deallocate(sdfg, cfg, dfg_scope, state_id, node, function_stream, callsite_stream)
+                if len(condition) > 0:
+                    scope_manager.open(condition=condition)
 
-            # Drain: fold each register partial across the block, one atomic per block.
+            self._dispatch_and_deallocate(sdfg, cfg, dfg_scope, state_id, node, function_stream, callsite_stream)
+
+            # Guards closed: every thread is live for the barrier-using cub fold.
+            scope_manager.close_through(guard_mark)
             for i, red in enumerate(reductions):
-                callsite_stream.write(
-                    drain_gpu_block_reduction(red, f'{state.block_id}_{state.node_id(node)}_{i}', covered), cfg,
-                    state_id, node)
+                callsite_stream.write(drain_gpu_block_reduction(red, f'{node.map.label}_{i}', covered), cfg, state_id,
+                                      node)
 
 
 class WarpScopeGenerator(ScopeGenerationStrategy):
@@ -295,7 +284,7 @@ class WarpScopeGenerator(ScopeGenerationStrategy):
             threadID_name = 'ThreadId_%s_%d_%d_%d' % (scope_map.label, cfg.cfg_id, state_dfg.block_id,
                                                       state_dfg.node_id(node))
 
-            callsite_stream.write(f"{ids_ctype} {threadID_name} = ({flat_thread_idx_expr}) / {warpSize};", cfg,
+            callsite_stream.write(f"const {ids_ctype} {threadID_name} = ({flat_thread_idx_expr}) / {warpSize};", cfg,
                                   state_id, node)
             self._dispatcher.defined_vars.add(threadID_name, DefinedType.Scalar, ids_ctype)
 
@@ -310,7 +299,7 @@ class WarpScopeGenerator(ScopeGenerationStrategy):
                 else:
                     expr = f"({threadID_name} % ({warp_dim_bounds[i]}))"
 
-                callsite_stream.write(f"{ids_ctype} {var_name} = {expr};", cfg, state_id, node)
+                callsite_stream.write(f"const {ids_ctype} {var_name} = {expr};", cfg, state_id, node)
                 self._dispatcher.defined_vars.add(var_name, DefinedType.Scalar, ids_ctype)
 
             self.codegen._frame.allocate_arrays_in_scope(sdfg, cfg, node, function_stream, callsite_stream)
@@ -456,3 +445,22 @@ class ScopeManager:
             line += f" // {self.comment} (open {self._opened + 1})"
         self.callsite_stream.write(line, self.cfg, self.state_id, self.entry_node)
         self._opened += 1
+
+    @property
+    def opened(self) -> int:
+        """How many brackets are currently open, as a mark for :meth:`close_through`."""
+        return self._opened
+
+    def close_through(self, mark: int):
+        """Close every bracket opened since ``mark``, leaving the rest to ``__exit__``.
+
+        Lets a caller emit code after its guards close but still inside the enclosing scope --
+        a thread-block reduction folds once every thread is past the bounds guard, yet must
+        still see the register partials the scope declared.
+        """
+        while self._opened > mark:
+            line = "}"
+            if self.debug:
+                line += f" // {self.comment} (close {self._opened})"
+            self.callsite_stream.write(line, self.cfg, self.state_id, self.exit_node)
+            self._opened -= 1

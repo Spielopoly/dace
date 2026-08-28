@@ -11,6 +11,7 @@ from dace.libraries.blas.blas_helpers import (to_blastype, check_access, dtype_t
 from dace.libraries.blas.nodes.matmul import _get_matmul_operands, _get_batchmm_opts, _get_codegen_gemm_opts
 from .. import environments
 import warnings
+from ordered_set import OrderedSet
 
 
 def refuse_broadcast_batches(node, state, sdfg) -> None:
@@ -20,6 +21,12 @@ def refuse_broadcast_batches(node, state, sdfg) -> None:
     element. A dimension of extent 1 on one side must instead be re-read for every element, which
     no single stride expresses, so such a call would read past the end of the smaller operand.
     The pure expansion handles it by indexing that dimension at 0.
+
+    Refused on the dimensions where broadcasting is what the pairing MEANS: one side provably 1,
+    or the two provably different. Two dimensions whose equality is merely unprovable -- distinct
+    symbols, ``a: [B, M, K] @ b: [L, K, N]`` -- are not a broadcast. numpy pairs those only when
+    they are equal at run time, the same thing the frontend assumed when it gave the result its
+    batch shape; refusing them sends every symbolically-batched matmul to a failed expansion.
 
     :param node: The library node being expanded.
     :param state: The state the node lives in.
@@ -33,7 +40,10 @@ def refuse_broadcast_batches(node, state, sdfg) -> None:
     offset = len(batch_a) - len(batch_b)
     paired = zip(batch_a[offset:], batch_b) if offset >= 0 else zip(batch_a, batch_b[-offset:])
     for d0, d1 in paired:
-        if equal(d0, d1) is not True:
+        same = equal(d0, d1)
+        if same is True:
+            continue
+        if same is False or equal(d0, 1) is True or equal(d1, 1) is True:
             raise ValueError(f'{type(node).__name__} cannot broadcast batch dimensions {batch_a} against {batch_b}: '
                              'this expansion walks a fixed batch stride. Use the "pure" implementation, or '
                              'materialize both operands at the same batch shape.')
@@ -338,8 +348,8 @@ class ExpandBatchedMatMulCuBLAS(ExpandTransformation):
         call_suffix = ''
         # Handle alpha / beta
         constants = {
-            1.0: f"__state->cublas_handle.Constants(__dace_cuda_device).{factort}Pone()",
-            0.0: f"__state->cublas_handle.Constants(__dace_cuda_device).{factort}Zero()",
+            1.0: f"__state->cublas_handle.Constants().{factort}Pone()",
+            0.0: f"__state->cublas_handle.Constants().{factort}Zero()",
         }
         if node.alpha not in constants:
             # Deal with complex input constants
@@ -349,18 +359,19 @@ class ExpandBatchedMatMulCuBLAS(ExpandTransformation):
                 alpha = f'{dtype.ctype}({node.alpha})'
 
             # Set pointer mode to host
-            call_prefix += f'''cublasSetPointerMode(__dace_cublas_handle, CUBLAS_POINTER_MODE_HOST);
+            call_prefix += f'''dace::blas::CheckCublasError(
+                cublasSetPointerMode(__dace_cublas_handle, CUBLAS_POINTER_MODE_HOST));
                 {dtype.ctype} alpha = {alpha};
                 {dtype.ctype} beta = 0;
                 '''
             call_suffix += '''
-    cublasSetPointerMode(__dace_cublas_handle, CUBLAS_POINTER_MODE_DEVICE);
+    dace::blas::CheckCublasError(cublasSetPointerMode(__dace_cublas_handle, CUBLAS_POINTER_MODE_DEVICE));
                 '''
             beta = f'({cdtype} *)&beta'
             alpha = f'({cdtype} *)&alpha'
         else:
             alpha = constants[node.alpha]
-            beta = "__state->cublas_handle.Constants(__dace_cuda_device).%sZero()" % factort
+            beta = "__state->cublas_handle.Constants().%sZero()" % factort
 
         # Set up options for code formatting
         opt = _get_codegen_gemm_opts(node, state, sdfg, adesc, bdesc, cdesc, alpha, beta, cdtype, func)
@@ -368,7 +379,7 @@ class ExpandBatchedMatMulCuBLAS(ExpandTransformation):
 
         # Matrix multiplication
         if (node.compute_type is None and node.accumulator_type is None and node.algorithm is None):
-            call = '''cublas{func}StridedBatched(__dace_cublas_handle,
+            call = '''dace::blas::CheckCublasError(cublas{func}StridedBatched(__dace_cublas_handle,
                 CUBLAS_OP_{ta}, CUBLAS_OP_{tb},
                 {M}, {N}, {K},
                 {alpha},
@@ -376,7 +387,7 @@ class ExpandBatchedMatMulCuBLAS(ExpandTransformation):
                 ({dtype}*){array_prefix}{y}, {ldb}, {stride_b},
                 {beta},
                 ({dtype}*){array_prefix}_c, {ldc}, {stride_c},
-                {BATCH});'''.format_map(opt)
+                {BATCH}));'''.format_map(opt)
         else:
             if node.compute_type is not None:
                 acctype = node.compute_type
@@ -391,7 +402,7 @@ class ExpandBatchedMatMulCuBLAS(ExpandTransformation):
                 algorithm = node.algorithm
 
             call = f'''
-            cublasGemmStridedBatchedEx(__dace_cublas_handle,
+            dace::blas::CheckCublasError(cublasGemmStridedBatchedEx(__dace_cublas_handle,
                 CUBLAS_OP_{opt['ta']}, CUBLAS_OP_{opt['tb']},
                 {opt['M']}, {opt['N']}, {opt['K']},
                 {alpha},
@@ -406,7 +417,7 @@ class ExpandBatchedMatMulCuBLAS(ExpandTransformation):
                 {dtype_to_cudadatatype(opt['cdtype'])},
                 {opt['ldc']}, {opt['stride_c']},
                 {opt['BATCH']},
-                {acctype}, {algorithm});
+                {acctype}, {algorithm}));
             '''
 
         code = call_prefix + call + call_suffix
@@ -614,7 +625,7 @@ class BatchedMatMul(dace.sdfg.nodes.LibraryNode):
     default_implementation = None
 
     def __init__(self, name, location=None):
-        super().__init__(name, location=location, inputs={'_a', '_b'}, outputs={'_c'})
+        super().__init__(name, location=location, inputs=OrderedSet(('_a', '_b')), outputs={'_c'})
 
     def validate(self, sdfg, state):
         in_edges = state.in_edges(self)

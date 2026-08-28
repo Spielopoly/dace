@@ -31,6 +31,7 @@ from dace.sdfg import propagation as sdprop
 from dace.sdfg.type_inference import infer_expr_type
 from dace.sdfg.validation import validate_state
 from dace.subsets import Range, Subset
+from ordered_set import OrderedSet
 
 if TYPE_CHECKING:
     import dace.sdfg.scope
@@ -929,24 +930,18 @@ class DataflowGraphView(BlockGraphView, abc.ABC):
                 } if top_source_edge.src.data not in descs else {})
 
             elif isinstance(edge.dst, nd.ExitNode) and isinstance(edge.src, (nd.AccessNode, nd.CodeNode)):
-                # Same case as above, but for outgoing Memlets. Every edge on the matching connector
-                #   is inspected, since the data can go to more than one destination, and each is
-                #   followed to where it lands: one hop still names the inner transient whenever the
-                #   write leaves through more than one exit, as it does in a tiled map.
+                # Outgoing counterpart of the above. A source-relative Memlet's .data names the
+                # inner transient, not the written array, so resolve the real destination via the
+                # memlet-tree root -- else its shape/stride symbols drop from the kernel signature.
                 additional_descs = {}
                 connector_to_look = "OUT_" + edge.dst_conn[3:]
                 for oedge in self.graph.out_edges_by_connector(edge.dst, connector_to_look):
-                    last = self.graph.memlet_path(oedge)[-1]
-                    if last.data.is_empty():
+                    if oedge.data.is_empty():
                         continue
-                    # Name the destination by the node the path LANDS ON, not by the terminal
-                    # memlet: a source-relative outgoing memlet still names the inner transient,
-                    # which is already in ``descs``, so trusting it drops the outer array -- and
-                    # its shape/stride symbols -- from the arglist, and codegen then emits a
-                    # signature referencing an undeclared identifier.
-                    dest = last.dst.data if isinstance(last.dst, nd.AccessNode) else last.data.data
-                    if dest not in descs and dest not in additional_descs:
-                        additional_descs[dest] = sdfg.arrays[dest]
+                    root_dst = self.graph.memlet_tree(oedge).root().edge.dst
+                    dst_name = root_dst.data if isinstance(root_dst, nd.AccessNode) else oedge.data.data
+                    if dst_name not in descs and dst_name not in additional_descs:
+                        additional_descs[dst_name] = sdfg.arrays[dst_name]
 
             else:
                 # Case is ignored.
@@ -1389,7 +1384,8 @@ def sdfg_scope_symbols(sdfg) -> Dict[str, dtypes.typeclass]:
     """Symbols visible at ``sdfg`` scope: its own symbols, array extents, and interstate edges."""
     symbols = collections.OrderedDict(sdfg.symbols)
     for desc in sdfg.arrays.values():
-        symbols.update([(str(s), s.dtype) for s in desc.free_symbols])
+        # ``s.name``, not ``str(s)``: printing a symbol runs sympy's printer for a string it holds.
+        symbols.update([(s.name, s.dtype) for s in desc.free_symbols])
     try:
         for e in sdfg.predecessor_state_transitions(sdfg.start_state):
             symbols.update(e.data.new_symbols(sdfg, symbols))
@@ -1765,8 +1761,8 @@ class SDFGState(OrderedMultiDiConnectorGraph[nd.Node, mm.Memlet], ControlFlowBlo
         debuginfo = _get_debug_info(debuginfo or self._default_lineinfo)
 
         # Make dictionary of autodetect connector types from set
-        if isinstance(inputs, set) or isinstance(outputs, set):
-            warnings.warn("Using sets as inputs is discouraged as it leads to indeterministic behavior.")
+        if any((isinstance(x, set) and len(x) > 1) for x in [inputs, outputs]):
+            warnings.warn("Using sets for connectors is discouraged as it leads to indeterministic behavior.")
         if isinstance(inputs, (set, collections.abc.KeysView, collections.abc.Set)):
             inputs = {k: None for k in inputs}
         if isinstance(outputs, (set, collections.abc.KeysView, collections.abc.Set)):
@@ -1845,8 +1841,8 @@ class SDFGState(OrderedMultiDiConnectorGraph[nd.Node, mm.Memlet], ControlFlowBlo
             sdfg.update_cfg_list([])
 
         # Make dictionary of autodetect connector types from set
-        if isinstance(inputs, set) or isinstance(outputs, set):
-            warnings.warn("Using sets as inputs is discouraged as it leads to indeterministic behavior.")
+        if any((isinstance(x, set) and len(x) > 1) for x in [inputs, outputs]):
+            warnings.warn("Using sets for connectors is discouraged as it leads to indeterministic behavior.")
         if isinstance(inputs, (set, collections.abc.KeysView, collections.abc.Set)):
             inputs = {k: None for k in inputs}
         if isinstance(outputs, (set, collections.abc.KeysView, collections.abc.Set)):
@@ -2067,11 +2063,19 @@ class SDFGState(OrderedMultiDiConnectorGraph[nd.Node, mm.Memlet], ControlFlowBlo
         if len(inputs) == 0:
             self.add_edge(map_entry, None, tasklet, None, mm.Memlet())
 
+        # Every edge below propagates through one scope, so its symbols are derived once.
+        defined_variables = (self.symbols_defined_at(map_entry).keys()
+                             | self.sdfg.constants.keys()) if external_edges and propagate else None
+
         if external_edges:
             for inp, inpnode in sorted(inpdict.items()):
                 # Add external edge
                 if propagate:
-                    outer_memlet = sdprop.propagate_memlet(self, tomemlet[inp], map_entry, True)
+                    outer_memlet = sdprop.propagate_memlet(self,
+                                                           tomemlet[inp],
+                                                           map_entry,
+                                                           True,
+                                                           defined_variables=defined_variables)
                 else:
                     outer_memlet = tomemlet[inp]
                 edges.append(self.add_edge(inpnode, None, map_entry, "IN_" + inp, outer_memlet))
@@ -2102,7 +2106,11 @@ class SDFGState(OrderedMultiDiConnectorGraph[nd.Node, mm.Memlet], ControlFlowBlo
             for out, outnode in sorted(outdict.items()):
                 # Add external edge
                 if propagate:
-                    outer_memlet = sdprop.propagate_memlet(self, tomemlet[out], map_exit, True)
+                    outer_memlet = sdprop.propagate_memlet(self,
+                                                           tomemlet[out],
+                                                           map_exit,
+                                                           True,
+                                                           defined_variables=defined_variables)
                 else:
                     outer_memlet = tomemlet[out]
                 edges.append(self.add_edge(map_exit, "OUT_" + out, outnode, None, outer_memlet))
@@ -2719,7 +2727,7 @@ class AbstractControlFlowRegion(OrderedDiGraph[ControlFlowBlock, 'dace.sdfg.Inte
         self._labels: Set[str] = set()
         # Held as the block itself, not its position: removing a node shifts every position after it,
         # which would silently re-point the start block at a different block.
-        self._start_block: Optional[ControlFlowBlock] = None
+        self._start_block: Optional[int] = None
         self._cached_start_block: Optional[ControlFlowBlock] = None
         self._cfg_list: List['ControlFlowRegion'] = [self]
 
@@ -2854,7 +2862,7 @@ class AbstractControlFlowRegion(OrderedDiGraph[ControlFlowBlock, 'dace.sdfg.Inte
         if parent:
 
             # Add all region states and make sure to keep track of all the ones that need to be connected in the end.
-            to_connect: Set[ControlFlowBlock] = set()
+            to_connect: OrderedSet[ControlFlowBlock] = OrderedSet()
             ends_context: Set[ControlFlowBlock] = set()
             block_to_state_map: Dict[ControlFlowBlock, SDFGState] = dict()
             for node in self.nodes():
@@ -2937,6 +2945,11 @@ class AbstractControlFlowRegion(OrderedDiGraph[ControlFlowBlock, 'dace.sdfg.Inte
             raise TypeError('Expected ControlFlowBlock, got ' + str(type(dst)))
         if not isinstance(data, dace.sdfg.InterstateEdge):
             raise TypeError('Expected InterstateEdge, got ' + str(type(data)))
+        # Only the DERIVED entry (`_cached_start_block`, resolved from the source nodes) goes stale
+        # when `dst` gains a predecessor -- drop it and let `start_block` re-resolve. An EXPLICIT pin
+        # (`_start_block`) is never touched: an entry with an incoming edge is the normal shape of any
+        # cyclic region, whose back-edge necessarily targets the entry, so treating the new edge as
+        # evidence the pin is wrong would discard the only thing that disambiguates such a region.
         if dst is self._cached_start_block:
             self._cached_start_block = None
         return super().add_edge(src, dst, data)
@@ -2983,16 +2996,37 @@ class AbstractControlFlowRegion(OrderedDiGraph[ControlFlowBlock, 'dace.sdfg.Inte
             start_block = is_start_state
 
         if start_block:
-            self._start_block = node
+            self._start_block = len(self.nodes()) - 1
             self._cached_start_block = node
 
-    def remove_node(self, node: ControlFlowBlock):
-        # The region owns this invariant, so callers never have to re-pin the start block by hand.
-        if node is self._start_block:
-            self._start_block = None
-        if node is self._cached_start_block:
-            self._cached_start_block = None
+    def remove_node(self, node):
+        # `_start_block` is an index into the node list, so any removal invalidates it:
+        # the indices of later nodes shift down, leaving it pointing at a different block
+        # or past the end. Re-resolve it by identity around the removal.
+        if self._start_block is not None:
+            start_block = self.node(self._start_block)
+        else:
+            start_block = None
         super().remove_node(node)
+        self._cached_start_block = None
+        if start_block is node:
+            # The pin named the block just removed. Re-pin to the region's new unique entry:
+            # dropping it looks harmless because the getter falls back to source_nodes(), but that
+            # fallback never writes _start_block and to_json() serializes it, so a graph rewritten
+            # twice differs from the same graph rewritten once.
+            sources = self.source_nodes()
+            self._start_block = self.node_id(sources[0]) if len(sources) == 1 else None
+        elif start_block is not None:
+            self.start_block = self.node_id(start_block)
+
+    def reorder_nodes(self, order):
+        # `_start_block` is an index too, so a permutation moves the pinned block out from under
+        # it. Re-resolve by identity, like `remove_node` does.
+        start_block = self.node(self._start_block) if self._start_block is not None else None
+        super().reorder_nodes(order)
+        self._cached_start_block = None
+        if start_block is not None:
+            self._start_block = self.node_id(start_block)
 
     def add_state(self, label=None, is_start_block=False, *, is_start_state: Optional[bool] = None) -> SDFGState:
         label = self._ensure_unique_block_name(label)
@@ -3185,7 +3219,7 @@ class AbstractControlFlowRegion(OrderedDiGraph[ControlFlowBlock, 'dace.sdfg.Inte
         graph_json.update(block_json)
 
         graph_json['cfg_list_id'] = int(self.cfg_id)
-        graph_json['start_block'] = self.node_id(self._start_block) if self._start_block is not None else None
+        graph_json['start_block'] = self._start_block
 
         return graph_json
 
@@ -3217,7 +3251,7 @@ class AbstractControlFlowRegion(OrderedDiGraph[ControlFlowBlock, 'dace.sdfg.Inte
             ret.add_edge(nodelist[int(e.src)], nodelist[int(e.dst)], e.data)
 
         if json_obj.get('start_block') is not None:
-            ret._start_block = nodelist[int(json_obj['start_block'])]
+            ret._start_block = json_obj['start_block']
 
         return ret
 
@@ -3254,7 +3288,7 @@ class AbstractControlFlowRegion(OrderedDiGraph[ControlFlowBlock, 'dace.sdfg.Inte
             return source_nodes[0]
         # If the starting block is ambiguous allow manual override.
         if self._start_block is not None:
-            self._cached_start_block = self._start_block
+            self._cached_start_block = self.node(self._start_block)
             return self._cached_start_block
         raise ValueError('Ambiguous or undefined starting block for ControlFlowGraph, '
                          'please use "is_start_block=True" when adding the '
@@ -3268,7 +3302,7 @@ class AbstractControlFlowRegion(OrderedDiGraph[ControlFlowBlock, 'dace.sdfg.Inte
         """
         if block_id < 0 or block_id >= self.number_of_nodes():
             raise ValueError('Invalid state ID')
-        self._start_block = self.node(block_id)
+        self._start_block = block_id
         self._cached_start_block = None
 
 
@@ -3422,8 +3456,8 @@ class LoopRegion(ControlFlowRegion):
         # Add all loop states and make sure to keep track of all the ones that need to be connected in the end.
         # Return blocks are inlined as-is. If the parent graph is an SDFG, they are converted to states, otherwise
         # they are left as explicit exit blocks.
-        connect_to_latch: Set[SDFGState] = set()
-        connect_to_end: Set[SDFGState] = set()
+        connect_to_latch: OrderedSet[SDFGState] = OrderedSet()
+        connect_to_end: OrderedSet[SDFGState] = OrderedSet()
         block_to_state_map: Dict[ControlFlowBlock, SDFGState] = dict()
         for node in self.nodes():
             node.label = self.label + '_' + node.label
@@ -3942,14 +3976,10 @@ class ConditionalBlock(AbstractControlFlowRegion):
         branch.parent_graph = self
         branch.sdfg = self.sdfg
         # A branch is reached only through this list, never through ``nodes()``, so the generic
-        # ``add_node`` bookkeeping never runs for it. Two things have to happen here instead.
-        # First the subtree repair: a branch is routinely a deep copy, and
-        # ``ControlFlowBlock.__deepcopy__`` resolves ``_sdfg`` through the memo, so every block
-        # copied without its owning SDFG comes back owner-less. Insertion establishes ownership.
-        for block in branch.all_control_flow_blocks():
-            block.sdfg = self.sdfg
-        # Then registration: otherwise the branch stays out of the CFG list and reports ``cfg_id``
-        # 0 -- colliding with the root and with every other unregistered region.
+        # ``add_node`` bookkeeping never runs for it: propagate the SDFG into the branch and
+        # invalidate here instead. Without this the branch's blocks keep ``sdfg is None``.
+        for n in branch.all_control_flow_blocks():
+            n.sdfg = self.sdfg
         self.reset_cfg_list()
 
     def remove_branch(self, branch: ControlFlowRegion):

@@ -54,8 +54,14 @@ def is_stream_wiring_applied(sdfg: SDFG) -> bool:
     return get_gpu_stream_array_name() in sdfg.arrays
 
 
-def enclosing_map_chain(state: SDFGState, node: nodes.Node, schedule: dtypes.ScheduleType) -> List[nodes.MapEntry]:
-    """Outermost-first chain of ``MapEntry`` nodes with ``schedule`` that enclose ``node`` (empty when none).
+def enclosing_map_chain(state: SDFGState,
+                        node: nodes.Node,
+                        schedule: Optional[dtypes.ScheduleType] = None) -> List[nodes.MapEntry]:
+    """Outermost-first chain of ``MapEntry`` nodes enclosing ``node`` (empty when none).
+
+    ``schedule`` keeps only the maps carrying it; ``None`` keeps every enclosing map, which is what
+    a caller wiring an edge INTO ``node`` needs -- an edge from a global node into a scoped one is
+    not a graph the scope traversal can walk.
 
     Invalidates the state's ``scope_dict`` cache first: earlier pipeline passes can mutate topology
     in ways that leave the cache stale.
@@ -65,7 +71,7 @@ def enclosing_map_chain(state: SDFGState, node: nodes.Node, schedule: dtypes.Sch
     chain: List[nodes.MapEntry] = []
     scope = sdict.get(node)
     while scope is not None:
-        if isinstance(scope, nodes.MapEntry) and scope.map.schedule == schedule:
+        if isinstance(scope, nodes.MapEntry) and (schedule is None or scope.map.schedule == schedule):
             chain.append(scope)
         scope = sdict.get(scope)
     chain.reverse()
@@ -103,21 +109,21 @@ def weakly_connected_node_sets(graph) -> List[Set[nodes.Node]]:
     return [set(c) for c in nx.weakly_connected_components(graph.nx)]
 
 
-# Storages that mark a copy/memset library node as "GPU-relevant" (its expansion emits a
+# Storages that mark a copy/fill library node as "GPU-relevant" (its expansion emits a
 # cudaMemcpy / cudaMemset). Hoisted to module scope because it is consulted per node visited
 # and rebuilding the set on every call shows up in profiles.
 _GPU_COPY_STORAGES = frozenset(
     {dtypes.StorageType.GPU_Global, dtypes.StorageType.GPU_Shared, dtypes.StorageType.CPU_Pinned})
 
 
-def is_gpu_copy_or_memset_libnode(node, sdfg: SDFG, state: SDFGState) -> bool:
-    """``CopyLibraryNode`` / ``MemsetLibraryNode`` whose storage involves GPU memory."""
-    from dace.libraries.standard.nodes.copy_node import CopyLibraryNode
-    from dace.libraries.standard.nodes.memset_node import MemsetLibraryNode
+def is_gpu_copy_or_fill_libnode(node, sdfg: SDFG, state: SDFGState) -> bool:
+    """``CopyLibraryNode`` / ``FillLibraryNode`` whose storage involves GPU memory."""
+    from dace.libraries.standard.nodes.copy import CopyLibraryNode
+    from dace.libraries.standard.nodes.fill import FillLibraryNode
 
     if isinstance(node, CopyLibraryNode):
         return (node.src_storage(state) in _GPU_COPY_STORAGES or node.dst_storage(state) in _GPU_COPY_STORAGES)
-    if isinstance(node, MemsetLibraryNode):
+    if isinstance(node, FillLibraryNode):
         for e in state.out_edges(node):
             if e.data and e.data.data and sdfg.arrays[e.data.data].storage in _GPU_COPY_STORAGES:
                 return True
@@ -130,13 +136,13 @@ def is_gpu_kernel_launcher(node) -> bool:
 
 
 def is_gpu_stream_consumer(node, sdfg: SDFG, state: SDFGState) -> bool:
-    """True for nodes that *take* a GPU stream: kernel ``MapEntry``, GPU Copy/Memset libnode, or a
+    """True for nodes that *take* a GPU stream: kernel ``MapEntry``, GPU Copy/Fill libnode, or a
     lowered runtime-call Tasklet.
 
     AccessNodes are excluded (memory references, not stream consumers); use
     :func:`is_gpu_relevant_node` for the broader "involves GPU work" question.
     """
-    return (is_gpu_kernel_launcher(node) or is_gpu_copy_or_memset_libnode(node, sdfg, state)
+    return (is_gpu_kernel_launcher(node) or is_gpu_copy_or_fill_libnode(node, sdfg, state)
             or is_already_lowered_gpu_runtime_call(node))
 
 
@@ -144,7 +150,7 @@ def is_already_lowered_gpu_runtime_call(node) -> bool:
     """True for a Tasklet that issues a stream-bound GPU runtime call.
 
     Detected either by a ``gpuStream_t`` in-connector (cuBLAS / cuSolver expansions that wire one)
-    or by a :data:`STREAM_CONNECTOR` reference in the body (Copy/Memset libnode expansions, which
+    or by a :data:`STREAM_CONNECTOR` reference in the body (Copy/Fill libnode expansions, which
     carry no connector and rely on the scheduler binding it post-expansion). Pipeline-emitted sync
     tasklets are excluded -- they are not consumers in the WCC sense.
     """
@@ -157,7 +163,9 @@ def is_already_lowered_gpu_runtime_call(node) -> bool:
     return STREAM_CONNECTOR in node.code.as_string
 
 
-SYNC_TASKLET_LABELS = ("gpu_streams_synchronization", "gpu_stream_synchronization")
+DEVICE_SYNC_TASKLET_LABEL = "gpu_callback_device_synchronization"
+
+SYNC_TASKLET_LABELS = ("gpu_streams_synchronization", "gpu_stream_synchronization", DEVICE_SYNC_TASKLET_LABEL)
 
 
 def is_pipeline_sync_tasklet(node) -> bool:
@@ -165,6 +173,16 @@ def is_pipeline_sync_tasklet(node) -> bool:
     label). Excluded from consumer re-detection despite its ``gpuStream_t`` connector.
     """
     return isinstance(node, nodes.Tasklet) and node.label in SYNC_TASKLET_LABELS
+
+
+def is_host_callback_tasklet(node) -> bool:
+    """True for a Tasklet that calls back into host code, i.e. a ``dace.callback`` invocation.
+
+    ``side_effects`` is set explicitly only by the frontend's callback lowering and by the stream
+    pipeline's own sync tasklets; the latter carry a canonical label and are excluded here. A
+    callback dereferences a host function pointer and can therefore never run on the device.
+    """
+    return isinstance(node, nodes.Tasklet) and node.side_effects is True and not is_pipeline_sync_tasklet(node)
 
 
 def is_gpu_relevant_node(node, sdfg: SDFG, state: SDFGState) -> bool:

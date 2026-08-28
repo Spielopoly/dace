@@ -11,6 +11,7 @@ The pure expansion returns a CPP tasklet whose body is a single
 ``for``-loop over the flattened tile (correctness-only).
 """
 import ast
+import math
 from typing import Dict, Optional, Set, Tuple
 
 import numpy as np
@@ -414,6 +415,41 @@ _CUTE_OP_EXPR = {
 }
 
 
+def _cutile_f64_const_tile(expr: str, widths: Tuple[int, ...]) -> Optional[str]:
+    """Render a non-float32-exact float64 literal as two exact terms.
+
+    cuda.tile first narrows plain Python float literals to float32. A high
+    float32 term plus a float32 residual reconstructs the original float64
+    value to within eight float64 ulps after promotion.
+
+    :param expr: Symbol-kind operand expression.
+    :param widths: Shape of the result tile.
+    :returns: A bounded-accuracy cuda.tile expression for a literal float, or ``None``.
+    """
+    try:
+        value = ast.literal_eval(str(expr))
+    except (SyntaxError, ValueError):
+        return None
+    if not isinstance(value, float) or not math.isfinite(value):
+        return None
+    value64 = np.float64(value)
+    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+        high = np.float64(np.float32(value64))
+        residual = np.float64(value64 - high)
+        low32 = np.float32(residual)
+        low = np.float64(low32)
+        reconstructed = np.float64(high + low)
+        reconstruction_error = abs(reconstructed - value64)
+        residual_tolerance = 0.5 * abs(np.float64(np.spacing(low32)))
+        float64_tolerance = 8.0 * abs(np.spacing(value64))
+    if value64 == high:
+        return None
+    if (not np.isfinite(high) or not np.isfinite(low) or not np.isfinite(reconstructed)
+            or reconstruction_error > residual_tolerance or reconstruction_error > float64_tolerance):
+        raise NotImplementedError(f"cuda.tile cannot accurately materialize float64 literal {value!r}")
+    return f"(ct.full({tuple(widths)!r}, {float(high)!r}, ct.float64) + {float(low)!r})"
+
+
 @library.expansion
 class ExpandTileBinopCutile(ExpandTransformation):
     """``cuda.tile``-Python expansion of :class:`TileBinop`.
@@ -421,7 +457,8 @@ class ExpandTileBinopCutile(ExpandTransformation):
     Emits the bare element-wise expression (e.g. ``a_tile + b_tile``)
     — matches the reference cuTile kernels, where the mask is applied
     at the ``ct.scatter`` store, not at the binop. Symbol-kind operands
-    are embedded inline. ``min`` / ``max`` route to ``ct.minimum`` /
+    are embedded inline; non-float32-exact float64 literals are materialized
+    from two exact terms. ``min`` / ``max`` route to ``ct.minimum`` /
     ``ct.maximum``.
     """
 
@@ -437,10 +474,28 @@ class ExpandTileBinopCutile(ExpandTransformation):
         :returns: A Python-language tasklet with the element-wise body.
         """
 
-        def _cutile_operand(kind, conn, expr):
-            """cuTile operand reference: inline expr for Symbol, the
-            connector for Tile or Scalar (broadcasts NumPy-style)."""
+        in_edges = {edge.dst_conn: edge for edge in parent_state.in_edges(node) if edge.dst_conn is not None}
+
+        def _operation_dtype() -> Optional[dace.dtypes.typeclass]:
+            """Infer the value dtype, preferring connected input operands."""
+            for kind, connector in ((node.kind_a, "_a"), (node.kind_b, "_b")):
+                if kind in (_TILE, _SCALAR) and connector in in_edges:
+                    return parent_sdfg.arrays[in_edges[connector].data.data].dtype
+            output = next((edge for edge in parent_state.out_edges(node) if edge.src_conn == "_c"), None)
+            if output is not None:
+                return parent_sdfg.arrays[output.data.data].dtype
+            return None
+
+        operation_dtype = _operation_dtype()
+
+        def _cutile_operand(kind: str, conn: str, expr: Optional[str]) -> str:
+            """Return an inline symbol expression or a data connector."""
             if kind == _SYMBOL:
+                assert expr is not None
+                if operation_dtype == dace.float64:
+                    exact_literal = _cutile_f64_const_tile(expr, tuple(node.widths))
+                    if exact_literal is not None:
+                        return exact_literal
                 from dace.symbolic import symstr
                 return symstr(expr)
             return conn

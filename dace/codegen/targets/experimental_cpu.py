@@ -19,20 +19,22 @@ from pygments.lexers import CppLexer
 from pygments.token import Token
 
 from dace import data as dt
-from dace import dtypes, symbolic
+from dace import dtypes, mpr_lowering, symbolic
 from dace.codegen import cppunparse
 from dace.codegen.codeobject import CODE_ANNOTATION
-from dace.codegen.common import sym2cpp
+from dace.codegen.common import emits_tree_reductions, sym2cpp
 from dace.config import Config
 from dace.codegen.dispatcher import DefinedType
 from dace.codegen.targets import cpp
-from dace.codegen.targets.cpu import (CPUCodeGen, aligned_new_value, decl_placement, hoist_loop_decls,
-                                      map_schedule_is_sequential, scalar_init_style, use_aligned_operator_new)
+from dace.codegen.targets.cpu import (CPUCodeGen, aligned_new_value, counter_init_assigns_only,
+                                      counter_used_outside_loop, decl_placement, hoist_loop_decls,
+                                      loop_region_index_ctype, map_schedule_is_sequential, scalar_init_style,
+                                      use_aligned_operator_new)
 from dace.frontend.python import astutils
 from dace.frontend.python.astutils import rname
 from dace.properties import CodeBlock
-from dace.sdfg import SDFG, nodes
-from dace.sdfg.state import SDFGState
+from dace.sdfg import SDFG, nodes, type_inference
+from dace.sdfg.state import LoopRegion, SDFGState
 from dace.sdfg.utils import dynamic_map_inputs
 
 #: C++ integer type for computed flat indices, per ``codegen_params.index_ctype``. Exact-width
@@ -47,6 +49,12 @@ INDEX_FUNCTION_QUALIFIER = 'static DACE_HDFI constexpr'
 # Qualifier for a CONSTANT ``<array>_size`` helper: ``consteval`` forces the fixed extent to fold at
 # compile time (a C++20 keyword, so size_qualifier falls back to ``constexpr`` before C++20).
 SIZE_CONSTEVAL_QUALIFIER = 'static DACE_HDFI consteval'
+# The same two qualifiers with ``DACE_HDFI`` written out. The macro expands to
+# ``__host__ __device__ __forceinline__`` under a device compiler and to ``inline`` otherwise;
+# standalone output has no ``types.h`` to define it and no device compiler to need it, so the
+# host expansion is inlined at the emission point.
+STANDALONE_INDEX_FUNCTION_QUALIFIER = 'static constexpr inline'
+STANDALONE_SIZE_CONSTEVAL_QUALIFIER = 'static consteval inline'
 # Identifier tokens of a code string. Used where a name has to be found in code that has no AST here
 # (a C++ tasklet body, a library node's code property): over-matching costs a refusal, missing a
 # token costs a miscompile, so the tokenizer is deliberately the crude one.
@@ -60,6 +68,60 @@ DECLARATOR_TOKENS = frozenset({'*', '&', '>'})
 INCLUDE_LINE = re.compile(r'^\s*#\s*include\s')
 PREPROCESSOR_IF = re.compile(r'^\s*#\s*if')
 PREPROCESSOR_ENDIF = re.compile(r'^\s*#\s*endif')
+
+
+def _experimental_loop_local_counter_ctype(name: str, dtype: dtypes.typeclass, sdfg: SDFG) -> Optional[str]:
+    """C++ type to declare a LoopRegion counter INSIDE its ``for``-init clause in the readable
+    generator, ignoring the ``decl_placement`` knob (which otherwise leaves it hoisted by default).
+
+    The eligibility gates match :func:`dace.codegen.targets.cpu.loop_local_counter_ctype`: the
+    counter must be owned by exactly one non-inverted LoopRegion whose init is a plain assignment,
+    and it must not be read outside that loop. ``loop_index_type``/``loop_region_index_ctype`` still
+    apply.
+    """
+    owners = [
+        cfr for cfr in sdfg.all_control_flow_regions()
+        if isinstance(cfr, LoopRegion) and cfr.loop_variable == name and cfr.init_statement is not None
+    ]
+    if len(owners) != 1:
+        return None
+    loop = owners[0]
+    if loop.inverted or not counter_init_assigns_only(loop) or counter_used_outside_loop(name, loop, sdfg):
+        return None
+    # Instrumentation conditions (e.g. data-instrument ``i == 0``) are emitted around access-node
+    # uses that may be outside the loop body, so the counter must stay in function scope.
+    if _loop_variable_in_instrument_conditions(loop, name):
+        return None
+    return loop_region_index_ctype() or dtype.ctype
+
+
+def _loop_variable_in_instrument_conditions(loop: LoopRegion, name: str) -> bool:
+    """Return True if ``name`` may be referenced by instrumentation code emitted outside ``loop``.
+
+    Data-instrumentation conditions and state-level symbol dumps are emitted around state
+    boundaries; the loop variable is not in scope before the ``for``-init clause, so any such
+    reference forces a hoisted declaration.
+    """
+    sdfg = loop.sdfg
+    name_re = re.compile(r'\b' + re.escape(name) + r'\b')
+
+    # Access-node instrumentation conditions anywhere in the SDFG may reference the loop variable.
+    for node, _state in sdfg.all_nodes_recursive():
+        cond = getattr(node, 'instrument_condition', None)
+        if isinstance(cond, CodeBlock) and cond.as_string and name_re.search(cond.as_string):
+            return True
+
+    # State-level symbol instrumentation dumps every symbol in state.defined_symbols(); if the loop
+    # variable is among them the dump is emitted at the top of the state, which can be before the
+    # ``for``-init clause that declares it.
+    for state in sdfg.states():
+        sym_instr = state.symbol_instrument
+        if sym_instr != dtypes.DataInstrumentationType.No_Instrumentation and name in state.defined_symbols():
+            return True
+        sym_cond = state.symbol_instrument_condition
+        if isinstance(sym_cond, CodeBlock) and sym_cond.as_string and name_re.search(sym_cond.as_string):
+            return True
+    return False
 
 
 def code_blocks_of(value) -> Tuple[CodeBlock, ...]:
@@ -95,6 +157,8 @@ def index_function_qualifier() -> str:
     an un-inlined access would block vectorization."""
     if Config.get('compiler', 'cpu', 'codegen_params', 'index_fn_qualifier') == 'always_inline':
         return 'static __attribute__((always_inline)) inline constexpr'
+    if mpr_lowering.standalone():
+        return STANDALONE_INDEX_FUNCTION_QUALIFIER
     return INDEX_FUNCTION_QUALIFIER
 
 
@@ -112,10 +176,70 @@ def index_ctype() -> str:
 def size_qualifier(is_constant: bool) -> str:
     """Qualifier for an ``<array>_size`` helper: ``consteval`` for a constant extent under C++20+
     (folds it at compile time), else ``constexpr`` (the same qualifier as the index functions)."""
+    standalone = mpr_lowering.standalone()
     if not is_constant:
-        return INDEX_FUNCTION_QUALIFIER
+        return STANDALONE_INDEX_FUNCTION_QUALIFIER if standalone else INDEX_FUNCTION_QUALIFIER
     standard = int(str(Config.get('compiler', 'cpp_standard')).strip())
-    return SIZE_CONSTEVAL_QUALIFIER if standard >= 20 else INDEX_FUNCTION_QUALIFIER
+    if standard < 20:
+        return STANDALONE_INDEX_FUNCTION_QUALIFIER if standalone else INDEX_FUNCTION_QUALIFIER
+    return STANDALONE_SIZE_CONSTEVAL_QUALIFIER if standalone else SIZE_CONSTEVAL_QUALIFIER
+
+
+def c_heap_alloc_stmt(alloc_name: str, ctype: str, count: str, nodedesc: Optional[dt.Data]) -> str:
+    """The C allocation for a heap transient, paired with ``free``.
+
+    C11 requires ``aligned_alloc``'s size to be an integral MULTIPLE of the alignment, which the
+    element count times the element size is not in general -- so the byte count is rounded up. The
+    extra bytes are past the last element and are never touched.
+
+    :param alloc_name: the assignment target: a plain pointer name, or a full declarator.
+    :param ctype: the element type.
+    :param count: the already-printed element count.
+    :param nodedesc: the descriptor, read for the alignment it asks for.
+    :returns: the allocation statement.
+    """
+    # The count is a SIGNED extent and the size argument is ``size_t``, so the conversion is spelled
+    # out: left implicit it is a ``-Wsign-conversion`` diagnostic on every allocation the render emits.
+    if nodedesc is None or not use_aligned_operator_new(nodedesc):
+        return '%s = malloc(sizeof(%s) * (size_t)(%s));\n' % (alloc_name, ctype, count)
+    alignment = aligned_new_value(nodedesc)
+    bytes_needed = '((sizeof(%s) * (size_t)(%s) + %d) / %d) * %d' % (ctype, count, alignment - 1, alignment, alignment)
+    return '%s = aligned_alloc(%d, %s);\n' % (alloc_name, alignment, bytes_needed)
+
+
+def format_index_helper(qualifier: str, ctype: str, fnname: str, parameters: List[str], body: str) -> str:
+    """The ``<array>_idx`` / ``<array>_size`` helper, as a function or (in C) as a macro.
+
+    C23 has ``constexpr`` for OBJECTS but not for functions, so the qualifier these helpers carry
+    has no C spelling at all. A function-like macro is what keeps them foldable at compile time --
+    which is the whole point of the qualifier: the index arithmetic collapses into the subscript
+    instead of surviving as a call.
+
+    Every parameter reference is parenthesized AND cast to the helper's own integer type. The
+    parentheses are what makes ``A_idx(i + 1, j)`` mean what it says; the cast is what keeps the
+    C++ helper's int64 return type, so a large extent does not overflow through int32 arithmetic
+    it would never have been evaluated in.
+
+    A comma inside a call argument (``A_idx(ipow(nclv, 2), j)``) is NOT a hazard: C protects commas
+    inside matched parentheses when splitting macro arguments.
+
+    :param qualifier: the C++ qualifier (ignored by the C form, which has no place for one).
+    :param ctype: the integer type the helper computes in.
+    :param fnname: the helper's name.
+    :param parameters: the parameter names, in order.
+    :param body: the already-printed expression, naming exactly ``parameters``.
+    :returns: the definition to emit once per translation unit.
+    """
+    if not mpr_lowering.standalone_c():
+        declared = ', '.join('%s %s' % (ctype, name) for name in parameters)
+        return '%s %s %s(%s) { return %s; }' % (qualifier, ctype, fnname, declared, body)
+    if parameters:
+        # One pass over an alternation, so a replacement's own text is never rescanned.
+        pattern = re.compile(r'\b(?:%s)\b' % '|'.join(re.escape(name) for name in parameters))
+        body = pattern.sub(lambda match: '((%s)(%s))' % (ctype, match.group(0)), body)
+    else:
+        body = '(%s)(%s)' % (ctype, body)
+    return '#define %s(%s) (%s)' % (fnname, ', '.join(parameters), body)
 
 
 def format_index_access(ptrname: str, fnname: str, indices: List[str], extra: List[str]) -> str:
@@ -198,6 +322,8 @@ def deduplicate_includes(code: str) -> str:
 class ExperimentalCPUCodeGen(CPUCodeGen):
     """ Human-readable CPU/GPU-kernel code generator (see module docstring). """
 
+    experimental_codegen = True
+
     def __init__(self, frame, sdfg):
         super().__init__(frame, sdfg)
         # Helper name -> full C++ definition (deduplicated), for the ``<array>_idx`` index
@@ -251,6 +377,21 @@ class ExperimentalCPUCodeGen(CPUCodeGen):
         # emit_tasklet_body_block, which is the first point that knows whether that tasklet is emitted
         # brace-free (fuse the binding) or in its own `{ }` block (declare ahead of the block instead).
         self.const_pending: List[dict] = []
+        # Library nodes whose description is already written into this unit (see emit_provenance),
+        # by ORIGIN GUID: one expansion produces many nodes that share a description, and two
+        # separate nodes of the same kind each deserve their own comment.
+        self._emitted_provenance: Set[str] = set()
+
+    def emit_interstate_variable_declaration(self, name, dtype, callsite_stream, sdfg):
+        """LoopRegion counters are declared inside their own ``for``-init clause in the readable
+        generator (``for (T i = ...)``); only non-loop interstate symbols keep the hoisted declaration.
+        """
+        local_ctype = _experimental_loop_local_counter_ctype(name, dtype, sdfg)
+        if local_ctype is not None:
+            self._frame.loop_local_counters[(sdfg.cfg_id, name)] = local_ctype
+            self._frame.dispatcher.defined_vars.add(name, DefinedType.Scalar, local_ctype)
+            return
+        super().emit_interstate_variable_declaration(name, dtype, callsite_stream, sdfg)
 
     def get_generated_codeobjects(self):
         # A split-nest / external translation unit assembles its global code the way the frame does --
@@ -274,7 +415,9 @@ class ExperimentalCPUCodeGen(CPUCodeGen):
         """
         if dynamic_map_inputs(state_dfg, node):  # emit memlet_definition declarations
             return True
-        if hoist_loop_decls(node):  # declares the induction variables ahead of the loop headers
+        if any(
+                hoist_loop_decls(node, self._map_loop_will_have_openmp_pragma(sdfg, state_dfg, node, i))
+                for i in range(len(node.map.range))):  # declares the induction variables ahead of the loop headers
             return True
         if self.walk_plan_for(sdfg, state_dfg, node):  # declares the walking base pointers ahead of the loop
             return True
@@ -286,8 +429,7 @@ class ExperimentalCPUCodeGen(CPUCodeGen):
         # this scope; keep the brace so the directive does not leak to the enclosing scope and clash
         # across sibling maps. (Real-type reductions need only a ``reduction(op:var)`` clause on the
         # pragma, which is self-contained, so they do not force the brace.)
-        if (node.map.schedule == dtypes.ScheduleType.CPU_Multicore
-                and Config.get_bool('compiler', 'emit_tree_reductions')
+        if (node.map.schedule == dtypes.ScheduleType.CPU_Multicore and emits_tree_reductions(self.experimental_codegen)
                 and any(declare is not None
                         for _op, _ct, _dname, declare in self._collect_omp_reductions(sdfg, state_dfg, node))):
             return True
@@ -295,9 +437,30 @@ class ExperimentalCPUCodeGen(CPUCodeGen):
 
     # -- ptr_increment: walking base pointers for a sequential map -------------
 
+    def emit_provenance(self, node, cfg, state_id, callsite_stream) -> None:
+        """Write the ``// <what this used to be>`` line for code a library node's expansion produced.
+
+        MPR records the description when it expands the node (``dace.codegen.mpr``); by the time
+        the code is emitted, all that is left is loops and tasklets. Written ONCE per description
+        per translation unit: a Cholesky expands into several maps and dozens of tasklets, and a
+        comment on each would bury the code it is there to explain.
+
+        A no-op outside a standalone rendering -- nothing records provenance then, so the ordinary
+        output is unchanged.
+        """
+        record = mpr_lowering.describe(node.guid)
+        if record is None:
+            return
+        origin, description = record
+        if origin in self._emitted_provenance:
+            return
+        self._emitted_provenance.add(origin)
+        callsite_stream.write('// %s' % description, cfg, state_id, node)
+
     def _generate_MapEntry(self, sdfg, cfg, dfg, state_id, node, function_stream, callsite_stream):
         # Compute (and memoize) the walk plan BEFORE the base emitter runs, so ``map_scope_needs_brace``
         # -- which the base calls -- sees it, and push this map so the scope hooks below can find it.
+        self.emit_provenance(node, cfg, state_id, callsite_stream)
         self.walk_plan_for(sdfg, cfg.state(state_id), node)
         self._map_scope_stack.append(node)
         super()._generate_MapEntry(sdfg, cfg, dfg, state_id, node, function_stream, callsite_stream)
@@ -561,6 +724,7 @@ class ExperimentalCPUCodeGen(CPUCodeGen):
         return ''
 
     def emit_tasklet_body_block(self, callsite_stream, cfg, state_id, node, inner_body, postamble, has_locals) -> None:
+        self.emit_provenance(node, cfg, state_id, callsite_stream)
         # A connector-free, single-statement tasklet collapses onto one brace-free
         # line: ``C[C_idx(i, j)] = A[A_idx(i, j)] + B[B_idx(i, j)];  // <label>``.
         # Anything with copy-in/out temporaries, code->code locals, or a multi-
@@ -579,6 +743,7 @@ class ExperimentalCPUCodeGen(CPUCodeGen):
                 # enclosing scope AND what its statement reads, which is exactly what a fused
                 # declaration needs: `T x = expr;` is only in scope for later readers if this line is
                 # not wrapped in a brace of its own.
+                line = self.explicit_store_conversion(cfg, state_id, node, line)
                 line = self.fuse_pending_decl(node, line)
                 self.emit_pending_late_decls(cfg, state_id, node, callsite_stream)
                 callsite_stream.write('%s  // %s\n' % (line, node.label), cfg, state_id, node)
@@ -590,6 +755,83 @@ class ExperimentalCPUCodeGen(CPUCodeGen):
         callsite_stream.write(inner_body, cfg, state_id, node)
         callsite_stream.write(postamble)
         callsite_stream.write('}', cfg, state_id, node)
+
+    @staticmethod
+    def tasklet_read_types(cfg, state_id: int, node) -> Dict[str, dtypes.typeclass]:
+        """Types for every name a tasklet body may read: its connectors AND its data containers.
+
+        A body does not have to spell its connectors -- ``out[:] = arr * s`` arrives as
+        ``(expr_times_a[0, 0] + c[0])``, naming the DATA. Passing only ``in_connectors`` leaves those
+        names unbound and inference gives up, which reads as "types agree" and silently drops a
+        conversion.
+        """
+        reads = {name: dtype for name, dtype in node.in_connectors.items() if isinstance(dtype, dtypes.typeclass)}
+        state = cfg.state(state_id)
+        arrays = state.sdfg.arrays
+        for edge in state.in_edges(node):
+            data = edge.data.data
+            if data in arrays:
+                reads.setdefault(data, arrays[data].dtype)
+        return reads
+
+    def explicit_store_conversion(self, cfg, state_id: int, node, line: str) -> str:
+        """Spell the conversion when a fused store's expression type is not the connector's.
+
+        A kernel that mixes a float scalar with integer arrays -- ``out[:] = arr * s`` over
+        ``dc.int64`` arrays and a ``dc_float`` scalar -- computes in double and stores into
+        ``int64_t``. The narrowing is real (the frontend chose it), but left implicit it is a
+        ``-Wfloat-conversion`` diagnostic on a render that is otherwise clean.
+
+        This store never reaches :meth:`CPUCodeGen.make_ptr_assignment`: the destination is
+        substituted INTO the tasklet body, so the statement arrives here already assembled. The out
+        connector is the type DaCe means to store, and the body is what produces the value, so the
+        two are compared directly.
+
+        :param cfg: the control-flow graph being emitted, to reach the tasklet's incoming edges.
+        :param state_id: index of the state holding the tasklet.
+        :param node: the tasklet, whose body is one assignment.
+        :param line: the emitted statement.
+        :returns: the statement, with the right-hand side cast when the types differ.
+        """
+        if not mpr_lowering.standalone() or node.language != dtypes.Language.Python:
+            return line
+        if len(node.out_connectors) != 1:
+            return line
+        dst = next(iter(node.out_connectors.values()))
+        if not isinstance(dst, dtypes.typeclass) or isinstance(dst, (dtypes.pointer, dtypes.vector)):
+            return line
+        value = self.assigned_expression(node)
+        if value is None:
+            return line
+        try:
+            src = type_inference.infer_expr_type(value, self.tasklet_read_types(cfg, state_id, node))
+        except Exception:  # inference is best-effort: an unknown call is not a reason to fail codegen
+            return line
+        if src is None or src == dst or isinstance(src, (dtypes.pointer, dtypes.vector)):
+            return line
+        split = re.search(r'(?<![=!<>+\-*/%&|^])=(?!=)', line)
+        if split is None:
+            return line
+        head, tail = line[:split.start()], line[split.end():].strip()
+        if not tail.endswith(';'):
+            return line
+        # C has one cast spelling; C++ has ``-Wold-style-cast``, so the render says which conversion it
+        # means rather than reaching for the one spelling that also reinterprets.
+        value = tail[:-1].strip()
+        if mpr_lowering.standalone_c():
+            return f'{head}= ({dst.ctype})({value});'
+        return f'{head}= static_cast<{dst.ctype}>({value});'
+
+    @staticmethod
+    def assigned_expression(node):
+        """The Python source of the single assignment's right-hand side, or ``None``."""
+        try:
+            body = ast.parse(node.code.as_string).body
+        except (SyntaxError, TypeError, ValueError):
+            return None
+        if len(body) != 1 or not isinstance(body[0], (ast.Assign, ast.AnnAssign)):
+            return None
+        return astutils.unparse(body[0].value) if body[0].value is not None else None
 
     def _single_statement_body(self, node) -> bool:
         """True if ``node`` is a Python tasklet whose body is exactly one assignment (so, once its
@@ -848,12 +1090,12 @@ class ExperimentalCPUCodeGen(CPUCodeGen):
         # `const T x = expr;` fused at its (single) write site (see
         # ReadableKeywordRemover.visit_Assign), so skip the mutable `T x;`
         # declaration -- but still register it so its reads resolve to a Scalar.
-        if self._is_const_scalar(nodedesc):
+        if self._is_const_scalar(nodedesc, node.data, sdfg):
             self._dispatcher.defined_vars.add(self.ptr(node.data, nodedesc, sdfg), DefinedType.Scalar,
                                               nodedesc.dtype.ctype)
             return
         # Same fusion for a single-element stack array -> `const T x[1] = {expr};`.
-        if self._is_const_len1_array(nodedesc):
+        if self._is_const_len1_array(nodedesc, node.data, sdfg):
             self._dispatcher.defined_vars.add(self.ptr(node.data, nodedesc, sdfg), DefinedType.Pointer,
                                               dtypes.pointer(nodedesc.dtype).ctype)
             return
@@ -946,10 +1188,19 @@ class ExperimentalCPUCodeGen(CPUCodeGen):
             if registered is not None:
                 fnname, call_args = registered
                 count = '%s(%s)' % (fnname, ', '.join(call_args))
+        if mpr_lowering.standalone_c():
+            return c_heap_alloc_stmt(alloc_name, ctype, count, nodedesc)
         placement = ''
         if nodedesc is not None and use_aligned_operator_new(nodedesc):
             placement = ' (std::align_val_t(%d))' % aligned_new_value(nodedesc)
         return '%s = new%s %s[%s];\n' % (alloc_name, placement, ctype, count)
+
+    def heap_free_stmt(self, alloc_name: str, is_array: bool, nodedesc: Optional[dt.Data] = None) -> str:
+        """The matching free. C releases both allocation shapes with ``free``, and has no
+        destructors for the base generator's trivial-destructibility assertion to be about."""
+        if mpr_lowering.standalone_c():
+            return 'free(%s);\n' % alloc_name
+        return super().heap_free_stmt(alloc_name, is_array, nodedesc)
 
     def _flush_generated_functions(self, function_stream, cfg, state_id, node) -> None:
         # Emit each registered index / size helper once per OUTPUT FILE. A non-inline nested-SDFG
@@ -1330,16 +1581,36 @@ class ExperimentalCPUCodeGen(CPUCodeGen):
             callsite_stream.write('%s %s%s;' % (info['ctype'], info['ptrname'], zero), cfg, state_id, tasklet)
             del self._late_pending[ptrname]
 
-    def _is_const_scalar(self, desc) -> bool:
+    def const_binding_scope_is_local(self, sdfg, name: str) -> bool:
+        """The allocation planner would declare ``name`` in the very block its write is emitted in.
+
+        A fused binding IS the declaration, so it only reaches later readers when that block is where
+        the declaration belonged anyway. ``determine_allocation_lifetime`` puts a ``Scope`` transient
+        touched in more than one state at FUNCTION scope, and ``SplitStateByGpuClass`` makes exactly
+        that shape by lifting host tasklets out of a kernel state: the binding would then die at the
+        writing state's closing brace while the kernel launch reading it sits in the next one. Asking
+        the planner rather than rescanning uses is the same inversion ``defer_scalar_declaration``
+        makes -- an unanticipated use shape reads as a scope mismatch, i.e. a refusal.
+        """
+        scope = self.eager_allocation_scope(sdfg, name)
+        return scope is not None and not isinstance(scope, SDFG)
+
+    def _is_const_scalar(self, desc, name: Optional[str] = None, sdfg=None) -> bool:
         """A single-write (``const_runtime``) scope-local scalar emitted as a fused
-        ``const T x = expr;`` binding. Restricted to scope-lifetime CPU value scalars so the binding
-        is declared in exactly the scope its reads live in; a device/persistent scalar stays classic."""
+        ``const T x = expr;`` binding. Restricted to scope-lifetime CPU value scalars, read in the one
+        state that writes them, so the binding is declared in exactly the scope its reads live in; a
+        device/persistent scalar, or one read from another state, stays classic."""
+        if name is not None and sdfg is not None and not self.const_binding_scope_is_local(sdfg, name):
+            return False
         return (isinstance(desc, dt.Scalar) and desc.const_init and desc.lifetime == dtypes.AllocationLifetime.Scope and
                 desc.storage in (dtypes.StorageType.Register, dtypes.StorageType.Default, dtypes.StorageType.CPU_Heap))
 
-    def _is_const_len1_array(self, desc) -> bool:
+    def _is_const_len1_array(self, desc, name: Optional[str] = None, sdfg=None) -> bool:
         """A single-write (``const_runtime``) single-element STACK (Register) array emitted as a fused
-        ``const T x[1] = {expr};`` binding. A heap or device single-element array stays classic."""
+        ``const T x[1] = {expr};`` binding. A heap or device single-element array, or one the planner
+        declares at function scope, stays classic."""
+        if name is not None and sdfg is not None and not self.const_binding_scope_is_local(sdfg, name):
+            return False
         return (isinstance(desc, dt.Array) and not isinstance(desc, dt.View) and desc.const_init
                 and desc.lifetime == dtypes.AllocationLifetime.Scope and desc.storage == dtypes.StorageType.Register
                 and len(desc.shape) >= 1 and all(d == 1 for d in desc.shape))
@@ -1394,11 +1665,9 @@ class ExperimentalCPUCodeGen(CPUCodeGen):
         self._index_sig_to_name[key] = fnname
 
         ctype = index_ctype()
-        params = ['%s %s' % (ctype, str(d)) for d in dim_syms]
-        params += ['%s %s' % (ctype, s) for s in extra_names]
-        body = sym2cpp(flatexpr)
-        self._index_functions[fnname] = '%s %s %s(%s) { return %s; }' % (index_function_qualifier(), ctype, fnname,
-                                                                         ', '.join(params), body)
+        parameters = [str(d) for d in dim_syms] + list(extra_names)
+        self._index_functions[fnname] = format_index_helper(index_function_qualifier(), ctype, fnname, parameters,
+                                                            sym2cpp(flatexpr))
         return fnname, extra_names
 
     # -- readable array size --------------------------------------------------
@@ -1446,13 +1715,28 @@ class ExperimentalCPUCodeGen(CPUCodeGen):
             fnname = '%s_%d_size' % (base, len(self._size_sig_to_name))
         self._size_sig_to_name[key] = fnname
 
-        qualifier = size_qualifier(is_constant)
-        ctype = index_ctype()
-        params = ['%s %s' % (ctype, s) for s in call_args]
-        body = sym2cpp(total)
-        self._size_functions[fnname] = '%s %s %s(%s) { return %s; }' % (qualifier, ctype, fnname, ', '.join(params),
-                                                                        body)
+        self._size_functions[fnname] = format_index_helper(size_qualifier(is_constant), index_ctype(), fnname,
+                                                           list(call_args), sym2cpp(total))
         return fnname, call_args
+
+
+class NestedMultiDimSubscriptLowerer(ast.NodeTransformer):
+    """Rewrites a nested multi-dim array subscript (``idx[i, j]``) found inside an index
+    expression to its ``<array>_idx`` C++ text, via the same ``_bare_access`` path a top-level
+    subscript uses. A rank>=2 nested subscript's ``Tuple`` slice reparses as a Python
+    ``ast.Tuple`` downstream (``format_index_access`` -> ``sym2cpp`` -> ``pystr_to_symbolic``)
+    and corrupts to ``std::make_tuple`` on a raw pointer; a rank-1 nested subscript (``idx[i]``)
+    already round-trips as valid C++ and is left untouched."""
+
+    def __init__(self, remover: 'ReadableKeywordRemover'):
+        self.remover = remover
+
+    def visit_Subscript(self, node: ast.Subscript) -> ast.AST:
+        if isinstance(node.slice, ast.Tuple) and self.remover._is_bare_data(rname(node)):
+            access = self.remover._bare_access(node)
+            if access is not None:
+                return ast.copy_location(ast.Name(id=access), node)
+        return self.generic_visit(node)
 
 
 class ReadableKeywordRemover(cpp.DaCeKeywordRemover):
@@ -1516,7 +1800,7 @@ class ReadableKeywordRemover(cpp.DaCeKeywordRemover):
         rhs = cppunparse.cppunparse(value, expr_semicolon=False)
         desc = self.sdfg.arrays[target]
         plain = '%s = %s;' % (lhs, rhs)
-        if self.codegen._is_const_scalar(desc):
+        if self.codegen._is_const_scalar(desc, target, self.sdfg):
             # Single-write scope-local scalar: the mutable `T x;` declaration was skipped in
             # allocate_array, so this write carries it -- as a fused `const T x = expr;` binding when
             # the tasklet is emitted brace-free, else as a plain `T x;` line ahead of its block.
@@ -1524,7 +1808,7 @@ class ReadableKeywordRemover(cpp.DaCeKeywordRemover):
             # write; register_const_binding's consumer picks (see emit_tasklet_body_block).
             ctype = desc.dtype.ctype
             self.codegen.register_const_binding('%s %s;' % (ctype, lhs), plain, 'const %s %s = %s;' % (ctype, lhs, rhs))
-        elif self.codegen._is_const_len1_array(desc):
+        elif self.codegen._is_const_len1_array(desc, target, self.sdfg):
             # Single-write single-element stack array -> `const T x[1] = {(T)(expr)};`; reads keep their
             # `x[x_idx(0)]` form (== x[0]). The explicit `(T)` cast matches legacy's implicit narrowing on
             # a plain `x[0] = expr;` assignment (e.g. a float sink of a double-returning ``sqrt``); without
@@ -1561,4 +1845,5 @@ class ReadableKeywordRemover(cpp.DaCeKeywordRemover):
         return super().visit_Name(node)
 
     def _index_list(self, slicenode: ast.AST) -> List[str]:
-        return subscript_index_strings(slicenode)
+        lowerer = NestedMultiDimSubscriptLowerer(self)
+        return [ast.unparse(lowerer.visit(astutils.copy_tree(e))) for e in index_expr_nodes(slicenode)]

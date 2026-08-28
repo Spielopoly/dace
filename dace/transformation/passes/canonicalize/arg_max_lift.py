@@ -176,6 +176,7 @@ from dace.sdfg.state import LoopRegion, SDFGState, ControlFlowRegion, Conditiona
 from dace.transformation import pass_pipeline as ppl
 from dace.transformation import transformation as xf
 from dace.transformation.passes.analysis import loop_analysis
+from dace.transformation.passes.canonicalize.induction_variable_substitution import staged_iedge_rhs
 from dace.libraries.standard.nodes.reduce import Reduce
 
 #: Map AST comparison op class -> DaCe reduction type.
@@ -901,7 +902,6 @@ class ArgMaxLift(ppl.Pass):
         aa_flat[total-1-k]``, materialised by a parallel map) and the returned
         position is mapped back with ``mflat = total - 1 - idx``.
         """
-        from dace.codegen.targets.cpp import sym2cpp
         from dace.libraries.standard.nodes import ArgReduce
         desc = sdfg.arrays[m.input_array]
         val_buf, _ = sdfg.add_scalar(f'_argmax2d_val_{m.outer_loop.label}',
@@ -928,20 +928,24 @@ class ArgMaxLift(ppl.Pass):
                                         transient=True,
                                         find_new_name=True)
             mat_state = m.parent.add_state(m.outer_loop.label + '_argreduce2d_rev')
+            # Symbolic bounds and subsets, never a rendered string: ``sym2cpp`` spells a symbolic
+            # extent as C++ (``dace::math::ipow(R, K)``), and the range parser splits on ':', so
+            # the qualified name comes back as bogus tokens.
+            _i, _j = symbolic.symbol('_i'), symbolic.symbol('_j')
+            rev_i = symbolic.simplify(nrows - 1) - _i
+            rev_j = symbolic.simplify(ncols_sym - 1) - _j
+            flat = _i * ncols_sym + _j
             mat_state.add_mapped_tasklet(
                 name='reverse_gather2d',
                 map_ranges={
-                    '_i': f'0:{sym2cpp(nrows)}',
-                    '_j': f'0:{sym2cpp(ncols_sym)}'
+                    '_i': (0, nrows - 1, 1),
+                    '_j': (0, ncols_sym - 1, 1)
                 },
                 inputs={
-                    '__in':
-                    mm.Memlet(data=m.input_array,
-                              subset=f'({sym2cpp(symbolic.simplify(nrows - 1))}) - _i, '
-                              f'({sym2cpp(symbolic.simplify(ncols_sym - 1))}) - _j')
+                    '__in': mm.Memlet(data=m.input_array, subset=subsets.Range([(rev_i, rev_i, 1), (rev_j, rev_j, 1)]))
                 },
                 code='__out = __in',
-                outputs={'__out': mm.Memlet(data=rev_buf, subset=f'_i * ({sym2cpp(ncols_sym)}) + _j')},
+                outputs={'__out': mm.Memlet(data=rev_buf, subset=subsets.Range([(flat, flat, 1)]))},
                 external_edges=True,
             )
             entry_state = mat_state
@@ -1157,6 +1161,8 @@ class ArgMaxLift(ppl.Pass):
             lv = symbolic.pystr_to_symbolic(loop_var)
         except Exception:  # pragma: no cover -- defensive parse guard
             return None
+        # membership and .coeff both go through identity; equalize before either
+        idx, lv = symbolic.equalize_symbols_across(idx, lv)
         if lv not in idx.free_symbols:
             return None
         # Linear-in-``lv`` decomposition: idx == base + coeff*lv with neither
@@ -1396,13 +1402,17 @@ class ArgMaxLift(ppl.Pass):
                 return False, None  # nested control flow not supported in v1
         return carrier_write_seen, idx_carrier
 
-    def _collect_preloop_assignments(self, loop: LoopRegion) -> dict:
+    def _collect_preloop_assignments(self, loop: LoopRegion, sdfg: SDFG) -> dict:
         """Walk back the linear pre-loop chain (each block reached by a single
         in-edge) and accumulate interstate-edge assignments. The binding closest
         to the loop wins for each name (it is the value live at loop entry).
 
         The seed of a TSVC argmax is spread over this chain -- e.g.
         ``block: a_index := a[0]; index := 0`` then ``-> loop: maxv := abs(a_index)``.
+        A binding staged through a transient scalar (``k := k_plus_inc`` with the
+        arithmetic in a tasklet) is resolved to the arithmetic it stands for, so the
+        seed-position check below sees a symbol value rather than an array name it
+        must discard.
         """
         preloop: dict = {}
         parent = loop.parent_graph
@@ -1415,7 +1425,8 @@ class ArgMaxLift(ppl.Pass):
             e = ins[0]
             for lhs, rhs in (e.data.assignments or {}).items():
                 if lhs not in preloop:  # closest-to-loop wins
-                    preloop[lhs] = str(rhs)
+                    staged = staged_iedge_rhs(str(rhs), e.src, sdfg)
+                    preloop[lhs] = str(rhs) if staged is None else symbolic.symstr(staged)
             if e.src in seen or not isinstance(e.src, (SDFGState, ControlFlowRegion)):
                 break
             seen[e.src] = None
@@ -1462,7 +1473,7 @@ class ArgMaxLift(ppl.Pass):
         abs(a_index)`` with ``a_index := a[0]`` on an earlier edge. Both the
         position comparison and the gather lookup substitute the chain's bindings.
         """
-        preloop = self._collect_preloop_assignments(loop)
+        preloop = self._collect_preloop_assignments(loop, sdfg)
         if value_carrier not in preloop:
             return False
         if idx_carrier is not None and idx_carrier not in preloop:
@@ -1698,7 +1709,6 @@ class ArgMaxLift(ppl.Pass):
         forward slice's last one; the position maps back as ``idx_carrier :=
         end - idx_buf``.
         """
-        from dace.codegen.targets.cpp import sym2cpp
         from dace.libraries.standard.nodes import ArgReduce
         start = symbolic.simplify(m.iter_start)
         end = symbolic.simplify(m.iter_end)
@@ -1725,10 +1735,11 @@ class ArgMaxLift(ppl.Pass):
                                         transient=True,
                                         find_new_name=True)
             mat_state = m.parent.add_state(m.loop.label + '_argreduce_rev')
+            rev = end - symbolic.symbol('_j')
             mat_state.add_mapped_tasklet(
                 name='reverse_gather',
-                map_ranges={'_j': f'0:{sym2cpp(n_elems)}'},
-                inputs={'__in': mm.Memlet(data=m.input_array, subset=f'({sym2cpp(end)}) - _j')},
+                map_ranges={'_j': (0, n_elems - 1, 1)},
+                inputs={'__in': mm.Memlet(data=m.input_array, subset=subsets.Range([(rev, rev, 1)]))},
                 code='__out = __in',
                 outputs={'__out': mm.Memlet(data=rev_buf, subset='_j')},
                 external_edges=True,
@@ -1792,7 +1803,6 @@ class ArgMaxLift(ppl.Pass):
         ``f`` is applied per element in the materialisation map, so the
         reduction itself stays a plain Max/Min fold over a unit-stride buffer.
         """
-        from dace.codegen.targets.cpp import sym2cpp
         start = symbolic.simplify(m.iter_start)
         end = symbolic.simplify(m.iter_end)
         arr_dtype = sdfg.arrays[m.input_array].dtype
@@ -1806,10 +1816,11 @@ class ArgMaxLift(ppl.Pass):
 
         # Materialisation state: buf[_j] = f(input_array[slice_lo + _j]).
         mat_state = m.parent.add_state(m.loop.label + '_argf')
+        gather = slice_lo + symbolic.symbol('_j')
         mat_state.add_mapped_tasklet(
             name='transform_gather',
-            map_ranges={'_j': f'0:{sym2cpp(n_elems)}'},
-            inputs={'__in': mm.Memlet(data=m.input_array, subset=f'{sym2cpp(slice_lo)} + _j')},
+            map_ranges={'_j': (0, n_elems - 1, 1)},
+            inputs={'__in': mm.Memlet(data=m.input_array, subset=subsets.Range([(gather, gather, 1)]))},
             code=f'__out = {m.transform}(__in)',
             outputs={'__out': mm.Memlet(data=buf, subset='_j')},
             external_edges=True,
@@ -1878,7 +1889,6 @@ class ArgMaxLift(ppl.Pass):
         the index maps back as ``index := end - idx_buf``. Reversal costs nothing
         extra here -- it only flips the direction of a map that already runs.
         """
-        from dace.codegen.targets.cpp import sym2cpp
         from dace.libraries.standard.nodes import ArgReduce
         start = symbolic.simplify(m.iter_start)
         end = symbolic.simplify(m.iter_end)
@@ -1905,13 +1915,13 @@ class ArgMaxLift(ppl.Pass):
         if m.last_wins:
             # Iteration ``iter_lo + n_elems - 1`` == ``end``, so buf[0] holds the
             # LAST scanned iteration and buf[n-1] the seed.
-            in_subset = f'({sym2cpp(pos_hi)}) - ({sym2cpp(coeff)}) * _j'
+            in_idx = pos_hi - coeff * symbolic.symbol('_j')
         else:
-            in_subset = f'({sym2cpp(pos_lo)}) + ({sym2cpp(coeff)}) * _j'
+            in_idx = pos_lo + coeff * symbolic.symbol('_j')
         mat_state.add_mapped_tasklet(
             name='transform_gather_idx',
-            map_ranges={'_j': f'0:{sym2cpp(n_elems)}'},
-            inputs={'__in': mm.Memlet(data=m.input_array, subset=in_subset)},
+            map_ranges={'_j': (0, n_elems - 1, 1)},
+            inputs={'__in': mm.Memlet(data=m.input_array, subset=subsets.Range([(in_idx, in_idx, 1)]))},
             code=f'__out = {m.transform}(__in)',
             outputs={'__out': mm.Memlet(data=buf, subset='_j')},
             external_edges=True,

@@ -1,4 +1,9 @@
 # Copyright 2019-2025 ETH Zurich and the DaCe authors. All rights reserved.
+import os
+import subprocess
+import sys
+import tempfile
+import textwrap
 import typing
 import dace
 import re
@@ -6,7 +11,7 @@ import copy
 import numpy
 import pytest
 import ast
-from dace.transformation.passes.split_tasklets import SplitTasklets
+from dace.transformation.passes.split_tasklets import SplitTasklets, to_ssa
 from dace.transformation.passes.canonicalize import canonicalize
 
 # Format: (expression, expected_num_statements_after_split)
@@ -1315,3 +1320,81 @@ def test_add_missing_symbols_honors_integer_cast():
     idx = numpy.minimum((bins * (a - lo) / (hi - lo)).astype(numpy.int64), bins - 1)
     ref = numpy.bincount(idx, minlength=bins).astype(numpy.int64)
     assert numpy.array_equal(hist, ref), f"hist={hist} ref={ref}"
+
+
+def test_split_is_deterministic_under_a_randomised_hash_seed():
+    """The connectors the pass emits, and the in-edges it wires to them, come from the names it
+    collects while walking a statement's right-hand side. Collected into a plain set, that order is
+    the hash order of the strings, so the same tasklet split into a different SDFG per interpreter
+    run -- seed 1 disagreed with seeds 0 and 2 on this very kernel. Run in children because
+    ``PYTHONHASHSEED`` is only read at interpreter start."""
+    src = textwrap.dedent('''
+        import dace
+        from dace.sdfg import nodes
+        from dace.transformation.passes.split_tasklets import SplitTasklets
+        N = dace.symbol('N')
+
+        @dace.program
+        def prog(a: dace.float64[N], b: dace.float64[N], c: dace.float64[N], d: dace.float64[N]):
+            for i in dace.map[0:N]:
+                with dace.tasklet:
+                    av << a[i]
+                    bv << b[i]
+                    cv >> c[i]
+                    dv >> d[i]
+
+                    cv = av * 2.0 + bv * 3.0 + av * bv
+                    dv = cv + av - bv * 4.0
+
+        sdfg = prog.to_sdfg(simplify=True)
+        SplitTasklets().apply_pass(sdfg, {})
+        sig = sorted((n.label, tuple(n.in_connectors), tuple(n.out_connectors))
+                     for n, _ in sdfg.all_nodes_recursive() if isinstance(n, nodes.Tasklet))
+        print('SIG', sig, flush=True)
+    ''')
+    with tempfile.TemporaryDirectory() as tmp:
+        script = os.path.join(tmp, 'split_tasklets_seed_child.py')
+        with open(script, 'w') as fh:
+            fh.write(src)
+        sigs = []
+        for seed in ('0', '1', '2'):
+            env = dict(os.environ, PYTHONHASHSEED=seed)
+            res = subprocess.run([sys.executable, script], capture_output=True, timeout=600, env=env)
+            lines = [l for l in res.stdout.decode().splitlines() if l.startswith('SIG')]
+            assert lines, f'child with PYTHONHASHSEED={seed} produced no signature: {res.stderr[-500:]!r}'
+            sigs.append(lines[0])
+    assert len(dict.fromkeys(sigs)) == 1, 'hash-seed dependent split:\n' + '\n'.join(sigs)
+
+
+def test_if_then_statement_folds_to_ite():
+    """``if c: y = a`` is an ITE whose false case is the value ``y`` already held.
+
+    The earlier write has to be versioned away, or the result is two assignments to one name and
+    the chain builder downstream sees one register written twice.
+    """
+    statements = to_ssa('y = 0.0\nif (x > 0.5):\n    y = x')
+    assert statements, 'the if-then body was declined'
+    assert statements[-1].startswith('y = ITE('), statements
+    targets = [line.split(' = ')[0] for line in statements]
+    assert len(targets) == len(set(targets)), f'not single-assignment: {statements}'
+
+
+def test_if_then_else_statement_folds_to_ite():
+    """With both branches present there is no earlier value to preserve, and no versioning needed."""
+    statements = to_ssa('if (x > 0.5):\n    y = x\nelse:\n    y = 0.0')
+    assert statements[-1] == 'y = ITE(__t0, x, 0.0)', statements
+
+
+def test_if_then_without_a_previous_value_is_declined():
+    """``if c: y = a`` alone would read an undefined ``y`` on the false path."""
+    assert to_ssa('if (x > 0.5):\n    y = x') == []
+
+
+def test_conditional_with_an_unassignable_branch_is_declined():
+    """A branch that is not a plain assignment cannot be blended, so the whole body is declined."""
+    assert to_ssa('y = 0.0\nif (x > 0.5):\n    z[0] = x') == []
+
+
+def test_multi_statement_body_without_a_conditional_is_still_declined():
+    """The annotation-then-assignment shape must keep being left intact."""
+    assert to_ssa('_out: dace.float64\n_out = a * b') == []

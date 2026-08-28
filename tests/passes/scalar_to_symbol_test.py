@@ -1,5 +1,7 @@
 # Copyright 2019-2024 ETH Zurich and the DaCe authors. All rights reserved.
 """ Tests the scalar to symbol promotion functionality. """
+import re
+
 import dace
 from dace.sdfg.state import LoopRegion
 from dace.transformation.passes import scalar_to_symbol
@@ -973,11 +975,17 @@ def test_abs_complex_guard_compiles_and_runs():
 
     sdfg = absguard.to_sdfg(simplify=True)
     canonicalize(sdfg, validate=True)
-    # The complex-magnitude guard must survive as an ``Abs(...) < ...`` comparison
-    # in generated code -- this is exactly the shape that regresses if ``Abs``
-    # returns complex instead of the real magnitude.
-    assert any('Abs(' in line and '<' in line for c in codegen.generate_code(sdfg)
-               for line in c.clean_code.splitlines()), "expected an ``Abs(...) < ...`` guard in codegen"
+    # The magnitude must reach the comparison as a REAL -- that is the contract ``Abs`` breaks
+    # when it returns complex. Two lowerings say it: the guard folded into an interstate
+    # condition (``Abs(<complex>) < 2.0`` inline), or the magnitude bound to a real local first
+    # (``double m; m = abs(z); if (m < 2.0)``). Assert the property, not one of the two shapes.
+    lines = [line.strip() for c in codegen.generate_code(sdfg) for line in c.clean_code.splitlines()]
+    inline = any('Abs(' in line and '<' in line for line in lines)
+    bound = next((m.group(1) for m in (re.match(r'(\w+)\s*=\s*[aA]bs\(', line) for line in lines) if m), None)
+    real_typed = bound is not None and any(re.match(rf'(double|float)\s+{bound}\s*;', line) for line in lines)
+    compared = bound is not None and any(f'{bound} <' in line for line in lines)
+    assert inline or (real_typed and compared), \
+        f"the complex magnitude must be compared as a real; got bound={bound!r} in:\n" + "\n".join(lines)
     csdfg = sdfg.compile()  # fails to compile if Abs(complex) returns complex
 
     n = 16
@@ -987,6 +995,71 @@ def test_abs_complex_guard_compiles_and_runs():
     got = np.zeros(n, np.complex128)
     csdfg(a=a.copy(), out=got, N=n)
     assert np.allclose(got, ref), f"mismatch: {np.abs(got - ref).max():.2e}"
+
+
+def test_non_transient_promotion_is_read_only():
+    """A scalar ARGUMENT may become a symbol only while nothing writes it.
+
+    ``transients_only=False`` is what lets a strided gather's stride (TSVC ``s318``'s ``inc``)
+    close its induction variable: a read-only argument's value comes from the caller, so the
+    symbol is exact. A WRITTEN non-transient is an OUTPUT of the SDFG, and a symbol is not an
+    output -- promoting one silently drops the value the caller reads back.
+    """
+
+    @dace.program
+    def readonly_stride(a: dace.float64[40], out: dace.float64[20], inc: dace.int64):
+        for i in range(20):
+            out[i] = a[i * inc]
+
+    @dace.program
+    def written_result(a: dace.int64[20], total: dace.int64[1]):
+        total[0] = a[0] + 1
+
+    ro: dace.SDFG = readonly_stride.to_sdfg(simplify=False)
+    assert 'inc' not in scalar_to_symbol.find_promotable_scalars(ro)
+    assert 'inc' in scalar_to_symbol.find_promotable_scalars(ro, transients_only=False)
+
+    wr: dace.SDFG = written_result.to_sdfg(simplify=False)
+    assert 'total' not in scalar_to_symbol.find_promotable_scalars(wr, transients_only=False)
+
+
+def test_index_produced_in_the_same_state_is_not_promotable():
+    """A definition whose INDEX the same state is still computing cannot be hoisted out of it.
+
+    Promotion peels the defining subgraph off into a preceding state (``state_fission``), so every
+    input it reads has to be ready before that state runs. The index here reaches the read through a
+    memlet SUBSET rather than a data edge -- ``ya[idx, 0]`` records no read edge for ``idx`` -- so
+    the degree tests over the tasklet's input edges never see the dependence. Promoting anyway put
+    the read in front of the map that writes ``idx``, and rayleigh_ritz_rotation segfaulted on the
+    untouched initialiser. ``val`` is a float, so it is a candidate only because an interstate
+    condition reads it, which is exactly how the real kernel reached the pass.
+    """
+    sdfg = dace.SDFG('index_from_same_state')
+    sdfg.add_array('ya', [4, 1], dace.float64)
+    sdfg.add_array('out', [1], dace.float64)
+    sdfg.add_scalar('idx', dace.int64, transient=True)
+    sdfg.add_scalar('val', dace.float64, transient=True)
+
+    state = sdfg.add_state(is_start_block=True)
+    idx_node = state.add_access('idx')
+    state.add_mapped_tasklet('pick', {'i': '0:4'}, {'y': dace.Memlet('ya[i, 0]')},
+                             'o = i', {'o': dace.Memlet('idx[0]')},
+                             external_edges=True,
+                             output_nodes={'idx': idx_node})
+    read = state.add_tasklet('read', {'y'}, {'v'}, 'v = y')
+    state.add_edge(state.add_access('ya'), None, read, 'y', dace.Memlet('ya[idx, 0]'))
+    state.add_edge(read, 'v', state.add_access('val'), None, dace.Memlet('val[0]'))
+
+    neg, pos = sdfg.add_state('neg'), sdfg.add_state('pos')
+    sdfg.add_edge(state, neg, dace.InterstateEdge(condition='val < 0.0'))
+    sdfg.add_edge(state, pos, dace.InterstateEdge(condition='not (val < 0.0)'))
+    for branch, value in ((neg, '-1.0'), (pos, '1.0')):
+        branch.add_edge(branch.add_tasklet('w', {}, {'o'}, f'o = {value}'), 'o', branch.add_access('out'), None,
+                        dace.Memlet('out[0]'))
+
+    promotable = scalar_to_symbol.find_promotable_scalars(sdfg, integers_only=False)
+    assert 'val' not in promotable, (
+        f"'val' was promoted despite indexing with 'idx', which the same state writes: {promotable}")
 
 
 if __name__ == '__main__':
@@ -1023,3 +1096,5 @@ if __name__ == '__main__':
     test_reversed_order()
     test_scalar_index_regression(False)
     test_scalar_index_regression(True)
+    test_non_transient_promotion_is_read_only()
+    test_index_produced_in_the_same_state_is_not_promotable()

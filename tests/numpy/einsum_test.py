@@ -155,7 +155,6 @@ def test_lift_einsum_mttkrp():
 
 def test_lift_einsum_reduce():
     from dace.libraries.standard.nodes.reduce import Reduce
-    from dace.libraries.blas.nodes.einsum import Einsum
     from dace.transformation.dataflow import LiftEinsum
 
     @dace.program
@@ -166,16 +165,13 @@ def test_lift_einsum_reduce():
     B = np.random.rand(1)
 
     sdfg = tester.to_sdfg(A, B, simplify=True)
-    sdfg.expand_library_nodes()
-    assert sdfg.apply_transformations(LiftEinsum) == 1
-    for node, _ in sdfg.all_nodes_recursive():
-        if isinstance(node, Einsum):
-            assert node.einsum_str == 'ijk->'
-
-    # Specialize to ensure Reduce node is there
-    sdfg.expand_library_nodes(recursive=False)
+    # Capture the original Reduce node before lowering; afterwards it lives in a
+    # nested SDFG that LiftEinsum intentionally does not traverse.
     rnode = next(node for node, _ in sdfg.all_nodes_recursive() if isinstance(node, Reduce))
-    assert tuple(rnode.axes) == (0, 1, 2)
+    assert rnode.axes is None
+
+    sdfg.expand_library_nodes()
+    assert sdfg.apply_transformations(LiftEinsum) == 0
 
     sdfg(A, B)
     assert np.allclose(B, np.einsum('ijk->', A))
@@ -183,7 +179,6 @@ def test_lift_einsum_reduce():
 
 def test_lift_einsum_reduce_partial():
     from dace.libraries.standard.nodes.reduce import Reduce
-    from dace.libraries.blas.nodes.einsum import Einsum
     from dace.transformation.dataflow import LiftEinsum
 
     @dace.program
@@ -194,16 +189,13 @@ def test_lift_einsum_reduce_partial():
     B = np.random.rand(10, 9)
 
     sdfg = tester.to_sdfg(A, B, simplify=True)
-    sdfg.expand_library_nodes()
-    assert sdfg.apply_transformations(LiftEinsum) == 1
-    for node, _ in sdfg.all_nodes_recursive():
-        if isinstance(node, Einsum):
-            assert node.einsum_str == 'ijk->ik'
-
-    # Specialize to ensure Reduce node is there
-    sdfg.expand_library_nodes(recursive=False)
+    # Capture the original Reduce node before lowering; afterwards it lives in a
+    # nested SDFG that LiftEinsum intentionally does not traverse.
     rnode = next(node for node, _ in sdfg.all_nodes_recursive() if isinstance(node, Reduce))
     assert tuple(rnode.axes) == (1, )
+
+    sdfg.expand_library_nodes()
+    assert sdfg.apply_transformations(LiftEinsum) == 0
 
     sdfg(A, B)
     assert np.allclose(B, np.einsum('ijk->ik', A))
@@ -403,6 +395,47 @@ def test_einsum_dot_node(beta):
     assert np.allclose(r[0], 2.0 * np.dot(x, y) + beta * prior), f'got {r[0]}'
 
 
+def test_einsum_shape_check_equalizes_symbols():
+    """One symbol name can reach the shape check as several sympy instances -- a descriptor a layout
+    pass rebuilt against one parsed from a string -- which compare unequal by identity. The einsum
+    dimension check must go through the name, or it rejects a contraction whose shapes agree."""
+    from dace.libraries.blas.nodes.einsum import Einsum
+    rows, cols = 4, 6
+    wide = dace.symbol('ESN', dace.int32)
+    narrow = dace.symbol('ESN', dace.int64)
+    # the premise: identity says these differ, the name says they do not
+    assert wide is not narrow and wide != narrow
+    assert not symbolic.inequal_symbols(wide, narrow)
+
+    sdfg = dace.SDFG('einsum_symbol_instances')
+    sdfg.add_array('A', [rows, wide], dace.float64)
+    sdfg.add_array('v', [narrow], dace.float64)
+    sdfg.add_array('out', [rows], dace.float64)
+    state = sdfg.add_state()
+    enode = Einsum('einsum')
+    enode.einsum_str = 'ij,j->i'
+    enode.in_connectors = {'_ein00': None, '_ein01': None}
+    enode.out_connectors = {'_out': None}
+    state.add_node(enode)
+    # from_array, not a parsed string: parsing both bounds from 'ESN' would mint ONE instance and
+    # the mismatch under test could not arise.
+    state.add_edge(state.add_read('A'), None, enode, '_ein00', dace.Memlet.from_array('A', sdfg.arrays['A']))
+    state.add_edge(state.add_read('v'), None, enode, '_ein01', dace.Memlet.from_array('v', sdfg.arrays['v']))
+    state.add_edge(enode, '_out', state.add_write('out'), None, dace.Memlet.from_array('out', sdfg.arrays['out']))
+
+    # the two instances survive as far as the check; without equalization this raises
+    assert sdfg.arrays['A'].shape[1] is not sdfg.arrays['v'].shape[0]
+    sdfg.expand_library_nodes()
+    assert not any(isinstance(n, Einsum) for n in state.nodes())
+
+    rng = np.random.default_rng(3)
+    a = rng.random((rows, cols))
+    v = rng.random(cols)
+    out = np.zeros(rows)
+    sdfg(A=a, v=v, out=out, ESN=cols)
+    assert np.allclose(out, a @ v), f'got {out}, want {a @ v}'
+
+
 if __name__ == '__main__':
     test_general_einsum()
     test_matmul()
@@ -422,3 +455,4 @@ if __name__ == '__main__':
     test_batched_dot_4d()
     test_batched_dot_in_loop()
     test_c_transposed()
+    test_einsum_shape_check_equalizes_symbols()

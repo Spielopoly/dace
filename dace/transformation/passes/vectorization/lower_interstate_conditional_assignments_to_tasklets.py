@@ -5,6 +5,7 @@ import dace
 from dace import SDFG, properties, SDFGState, symbolic
 from dace.sdfg import ControlFlowRegion, nodes
 from dace.sdfg.state import BreakBlock, ConditionalBlock, LoopRegion
+from dace.transformation.passes.vectorization.utils.tasklets import is_python_tasklet
 from dace.transformation import pass_pipeline as ppl, transformation
 import dace.sdfg.utils as sdutil
 
@@ -55,8 +56,11 @@ class LowerInterstateConditionalAssignmentsToTasklets(ppl.Pass):
             free_conditional_symbols: Dict[str, None] = {}
             for state in cfg.nodes():
                 for node in state.nodes():
-                    if isinstance(node, nodes.Tasklet) and node.label.startswith(
-                            self.conditional_assignment_tasklet_prefix):
+                    # Python-bodied only -- the expression parse below is undefined otherwise.
+                    # NOT the lane-level guard: this demotes a symbol SDFG-wide and the conditional
+                    # arm it reads is lowered before any map scope exists around it.
+                    if (isinstance(node, nodes.Tasklet) and is_python_tasklet(node)
+                            and node.label.startswith(self.conditional_assignment_tasklet_prefix)):
                         expr = symbolic.SymExpr(node.code.as_string.split(" = ")[-1])
                         syms = expr.free_symbols
                         # If not in inconnectors then it is a symbol
@@ -86,6 +90,12 @@ class LowerInterstateConditionalAssignmentsToTasklets(ppl.Pass):
             # We should demote all the free conditional symbols
             for conditional_sym in free_conditional_symbols:
                 sdfg = cfg.sdfg if not isinstance(cfg, SDFG) else cfg
+                # An SDFG argument has no definition here to rewrite, and a symbol the graph
+                # evaluates (subset, map range, loop variable) stops being expressible as a scalar.
+                # Both are uniform across lanes, so the condition holds with them left symbols.
+                if (not sdutil.symbol_demotes_to_transient_scalar(sdfg, conditional_sym)
+                        or sdutil.symbol_carries_graph_structure(sdfg, conditional_sym)):
+                    continue
                 # Cast all symbols to fp64
                 sdfg.symbols[conditional_sym] = dace.float64
                 sdutil.demote_symbol_to_scalar(sdfg, conditional_sym, dace.float64, None)

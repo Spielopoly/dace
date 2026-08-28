@@ -83,6 +83,26 @@ def test_fuse_pass_rewrites_mul_add_to_fma():
     assert not resid, f"residual mul/add tasklets: {[t.code.as_string for t in resid]}"
 
 
+def test_integer_fma_keeps_integer_semantics():
+    """A residual integer FMA stays integral instead of round-tripping through ``double``."""
+
+    @dace.program
+    def integer_fma(A: dace.int64[N], B: dace.int64[N], C: dace.int64[N]):
+        for i in dace.map[0:N]:
+            with dace.tasklet:
+                aval << A[i]
+                bval << B[i]
+                outval >> C[i]
+                outval = fma(aval, bval, aval)
+
+    host_a = np.arange(8, dtype=np.int64) + (2**27 + 1)
+    host_b = np.arange(8, dtype=np.int64) + (2**26 + 3)
+    expected = host_a * host_b + host_a
+    result = np.zeros_like(expected)
+    integer_fma(A=host_a, B=host_b, C=result, N=8)
+    assert np.array_equal(result, expected)
+
+
 def test_fuse_pass_refuses_reused_intermediate():
     """A product read TWICE (not a single-use intermediate) must NOT be fused into an FMA."""
     from dace.sdfg.nodes import Tasklet

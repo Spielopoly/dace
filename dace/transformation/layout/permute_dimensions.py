@@ -3,6 +3,7 @@ import warnings
 
 from typing import Dict, List, Any, Tuple
 from dace.transformation import pass_pipeline as ppl
+from dace.transformation.layout.subscript_rewrite import rewrite_expression
 from dace.sdfg import nodes as nd
 from dataclasses import dataclass
 
@@ -432,7 +433,7 @@ def inverse_permutation(permute_indices: List[int]) -> List[int]:
 
 def note_copy_side(sides: Dict, edge, permute_indices: List[int]) -> None:
     """Marks edge (a CopyLibraryNode operand) as relaid out; may turn an elementwise copy transposing."""
-    from dace.libraries.standard.nodes.copy_node import CopyLibraryNode
+    from dace.libraries.standard.nodes.copy import CopyLibraryNode
 
     if isinstance(edge.dst, CopyLibraryNode):
         sides.setdefault(edge.dst, {})['in'] = list(permute_indices)
@@ -467,7 +468,7 @@ def covers_full_array(memlet, desc) -> bool:
 def retranspose_copies(state: dace.SDFGState, sides: Dict, context: str = "PermuteDimensions") -> None:
     """Replaces transposing copies with TensorTranspose; must run now, the permutation isn't recoverable later (axes = P^-1 if input relaid, P if output relaid)."""
     from dace.libraries.linalg import TensorTranspose
-    from dace.libraries.standard.nodes.copy_node import CopyLibraryNode
+    from dace.libraries.standard.nodes.copy import CopyLibraryNode
 
     for copy_node, permuted in sides.items():
         if 'in' in permuted and 'out' in permuted:
@@ -543,6 +544,7 @@ def rewrite_state_for_permute(state: dace.SDFGState,
             edge.data.subset = dace.subsets.Range(new_subset)
 
             flip_gemm_operand_if_transposed(edge, permute_indices)
+            rewrite_einsum_if_permuted(edge, permute_indices)
 
             if note_copy_side is not None:
                 note_copy_side(sides, edge, permute_indices)
@@ -569,22 +571,39 @@ def flip_gemm_operand_if_transposed(edge, permute_indices: List[int]) -> None:
     flip_operand_transpose(edge.dst, edge.dst_conn)
 
 
+def rewrite_einsum_if_permuted(edge, permute_indices: List[int]) -> None:
+    """Special rewrite rule: an ``Einsum`` operand permuted by ``permute_indices`` needs the matching subscript group permuted the same way, since the node reads its shapes from the descriptors but its contraction from the string. Without this the expansion sees ``'ij,j->i'`` against a relaid-out ``(M, N)`` operand and rejects it as a dimension mismatch. Identity permutations are ignored; a permuted OUTPUT is refused, as the output subscripts are shared with every operand."""
+    from dace.libraries.blas.nodes.einsum import Einsum
+    from dace.transformation.layout.rewrite_libnodes import transform_einsum
+
+    if list(permute_indices) == list(range(len(permute_indices))):
+        return  # identity permutation -- subscripts unchanged
+    if isinstance(edge.src, Einsum):
+        raise NotImplementedError(
+            f"PermuteDimensions: the output of '{edge.src.label}' was permuted by {permute_indices}, but the "
+            f"output subscripts are shared with every operand, so permuting them alone would silently "
+            f"re-contract the expression.")
+    if not (isinstance(edge.dst, Einsum) and edge.dst_conn is not None and edge.dst_conn.startswith("_ein")):
+        return
+    operands = sorted(c for c in edge.dst.in_connectors if c.startswith("_ein"))
+    edge.dst.einsum_str = transform_einsum(edge.dst.einsum_str, operands.index(edge.dst_conn), tuple(permute_indices))
+
+
 def permute_args(expr, permute_map: dict[str, list[int]]):
-    """Recursively permutes call args in a SymPy expr; permute_map[func][new_pos] = old_pos."""
-    if not expr.args:
-        return expr
-    args = tuple(permute_args(a, permute_map) for a in expr.args)
-    name = str(expr.func)
-    if name in permute_map:
+    """Permutes the indices of every mapped array access in a SymPy expr; permute_map[name][new] = old."""
+
+    def permuted_indices(name: str, indices):
         perm = permute_map[name]
-        args = tuple(args[perm[i]] for i in range(len(args)))
-    if args == expr.args:
-        return expr
-    return expr.func(*args)
+        if len(perm) != len(indices):
+            raise ValueError(f'{name} is accessed with {len(indices)} indices, but its permutation has '
+                             f'{len(perm)} entries')
+        return [indices[perm[i]] for i in range(len(indices))]
+
+    for name in permute_map:
+        expr = rewrite_expression(expr, name, lambda indices, name=name: permuted_indices(name, indices))
+    return expr
 
 
 def _parse_interstate_edge(edge_data: str, permute_map: dict[str, list[int]], sdfg: dace.SDFG = None):
-    symbolic_expr: dace.symbolic.SymExpr = dace.symbolic.pystr_to_symbolic(edge_data)
-    permuted_symbolic_expr: dace.symbolic.SymExpr = permute_args(symbolic_expr, permute_map)
-    permuted_str_expr: str = dace.symbolic.symstr(sym=permuted_symbolic_expr, arrayexprs=frozenset(sdfg.arrays.keys()))
-    return permuted_str_expr
+    permuted: dace.symbolic.SymExpr = permute_args(dace.symbolic.pystr_to_symbolic(edge_data), permute_map)
+    return dace.symbolic.symstr(sym=permuted, arrayexprs=frozenset(sdfg.arrays.keys()))

@@ -72,10 +72,19 @@ def test_parallelize_runs_once_idempotent():
             C[i] = A[i] + B[i]
 
     sdfg = add.to_sdfg(simplify=True)
-    assert ParallelizePipeline().apply_pass(sdfg, {}) == 11  # composed stages
-    # Re-running is harmless (nothing left to parallelize).
-    assert ParallelizePipeline().apply_pass(sdfg, {}) == 11
+    # Compare against the pipeline's own composed-stage list rather than a hardcoded number: the
+    # list is what apply_pass actually iterates, so this stays correct across stage additions or
+    # removals instead of going stale (LoopToReduce's normalization split into an explicit
+    # WCRToAugAssign stage, moving the count from 11 to 12, and this assertion missed it).
+    expected_stages = len(ParallelizePipeline()._stages())
+    assert ParallelizePipeline().apply_pass(sdfg, {}) == expected_stages
+    # Re-running is harmless (nothing left to parallelize) and reports the same count.
+    assert ParallelizePipeline().apply_pass(sdfg, {}) == expected_stages
     sdfg.validate()
+
+    # Structural: the loop actually became a map, not just "some stages ran".
+    assert _num_loops(sdfg) == 0
+    assert _num_maps(sdfg) > 0
 
     A = np.random.default_rng(2).random(8)
     B = np.random.default_rng(3).random(8)
@@ -148,9 +157,9 @@ def test_short_loop_unroll_refuses_unfusable_branchy_body() -> None:
                 B[0] = B[0] - A[m]
 
     @dace.program
-    def straight_line(x: dace.float64[1]):
+    def straight_line(A: dace.float64[1], B: dace.float64[1]):
         for _ in range(4):
-            x[0] = x[0] * 0.5
+            B[0] = A[0] * 0.5
 
     # Branchy AND the iterate is unused -> refused, and the refusal leaves the SDFG untouched.
     refused = bit_mix.to_sdfg(simplify=True)

@@ -11,9 +11,9 @@ THE KERNEL (:func:`option_matrix_sdfg`) is a single, hand-built SDFG (not a ``@d
 arms need explicit control the frontend does not expose: a forced SEQUENTIAL map schedule for
 ``loop_decl_style``/``loop_access_form``, and ``no_inline`` nested SDFGs for the split/inline knobs)
 that in one pass touches: a symbolic-size heap transient (``heap_ptr_restrict``), a write-once constant
-scalar (``const_init``/``scalar_emission_type``) and a separate genuinely MUTABLE, twice-reassigned
-scalar (``scalar_init_style``/``decl_placement``) feeding a write-once length-1 array
-(``scalar_emission_type``), two SEQUENTIAL strided maps (``loop_index_type``/``loop_bound_cmp``/
+scalar (``const_init``) and a separate genuinely MUTABLE, twice-reassigned scalar
+(``scalar_init_style``/``decl_placement``) feeding a write-once length-1 array, two SEQUENTIAL strided maps
+(``loop_index_type``/``loop_bound_cmp``/
 ``loop_decl_style``/``loop_access_form``/``index_ctype``), a direct array-to-array copy
 (``explicit_copy``), and TWO separate top-level ``no_inline`` nested SDFGs: one with ONLY full-array
 connectors (``split_nsdfg_translation_units``/``external_translation_units``/
@@ -37,9 +37,6 @@ its OWN regression test rather than silently "fixed":
                                              'split' ('setzero' names a node property, not a value).
   - ``const_init = 'const'/'constexpr_static'`` -- only 'on' is special-cased; both behave like 'off'
                                              (both are ``const_init_kind`` classification labels).
-  - ``scalar_emission_type = 'transient_only'`` -- only 'scalar'/'len1_array' are special-cased;
-                                             behaves like 'keep' ('transient_only' describes a
-                                             PROPERTY both conversions share, not a value).
   - ``heap_ptr_restrict = 'may_alias'``   -- only 'restrict' is special-cased; behaves like 'none'
                                              ('may_alias' is the ARRAY-DESCRIPTOR flag this key reads,
                                              not a value of the key itself).
@@ -84,7 +81,7 @@ def option_matrix_sdfg(name: str) -> dace.SDFG:
     sdfg.add_array('buf', [1], dace.float64, transient=True)
     sdfg.add_array('heap', [N], dace.float64, transient=True)  # symbolic size -> heap allocation
 
-    # Write-once constant scalar `s` (const_init / scalar_emission_type).
+    # Write-once constant scalar `s` (const_init).
     init_s = sdfg.add_state('init_s', is_start_block=True)
     ts = init_s.add_tasklet('set_s', {}, {'o': None}, 'o = 3.0')
     init_s.add_edge(ts, 'o', init_s.add_access('s'), None, dace.Memlet('s[0]'))
@@ -207,11 +204,6 @@ ARMS: Tuple[Tuple[str, Optional[Tuple[str, ...]], object], ...] = (
     ('const_init_off', ('compiler', 'cpu', 'codegen_params', 'const_init'), 'off'),
     ('const_init_const', ('compiler', 'cpu', 'codegen_params', 'const_init'), 'const'),
     ('const_init_constexpr_static', ('compiler', 'cpu', 'codegen_params', 'const_init'), 'constexpr_static'),
-    ('explicit_copy_off', ('compiler', 'cpu', 'codegen_params', 'explicit_copy'), 'off'),
-    ('scalar_emission_type_keep', ('compiler', 'cpu', 'codegen_params', 'scalar_emission_type'), 'keep'),
-    ('scalar_emission_type_len1_array', ('compiler', 'cpu', 'codegen_params', 'scalar_emission_type'), 'len1_array'),
-    ('scalar_emission_type_transient_only', ('compiler', 'cpu', 'codegen_params', 'scalar_emission_type'),
-     'transient_only'),
     ('const_scalar_abi_by_value', ('compiler', 'cpu', 'codegen_params', 'const_scalar_abi'), 'by_value'),
     ('split_nsdfg_translation_units', ('compiler', 'cpu', 'codegen_params', 'split_nsdfg_translation_units'), True),
     ('external_translation_units', ('compiler', 'cpu', 'codegen_params', 'external_translation_units'), True),
@@ -272,33 +264,24 @@ def test_heap_ptr_restrict_none_drops_restrict() -> None:
     assert '__restrict__ heap' not in arm
 
 
-def test_explicit_copy_off_keeps_copynd() -> None:
-    """``explicit_copy`` decides WHO moves ``heap[0:N] -> B``.
+def test_explicit_copy_always_lifts_in_readable() -> None:
+    """The readable generator lifts ``heap[0:N] -> B`` unconditionally (the ``explicit_copy`` knob
+    governs only the classic generator -- see ``tests/codegen/readable/test_explicit_copy.py``).
 
-    ON (default) lifts the edge to a copy library node with its own emitted routine, lowered to the
-    canonical PARALLEL element map: the maximally parallel form is the default on every device, and
-    a symbolic count is assumed big. A single ``std::memcpy`` is the CPU SPECIALIZATION of a
-    ``Sequential`` contiguous transfer (``SpecializeCpuTransfers``) -- this copy is top level and
-    never re-entered, so nothing sequentializes it and no ``memcpy`` is emitted here. The
-    ``memcpy``/``memset`` selection itself is pinned in
+    The lifted copy lowers to the canonical PARALLEL element map: the maximally parallel form is
+    the default on every device, and a symbolic count is assumed big. A single ``std::memcpy`` is
+    the CPU SPECIALIZATION of a ``Sequential`` contiguous transfer (``SpecializeCpuTransfers``) --
+    this copy is top level and never re-entered, so nothing sequentializes it and no ``memcpy`` is
+    emitted here. The ``memcpy``/``memset`` selection itself is pinned in
     ``tests/passes/copy_memset_parallel_selection_test.py`` and
-    ``tests/passes/cpu_specialization_fork_join_test.py``, not here.
-
-    OFF lifts nothing: the edge stays implicit and the legacy runtime template ``dace::CopyND``
-    moves the bytes."""
+    ``tests/passes/cpu_specialization_fork_join_test.py``, not here."""
     default = cpp_text('nv_explicit_copy')
-    arm = cpp_text('nv_explicit_copy', ('compiler', 'cpu', 'codegen_params', 'explicit_copy'), 'off')
-    assert default != arm
-    # ON: a lifted copy routine, parallel element map inside it, and no runtime template anywhere.
     routine = re.search(r'inline void copy_heap_to_B_\w+\(.*?\n\}', default, re.DOTALL)
-    assert routine is not None, 'explicit_copy=on must emit the lifted heap->B copy routine'
+    assert routine is not None, 'the readable generator must emit the lifted heap->B copy routine'
     body = routine.group(0)
     assert '#pragma omp parallel for' in body
     assert re.search(r'_cpy_out\[[^\]]+\] = _cpy_in\[[^\]]+\];', body) is not None
     assert 'dace::CopyND' not in default
-    # OFF: no lifting at all, the runtime template does the move.
-    assert 'dace::CopyND' in arm
-    assert 'copy_heap_to_B' not in arm
 
 
 def test_const_scalar_abi_by_value_drops_the_reference() -> None:
@@ -382,14 +365,6 @@ def test_const_init_recognizes_only_on(value: str) -> None:
     assert arm == off
 
 
-def test_scalar_emission_type_transient_only_is_not_a_recognized_value() -> None:
-    """Only 'scalar' and 'len1_array' are special-cased; 'transient_only' names a PROPERTY both
-    conversions share (per the schema prose), not a settable value -- behaves like 'keep'."""
-    keep = cpp_text('nv_set', ('compiler', 'cpu', 'codegen_params', 'scalar_emission_type'), 'keep')
-    arm = cpp_text('nv_set', ('compiler', 'cpu', 'codegen_params', 'scalar_emission_type'), 'transient_only')
-    assert arm == keep
-
-
 def test_heap_ptr_restrict_may_alias_behaves_like_none() -> None:
     """Only the literal 'restrict' is special-cased; 'may_alias' is the ARRAY-DESCRIPTOR flag this
     key reads (``desc.may_alias``), not a value of the key itself -- behaves exactly like 'none'."""
@@ -409,12 +384,12 @@ def test_external_translation_units_restructures_a_cpu_only_kernel_too() -> None
 
 
 if __name__ == '__main__':
-    # A representative slice, not the full (expensive) 28-arm matrix -- see the module docstring.
+    # A representative slice, not the full (expensive) ARMS matrix -- see the module docstring.
     for _arm_id, _path, _value in ARMS[:4]:
         test_arm_matches_numpy_reference(_arm_id, _path, _value)
     test_index_ctype_int32_changes_the_helper_type()
     test_heap_ptr_restrict_none_drops_restrict()
-    test_explicit_copy_off_keeps_copynd()
+    test_explicit_copy_always_lifts_in_readable()
     test_const_scalar_abi_by_value_drops_the_reference()
     test_inline_full_array_nsdfg_inlines_the_full_array_nest_only()
     test_split_nsdfg_translation_units_splits_the_frame()
@@ -426,7 +401,6 @@ if __name__ == '__main__':
         test_scalar_init_style_recognizes_only_fused(_value)
     for _value in ('const', 'constexpr_static'):
         test_const_init_recognizes_only_on(_value)
-    test_scalar_emission_type_transient_only_is_not_a_recognized_value()
     test_heap_ptr_restrict_may_alias_behaves_like_none()
     test_external_translation_units_restructures_a_cpu_only_kernel_too()
     print('ok')

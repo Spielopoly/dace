@@ -19,6 +19,7 @@ from typing import Tuple, Set, Union
 from dace.symbolic import pystr_to_symbolic
 from dace.transformation.passes import FuseStates
 from dace.transformation.passes.prune_symbols import RemoveUnusedSymbols
+from ordered_set import OrderedSet
 
 
 def remove_symbol_assignments(graph: ControlFlowRegion, sym_name: str):
@@ -324,7 +325,7 @@ class BranchElimination(transformation.MultiStateTransformation):
                      | dace.symbolic.arrays(rhs)) - {"AND", "OR", "NOT", "and", "or", "not", "And", "Or", "Not"}
 
         # Collect inputs we need
-        arr_inputs = {var for var in free_vars if var in state.sdfg.arrays}
+        arr_inputs = sorted(var for var in free_vars if var in state.sdfg.arrays)
         sym_inputs = {var for var in free_vars if var not in state.sdfg.arrays}
         for sym_name in sym_inputs:
             if sym_name not in state.sdfg.symbols:
@@ -373,11 +374,10 @@ class BranchElimination(transformation.MultiStateTransformation):
                                                                                           arrays=set(
                                                                                               state.sdfg.arrays.keys()))
 
-        assert arr_inputs.union(symbol_inputs) == free_vars
+        assert set(arr_inputs) | symbol_inputs == free_vars
 
         tasklet = state.add_tasklet(name=f"condition_symbol_to_scalar_{lhs}_to_{float_lhs_name}_scalar",
-                                    inputs={f"_in_{arr_input}_{i}"
-                                            for i, arr_input in enumerate(arr_inputs)},
+                                    inputs=OrderedSet(f"_in_{arr_input}_{i}" for i, arr_input in enumerate(arr_inputs)),
                                     outputs={f"_out_{float_lhs_name}"},
                                     code=f"_out_{float_lhs_name} = ({cleaned})")
 
@@ -700,7 +700,7 @@ class BranchElimination(transformation.MultiStateTransformation):
         # 3. Add the combine tasklet which performs: float_cond1 * tmp1 + (1 - float_cond1) * tmp2
         combine_tasklet = new_state.add_tasklet(
             name=f"combine_branch_values_for_{write_name}_{index}",
-            inputs={"_in_left", "_in_right", "_in_factor"},
+            inputs=OrderedSet(('_in_left', '_in_right', '_in_factor')),
             outputs={"_out"},
             code="_out = (_in_factor * _in_left) + ((1.0 - _in_factor) * _in_right)")
 
@@ -1363,7 +1363,7 @@ class BranchElimination(transformation.MultiStateTransformation):
                 sdutil.set_nested_sdfg_parent_references(graph.sdfg)
 
         # This function my create empty conditionals we need to remove them
-        nodes_to_rm = set()
+        nodes_to_rm = OrderedSet()
         for node in graph.nodes():
             if isinstance(node, ConditionalBlock):
                 # 1 branch, 1 state, empty state
@@ -1802,25 +1802,6 @@ class BranchElimination(transformation.MultiStateTransformation):
             nodes_to_check = nodes_to_check.union({ie.src for ie in ies})
 
         return all_params.intersection(free_syms) != set()
-
-    def _first_access_node(self, cfg: ControlFlowRegion, accessnode: dace.nodes.AccessNode, current_state: SDFGState):
-        assert accessnode in cfg.nodes()
-        dataname = accessnode.data
-        if current_state in in_cfg.nodes():
-            for node in in_cfg.bfs_nodes():
-                if node != current_state:
-                    if dataname in node.read_and_write_sets()[1]:
-                        return False
-                else:
-                    src_nodes = {n for n in current_state.nodes() if current_state.in_degree(n) == 0}
-                    if accessnode in src_nodes:
-                        return True
-                    else:
-                        return False
-        elif dataname in cfg.read_and_write_sets()[1]:
-            return False
-
-        return True
 
     _index = 0
 
