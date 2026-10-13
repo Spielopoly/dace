@@ -9,14 +9,14 @@ from typing import TYPE_CHECKING, Callable, Dict, Optional, Set
 
 from dace import dtypes
 from dace.codegen.py.prettycode import PythonCodeIOStream
+from dace.codegen.py.utils import rewrite_dtype_casts
 from dace.frontend.python import astutils
 from dace.properties import CodeBlock
 from dace.sdfg.analysis import cfg as cfg_analysis
 from dace.sdfg.graph import Edge
 from dace.sdfg.sdfg import SDFG, InterstateEdge
-from dace.sdfg.state import (AbstractControlFlowRegion, BreakBlock, ConditionalBlock, ContinueBlock,
-                              ControlFlowBlock, ControlFlowRegion, LoopRegion, ReturnBlock, SDFGState,
-                              UnstructuredControlFlow)
+from dace.sdfg.state import (AbstractControlFlowRegion, BreakBlock, ConditionalBlock, ContinueBlock, ControlFlowBlock,
+                             ControlFlowRegion, LoopRegion, ReturnBlock, SDFGState, UnstructuredControlFlow)
 
 if TYPE_CHECKING:
     from dace.codegen.py.framecode import DaCePythonCodeGenerator
@@ -27,14 +27,16 @@ def _unparse_py_expr(code_ast, sdfg: SDFG) -> str:
     Converts an AST node (or string expression) to a Python expression string.
 
     Unlike the C++ ``unparse_interstate_edge``, this produces valid Python and
-    does not need C++ casting or type-suffix handling.
+    does not need C++ casting or type-suffix handling. A target may install a
+    temporary ``_python_control_flow_expr_rewriter`` on the SDFG when its
+    device dialect needs different array-load or cast syntax.
     """
-    if isinstance(code_ast, str):
-        return code_ast
     if isinstance(code_ast, list):
         # CodeBlock.code is a list of AST statements; unparse each and join.
-        return '; '.join(_unparse_py_expr(node, sdfg) for node in code_ast)
-    return astutils.unparse(code_ast)
+        return "; ".join(_unparse_py_expr(node, sdfg) for node in code_ast)
+    source = code_ast if isinstance(code_ast, str) else astutils.unparse(code_ast)
+    target_rewriter = getattr(sdfg, "_python_control_flow_expr_rewriter", None)
+    return target_rewriter(source) if target_rewriter is not None else rewrite_dtype_casts(source)
 
 
 def _unparse_codeblock(cb: Optional[CodeBlock], sdfg: SDFG) -> str:
@@ -441,4 +443,3 @@ def control_flow_region_to_code(region: AbstractControlFlowRegion,
     _write_control_flow_region(region, dispatch_state, codegen, symbols, stream,
                                start=start, stop=stop, generate_children_of=generate_children_of,
                                ptree=parent_tree, visited=visited)
-    

@@ -142,6 +142,37 @@ def is_tile_eligible(state: SDFGState, map_entry: dace.nodes.MapEntry) -> bool:
     return True
 
 
+def map_body_depends_on_tiled_params(state: SDFGState, map_entry: dace.nodes.MapEntry, iter_vars: Tuple[str,
+                                                                                                        ...]) -> bool:
+    """Return whether a map body references any parameter that would be tiled.
+
+    GPU transforms may wrap a scalar expression in a fixed-size helper map whose
+    parameter is unused. Tiling such a map turns its scalar computation into a
+    tile operation with a scalar destination. Leaving it scalar preserves the
+    original repeated execution and avoids inventing lane semantics.
+
+    :param state: State containing the map.
+    :param map_entry: Candidate map entry.
+    :param iter_vars: Parameters that the vectorizer would stride.
+    :returns: ``True`` when a body node or memlet uses a tiled parameter.
+    """
+    params = set(map(str, iter_vars))
+    map_exit = state.exit_node(map_entry)
+    body = set(state.all_nodes_between(map_entry, map_exit))
+    for node in body:
+        try:
+            if params & set(map(str, node.free_symbols)):
+                return True
+        except (AttributeError, TypeError):
+            pass
+    for edge in state.edges():
+        if not (edge.src is map_entry or edge.dst is map_exit or edge.src in body or edge.dst in body):
+            continue
+        if edge.data is not None and params & set(map(str, edge.data.free_symbols)):
+            return True
+    return False
+
+
 def map_body_has_library_node(state: SDFGState, map_entry: dace.nodes.MapEntry) -> bool:
     """True if the map's body contains an OPAQUE library node (recursively, incl. nested SDFGs).
 
@@ -282,6 +313,8 @@ def is_vectorizable_map(state: SDFGState, map_entry: dace.nodes.MapEntry) -> boo
     classification.
     """
     if not (is_innermost_map(state, map_entry) and is_tile_eligible(state, map_entry)):
+        return False
+    if not map_body_depends_on_tiled_params(state, map_entry, tuple(map_entry.map.params)):
         return False
     if map_body_has_library_node(state, map_entry):
         return False

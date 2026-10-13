@@ -10,17 +10,60 @@ Symbol pair belongs outside the tile path.
 The pure expansion returns a CPP tasklet whose body is a single
 ``for``-loop over the flattened tile (correctness-only).
 """
-from typing import Optional, Set, Tuple
+import ast
+from typing import Dict, Optional, Set, Tuple
 
 import numpy as np
 
 import dace
 from dace import library, properties
+from dace.frontend.python import astutils
 from dace.sdfg import nodes
 from dace.transformation.transformation import ExpandTransformation
 
 from .._pure_codegen import nested_loops, tile_offset
 from .. import _isa_codegen
+
+
+class _ReplaceComplexLiterals(ast.NodeTransformer):
+    """Replace Python complex literals before symbolic dependency analysis."""
+
+    def visit_Constant(self, node: ast.Constant) -> ast.Constant:
+        if isinstance(node.value, complex):
+            return ast.copy_location(ast.Constant(value=0), node)
+        return node
+
+
+def _symbol_operand_free_symbols(expr: str) -> Set[str]:
+    """Return runtime symbols in an inline Python operand expression.
+
+    ``pystr_to_symbolic`` represents a Python imaginary literal such as
+    ``6.28j`` as SymPy's ``I`` and then converts ``I`` to a DaCe symbol. The
+    literal is still emitted as valid Python by the cuTile expansion, so
+    treating ``I`` as a runtime dependency creates a spurious nested-SDFG
+    argument. Remove complex AST constants only for dependency analysis;
+    genuine names, including a user symbol named ``I``, remain untouched.
+
+    :param expr: Inline operand expression.
+    :returns: Names of runtime symbols used by the expression.
+    """
+    try:
+        tree = ast.parse(expr, mode="eval")
+        normalized = ast.unparse(_ReplaceComplexLiterals().visit(tree))
+        return {str(s) for s in dace.symbolic.pystr_to_symbolic(normalized).free_symbols}
+    except (SyntaxError, TypeError, ValueError):
+        return {str(s) for s in dace.symbolic.pystr_to_symbolic(expr).free_symbols}
+
+
+def _replace_symbol_operand(expr: Optional[str], repl: Dict[str, str]) -> Optional[str]:
+    """Replace names in an inline Python operand while preserving literals."""
+    if expr is None:
+        return None
+    try:
+        tree = astutils.ASTFindReplace(repl).visit(ast.parse(expr, mode="eval"))
+        return astutils.unparse(tree)
+    except (SyntaxError, TypeError, ValueError):
+        return expr
 
 
 def _is_tile_shape(desc, widths) -> bool:
@@ -551,8 +594,12 @@ class TileBinop(nodes.LibraryNode):
         result: Set[str] = set()
         for expr in (self.expr_a, self.expr_b):
             if expr:
-                result |= {str(s) for s in dace.symbolic.pystr_to_symbolic(expr).free_symbols}
+                result |= _symbol_operand_free_symbols(expr)
         return result
+
+    def replace_dict(self, repl: Dict[str, str]) -> None:
+        self.expr_a = _replace_symbol_operand(self.expr_a, repl)
+        self.expr_b = _replace_symbol_operand(self.expr_b, repl)
 
     def validate(self, sdfg: dace.SDFG, state: dace.SDFGState) -> None:
         """Validate connector counts + output-kind rule at expansion time.

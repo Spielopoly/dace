@@ -488,6 +488,14 @@ class GPUTransformSDFG(transformation.MultiStateTransformation):
                         if self.register_trans:
                             nodedesc.storage = dtypes.StorageType.Register
 
+        # Step 6 can move a top-level transient to GPU_Global after the initial
+        # interstate-read scan. Track those newly device-resident containers so
+        # Step 8 stages a host copy before evaluating control flow.
+        for read_memlet in check_memlets:
+            desc = sdfg.arrays[read_memlet.data]
+            if desc.storage == dtypes.StorageType.GPU_Global:
+                data_already_on_gpu.setdefault(read_memlet.data, None)
+
         #######################################################
         # Step 7: Wrap free tasklets and nested SDFGs with a GPU map
 

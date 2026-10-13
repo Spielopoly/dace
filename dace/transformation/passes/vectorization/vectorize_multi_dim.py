@@ -95,11 +95,12 @@ from dace.transformation.interstate.expand_nested_sdfg_inputs import ExpandNeste
 from dace.transformation.passes.pattern_matching import PatternMatchAndApplyRepeated
 from dace.transformation.passes.vectorization.split_multi_output_tasklets import SplitMultiOutputTasklets
 from dace.transformation.passes.vectorization.normalize_masked_write_tasklets import NormalizeMaskedWriteTasklets
-from dace.libraries.tileops.nodes import (TileBinop, TileLoad, TileMaskGen, TileITE, TileReduce, TileStore, TileUnop)
+from dace.libraries.tileops.nodes import (TileBinop, TileIota, TileLoad, TileMaskGen, TileITE, TileReduce, TileStore,
+                                          TileUnop)
 from dace.libraries.tileops._dispatch import select_tile_implementation
 
 #: Tile lib-node types -- all of them, used by the implementation selector.
-_TILE_NODE_TYPES = (TileBinop, TileLoad, TileMaskGen, TileITE, TileReduce, TileStore, TileUnop)
+_TILE_NODE_TYPES = (TileBinop, TileIota, TileLoad, TileMaskGen, TileITE, TileReduce, TileStore, TileUnop)
 
 
 class VectorizeUnsupported(Exception):
@@ -402,7 +403,8 @@ def _promote_read_output_connectors_to_inout(sdfg: dace.SDFG) -> None:
                             None)
             if template is None:
                 continue
-            node.add_in_connector(oc)
+            # Inout connectors share a name across input and output dictionaries.
+            node.add_in_connector(oc, force=True)
             parent.add_edge(template.src, template.src_conn, node, oc, copy.deepcopy(out_edge.data))
 
 

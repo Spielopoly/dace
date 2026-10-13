@@ -5,16 +5,17 @@ The ``cuda.tile`` launch boundary (1.5.0) cannot pass numeric scalars by
 value faithfully: by-value floats are typed float32 (silent f64 precision
 loss), Python ints >= 2**31 raise ``OverflowError`` (int32 typing), and
 numpy int scalars are rejected outright. The cuTile codegen therefore stages
-every float/int/uint Scalar and symbol as a dtype-preserving 1-element cupy
-array at the launch site and binds it as a scalar tile
+every float/int/uint/complex Scalar and symbol as a dtype-preserving
+1-element cupy array at the launch site and binds it as a scalar tile
 (``ct.load(name, (0,), shape=()).item()``) at kernel entry. Bool scalars stay by
-value (typed exactly as ``bool_``).
+value (typed exactly as ``bool_``). Installed cuda.tile versions without
+complex array dtypes still skip complex runtime coverage.
 
 Covers: f64 bit-exactness, int64 >= 2**31 (the old OverflowError case),
 uint64 >= 2**63, narrow ints (int8/int16 -- probed: cuda.tile accepts
 narrow-dtype 0-d tile loads, so no widening at the staging site), int symbols
-as sizes with non-divisible boundaries, bool args, and the structural
-launch-site/kernel-entry contract.
+as sizes with non-divisible boundaries, complex scalar staging, bool args,
+and the structural launch-site/kernel-entry contract.
 """
 import itertools
 
@@ -62,6 +63,20 @@ def _shift_i64(x: dace.int64[N], a: dace.int64):
 @dace.program
 def _shift_u64(x: dace.uint64[N], a: dace.uint64):
     return x + a
+
+
+@dace.program
+def _scale_c128(x: dace.complex128[N], a: dace.complex128):
+    return x * a
+
+
+def _cutile_supports_complex() -> bool:
+    """Whether the installed cuda.tile exposes complex kernel dtypes."""
+    try:
+        import cuda.tile as ct
+    except ImportError:
+        return False
+    return hasattr(ct, 'complex64') and hasattr(ct, 'complex128')
 
 
 # =============================================================================
@@ -140,6 +155,19 @@ class TestScalarDeviceArrayRuntime:
         csdfg(x=x, y=y, a=np_dtype(7))
         np.testing.assert_array_equal(cupy.asnumpy(y), x_host + 7.0)
 
+    def test_numeric_inout_scalar_arg(self):
+        """A numeric scalar is loaded and stored through one device buffer."""
+        cupy = pytest.importorskip("cupy")
+        sdfg = _inout_scalar_sdfg(f"inout_scalar_{next(_COUNTER)}")
+        csdfg = sdfg.compile()
+        device_value = cupy.asarray(np.float64(3.25))
+        csdfg(s=device_value)
+        assert device_value.item() == np.float64(5.25)
+
+        host_value = np.asarray(7.5)
+        csdfg(s=host_value)
+        assert host_value.item() == np.float64(9.5)
+
     def test_bool_scalar_arg(self):
         """Bool scalars keep the by-value path and still work."""
         cupy = pytest.importorskip('cupy')
@@ -152,6 +180,17 @@ class TestScalarDeviceArrayRuntime:
             csdfg(x=x, y=y, flag=flag)
             ref = x_host * 2.0 if flag else x_host
             np.testing.assert_array_equal(cupy.asnumpy(y), ref)
+
+    @pytest.mark.skipif(not _cutile_supports_complex(), reason='cuda.tile has no complex dtype support')
+    def test_complex128_scalar_arg(self):
+        """Complex arrays and scalars execute when cuda.tile supports them."""
+        csdfg = _cutile_compile(_scale_c128)
+        n = 70
+        rng = np.random.default_rng(12)
+        x = (rng.random(n) + 1j * rng.random(n)).astype(np.complex128)
+        a = np.complex128(0.25 - 0.75j)
+        out = np.asarray(csdfg(x=x, a=a, N=n))
+        np.testing.assert_array_equal(out, x * a)
 
 
 # =============================================================================
@@ -182,6 +221,20 @@ def _scalar_arg_sdfg(name: str, dtype, n: int = 64, tile_w: int = 32) -> dace.SD
     state.add_edge(tx, None, tk, 'inp', Memlet(data='_tx', subset=f'0:{tile_w}'))
     state.add_edge(tk, 'out', ty, None, Memlet(data='_ty', subset=f'0:{tile_w}'))
     state.add_memlet_path(ty, mx, yw, memlet=Memlet(data='y', subset=f'0:{n}'))
+    sdfg.fill_scope_connectors()
+    return sdfg
+
+
+def _inout_scalar_sdfg(name: str) -> dace.SDFG:
+    """Build a one-block kernel that increments a numeric Scalar in place."""
+    sdfg = dace.SDFG(name)
+    sdfg.backend = dtypes.BackendLanguage.Python
+    sdfg.add_scalar("s", dace.float64, storage=StorageType.GPU_Global)
+    state = sdfg.add_state("main")
+    me, mx = state.add_map("cutile_map", {"tile_i": "0:1"}, schedule=ScheduleType.CuTile)
+    tasklet = state.add_tasklet("increment", {"s_in"}, {"s_out"}, "s_out = s_in + 2.0", language=Language.Python)
+    state.add_memlet_path(state.add_read("s"), me, tasklet, dst_conn="s_in", memlet=Memlet("s[0]"))
+    state.add_memlet_path(tasklet, mx, state.add_write("s"), src_conn="s_out", memlet=Memlet("s[0]"))
     sdfg.fill_scope_connectors()
     return sdfg
 
@@ -226,6 +279,8 @@ class TestLaunchSiteStaging:
         (dace.int16, 'int16'),
         (dace.int8, 'int8'),
         (dace.uint64, 'uint64'),
+        (dace.complex64, 'complex64'),
+        (dace.complex128, 'complex128'),
     ])
     def test_numeric_scalar_staged_and_tile_loaded(self, dtype, np_name):
         sdfg = _scalar_arg_sdfg(f'stage_{np_name}_{next(_COUNTER)}', dtype)
@@ -235,6 +290,15 @@ class TestLaunchSiteStaging:
         assert 'a.item()' not in code
         # Kernel entry: bound as a scalar tile (device-side .item()).
         assert 'a_in=ct.load(a,(0,),shape=()).item()' in code
+
+    def test_numeric_inout_scalar_loads_and_stores(self):
+        sdfg = _inout_scalar_sdfg(f"stage_inout_{next(_COUNTER)}")
+        code = sdfg.generate_code()[0].code.replace(" ", "")
+        assert "cupy.asarray(s,dtype=numpy.float64).reshape(1)" in code
+        assert "s_in=ct.load(s,(0,),shape=()).item()" in code
+        assert "ct.store(s,index=(0,),tile=s_out)" in code
+        assert ".get()[0]" in code
+        assert "s[...]=__dace_cutile_" in code
 
     def test_bool_scalar_stays_by_value(self):
         sdfg = _bool_scalar_sdfg(f'stage_bool_{next(_COUNTER)}')

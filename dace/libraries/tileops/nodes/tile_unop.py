@@ -12,7 +12,7 @@ The pure expansion returns a CPP tasklet whose body is a single ``for``-loop
 over the flattened tile (correctness-only); the K=1 ISA backends call
 ``dace::tileops::tile_unop`` in ``dace/tile_ops/<backend>.h``.
 """
-from typing import Optional, Set, Tuple
+from typing import Dict, Optional, Set, Tuple
 
 import numpy as np
 
@@ -23,6 +23,7 @@ from dace.transformation.transformation import ExpandTransformation
 
 from .._pure_codegen import nested_loops, tile_offset
 from .. import _isa_codegen
+from .tile_binop import _replace_symbol_operand, _symbol_operand_free_symbols
 
 _TILE = "Tile"
 _SYMBOL = "Symbol"
@@ -381,8 +382,11 @@ class TileUnop(nodes.LibraryNode):
         """
         result: Set[str] = set()
         if self.expr_a:
-            result |= {str(s) for s in dace.symbolic.pystr_to_symbolic(self.expr_a).free_symbols}
+            result |= _symbol_operand_free_symbols(self.expr_a)
         return result
+
+    def replace_dict(self, repl: Dict[str, str]) -> None:
+        self.expr_a = _replace_symbol_operand(self.expr_a, repl)
 
     def validate(self, sdfg: dace.SDFG, state: dace.SDFGState) -> None:
         """Validate connectors + the operand promotion at expansion time.

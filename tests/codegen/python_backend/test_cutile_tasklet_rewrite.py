@@ -17,6 +17,15 @@ from dace.codegen.py.cutile_target import _rewrite_cutile_tasklet_code
 
 class TestMathNameMapping:
 
+    @pytest.mark.parametrize("cast", ["int64", "dace.int64", "numpy.int64", "np.int64"])
+    def test_dtype_cast(self, cast):
+        code = _rewrite_cutile_tasklet_code(f"o = {cast}(a)", {})
+        assert code == "o = ct.astype(a, ct.int64)"
+
+    def test_bool_dtype_cast_alias(self):
+        code = _rewrite_cutile_tasklet_code("o = dace.bool(a)", {})
+        assert code == "o = ct.astype(a, ct.bool_)"
+
     def test_binary_math_call(self):
         code = _rewrite_cutile_tasklet_code("__out = atan2(__in1, __in2)", {})
         assert code == "__out = ct.atan2(__in1, __in2)"

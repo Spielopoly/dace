@@ -542,9 +542,10 @@ class CuTileSetTileStorage(_CuTileLoweringPass):
 
     Three rules, applied in order:
 
-    a. **Anchored:** every AccessNode adjacent to a tileops anchor whose
-       descriptor (in its owning SDFG) is a transient ``data.Array`` with
-       ``StorageType.Register`` becomes ``CuTile_Tile``. Scalars are left
+    a. **Anchored:** every tile-valued AccessNode adjacent to a tileops anchor whose
+       descriptor is a transient ``data.Array`` becomes ``CuTile_Tile``. Register
+       storage marks tile values directly; an exact ``widths`` shape also recovers
+       tile outputs that an earlier fusion pass stamped ``CPU_Heap``. Scalars are left
        untouched (e.g. TileReduce-adjacent accumulator Scalars stay Register).
     b. **NSDFG boundary propagation:** for NestedSDFGs inside a CuTile scope,
        a ``CuTile_Tile`` array on one side of a connector stamps the
@@ -589,15 +590,22 @@ class CuTileSetTileStorage(_CuTileLoweringPass):
                 desc.storage = dtypes.StorageType.CuTile_Tile
                 stamped.add(id(desc))
 
-        # Rule (a): AccessNodes adjacent to tileops anchors.
+        # Rule (a): tile-valued AccessNodes adjacent to tileops anchors.
+        from dace.libraries.tileops import TileLoad, TileStore
         for node, state in _collect_tile_nodes(sdfg):
             owning_arrays = state.sdfg.arrays
-            neighbors = [e.src for e in state.in_edges(node)] + [e.dst for e in state.out_edges(node)]
-            for neighbor in neighbors:
+            incident = list(state.in_edges(node)) + list(state.out_edges(node))
+            for edge in incident:
+                neighbor = edge.src if edge.dst is node else edge.dst
                 if not isinstance(neighbor, nodes.AccessNode):
                     continue
+                connector = edge.dst_conn if edge.dst is node else edge.src_conn
+                is_global_boundary = ((isinstance(node, TileLoad) and connector == "_src")
+                                      or (isinstance(node, TileStore) and connector == "_dst"))
                 desc = owning_arrays.get(neighbor.data)
-                if (isinstance(desc, data.Array) and desc.transient and desc.storage == dtypes.StorageType.Register):
+                exact_tile_shape = (isinstance(desc, data.Array) and tuple(desc.shape) == tuple(node.widths))
+                if (isinstance(desc, data.Array) and desc.transient and
+                    (desc.storage == dtypes.StorageType.Register or (exact_tile_shape and not is_global_boundary))):
                     _stamp(desc)
 
         # Rule (b): NSDFG boundary propagation (fixpoint).

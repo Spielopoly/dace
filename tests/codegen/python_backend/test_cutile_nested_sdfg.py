@@ -365,6 +365,43 @@ def _build_recursive_nested_sdfg(name: str = "recursive_nsdfg"):
 # =============================================================================
 
 
+def _build_control_flow_nested_sdfg(name: str = "control_flow_nsdfg"):
+    """Build a nested cuTile helper with casted array reads on an interstate edge."""
+    sdfg = _make_cutile_python_sdfg(name)
+    sdfg.add_array("A", [1], dace.int64, storage=StorageType.GPU_Global)
+    state = sdfg.add_state("main")
+    me, mx = state.add_map("cutile_map", {"tile_i": "0:1"}, schedule=ScheduleType.CuTile)
+
+    inner = SDFG("control_flow_inner")
+    inner.add_array("A", [1], dace.int64, storage=StorageType.GPU_Global)
+    inner.add_symbol("k", dace.int64)
+    start = inner.add_state("start", is_start_block=True)
+    done = inner.add_state("done")
+    edge = inner.add_edge(start, done, dace.InterstateEdge(condition="int64(A[0]) > 0",
+                                                           assignments={"k": "int64(A[0])"}))
+    nested = state.add_nested_sdfg(inner, {"A"}, set())
+    state.add_memlet_path(state.add_read("A"), me, nested, dst_conn="A", memlet=Memlet("A[0:1]"))
+    state.add_nedge(nested, mx, Memlet())
+    sdfg.fill_scope_connectors()
+    return sdfg, state, nested, edge
+
+
+def test_nested_control_flow_uses_cutile_array_loads_and_casts():
+    """Nested kernel conditions and assignments use device, not host, syntax."""
+    sdfg, state, nested, edge = _build_control_flow_nested_sdfg()
+    condition_before = edge.data.condition.as_string
+    assignments_before = dict(edge.data.assignments)
+    function_code, _ = _generate_nested_code(sdfg, state, nested)
+    compact = function_code.replace(" ", "")
+    rewritten = "ct.astype(ct.load(A,(0,),shape=()).item(),ct.int64)"
+    assert compact.count(rewritten) == 2
+    assert "numpy" not in function_code
+    assert "lambda" not in function_code
+    assert edge.data.condition.as_string == condition_before
+    assert edge.data.assignments == assignments_before
+    assert not hasattr(nested.sdfg, "_python_control_flow_expr_rewriter")
+
+
 class TestNestedSDFGFunctionGeneration:
     """Test that NestedSDFGs generate module-level functions."""
 

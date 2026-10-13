@@ -58,6 +58,22 @@ def test_scalar_to_symbol_in_nested_sdfg():
     assert np.array_equal(out, np.array([0, 10] * 5, dtype=np.int32))
 
 
+def test_transient_array_used_on_interstate_edge_is_copied_to_host():
+    """A transient moved to GPU storage is staged before host control flow."""
+    sdfg = dace.SDFG("gpu_transient_interstate")
+    sdfg.add_array("I", (1, ), dace.int32, transient=True)
+    first = sdfg.add_state("first")
+    done = sdfg.add_state("done")
+    write = first.add_tasklet("write", {}, {"out"}, "out = 1")
+    first.add_edge(write, "out", first.add_write("I"), None, dace.Memlet("I[0]"))
+    sdfg.add_edge(first, done, dace.InterstateEdge(condition="I[0] > 0"))
+
+    assert sdfg.apply_transformations(GPUTransformSDFG) == 1
+    sdfg.validate()
+    assert any(name.startswith("host_I") for name in sdfg.arrays)
+    assert all("I[0]" not in str(edge.data.condition) for edge in sdfg.all_interstate_edges())
+
+
 @pytest.mark.gpu
 def test_write_subset():
 

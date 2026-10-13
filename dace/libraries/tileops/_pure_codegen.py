@@ -10,6 +10,11 @@ and uses :func:`tile_offset` to flatten the tile transient's index
 """
 from typing import List, Sequence
 
+import dace
+
+# Index values are cast to signed long long before computing gather/scatter offsets.
+GATHER_INDEX_DTYPES = (dace.int32, dace.int64, dace.uint32, dace.uint64)
+
 
 def ct_dtype_name(dtype) -> str:
     """``cuda.tile`` dtype attribute name for a DaCe typeclass.
@@ -266,7 +271,7 @@ def cutile_tile_dim_bids(node, parent_state, parent_sdfg, used_dimensions: Seque
         sd = used_dimensions[d] if d < len(used_dimensions) else None
         pos = None
         has_symbols = False
-        if sd is not None and sd < len(src_begins):
+        if sd is not None and 0 <= sd < len(src_begins):
             try:
                 syms = {str(s) for s in _sym.pystr_to_symbolic(str(src_begins[sd])).free_symbols}
             except Exception:  # noqa: BLE001 - non-symbolic begin -> use the raw string
@@ -359,7 +364,7 @@ def cutile_tile_dim_offsets(node, parent_state, parent_sdfg, used_dimensions: Se
     offsets = []
     for d in range(K):
         sd = used_dimensions[d] if d < len(used_dimensions) else None
-        if sd is None or sd >= len(begins):
+        if sd is None or sd < 0 or sd >= len(begins):
             offsets.append(0)
             continue
         try:
@@ -730,17 +735,20 @@ def gather_lane_offset(deps, widths, conn):
 
     For the scalar case (``deps == ()``) returns ``conn[0]``.
 
+    The read is cast to ``long long``: callers sum it with affine terms that may
+    be negative, and an unsigned index dtype would make the whole sum wrap.
+
     :param deps: Sorted tuple of tile dim indices from :func:`resolve_gather_deps`.
     :param widths: Lib node's full tile widths.
     :param conn: The connector name (e.g. ``"_idx_0"``).
-    :returns: A CPP expression string of the form ``conn[<offset>]``.
+    :returns: A CPP expression string of the form ``(long long)conn[<offset>]``.
     """
     if not deps:
-        return f"{conn}[0]"
+        return f"(long long)({conn}[0])"
     parts = []
     for i, p in enumerate(deps):
         inner = 1
         for q in deps[i + 1:]:
             inner *= widths[q]
         parts.append(f"__l{p}" if inner == 1 else f"(__l{p} * {inner})")
-    return f"{conn}[{' + '.join(parts)}]"
+    return f"(long long)({conn}[{' + '.join(parts)}])"

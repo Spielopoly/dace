@@ -121,6 +121,7 @@ def replace_dict(subgraph: 'StateSubgraphView',
     # Replace in node properties
     for node in subgraph.nodes():
         replace_properties_dict(node, repl, symrepl)
+        node.replace_dict(repl)
 
     # Replace in memlets
     for edge in subgraph.edges():
