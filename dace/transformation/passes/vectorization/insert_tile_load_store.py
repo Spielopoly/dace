@@ -614,20 +614,6 @@ class InsertTileLoadStore(ppl.Pass):
                 continue  # No write to stage (pure source -- the read phase owns it).
             if any(isinstance(e.src, (TileLoad, TileStore)) for e in pre_stage_in_edges):
                 continue  # Already staged by phase 1's bridge->output insertion.
-            # A widened transient may feed the global output directly even when this AccessNode
-            # is also read in the state. Route that copy straight through a TileStore before the
-            # in-place read gate below; otherwise it survives into cuTile code generation as an
-            # unsupported AccessNode-to-AccessNode copy.
-            for edge in list(pre_stage_in_edges):
-                if (isinstance(edge.src, AccessNode)
-                        and self._maybe_stage_tilestore_to_output(inner_state, edge.src, an, iter_vars, edge)):
-                    inner_state.remove_edge(edge)
-                    staged += 1
-            pre_stage_in_edges = list(inner_state.in_edges(an))
-            if not pre_stage_in_edges:
-                continue
-            if any(isinstance(e.src, (TileLoad, TileStore)) for e in pre_stage_in_edges):
-                continue  # The direct-copy path above just staged this write.
             # Pure sink (writes, no reads) is common. Other staged shape = in-place RMW
             # intermediate (user 2026-06-15): non-transient WRITTEN + re-READ in the SAME state
             # (cloudsc ``zqx_v = zqx_v + zqx_l`` then ``zqx_v = zqx_v + zqx_i``). Phase 1
