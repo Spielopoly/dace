@@ -68,6 +68,20 @@ def test_symbol_operand_named_i_remains_a_free_symbol():
     assert node.free_symbols == {"I"}
 
 
+@pytest.mark.parametrize("expression", ["1j * scale", "1j / scale"])
+def test_complex_operand_retains_runtime_dependency(expression: str):
+    """Imaginary coefficients must not erase real runtime dependencies."""
+    from dace.transformation.passes.prune_symbols import RemoveUnusedSymbols
+
+    sdfg = dace.SDFG("complex_operand_dependency")
+    sdfg.add_symbol("scale", dace.float64)
+    node = TileBinop(name="binop", widths=(8,), op="+", kind_b="Symbol", expr_b=expression)
+    sdfg.add_state("main").add_node(node)
+    assert "scale" in node.free_symbols
+    RemoveUnusedSymbols().apply_pass(sdfg, {})
+    assert "scale" in sdfg.symbols
+
+
 def _build_binop_sdfg(widths, op, has_mask, dtype):
     """Build a minimal SDFG: two input tiles -> TileBinop -> output tile."""
     sdfg = dace.SDFG(f"tile_binop_pure_{_OP_TAG[op]}_{'x'.join(str(w) for w in widths)}_{'m' if has_mask else 'nm'}")

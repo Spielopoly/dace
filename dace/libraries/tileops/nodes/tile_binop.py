@@ -25,34 +25,13 @@ from .._pure_codegen import nested_loops, tile_offset
 from .. import _isa_codegen
 
 
-class _ReplaceComplexLiterals(ast.NodeTransformer):
-    """Replace Python complex literals before symbolic dependency analysis."""
-
-    def visit_Constant(self, node: ast.Constant) -> ast.Constant:
-        if isinstance(node.value, complex):
-            return ast.copy_location(ast.Constant(value=0), node)
-        return node
-
-
 def _symbol_operand_free_symbols(expr: str) -> Set[str]:
     """Return runtime symbols in an inline Python operand expression.
-
-    ``pystr_to_symbolic`` represents a Python imaginary literal such as
-    ``6.28j`` as SymPy's ``I`` and then converts ``I`` to a DaCe symbol. The
-    literal is still emitted as valid Python by the cuTile expansion, so
-    treating ``I`` as a runtime dependency creates a spurious nested-SDFG
-    argument. Remove complex AST constants only for dependency analysis;
-    genuine names, including a user symbol named ``I``, remain untouched.
 
     :param expr: Inline operand expression.
     :returns: Names of runtime symbols used by the expression.
     """
-    try:
-        tree = ast.parse(expr, mode="eval")
-        normalized = ast.unparse(_ReplaceComplexLiterals().visit(tree))
-        return {str(s) for s in dace.symbolic.pystr_to_symbolic(normalized).free_symbols}
-    except (SyntaxError, TypeError, ValueError):
-        return {str(s) for s in dace.symbolic.pystr_to_symbolic(expr).free_symbols}
+    return {str(s) for s in dace.symbolic.pystr_to_symbolic(expr).free_symbols}
 
 
 def _replace_symbol_operand(expr: Optional[str], repl: Dict[str, str]) -> Optional[str]:

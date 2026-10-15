@@ -58,7 +58,7 @@ class _BoundNameCollector(ast.NodeVisitor):
 
 
 class _PythonDtypeCastRewriter(ast.NodeTransformer):
-    """Make dtype calls safe for Python, NumPy, and CuPy scalar values."""
+    """Qualify serialized dtype calls for the Python backend."""
 
     def __init__(self, bound_names: set[str]) -> None:
         self.changed = False
@@ -76,34 +76,12 @@ class _PythonDtypeCastRewriter(ast.NodeTransformer):
         if dtype_name is None or len(node.args) != 1 or node.keywords:
             return node
         self.changed = True
-
-        def _value() -> ast.Name:
-            return ast.Name(id="__dace_value", ctx=ast.Load())
-
-        normalized = ast.IfExp(
-            test=ast.Call(func=ast.Name(id="hasattr", ctx=ast.Load()),
-                          args=[_value(), ast.Constant(value="item")],
-                          keywords=[]),
-            body=ast.Call(func=ast.Attribute(value=_value(), attr="item", ctx=ast.Load()), args=[], keywords=[]),
-            orelse=_value(),
-        )
         cast_target = ast.parse(_PY_CAST_TARGETS[dtype_name], mode="eval").body
-        cast = ast.Call(func=cast_target, args=[normalized], keywords=[])
-        cast_lambda = ast.Lambda(
-            args=ast.arguments(posonlyargs=[],
-                               args=[ast.arg(arg="__dace_value")],
-                               vararg=None,
-                               kwonlyargs=[],
-                               kw_defaults=[],
-                               kwarg=None,
-                               defaults=[]),
-            body=cast,
-        )
-        return ast.copy_location(ast.Call(func=cast_lambda, args=node.args, keywords=[]), node)
+        return ast.copy_location(ast.Call(func=cast_target, args=node.args, keywords=[]), node)
 
 
 def rewrite_dtype_casts(body: str) -> str:
-    """Qualify DaCe dtype calls and safely unwrap array scalar values."""
+    """Qualify DaCe dtype calls without changing their operands."""
     try:
         tree = ast.parse(body)
     except SyntaxError:

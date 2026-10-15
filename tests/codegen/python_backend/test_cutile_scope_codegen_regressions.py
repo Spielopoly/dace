@@ -115,7 +115,56 @@ def test_nested_control_flow_array_read_uses_scalar_load():
     from dace.codegen.py.cutile_target import _rewrite_cutile_control_flow_expr
 
     expr = _rewrite_cutile_control_flow_expr("A_row[i + 1]", {"A_row": dace.data.Array(dace.uint32, [4])})
-    assert expr.replace(" ", "") == "ct.astype(ct.load(A_row,(i+1,),shape=()),ct.int64).item()"
+    assert expr.replace(" ", "") == "ct.load(A_row,(i+1,),shape=()).item()"
+
+
+def _unsigned_control_flow_sdfg(dtype: dtypes.typeclass) -> dace.SDFG:
+    """Build a nested kernel branching on an unsigned array element."""
+    sdfg = dace.SDFG(f"unsigned_control_{dtype.to_string()}")
+    sdfg.backend = dtypes.BackendLanguage.Python
+    sdfg.add_array("A", [1], dtype, storage=StorageType.GPU_Global)
+    sdfg.add_array("B", [1], dace.int64, storage=StorageType.GPU_Global)
+    sdfg.add_array("tile_result", [1], dace.int64, transient=True, storage=StorageType.CuTile_Tile)
+    state = sdfg.add_state("main")
+    entry, exit_node = state.add_map("kernel", {"tile_i": "0:1"}, schedule=ScheduleType.CuTile)
+
+    inner = dace.SDFG("unsigned_branch")
+    inner.add_array("A", [1], dtype, storage=StorageType.GPU_Global)
+    inner.add_array("result", [1], dace.int64, storage=StorageType.CuTile_Tile)
+    start = inner.add_state("start", is_start_block=True)
+    positive = inner.add_state("positive")
+    zero = inner.add_state("zero")
+    done = inner.add_state("done")
+    inner.add_edge(start, positive, dace.InterstateEdge(condition="A[0] > 0"))
+    inner.add_edge(start, zero, dace.InterstateEdge(condition="A[0] <= 0"))
+    inner.add_edge(positive, done, dace.InterstateEdge())
+    inner.add_edge(zero, done, dace.InterstateEdge())
+    for branch, value in ((positive, 1), (zero, 0)):
+        tasklet = branch.add_tasklet("value", {}, {"out"}, f"out = {value}")
+        branch.add_edge(tasklet, "out", branch.add_write("result"), None, Memlet("result[0]"))
+
+    nested = state.add_nested_sdfg(inner, {"A"}, {"result"})
+    state.add_memlet_path(state.add_read("A"), entry, nested, dst_conn="A", memlet=Memlet("A[0]"))
+    tile_result = state.add_access("tile_result")
+    state.add_edge(nested, "result", tile_result, None, Memlet("tile_result[0]"))
+    state.add_memlet_path(tile_result, exit_node, state.add_write("B"), memlet=Memlet("B[0]"))
+    sdfg.fill_scope_connectors()
+    return sdfg
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("dtype", [dace.uint32, dace.uint64])
+def test_nested_unsigned_control_flow_matches_numpy(dtype: dtypes.typeclass):
+    """Values above the signed range still take the positive branch."""
+    import cupy as cp
+
+    compiled = _unsigned_control_flow_sdfg(dtype).compile()
+    unsigned_max = np.iinfo(dtype.as_numpy_dtype()).max
+    for value in (0, 1, unsigned_max // 2 + 2, unsigned_max):
+        a = np.array([value], dtype=dtype.as_numpy_dtype())
+        result = cp.full(1, -99, dtype=cp.int64)
+        compiled(A=cp.asarray(a), B=result)
+        np.testing.assert_array_equal(cp.asnumpy(result), (a > 0).astype(np.int64))
 
 
 # ---------------------------------------------------------------------------

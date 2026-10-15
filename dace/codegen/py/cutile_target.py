@@ -102,9 +102,6 @@ class _CuTileControlFlowArrayLoads(ast.NodeTransformer):
             args=[node.value, ast.Tuple(elts=indices, ctx=ast.Load())],
             keywords=[ast.keyword(arg="shape", value=ast.Tuple(elts=[], ctx=ast.Load()))],
         )
-        desc = self._arrays[node.value.id]
-        if desc.dtype.as_numpy_dtype().kind == "u":
-            load = ast.Call(func=_ct_attr("astype"), args=[load, _ct_attr("int64")], keywords=[])
         return ast.copy_location(
             ast.Call(func=ast.Attribute(value=load, attr="item", ctx=ast.Load()), args=[], keywords=[]), node)
 

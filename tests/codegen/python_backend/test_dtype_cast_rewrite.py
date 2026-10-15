@@ -65,3 +65,20 @@ result = int64(value)""",
     sdfg.compile()(x=np.array([3.75]), y=result)
 
     assert result[0] == 5.75
+
+
+def test_array_dtype_cast_preserves_array():
+    """A dtype constructor on an array must not unwrap it as a scalar."""
+    @dace.program
+    def cast_array(A: dace.float32[3], B: dace.float64[3]):
+        with dace.tasklet:
+            cast_input << A[:]
+            cast_output >> B[:]
+            cast_output = np.float64(cast_input)
+
+    sdfg = cast_array.to_sdfg(simplify=False)
+    sdfg.backend = dtypes.BackendLanguage.Python
+    a = np.array([1.25, -2.5, 3.75], dtype=np.float32)
+    b = np.full(a.shape, np.nan, dtype=np.float64)
+    sdfg.compile()(A=a, B=b)
+    np.testing.assert_array_equal(b, np.float64(a))
